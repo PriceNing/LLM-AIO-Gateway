@@ -18,6 +18,7 @@ config.json
 # Project-local notes (not for distribution)
 CLAUDE.md
 opencode-fix.md
+history/
 
 # Logs
 logs/
