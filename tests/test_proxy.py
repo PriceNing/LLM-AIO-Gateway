@@ -43,9 +43,6 @@ def temp_db(tmp_path):
     })
     add_user_api_key("alice", "default", ["allowed-model"])
     # Override the key to a known value for tests
-    from app.database import update_user_api_key
-    update_user_api_key("alice", "sk-aio-dummy", {"allowed_models": ["allowed-model"]})
-    # Re-create with known key
     from app.database import get_db
     with get_db() as db:
         db.execute("UPDATE user_api_keys SET key = 'user-key' WHERE username = 'alice'")
