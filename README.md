@@ -100,7 +100,7 @@
 ### 安装与运行
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/PriceNing/LLM-AIO-Gateway.git
 cd LLM-AIO
 pip install -r requirements.txt
 python main.py

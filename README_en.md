@@ -101,7 +101,7 @@ You can also use online multimodal models as preprocessors for other models to a
 ### Install & Run
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/PriceNing/LLM-AIO-Gateway.git
 cd LLM-AIO
 pip install -r requirements.txt
 python main.py
