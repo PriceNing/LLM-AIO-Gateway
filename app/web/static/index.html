@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LLM AIO Gateway</title>
+    <link rel="stylesheet" href="styles.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+</head>
+<body>
+
+    <!-- Background blobs -->
+    <div class="bg-blobs">
+        <div class="blob blob-1"></div>
+        <div class="blob blob-2"></div>
+        <div class="blob blob-3"></div>
+    </div>
+
+    <!-- Toast container -->
+    <div class="toast-container" id="toastContainer"></div>
+
+    <!-- Auth View -->
+    <div id="authView" class="auth-view">
+        <div class="auth-panel glass">
+            <div class="logo">&#9883;</div>
+            <h1 data-i18n="auth.title">LLM AIO Gateway</h1>
+            <p class="subtitle" id="authHint" data-i18n="auth.hint">登录后管理用户、模型和调用 Key。</p>
+            <div class="form-group">
+                <label data-i18n="auth.username">管理员账号</label>
+                <input type="text" id="adminUsername" autocomplete="username" onkeydown="if(event.key==='Enter')submitAuth()">
+            </div>
+            <div class="form-group">
+                <label data-i18n="auth.password">密码</label>
+                <input type="password" id="adminPassword" autocomplete="current-password" onkeydown="if(event.key==='Enter')submitAuth()">
+            </div>
+            <button class="btn btn-primary auth-submit" onclick="submitAuth()" style="width:100%;justify-content:center;" data-i18n="auth.login">登录</button>
+        </div>
+    </div>
+
+    <!-- App View -->
+    <div id="appView" class="app-container" style="display:none;">
+
+        <!-- Top Bar -->
+        <header class="topbar glass">
+            <div class="topbar-left">
+                <h1>&#9883; LLM AIO Gateway</h1>
+            </div>
+            <div class="topbar-right">
+                <span class="admin-name" id="currentAdmin"></span>
+                <button class="icon-btn" id="btnLang" onclick="toggleLang()" data-i18n-title="nav.switchLang">&#127760;</button>
+                <button class="icon-btn" id="btnTheme" onclick="toggleTheme()" data-i18n-title="nav.switchTheme">&#9790;</button>
+                <button class="btn btn-secondary btn-sm" onclick="logout()" data-i18n="nav.logout">退出</button>
+            </div>
+        </header>
+
+        <!-- Main Layout -->
+        <div class="main-layout">
+            <!-- Sidebar -->
+            <aside class="sidebar">
+                <button class="nav-btn active" onclick="showSection('users', event)" data-section="users">
+                    <span class="nav-icon">&#128101;</span><span data-i18n="nav.users">用户管理</span>
+                </button>
+                <button class="nav-btn" onclick="showSection('providers', event)" data-section="providers">
+                    <span class="nav-icon">&#9881;</span><span data-i18n="nav.providers">提供商</span>
+                </button>
+                <button class="nav-btn" onclick="showSection('models', event)" data-section="models">
+                    <span class="nav-icon">&#128269;</span><span data-i18n="nav.models">模型管理</span>
+                </button>
+                <button class="nav-btn" onclick="showSection('routing', event)" data-section="routing">
+                    <span class="nav-icon">&#128257;</span><span data-i18n="nav.routing">路由规则</span>
+                </button>
+                <button class="nav-btn" onclick="showSection('preprocessors', event)" data-section="preprocessors">
+                    <span class="nav-icon">&#127918;</span><span data-i18n="nav.preprocessors">视觉模型注入</span>
+                </button>
+                <button class="nav-btn" onclick="showSection('stats', event)" data-section="stats">
+                    <span class="nav-icon">&#128200;</span><span data-i18n="nav.stats">统计</span>
+                </button>
+            </aside>
+
+            <!-- Content -->
+            <main class="content">
+                <!-- Users -->
+                <div id="users-section" class="section">
+                    <div class="section-header">
+                        <h2 data-i18n="users.title">用户管理</h2>
+                        <button class="btn btn-primary" onclick="showAddUserModal()" data-i18n="users.add">新增用户</button>
+                    </div>
+                    <div id="usersList" class="users-list"></div>
+                </div>
+
+                <!-- Providers -->
+                <div id="providers-section" class="section" style="display:none;">
+                    <div class="section-header">
+                        <h2 data-i18n="providers.title">提供商列表</h2>
+                        <button class="btn btn-primary" onclick="showAddProviderModal()" data-i18n="providers.add">新增提供商</button>
+                    </div>
+                    <div id="providersList" class="providers-grid"></div>
+                </div>
+
+                <!-- Models -->
+                <div id="models-section" class="section" style="display:none;">
+                    <div class="section-header">
+                        <h2 data-i18n="models.title">模型列表</h2>
+                        <div class="search-box">
+                            <input type="text" id="modelSearch" data-i18n-placeholder="models.search" placeholder="搜索模型..." oninput="filterModels()">
+                        </div>
+                        <button class="btn btn-secondary" onclick="refreshAllModels()" data-i18n="models.refreshAll">刷新所有模型</button>
+                    </div>
+                    <div id="modelsList" class="models-list"></div>
+                </div>
+
+                <!-- Routing Rules -->
+                <div id="routing-section" class="section" style="display:none;">
+                    <div class="section-header">
+                        <h2 data-i18n="routing.title">路由规则</h2>
+                        <button class="btn btn-primary" onclick="showAddRoutingRuleModal()" data-i18n="routing.add">新增规则</button>
+                    </div>
+                    <div id="routingRulesList" class="routing-list"></div>
+                </div>
+
+                <!-- Stats -->
+                <div id="stats-section" class="section" style="display:none;">
+                    <div class="section-header">
+                        <h2 data-i18n="stats.title">调用统计</h2>
+                    </div>
+                    <div id="statsContent" class="stats-grid"></div>
+                </div>
+
+                <!-- Preprocessors -->
+                <div id="preprocessors-section" class="section" style="display:none;">
+                    <div class="section-header">
+                        <h2 data-i18n="preprocessors.title">视觉模型注入</h2>
+                    </div>
+                    <div id="preprocessorsContent" class="preprocessors-grid"></div>
+                </div>
+            </main>
+        </div>
+    </div>
+
+    <!-- Modal -->
+    <div id="modal" class="modal" style="display:none;">
+        <div class="modal-content glass">
+            <button class="modal-close" onclick="closeModal()" data-i18n-title="common.close">&times;</button>
+            <div id="modalContent"></div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>

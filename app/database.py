@@ -1,0 +1,625 @@
+import sqlite3
+import json
+import time
+import threading
+from datetime import date
+from typing import Optional
+from contextlib import contextmanager
+
+_lock = threading.Lock()
+_initialized = False
+
+DB_PATH: str = "data.db"
+
+# ── Connection management ──
+
+def _db_path() -> str:
+    return DB_PATH
+
+
+def init_db(path: Optional[str] = None) -> None:
+    """Initialize database: create tables if not exist, enable WAL."""
+    global DB_PATH, _initialized
+    if path:
+        DB_PATH = path
+    with _lock:
+        with sqlite3.connect(_db_path()) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.executescript(_SCHEMA)
+            # Migration: add created_at to provider_models if missing
+            _migrate_provider_models_created_at(conn)
+        _initialized = True
+
+
+def _migrate_provider_models_created_at(conn: sqlite3.Connection) -> None:
+    """Add created_at and preprocessor columns to provider_models if missing."""
+    for col, default in (("created_at", "''"), ("preprocessor", "''")):
+        try:
+            conn.execute(f"ALTER TABLE provider_models ADD COLUMN {col} TEXT NOT NULL DEFAULT {default}")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
+
+def _ensure_init() -> None:
+    if not _initialized:
+        init_db()
+
+
+@contextmanager
+def get_db():
+    """Get a database connection with WAL mode enabled."""
+    _ensure_init()
+    conn = sqlite3.connect(_db_path(), timeout=10)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+# ── Schema ──
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS admins (
+    username TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL DEFAULT '',
+    password_hash TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS users (
+    username TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL DEFAULT '',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    total_calls INTEGER NOT NULL DEFAULT 0,
+    failed_calls INTEGER NOT NULL DEFAULT 0,
+    total_tokens INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS user_api_keys (
+    key TEXT PRIMARY KEY,
+    username TEXT NOT NULL,
+    name TEXT NOT NULL DEFAULT 'default',
+    allowed_models TEXT NOT NULL DEFAULT '["*"]',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    total_calls INTEGER NOT NULL DEFAULT 0,
+    failed_calls INTEGER NOT NULL DEFAULT 0,
+    total_tokens INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY (username) REFERENCES users(username) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS providers (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    provider_type TEXT NOT NULL DEFAULT 'openai',
+    api_base TEXT NOT NULL DEFAULT '',
+    api_key TEXT NOT NULL DEFAULT '',
+    enabled INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS provider_models (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider_id TEXT NOT NULL,
+    model_id TEXT NOT NULL,
+    model_name TEXT NOT NULL DEFAULT '',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT '',
+    preprocessor TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY (provider_id) REFERENCES providers(id) ON DELETE CASCADE,
+    UNIQUE(provider_id, model_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_provider_models_model_id ON provider_models(model_id);
+
+CREATE TABLE IF NOT EXISTS routing_rules (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL DEFAULT 'New Rule',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    username TEXT NOT NULL DEFAULT '',
+    api_key_pattern TEXT NOT NULL DEFAULT '',
+    match_model TEXT NOT NULL DEFAULT '',
+    target_model TEXT NOT NULL DEFAULT '',
+    target_provider TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS global_stats (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL DEFAULT '0'
+);
+"""
+
+# ── Helpers ──
+
+def _row_to_dict(row: sqlite3.Row) -> dict:
+    if row is None:
+        return None
+    return dict(row)
+
+
+def _json_loads(s: str):
+    if not s:
+        return None  # empty string is not valid JSON — treated as "not configured" by callers
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        return None
+
+
+def _to_bool(v) -> bool:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, int):
+        return bool(v)
+    if isinstance(v, str):
+        return v.lower() in ("1", "true", "yes")
+    return False
+
+
+# ── Global stats ──
+
+def get_global_stats() -> dict:
+    with get_db() as db:
+        rows = db.execute("SELECT key, value FROM global_stats").fetchall()
+        result = {}
+        for r in rows:
+            v = r["value"]
+            result[r["key"]] = int(v) if v.lstrip("-").isdigit() else v
+        return result
+
+
+def increment_global_stats(success: bool) -> None:
+    with get_db() as db:
+        db.execute("INSERT OR IGNORE INTO global_stats (key, value) VALUES ('total_calls', '0')")
+        db.execute("INSERT OR IGNORE INTO global_stats (key, value) VALUES ('failed_calls', '0')")
+        db.execute("INSERT OR IGNORE INTO global_stats (key, value) VALUES ('last_reset', '')")
+        db.execute("UPDATE global_stats SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = 'total_calls'")
+        if not success:
+            db.execute("UPDATE global_stats SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = 'failed_calls'")
+
+
+def reset_global_stats() -> None:
+    today = date.today().isoformat()
+    with get_db() as db:
+        db.execute("UPDATE global_stats SET value = '0' WHERE key IN ('total_calls', 'failed_calls')")
+        db.execute("INSERT OR REPLACE INTO global_stats (key, value) VALUES ('last_reset', ?)", (today,))
+
+
+# ── Admins ──
+
+def get_admins() -> list:
+    with get_db() as db:
+        rows = db.execute("SELECT * FROM admins ORDER BY created_at").fetchall()
+        return [_row_to_dict(r) for r in rows]
+
+
+def get_admin(username: str) -> Optional[dict]:
+    with get_db() as db:
+        row = db.execute("SELECT * FROM admins WHERE username = ?", (username,)).fetchone()
+        return _row_to_dict(row)
+
+
+def add_admin(username: str, password_hash: str, display_name: str = "") -> dict:
+    today = date.today().isoformat()
+    with get_db() as db:
+        try:
+            db.execute(
+                "INSERT INTO admins (username, display_name, password_hash, enabled, created_at) VALUES (?, ?, ?, 1, ?)",
+                (username, display_name or username, password_hash, today)
+            )
+        except sqlite3.IntegrityError:
+            raise ValueError("Admin already exists")
+    return {"username": username, "display_name": display_name or username, "password_hash": password_hash, "enabled": True, "created_at": today}
+
+
+# ── Users ──
+
+def _api_key_from_row(k: sqlite3.Row) -> dict:
+    kd = _row_to_dict(k)
+    kd["allowed_models"] = _json_loads(kd.get("allowed_models", '["*"]'))
+    kd["stats"] = {"total_calls": kd.pop("total_calls", 0), "failed_calls": kd.pop("failed_calls", 0), "total_tokens": kd.pop("total_tokens", 0)}
+    kd["enabled"] = _to_bool(kd.get("enabled"))
+    return kd
+
+
+def _user_from_row(r: sqlite3.Row) -> dict:
+    user = _row_to_dict(r)
+    user["stats"] = {"total_calls": user.pop("total_calls", 0), "failed_calls": user.pop("failed_calls", 0), "total_tokens": user.pop("total_tokens", 0)}
+    user["enabled"] = _to_bool(user.get("enabled"))
+    user["api_keys"] = []
+    return user
+
+
+def get_users() -> list:
+    with get_db() as db:
+        users_rows = db.execute("SELECT username, display_name, enabled, total_calls, failed_calls, total_tokens, created_at FROM users ORDER BY created_at").fetchall()
+        keys_rows = db.execute("SELECT * FROM user_api_keys ORDER BY username, created_at").fetchall()
+        keys_by_user: dict[str, list] = {}
+        for k in keys_rows:
+            uname = k["username"]
+            keys_by_user.setdefault(uname, []).append(_api_key_from_row(k))
+        result = []
+        for r in users_rows:
+            user = _user_from_row(r)
+            user["api_keys"] = keys_by_user.get(user["username"], [])
+            result.append(user)
+        return result
+
+
+def get_user(username: str) -> Optional[dict]:
+    with get_db() as db:
+        row = db.execute("SELECT username, display_name, enabled, total_calls, failed_calls, total_tokens, created_at FROM users WHERE username = ?", (username,)).fetchone()
+        if not row:
+            return None
+        user = _user_from_row(row)
+        keys = db.execute("SELECT * FROM user_api_keys WHERE username = ? ORDER BY created_at", (username,)).fetchall()
+        user["api_keys"] = [_api_key_from_row(k) for k in keys]
+        return user
+
+
+def add_user(user_info: dict) -> dict:
+    username = user_info.get("username", "").strip()
+    if not username:
+        raise ValueError("username is required")
+    today = date.today().isoformat()
+    with get_db() as db:
+        existing = db.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone()
+        if existing:
+            raise ValueError("User already exists")
+        db.execute(
+            "INSERT INTO users (username, display_name, enabled, created_at) VALUES (?, ?, ?, ?)",
+            (username, user_info.get("display_name") or username, 1 if user_info.get("enabled", True) else 0, today)
+        )
+    return get_user(username)
+
+
+def update_user(username: str, updates: dict) -> Optional[dict]:
+    with get_db() as db:
+        existing = db.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone()
+        if not existing:
+            return None
+        if "display_name" in updates:
+            db.execute("UPDATE users SET display_name = ? WHERE username = ?", (updates["display_name"], username))
+        if "enabled" in updates:
+            db.execute("UPDATE users SET enabled = ? WHERE username = ?", (1 if updates["enabled"] else 0, username))
+    return get_user(username)
+
+
+def delete_user(username: str) -> bool:
+    with get_db() as db:
+        cursor = db.execute("DELETE FROM users WHERE username = ?", (username,))
+        return cursor.rowcount > 0
+
+
+# ── API Keys ──
+
+def add_user_api_key(username: str, name: str, allowed_models: Optional[list] = None) -> dict:
+    from app.security import new_api_key
+    today = date.today().isoformat()
+    allowed = allowed_models if allowed_models is not None else ["*"]
+    key = new_api_key()
+    with get_db() as db:
+        existing = db.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone()
+        if not existing:
+            raise ValueError("User not found")
+        db.execute(
+            "INSERT INTO user_api_keys (key, username, name, allowed_models, enabled, created_at) VALUES (?, ?, ?, ?, 1, ?)",
+            (key, username, name or "default", json.dumps(allowed), today)
+        )
+    return {"key": key, "name": name or "default", "allowed_models": allowed, "created_at": today, "enabled": True, "stats": {"total_calls": 0, "failed_calls": 0, "total_tokens": 0}}
+
+
+def update_user_api_key(username: str, key: str, updates: dict) -> Optional[dict]:
+    with get_db() as db:
+        row = db.execute("SELECT * FROM user_api_keys WHERE key = ? AND username = ?", (key, username)).fetchone()
+        if not row:
+            return None
+        if "name" in updates:
+            db.execute("UPDATE user_api_keys SET name = ? WHERE key = ?", (updates["name"], key))
+        if "allowed_models" in updates:
+            db.execute("UPDATE user_api_keys SET allowed_models = ? WHERE key = ?", (json.dumps(updates["allowed_models"]), key))
+        if "enabled" in updates:
+            db.execute("UPDATE user_api_keys SET enabled = ? WHERE key = ?", (1 if updates["enabled"] else 0, key))
+        row2 = db.execute("SELECT * FROM user_api_keys WHERE key = ?", (key,)).fetchone()
+        kd = _row_to_dict(row2)
+        kd["allowed_models"] = _json_loads(kd.get("allowed_models", '["*"]'))
+        kd["stats"] = {"total_calls": kd.pop("total_calls", 0), "failed_calls": kd.pop("failed_calls", 0), "total_tokens": kd.pop("total_tokens", 0)}
+        kd["enabled"] = _to_bool(kd.get("enabled"))
+        return kd
+
+
+def delete_user_api_key(username: str, key: str) -> bool:
+    with get_db() as db:
+        cursor = db.execute("DELETE FROM user_api_keys WHERE key = ? AND username = ?", (key, username))
+        return cursor.rowcount > 0
+
+
+# ── Find user by API key ──
+
+def find_user_by_api_key(key: str) -> Optional[tuple[dict, dict]]:
+    with get_db() as db:
+        row = db.execute("""
+            SELECT u.username, u.display_name, u.enabled as user_enabled,
+                   k.key, k.name, k.allowed_models, k.enabled as key_enabled, k.total_calls, k.failed_calls, k.total_tokens, k.created_at
+            FROM users u
+            JOIN user_api_keys k ON k.username = u.username
+            WHERE k.key = ?
+        """, (key,)).fetchone()
+        if not row:
+            return None
+        r = dict(row)
+        if not r.get("user_enabled") or not r.get("key_enabled"):
+            return None
+        user = {"username": r["username"], "display_name": r["display_name"], "enabled": bool(r["user_enabled"])}
+        api_key = {
+            "key": r["key"], "name": r["name"],
+            "allowed_models": _json_loads(r["allowed_models"]),
+            "enabled": bool(r["key_enabled"]),
+            "stats": {"total_calls": r["total_calls"], "failed_calls": r["failed_calls"], "total_tokens": r["total_tokens"]},
+            "created_at": r["created_at"]
+        }
+        return user, api_key
+
+
+# ── Increment usage stats ──
+
+def increment_user_usage(username: str, api_key_value: str, success: bool, tokens: int = 0) -> None:
+    with get_db() as db:
+        db.execute("UPDATE users SET total_calls = total_calls + 1, total_tokens = total_tokens + ? WHERE username = ?", (tokens, username))
+        if not success:
+            db.execute("UPDATE users SET failed_calls = failed_calls + 1 WHERE username = ?", (username,))
+        db.execute("UPDATE user_api_keys SET total_calls = total_calls + 1, total_tokens = total_tokens + ? WHERE key = ?", (tokens, api_key_value))
+        if not success:
+            db.execute("UPDATE user_api_keys SET failed_calls = failed_calls + 1 WHERE key = ?", (api_key_value,))
+
+
+def reset_user_stats() -> None:
+    with get_db() as db:
+        db.execute("UPDATE users SET total_calls = 0, failed_calls = 0, total_tokens = 0")
+        db.execute("UPDATE user_api_keys SET total_calls = 0, failed_calls = 0, total_tokens = 0")
+
+
+# ── Providers ──
+
+def get_providers() -> list:
+    with get_db() as db:
+        rows = db.execute("SELECT * FROM providers ORDER BY id").fetchall()
+        result = []
+        for r in rows:
+            p = _row_to_dict(r)
+            p["enabled"] = _to_bool(p["enabled"])
+            models_rows = db.execute("SELECT * FROM provider_models WHERE provider_id = ? ORDER BY model_id", (p["id"],)).fetchall()
+            p["models"] = [{"id": m["model_id"], "name": m["model_name"], "enabled": _to_bool(m["enabled"]), "preprocessor": m["preprocessor"] or ""} for m in models_rows]
+            result.append(p)
+        return result
+
+
+def get_provider(provider_id: str) -> Optional[dict]:
+    with get_db() as db:
+        row = db.execute("SELECT * FROM providers WHERE id = ?", (provider_id,)).fetchone()
+        if not row:
+            return None
+        p = _row_to_dict(row)
+        p["enabled"] = _to_bool(p["enabled"])
+        models_rows = db.execute("SELECT * FROM provider_models WHERE provider_id = ? ORDER BY model_id", (provider_id,)).fetchall()
+        p["models"] = [{"id": m["model_id"], "name": m["model_name"], "enabled": _to_bool(m["enabled"])} for m in models_rows]
+        return p
+
+
+def add_provider(provider: dict) -> dict:
+    with get_db() as db:
+        try:
+            db.execute(
+                "INSERT INTO providers (id, name, provider_type, api_base, api_key, enabled) VALUES (?, ?, ?, ?, ?, ?)",
+                (provider["id"], provider["name"], provider.get("provider_type", "openai"),
+                 provider.get("api_base", ""), provider.get("api_key", ""),
+                 1 if provider.get("enabled", True) else 0)
+            )
+        except sqlite3.IntegrityError:
+            raise ValueError(f"Provider '{provider['id']}' already exists")
+        for m in provider.get("models", []):
+            db.execute(
+                "INSERT OR IGNORE INTO provider_models (provider_id, model_id, model_name, enabled) VALUES (?, ?, ?, ?)",
+                (provider["id"], m["id"], m.get("name", m["id"]), 1 if m.get("enabled", True) else 0)
+            )
+    return {
+        "id": provider["id"],
+        "name": provider["name"],
+        "provider_type": provider.get("provider_type", "openai"),
+        "api_base": provider.get("api_base", ""),
+        "api_key": provider.get("api_key", ""),
+        "enabled": provider.get("enabled", True),
+        "models": [{"id": m["id"], "name": m.get("name", m["id"]), "enabled": m.get("enabled", True)} for m in provider.get("models", [])]
+    }
+
+
+def update_provider(provider_id: str, updates: dict) -> Optional[dict]:
+    with get_db() as db:
+        existing = db.execute("SELECT 1 FROM providers WHERE id = ?", (provider_id,)).fetchone()
+        if not existing:
+            return None
+        _updatable = {"name", "provider_type", "api_base", "api_key"}
+        for key in _updatable:
+            if key in updates:
+                db.execute(f"UPDATE providers SET {key} = ? WHERE id = ?", (updates[key], provider_id))
+        if "enabled" in updates:
+            db.execute("UPDATE providers SET enabled = ? WHERE id = ?", (1 if updates["enabled"] else 0, provider_id))
+        if "models" in updates:
+            existing_ids = {m["model_id"] for m in db.execute("SELECT model_id FROM provider_models WHERE provider_id = ?", (provider_id,)).fetchall()}
+            for m in updates["models"]:
+                if m["id"] not in existing_ids:
+                    db.execute(
+                        "INSERT OR IGNORE INTO provider_models (provider_id, model_id, model_name, enabled) VALUES (?, ?, ?, ?)",
+                        (provider_id, m["id"], m.get("name", m["id"]), 1 if m.get("enabled", True) else 0)
+                    )
+        # Fetch updated state within same transaction
+        row = db.execute("SELECT * FROM providers WHERE id = ?", (provider_id,)).fetchone()
+        if not row:
+            return None
+        p = _row_to_dict(row)
+        p["enabled"] = _to_bool(p["enabled"])
+        models_rows = db.execute("SELECT * FROM provider_models WHERE provider_id = ? ORDER BY model_id", (provider_id,)).fetchall()
+        p["models"] = [{"id": m["model_id"], "name": m["model_name"], "enabled": _to_bool(m["enabled"])} for m in models_rows]
+        return p
+
+
+def delete_provider(provider_id: str) -> bool:
+    with get_db() as db:
+        cursor = db.execute("DELETE FROM providers WHERE id = ?", (provider_id,))
+        return cursor.rowcount > 0
+
+
+class ModelId:
+    """统一的模型标识符，封装 provider/model 复合格式的解析逻辑。
+
+    支持简单格式 "model" 和复合格式 "provider/model"。
+    可与字符串比较：model_id in ["allowed-model", "provider/model"]。
+    """
+
+    __slots__ = ("provider_id", "model_name")
+
+    def __init__(self, provider_id: str = "", model_name: str = ""):
+        self.provider_id = provider_id
+        self.model_name = model_name
+
+    @classmethod
+    def parse(cls, raw: str) -> "ModelId":
+        if not raw:
+            return cls("", "")
+        if "/" in raw:
+            parts = raw.split("/", 1)
+            return cls(parts[0], parts[1])
+        return cls("", raw)
+
+    @property
+    def composite(self) -> str:
+        return f"{self.provider_id}/{self.model_name}" if self.provider_id else self.model_name
+
+    @property
+    def is_composite(self) -> bool:
+        return bool(self.provider_id)
+
+    def __str__(self) -> str:
+        return self.composite
+
+    def __repr__(self) -> str:
+        return f"ModelId(provider={self.provider_id!r}, model={self.model_name!r})"
+
+    def __eq__(self, other):
+        if isinstance(other, ModelId):
+            return (self.provider_id, self.model_name) == (other.provider_id, other.model_name)
+        if isinstance(other, str):
+            if self.composite == other:
+                return True
+            # 复合 ID == 简单名：比较 model_name 部分
+            if self.model_name == other:
+                return True
+            # 简单名 == 复合 ID 字符串：比较后缀 model 部分
+            if not self.is_composite and "/" in other:
+                return self.model_name == other.rsplit("/", 1)[-1]
+            return False
+        return NotImplemented
+
+    def __hash__(self):
+        return hash((self.provider_id, self.model_name))
+
+    def __bool__(self):
+        return bool(self.model_name)
+
+
+def parse_model_id(model_id: str) -> ModelId:
+    """解析模型标识符为 ModelId 对象。"""
+    return ModelId.parse(model_id)
+
+
+def find_provider_by_model(model_id: str) -> Optional[dict]:
+    """查找提供指定模型的第一个启用的 provider。
+
+    支持 provider/model 复合格式精确匹配；无前缀时取第一个匹配的 provider。
+    """
+    mid = parse_model_id(model_id)
+    with get_db() as db:
+        if mid.provider_id:
+            row = db.execute("""
+                SELECT p.* FROM providers p
+                JOIN provider_models m ON m.provider_id = p.id
+                WHERE p.id = ? AND m.model_id = ? AND m.enabled = 1 AND p.enabled = 1
+            """, (mid.provider_id, mid.model_name)).fetchone()
+        else:
+            row = db.execute("""
+                SELECT p.* FROM providers p
+                JOIN provider_models m ON m.provider_id = p.id
+                WHERE m.model_id = ? AND m.enabled = 1 AND p.enabled = 1
+                ORDER BY p.id
+            """, (mid.model_name,)).fetchone()
+        if not row:
+            return None
+        p = _row_to_dict(row)
+        p["enabled"] = _to_bool(p["enabled"])
+        return p
+
+
+# ── Routing rules ──
+
+def get_routing_rules() -> list:
+    with get_db() as db:
+        rows = db.execute("SELECT * FROM routing_rules ORDER BY rowid").fetchall()
+        result = []
+        for r in rows:
+            d = _row_to_dict(r)
+            d["enabled"] = _to_bool(d["enabled"])
+            result.append(d)
+        return result
+
+
+def get_routing_rule(rule_id: str) -> Optional[dict]:
+    with get_db() as db:
+        row = db.execute("SELECT * FROM routing_rules WHERE id = ?", (rule_id,)).fetchone()
+        if not row:
+            return None
+        d = _row_to_dict(row)
+        d["enabled"] = _to_bool(d["enabled"])
+        return d
+
+
+def add_routing_rule(rule: dict) -> dict:
+    import uuid
+    entry_id = rule.get("id") or uuid.uuid4().hex[:8]
+    with get_db() as db:
+        db.execute(
+            "INSERT INTO routing_rules (id, name, enabled, username, api_key_pattern, match_model, target_model, target_provider) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (entry_id, rule.get("name", "New Rule"), 1 if rule.get("enabled", True) else 0,
+             rule.get("username", ""), rule.get("api_key_pattern", ""),
+             rule.get("match_model", ""), rule.get("target_model", ""), rule.get("target_provider", ""))
+        )
+    return get_routing_rule(entry_id)
+
+
+def update_routing_rule(rule_id: str, updates: dict) -> Optional[dict]:
+    with get_db() as db:
+        existing = db.execute("SELECT 1 FROM routing_rules WHERE id = ?", (rule_id,)).fetchone()
+        if not existing:
+            return None
+        for key in ("name", "enabled", "username", "api_key_pattern", "match_model", "target_model", "target_provider"):
+            if key in updates:
+                val = updates[key]
+                if key == "enabled":
+                    val = 1 if val else 0
+                db.execute(f"UPDATE routing_rules SET {key} = ? WHERE id = ?", (val, rule_id))
+    return get_routing_rule(rule_id)
+
+
+def delete_routing_rule(rule_id: str) -> bool:
+    with get_db() as db:
+        cursor = db.execute("DELETE FROM routing_rules WHERE id = ?", (rule_id,))
+        return cursor.rowcount > 0
+

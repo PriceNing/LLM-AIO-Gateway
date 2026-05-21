@@ -1,0 +1,37 @@
+{
+  "host": "0.0.0.0",
+  "port": 8000,
+  "database": "data.db",
+  "logging": {
+    "enabled": true,
+    "level": "INFO",
+    "log_dir": "logs",
+    "retention_days": 30,
+    "console": false
+  },
+  "defaults": {
+    "max_tokens": 16384,
+    "temperature": 0.7,
+    "tool_only_limit": 20,
+    "min_image_max_tokens": 2000,
+    "session_ttl_hours": 12,
+    "request_log_max": 200,
+    "reasoning_cache_ttl": 1800,
+    "reasoning_cache_max_size": 1000,
+    "tool_only_turns_ttl": 600,
+    "tool_only_turns_max_size": 2000,
+    "image_cache_max_size": 500
+  },
+  "preprocessors": {
+    "your-vision-model": {
+      "api_base": "http://127.0.0.1:8080/v1",
+      "model": "your-vision-model",
+      "api_key": "",
+      "timeout": 60,
+      "max_images": 20,
+      "max_tokens": 1024,
+      "prompt": "Please describe this image in detail.",
+      "enabled": false
+    }
+  }
+}
