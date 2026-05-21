@@ -221,6 +221,15 @@ def add_admin(username: str, password_hash: str, display_name: str = "") -> dict
     return {"username": username, "display_name": display_name or username, "password_hash": password_hash, "enabled": True, "created_at": today}
 
 
+def update_admin_password(username: str, password_hash: str) -> bool:
+    with get_db() as db:
+        db.execute(
+            "UPDATE admins SET password_hash = ? WHERE username = ?",
+            (password_hash, username)
+        )
+        return db.total_changes > 0
+
+
 # ── Users ──
 
 def _api_key_from_row(k: sqlite3.Row) -> dict:

@@ -1,7 +1,7 @@
 import asyncio
 from fastapi import APIRouter, Header, HTTPException
 from typing import Optional
-from app.database import get_admins, get_admin, add_admin
+from app.database import get_admins, get_admin, add_admin, update_admin_password
 from app.security import create_session, delete_session, get_session_username, hash_password, verify_password
 
 router = APIRouter()
@@ -72,4 +72,22 @@ async def me(authorization: Optional[str] = Header(None)):
 async def logout(authorization: Optional[str] = Header(None)):
     token = get_bearer_token(authorization)
     delete_session(token)
+    return {"status": "ok"}
+
+
+@router.put("/password")
+async def change_password(payload: dict, authorization: Optional[str] = Header(None)):
+    username = await require_admin_session(authorization)
+    current_password = payload.get("current_password", "")
+    new_password = payload.get("new_password", "")
+    if not current_password or not new_password:
+        raise HTTPException(status_code=400, detail="current_password and new_password are required")
+    if len(new_password) < 6:
+        raise HTTPException(status_code=400, detail="new_password must be at least 6 characters")
+    admin = get_admin(username)
+    valid = await asyncio.to_thread(verify_password, current_password, admin.get("password_hash", ""))
+    if not valid:
+        raise HTTPException(status_code=401, detail="Current password is incorrect")
+    password_hash = await asyncio.to_thread(hash_password, new_password)
+    update_admin_password(username, password_hash)
     return {"status": "ok"}

@@ -38,6 +38,17 @@ zh: {
     'nav.logout': '退出',
     'nav.switchLang': '切换语言',
     'nav.switchTheme': '切换主题',
+    'nav.changePassword': '修改密码',
+
+    'password.title': '修改密码',
+    'password.current': '当前密码',
+    'password.new': '新密码',
+    'password.confirm': '确认新密码',
+    'password.submit': '修改',
+    'password.success': '密码修改成功',
+    'password.mismatch': '两次输入的新密码不一致',
+    'password.tooShort': '新密码不能少于6位',
+    'password.wrongCurrent': '当前密码错误',
 
     'users.title': '用户管理',
     'users.add': '新增用户',
@@ -235,6 +246,17 @@ en: {
     'nav.logout': 'Logout',
     'nav.switchLang': 'Switch Language',
     'nav.switchTheme': 'Toggle Theme',
+    'nav.changePassword': 'Change Password',
+
+    'password.title': 'Change Password',
+    'password.current': 'Current Password',
+    'password.new': 'New Password',
+    'password.confirm': 'Confirm New Password',
+    'password.submit': 'Change',
+    'password.success': 'Password changed successfully',
+    'password.mismatch': 'Passwords do not match',
+    'password.tooShort': 'Password must be at least 6 characters',
+    'password.wrongCurrent': 'Current password is incorrect',
 
     'users.title': 'User Management',
     'users.add': 'Add User',
@@ -581,6 +603,43 @@ async function logout() {
     try { await api('/auth/logout', { method: 'POST' }); } catch (e) {}
     localStorage.removeItem(SESSION_KEY);
     location.reload();
+}
+
+function showChangePasswordModal() {
+    document.getElementById('modalContent').innerHTML =
+        '<h3 data-i18n="password.title">' + t('password.title') + '</h3>' +
+        '<div class="form-group"><label data-i18n="password.current">' + t('password.current') + '</label>' +
+        '<input type="password" id="currentPwd" autocomplete="current-password"></div>' +
+        '<div class="form-group"><label data-i18n="password.new">' + t('password.new') + '</label>' +
+        '<input type="password" id="newPwd1" autocomplete="new-password"></div>' +
+        '<div class="form-group"><label data-i18n="password.confirm">' + t('password.confirm') + '</label>' +
+        '<input type="password" id="newPwd2" autocomplete="new-password" onkeydown="if(event.key===\'Enter\')submitChangePassword()"></div>' +
+        '<div style="display:flex;gap:1rem;margin-top:1.5rem;">' +
+        '<button class="btn btn-secondary" onclick="closeModal()" data-i18n="users.cancel">' + t('users.cancel') + '</button>' +
+        '<button class="btn btn-primary" onclick="submitChangePassword()" data-i18n="password.submit">' + t('password.submit') + '</button>' +
+        '</div>';
+    document.getElementById('modal').style.display = 'flex';
+}
+
+async function submitChangePassword() {
+    var current = document.getElementById('currentPwd').value;
+    var pw1 = document.getElementById('newPwd1').value;
+    var pw2 = document.getElementById('newPwd2').value;
+    if (!current || !pw1) return;
+    if (pw1.length < 6) { toast(t('password.tooShort'), 'error'); return; }
+    if (pw1 !== pw2) { toast(t('password.mismatch'), 'error'); return; }
+    try {
+        var resp = await api('/auth/password', {
+            method: 'PUT',
+            body: JSON.stringify({ current_password: current, new_password: pw1 })
+        });
+        if (resp.status === 'ok') {
+            toast(t('password.success'), 'success');
+            closeModal();
+        }
+    } catch (e) {
+        toast(t('password.wrongCurrent'), 'error');
+    }
 }
 
 async function loadAll() {
