@@ -15,6 +15,10 @@ data.db
 config.json
 *.log
 
+# Project-local notes (not for distribution)
+CLAUDE.md
+opencode-fix.md
+
 # Logs
 logs/
 
