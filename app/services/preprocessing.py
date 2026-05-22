@@ -152,7 +152,8 @@ async def preprocess_messages(
         return messages
 
     if preprocessor_config.get("enabled") is False:
-        _log.info("[preprocess] SKIP preprocessor disabled")
+        _log.info("[preprocess] SKIP preprocessor disabled — stripping images anyway")
+        _strip_all_images(messages)
         return messages
 
     preprocessor_id = preprocessor_config.get("id", "unknown")

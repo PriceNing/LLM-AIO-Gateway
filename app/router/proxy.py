@@ -15,7 +15,7 @@ from app.database import (
     parse_model_id,
 )
 from app.services.lite_llm import create_chat_completion, create_completion, create_chat_completion_stream, create_completion_stream
-from app.services.preprocessing import _get_preprocessor_config, preprocess_messages
+from app.services.preprocessing import preprocess_messages
 from app.services.logger import get_logger
 from app.config import get_default
 
@@ -153,7 +153,7 @@ async def _maybe_preprocess(messages: list, model: str, provider_id: str = "", r
             ).fetchone()
         else:
             row = db.execute(
-                "SELECT preprocessor FROM provider_models WHERE model_id = ? AND enabled = 1 LIMIT 1",
+                "SELECT preprocessor FROM provider_models WHERE model_id = ? AND enabled = 1 ORDER BY provider_id LIMIT 1",
                 (mid.model_name,)
             ).fetchone()
     _app_log.info("[preprocess] DB lookup model='%s' -> row=%s", check_model, dict(row) if row else None)
@@ -279,6 +279,11 @@ class TTLDict:
                 else:
                     val = self._data[key] + delta
             else:
+                if len(self._data) >= self.max_size:
+                    self._evict_expired()
+                    if len(self._data) >= self.max_size and self._timestamps:
+                        oldest = min(self._timestamps, key=lambda k: self._timestamps[k])
+                        self._drop_locked(oldest)
                 val = delta
             self._data[key] = val
             self._timestamps[key] = time.time()
@@ -311,7 +316,7 @@ class TTLDict:
         with self._lock:
             if len(self._data) >= self.max_size and key not in self._data:
                 self._evict_expired()
-                if len(self._data) >= self.max_size:
+                if len(self._data) >= self.max_size and self._timestamps:
                     oldest = min(self._timestamps, key=lambda k: self._timestamps[k])
                     self._drop_locked(oldest)
             self._data[key] = value
@@ -620,8 +625,15 @@ async def _stream_chat(model, messages, provider_id, temperature, max_tokens, us
                                     delta["content"] = think_buf
                                     has_text_content = True
                             elif '<think>' in think_buf or think_buf.lstrip().startswith('<think'):
-                                # Still inside a <think> block — suppress for now
-                                pass
+                                # If <think> never closes after buffering much content,
+                                # treat it as plain text so users aren't stuck waiting.
+                                if len(think_buf) >= 200:
+                                    think_buf = think_buf.replace('<think>', '', 1)
+                                    think_stripped = True
+                                    delta["content"] = think_buf
+                                    has_text_content = True
+                                    think_buf = ""
+                                # else: Still inside a <think> block — suppress for now
                             else:
                                 # No <think> tag — not a thinking-mode response.
                                 # Flush buffer as regular text immediately.
@@ -823,6 +835,7 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
     stream = body.get("stream", False)
 
     username = user.get("username", "legacy")
+    api_key_value = api_key.get("key", "")
     _log_request_body(username, model, "chat", body)
 
     if not model:
@@ -835,8 +848,6 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
     # Debug: log content types in messages to diagnose image format issues
     _debug_msg_types(messages)
 
-    username = user.get("username", "legacy")
-    api_key_value = api_key.get("key", "")
     requested_model = model
     route_model, route_provider = _apply_routing_rules(username, api_key_value, model, model)
     if route_model != model:
@@ -971,7 +982,7 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
                 if tc_dict.get("id") is not None and not isinstance(tc_dict["id"], str):
                     tc_dict["id"] = str(tc_dict["id"])
                 if int(tc_dict.get("index", 0)) < 0:
-                    _tool_log.info("[chat_completions] FILTERED spurious: id=%s idx=%s", tc_dict.get("id"), tc_idx)
+                    _tool_log.info("[chat_completions] FILTERED spurious: id=%s idx=%s", tc_dict.get("id"), tc_dict.get("index", 0))
                     continue
                 _fix_tool_args(tc_dict)
                 _tool_log.info("[chat_completions] after _fix_tool_args: %s", json.dumps(tc_dict, ensure_ascii=False, default=str))
@@ -1721,6 +1732,16 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
         else:
             tools = body.get("tools")  # pass through if not our format
 
+        # Non-Anthropic providers: strip tool_choice that will cause rejection.
+        # MiniMax rejects "auto" (error 2013), and Anthropic dict-format
+        # tool_choice ({type: "auto"}) has no OpenAI equivalent.
+        tool_choice = body.get("tool_choice")
+        if not is_anthropic_provider:
+            if isinstance(tool_choice, dict) and not tool_choice.get("name"):
+                tool_choice = None  # Anthropic "auto"/"any" → let provider default
+            elif tool_choice == "auto":
+                tool_choice = None  # MiniMax rejects "auto"
+
         # Stream or non-stream
         # Inject DeepSeek reasoning_content for multi-turn continuity
         if not is_anthropic_provider:
@@ -1751,7 +1772,7 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
                     temperature=temperature, max_tokens=max_tokens,
                     username=username, api_key_value=api_key_value,
                     requested_model=requested_model, system_prompt=system_prompt,
-                    tools=tools, tool_choice=body.get("tool_choice"),
+                    tools=tools, tool_choice=tool_choice,
                     conv_key=conv_key,
                 ),
                 media_type="text/event-stream"
@@ -1766,7 +1787,7 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
                 lambda: create_chat_completion(
                     model=model, messages=messages, provider_id=provider_id,
                     max_tokens=max_tokens, temperature=temperature,
-                    tools=tools, tool_choice=body.get("tool_choice"),
+                    tools=tools, tool_choice=tool_choice,
                 )
             )
         choice = response.choices[0]
@@ -1895,7 +1916,13 @@ async def _stream_responses(model, messages, provider_id, temperature, max_token
                             think_stripped = True
                             text_buffer = accumulated_text  # seed with cleaned text
                         elif '<think>' in accumulated_text or accumulated_text.lstrip().startswith('<think'):
-                            pass  # still inside <think> block — don't yield yet
+                            # If <think> never closes after buffering much content,
+                            # treat it as plain text so users aren't stuck waiting.
+                            if len(accumulated_text) >= 200:
+                                accumulated_text = accumulated_text.replace('<think>', '', 1)
+                                think_stripped = True
+                                text_buffer = accumulated_text
+                            # else: still inside <think> block — don't yield yet
                         elif len(accumulated_text) >= 5:
                             # No think tag detected — model doesn't use thinking mode
                             think_stripped = True
@@ -2048,6 +2075,12 @@ async def _stream_responses(model, messages, provider_id, temperature, max_token
                 # Thinking mode consumed all tokens before generating visible content.
                 # Fall back to reasoning_content as the response.
                 completion_output.append({'type': 'message', 'id': msg_id, 'status': 'completed', 'role': 'assistant', 'content': [{'type': 'output_text', 'text': accumulated_reasoning, 'annotations': []}]})
+            elif accumulated_text:
+                # <think> opened but never closed before stream ended, or no
+                # thinking tags at all. Flush whatever was buffered as the response.
+                flushed = accumulated_text.replace('<think>', '', 1) if '<think>' in accumulated_text else accumulated_text
+                if flushed.strip():
+                    completion_output.append({'type': 'message', 'id': msg_id, 'status': 'completed', 'role': 'assistant', 'content': [{'type': 'output_text', 'text': flushed, 'annotations': []}]})
             for idx in sorted(tool_calls_state.keys()):
                 state = tool_calls_state[idx]
                 if state["item_added"]:
@@ -2330,13 +2363,23 @@ def _convert_responses_tools(tools: list) -> list:
         # Responses API flat format — wrap non-type fields under 'function'
         # Strip OpenAI-specific fields (strict, additionalProperties) that
         # non-OpenAI providers (MiniMax) reject as "invalid chat setting (2013)".
+        # Always copy nested structures before modifying to avoid mutating the
+        # original request body.
         function_fields = {k: v for k, v in tool.items() if k not in ("type", "strict", "additionalProperties")}
         params = function_fields.get("parameters")
         if isinstance(params, dict):
+            params = dict(params)  # shallow copy to avoid mutating original
             params.pop("additionalProperties", None)
-            for prop in params.get("properties", {}).values():
-                if isinstance(prop, dict):
-                    prop.pop("additionalProperties", None)
+            props = params.get("properties", {})
+            if isinstance(props, dict):
+                cleaned = {}
+                for key, prop in props.items():
+                    if isinstance(prop, dict):
+                        prop = dict(prop)  # copy before modifying
+                        prop.pop("additionalProperties", None)
+                    cleaned[key] = prop
+                params["properties"] = cleaned
+            function_fields["parameters"] = params
         converted.append({"type": tool_type, "function": function_fields})
     return converted
 

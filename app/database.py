@@ -1,6 +1,6 @@
 import sqlite3
 import json
-import time
+import uuid
 import threading
 from datetime import date
 from typing import Optional
@@ -420,7 +420,7 @@ def get_provider(provider_id: str) -> Optional[dict]:
         p = _row_to_dict(row)
         p["enabled"] = _to_bool(p["enabled"])
         models_rows = db.execute("SELECT * FROM provider_models WHERE provider_id = ? ORDER BY model_id", (provider_id,)).fetchall()
-        p["models"] = [{"id": m["model_id"], "name": m["model_name"], "enabled": _to_bool(m["enabled"])} for m in models_rows]
+        p["models"] = [{"id": m["model_id"], "name": m["model_name"], "enabled": _to_bool(m["enabled"]), "preprocessor": m["preprocessor"] or ""} for m in models_rows]
         return p
 
 
@@ -465,10 +465,15 @@ def update_provider(provider_id: str, updates: dict) -> Optional[dict]:
         if "models" in updates:
             existing_ids = {m["model_id"] for m in db.execute("SELECT model_id FROM provider_models WHERE provider_id = ?", (provider_id,)).fetchall()}
             for m in updates["models"]:
-                if m["id"] not in existing_ids:
+                if m["id"] in existing_ids:
                     db.execute(
-                        "INSERT OR IGNORE INTO provider_models (provider_id, model_id, model_name, enabled) VALUES (?, ?, ?, ?)",
-                        (provider_id, m["id"], m.get("name", m["id"]), 1 if m.get("enabled", True) else 0)
+                        "UPDATE provider_models SET model_name = ?, enabled = ?, preprocessor = ? WHERE provider_id = ? AND model_id = ?",
+                        (m.get("name", m["id"]), 1 if m.get("enabled", True) else 0, m.get("preprocessor", ""), provider_id, m["id"])
+                    )
+                else:
+                    db.execute(
+                        "INSERT OR IGNORE INTO provider_models (provider_id, model_id, model_name, enabled, preprocessor) VALUES (?, ?, ?, ?, ?)",
+                        (provider_id, m["id"], m.get("name", m["id"]), 1 if m.get("enabled", True) else 0, m.get("preprocessor", ""))
                     )
         # Fetch updated state within same transaction
         row = db.execute("SELECT * FROM providers WHERE id = ?", (provider_id,)).fetchone()
@@ -477,7 +482,7 @@ def update_provider(provider_id: str, updates: dict) -> Optional[dict]:
         p = _row_to_dict(row)
         p["enabled"] = _to_bool(p["enabled"])
         models_rows = db.execute("SELECT * FROM provider_models WHERE provider_id = ? ORDER BY model_id", (provider_id,)).fetchall()
-        p["models"] = [{"id": m["model_id"], "name": m["model_name"], "enabled": _to_bool(m["enabled"])} for m in models_rows]
+        p["models"] = [{"id": m["model_id"], "name": m["model_name"], "enabled": _to_bool(m["enabled"]), "preprocessor": m["preprocessor"] or ""} for m in models_rows]
         return p
 
 
@@ -601,7 +606,6 @@ def get_routing_rule(rule_id: str) -> Optional[dict]:
 
 
 def add_routing_rule(rule: dict) -> dict:
-    import uuid
     entry_id = rule.get("id") or uuid.uuid4().hex[:8]
     with get_db() as db:
         db.execute(
