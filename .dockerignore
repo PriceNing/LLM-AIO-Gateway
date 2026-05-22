@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+venv/
+.venv/
+
+# Git
+.git/
+.gitignore
+
+# Runtime data (volume mounted)
+data.db
+config.json
+data/
+logs/
+*.log
+
+# Test
+.pytest_cache/
+tests/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Docs / notes
+CLAUDE.md
+opencode-fix.md
+history/
+README.md
+README_en.md
+LICENSE

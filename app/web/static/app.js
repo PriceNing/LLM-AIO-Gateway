@@ -803,8 +803,7 @@ async function addUserKey(username) {
         });
         closeModal();
         await loadUsers();
-        await navigator.clipboard.writeText(key.key);
-        toast(t('users.keyCopied'), 'success');
+        await copyText(key.key);
     } catch (e) { toast(t('users.keyFail') + ': ' + e.message, 'error'); }
 }
 

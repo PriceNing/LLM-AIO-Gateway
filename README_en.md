@@ -98,11 +98,28 @@ You can also use online multimodal models as preprocessors for other models to a
 - Python 3.11+
 - pip
 
-### Install & Run
+### Docker Deployment (Recommended)
 
 ```bash
 git clone https://github.com/PriceNing/LLM-AIO-Gateway.git
-cd LLM-AIO
+cd LLM-AIO-Gateway
+docker compose up -d
+```
+
+On first startup, `config.json` and `data.db` are auto-generated in the `./data` directory. The service runs at `http://localhost:8000`.
+
+To update, pull the latest code and rebuild:
+
+```bash
+git pull
+docker compose up -d --build
+```
+
+### Manual Install
+
+```bash
+git clone https://github.com/PriceNing/LLM-AIO-Gateway.git
+cd LLM-AIO-Gateway
 pip install -r requirements.txt
 python main.py
 ```

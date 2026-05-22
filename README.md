@@ -97,11 +97,28 @@
 - Python 3.11+
 - pip
 
-### 安装与运行
+### Docker 部署（推荐）
 
 ```bash
 git clone https://github.com/PriceNing/LLM-AIO-Gateway.git
-cd LLM-AIO
+cd LLM-AIO-Gateway
+docker compose up -d
+```
+
+首次启动自动在 `./data` 目录生成 `config.json` 和 `data.db`。服务运行在 `http://localhost:8000`。
+
+更新时拉取最新代码后重建镜像：
+
+```bash
+git pull
+docker compose up -d --build
+```
+
+### 手动安装
+
+```bash
+git clone https://github.com/PriceNing/LLM-AIO-Gateway.git
+cd LLM-AIO-Gateway
 pip install -r requirements.txt
 python main.py
 ```
