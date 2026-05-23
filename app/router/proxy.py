@@ -1860,7 +1860,12 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
         max_tokens = get_default("max_tokens", 16384)
     provider_id = body.get("provider_id")
     stream = body.get("stream", False)
-    system_prompt = _strip_billing_header(body.get("system", ""))
+    raw_system = body.get("system", "")
+    system_prompt = _strip_billing_header(raw_system)
+    if raw_system and raw_system != system_prompt:
+        _app_log.info("BILLING_STRIPPED system len_before=%d len_after=%d", len(str(raw_system)), len(str(system_prompt)))
+    elif raw_system and "x-anthropic-billing" in str(raw_system).lower():
+        _app_log.info("BILLING_NOT_STRIPPED system=%s", str(raw_system)[:300])
     temperature = body.get("temperature")
 
     if not model:
@@ -2348,8 +2353,13 @@ def _normalize_messages(messages: list) -> list:
 
         # Strip billing header from system message text
         if role == "system" and isinstance(content, str):
+            old = content
             msg["content"] = _strip_billing_header(content)
             content = msg["content"]
+            if old != content:
+                _app_log.info("BILLING_STRIPPED role=system len_before=%d len_after=%d matched=True", len(old), len(content))
+            elif "x-anthropic-billing" in content.lower():
+                _app_log.info("BILLING_NOT_STRIPPED role=system text=%s...", content[:200])
 
         if merged and merged[-1].get("role") == role and role in ("system", "user"):
             # Merge content into previous same-role message
