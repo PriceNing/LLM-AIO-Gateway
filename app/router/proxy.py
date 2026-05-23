@@ -1720,6 +1720,7 @@ async def _anthropic_passthrough(provider_info: dict, messages: list,
     system = _strip_billing_header(body.get("system"))
     if system:
         req_body["system"] = system
+    _app_log.info("[anthropic_passthrough] filtered system=%s", req_body.get("system"))
     tools = body.get("tools")
     if tools:
         req_body["tools"] = [{"name": t["name"], "description": t.get("description", ""),
@@ -1730,6 +1731,7 @@ async def _anthropic_passthrough(provider_info: dict, messages: list,
     thinking = extra_headers.get("thinking")
     if thinking in ("enabled", "disabled"):
         req_body["thinking"] = {"type": thinking}
+    _app_log.info("[anthropic_passthrough] request body=%s", json.dumps(req_body, ensure_ascii=False))
     async with httpx.AsyncClient(timeout=120) as client:
         resp = await client.post(
             f"{api_base}/v1/messages",
