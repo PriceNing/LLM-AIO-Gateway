@@ -1720,7 +1720,6 @@ async def _anthropic_passthrough(provider_info: dict, messages: list,
     system = _strip_billing_header(body.get("system"))
     if system:
         req_body["system"] = system
-    _app_log.info("[anthropic_passthrough] filtered system=%s", req_body.get("system"))
     tools = body.get("tools")
     if tools:
         req_body["tools"] = [{"name": t["name"], "description": t.get("description", ""),
@@ -1731,7 +1730,6 @@ async def _anthropic_passthrough(provider_info: dict, messages: list,
     thinking = extra_headers.get("thinking")
     if thinking in ("enabled", "disabled"):
         req_body["thinking"] = {"type": thinking}
-    _app_log.info("[anthropic_passthrough] request body=%s", json.dumps(req_body, ensure_ascii=False))
     async with httpx.AsyncClient(timeout=120) as client:
         resp = await client.post(
             f"{api_base}/v1/messages",
@@ -1860,16 +1858,11 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
         max_tokens = get_default("max_tokens", 16384)
     provider_id = body.get("provider_id")
     stream = body.get("stream", False)
-    raw_system = body.get("system", "")
-    system_prompt = _strip_billing_header(raw_system)
-    _app_log.info("[messages_entry] system_type=%s empty=%s has_anthropic_billing=%s len=%d",
-                  type(raw_system).__name__, not raw_system,
-                  "x-anthropic-billing" in str(raw_system).lower() if raw_system else False,
-                  len(str(raw_system)) if raw_system else 0)
-    if raw_system and "x-anthropic-billing" in str(raw_system).lower():
-        _app_log.info("[messages_entry] raw_system=%s", str(raw_system)[:500])
-    if raw_system and raw_system != system_prompt:
-        _app_log.info("[messages_entry] BILLING_STRIPPED len_before=%d len_after=%d", len(str(raw_system)), len(str(system_prompt)))
+    system_prompt = _strip_billing_header(body.get("system", ""))
+    _app_log.info("[ANTHRO_ENTRY] model=%s msgs=%d system=%s tools=%s",
+                  model, len(anthropic_msgs),
+                  "yes" if system_prompt else "no",
+                  "yes" if body.get("tools") else "no")
     temperature = body.get("temperature")
 
     if not model:
@@ -1994,6 +1987,8 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
             response = await _anthropic_passthrough(
                 provider_info, messages, body, max_tokens, temperature, model)
         else:
+            _app_log.info("[OPENAI_EXIT] model=%s msgs=%d tools=%s tool_choice=%s conv_key=%s",
+                          model, len(messages), "yes" if tools else "no", str(tool_choice), conv_key)
             response = await anyio.to_thread.run_sync(
                 lambda: create_chat_completion(
                     model=model, messages=messages, provider_id=provider_id,
@@ -2357,13 +2352,8 @@ def _normalize_messages(messages: list) -> list:
 
         # Strip billing header from system message text
         if role == "system" and isinstance(content, str):
-            old = content
             msg["content"] = _strip_billing_header(content)
             content = msg["content"]
-            if old != content:
-                _app_log.info("BILLING_STRIPPED role=system len_before=%d len_after=%d matched=True", len(old), len(content))
-            elif "x-anthropic-billing" in content.lower():
-                _app_log.info("BILLING_NOT_STRIPPED role=system text=%s...", content[:200])
 
         if merged and merged[-1].get("role") == role and role in ("system", "user"):
             # Merge content into previous same-role message
