@@ -1,3 +1,4 @@
+import json
 import logging
 import re
 import litellm
@@ -259,6 +260,11 @@ def build_completion_args(model: str, provider_id: Optional[str] = None) -> tupl
     # Per-provider thinking mode: configured via provider.extra_headers.
     # If not set, no thinking parameter is sent (each provider defaults).
     extra_headers = provider.get("extra_headers", {}) or {}
+    if isinstance(extra_headers, str):
+        try:
+            extra_headers = json.loads(extra_headers)
+        except (json.JSONDecodeError, TypeError):
+            extra_headers = {}
     thinking = extra_headers.get("thinking")
     if thinking in ("enabled", "disabled"):
         params.setdefault("extra_body", {})

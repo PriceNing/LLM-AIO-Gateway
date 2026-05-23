@@ -787,6 +787,7 @@ def find_provider_by_model(model_id: str) -> Optional[dict]:
             return None
         p = _row_to_dict(row)
         p["enabled"] = _to_bool(p["enabled"])
+        p["extra_headers"] = _json_loads(p.get("extra_headers", "{}")) or {}
         return p
 
 
