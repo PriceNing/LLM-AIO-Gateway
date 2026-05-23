@@ -12,7 +12,7 @@ from collections import deque
 from app.database import (
     get_providers, find_user_by_api_key, get_routing_rules,
     increment_global_stats, increment_user_usage, get_db,
-    parse_model_id,
+    parse_model_id, add_request_record,
 )
 from app.services.lite_llm import create_chat_completion, create_completion, create_chat_completion_stream, create_completion_stream
 from app.services.preprocessing import preprocess_messages
@@ -26,6 +26,8 @@ _req_log = get_logger("request")
 _app_log = get_logger("app")
 
 router = APIRouter()
+
+_STREAM_SENTINEL = object()  # Sentinel value to signal end of streaming queue
 
 # Rolling log of recent requests for the admin stats dashboard
 _request_log = deque(maxlen=get_default("request_log_max", 200))
@@ -116,6 +118,11 @@ def _log_request(username: str, api_key: str, model: str, provider_id: str,
     else:
         _access_log.warning("[FAIL] %s user=%s model=%s provider=%s",
                            endpoint, username, model, provider_id or "-")
+    # Write to persistent history for stats
+    try:
+        add_request_record(model=requested_model or model, username=username, success=success, tokens=tokens)
+    except Exception:
+        pass  # Never let DB errors block the response
 
 
 def _log_request_body(username: str, model: str, endpoint: str, body: dict) -> None:
@@ -191,9 +198,11 @@ def clear_request_log() -> None:
 
 
 def get_timeline_data() -> dict:
-    """Aggregate requests by minute for timeline chart."""
+    """Aggregate requests by minute for timeline chart. Zero-fills gaps."""
     with _request_log_lock:
         snapshot = list(_request_log)
+    if not snapshot:
+        return {"labels": [], "success": [], "failed": []}
     buckets: dict[str, dict] = {}
     for entry in snapshot:
         minute = entry.get("full_time", entry["time"])[:16]
@@ -203,6 +212,26 @@ def get_timeline_data() -> dict:
             buckets[minute]["success"] += 1
         else:
             buckets[minute]["failed"] += 1
+    sorted_keys = sorted(buckets.keys())
+    # Zero-fill gaps between first and last minute
+    if len(sorted_keys) >= 2:
+        from datetime import datetime, timedelta
+        def _parse_minute(s):
+            for fmt in ("%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M"):
+                try:
+                    return datetime.strptime(s[:16].replace("T", " "), "%Y-%m-%d %H:%M")
+                except ValueError:
+                    continue
+            return datetime.strptime(s[:16], "%Y-%m-%d %H:%M")
+        start = _parse_minute(sorted_keys[0])
+        end = _parse_minute(sorted_keys[-1])
+        cur = start
+        while cur <= end:
+            key = cur.strftime("%Y-%m-%d %H:%M")
+            if key not in buckets:
+                label = cur.strftime("%H:%M")
+                buckets[key] = {"label": label, "success": 0, "failed": 0}
+            cur += timedelta(minutes=1)
     sorted_buckets = sorted(buckets.items(), key=lambda x: x[0])
     return {
         "labels": [b["label"] for _, b in sorted_buckets],
@@ -240,6 +269,46 @@ def get_model_stats() -> dict:
             models[mid]["failed"] += 1
         models[mid]["tokens"] += entry["tokens"]
     return models
+
+
+def get_timeline_model_data() -> dict:
+    """Per-model per-minute breakdown from request log for stacked bar chart. Zero-fills gaps."""
+    with _request_log_lock:
+        snapshot = list(_request_log)
+    if not snapshot:
+        return {"labels": [], "models": [], "calls": [], "tokens": []}
+    buckets: dict[str, dict] = {}
+    for entry in snapshot:
+        minute = entry.get("full_time", entry["time"])[:16]
+        if minute not in buckets:
+            buckets[minute] = {}
+        model = entry["model"]
+        if model not in buckets[minute]:
+            buckets[minute][model] = {"total": 0, "tokens": 0}
+        buckets[minute][model]["total"] += 1
+        buckets[minute][model]["tokens"] += entry["tokens"]
+    sorted_keys = sorted(buckets.keys())
+    # Zero-fill gaps between first and last minute
+    if len(sorted_keys) >= 2:
+        from datetime import datetime, timedelta
+        def _parse_minute_ts(s):
+            return datetime.strptime(s[:16].replace("T", " "), "%Y-%m-%d %H:%M")
+        start = _parse_minute_ts(sorted_keys[0])
+        end = _parse_minute_ts(sorted_keys[-1])
+        cur = start
+        while cur <= end:
+            key = cur.strftime("%Y-%m-%d %H:%M")
+            if key not in buckets:
+                buckets[key] = {}
+            cur += timedelta(minutes=1)
+        sorted_keys = sorted(buckets.keys())
+    all_models = sorted({m for b in buckets.values() for m in b})
+    return {
+        "labels": [k[-5:] for k in sorted_keys],
+        "models": all_models,
+        "calls": [[buckets[k].get(m, {}).get("total", 0) for k in sorted_keys] for m in all_models],
+        "tokens": [[buckets[k].get(m, {}).get("tokens", 0) for k in sorted_keys] for m in all_models],
+    }
 
 
 class TTLDict:
@@ -521,10 +590,13 @@ async def _iter_stream_async(stream_func):
         nonlocal error, stream_gen
         try:
             stream_gen = stream_func()
+            _chunk_idx = 0
             for chunk in stream_gen:
                 if cancel.is_set():
                     break
+                _chunk_idx += 1
                 chunk_queue.put(chunk)
+            _app_log.info("[_iter_stream_async] generator finished, total_chunks=%d", _chunk_idx)
         except GeneratorExit:
             pass
         except Exception as e:
@@ -541,6 +613,7 @@ async def _iter_stream_async(stream_func):
                     stream_gen.close()
                 except Exception:
                     pass
+            chunk_queue.put(_STREAM_SENTINEL)
             done.set()
 
     bg_thread = threading.Thread(target=_run, daemon=True)
@@ -549,7 +622,10 @@ async def _iter_stream_async(stream_func):
     try:
         while True:
             try:
-                yield chunk_queue.get(timeout=0.01)
+                chunk = chunk_queue.get(timeout=0.01)
+                if chunk is _STREAM_SENTINEL:
+                    break
+                yield chunk
             except queue.Empty:
                 if done.is_set():
                     break
@@ -1396,6 +1472,8 @@ async def _stream_anthropic_messages(model, messages, provider_id, temperature,
     total_tokens = 0
     output_tokens = 0
     error_msg = None
+    finish_reason = None
+    _flushed = False  # guard: finish_reason flush runs only once
     accumulated_text = ""
     text_buffer = ""
     text_content_started = False
@@ -1404,23 +1482,37 @@ async def _stream_anthropic_messages(model, messages, provider_id, temperature,
     accumulated_reasoning = ""  # index -> {id, name, arguments_buffer, started}
 
     try:
-        _app_log.info("[messages_stream] START model=%s", model)
+        # Diagnostic: log message structure summary
+        msg_roles = [m.get("role", "?") if isinstance(m, dict) else "?" for m in messages]
+        _app_log.info("[messages_stream] START model=%s msg_count=%d roles=%s max_tokens=%s tools=%s",
+                      model, len(messages), str(msg_roles), str(max_tokens),
+                      str(extra.get("tools", [])[:10]) if extra.get("tools") else "none")
         stream_func = lambda: create_chat_completion_stream(
             model=model, messages=messages, provider_id=provider_id,
             temperature=temperature, max_tokens=max_tokens, **extra
         )
         yield f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': msg_id, 'type': 'message', 'role': 'assistant', 'content': [], 'model': model, 'stop_reason': None, 'stop_sequence': None, 'usage': {'input_tokens': 0, 'output_tokens': 0}}})}\n\n"
 
+        chunk_count = 0
+        content_total = 0
         async for chunk in _iter_stream_async(stream_func):
+            chunk_count += 1
             choice = chunk.choices[0] if chunk.choices else None
             if not choice:
                 continue
             delta = getattr(choice, "delta", None)
-            finish_reason = getattr(choice, "finish_reason", None)
+            chunk_finish = getattr(choice, "finish_reason", None)
+            if chunk_finish:
+                finish_reason = chunk_finish  # save first finish_reason, don't overwrite
+                _app_log.info(
+                    "[messages_stream] GOT finish_reason=%s at chunk=%d content_chars=%d",
+                    finish_reason, chunk_count, content_total
+                )
 
             if delta:
                 content_delta = getattr(delta, "content", None)
                 if content_delta:
+                    content_total += len(content_delta)
                     accumulated_text += content_delta
                     text_buffer += content_delta
                     if not text_content_started:
@@ -1461,7 +1553,8 @@ async def _stream_anthropic_messages(model, messages, provider_id, temperature,
                                 except Exception:
                                     pass  # still building, don't output incomplete JSON
 
-            if finish_reason:
+            if finish_reason and not _flushed:
+                _flushed = True
                 # Flush text
                 if text_buffer:
                     yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'text_delta', 'text': text_buffer}})}\n\n"
@@ -1496,6 +1589,13 @@ async def _stream_anthropic_messages(model, messages, provider_id, temperature,
                 output_tokens = getattr(chunk.usage, "completion_tokens", 0) or 0
 
         stop_reason = _map_stop_reason(finish_reason) if finish_reason else "end_turn"
+        # Diagnostic: log accumulated content stats before sending final events
+        _app_log.info(
+            "[messages_stream] DONE finish_reason=%s stop_reason=%s total_chunks=%d content_chars=%d accumulated_text_len=%d text_buffer_len=%d tool_uses_count=%d reasoning_chars=%d max_tokens_param=%s",
+            finish_reason or "None", stop_reason, chunk_count, content_total,
+            len(accumulated_text), len(text_buffer), len(tool_uses),
+            len(accumulated_reasoning), str(max_tokens)
+        )
         yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': stop_reason, 'stop_sequence': None}, 'usage': {'output_tokens': output_tokens}})}\n\n"
         yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
 
@@ -1541,8 +1641,9 @@ async def _anthropic_passthrough(provider_info: dict, messages: list,
         req_body["tools"] = [{"name": t["name"], "description": t.get("description", ""),
                              "input_schema": t.get("input_schema", {"type": "object", "properties": {}})}
                             for t in tools if isinstance(t, dict) and t.get("name")]
-    # Force-disable thinking for non-Anthropic endpoints (DeepSeek etc.)
-    # to prevent thinking block continuity errors across multi-turn conversations.
+    # Force-disable thinking for non-Anthropic endpoints — DeepSeek requires
+    # thinking blocks to be echoed back in multi-turn conversations, which the
+    # gateway's passthrough doesn't handle yet. Without this, multi-turn breaks.
     if "api.anthropic.com" not in api_base:
         req_body["thinking"] = {"type": "disabled"}
     async with httpx.AsyncClient(timeout=120) as client:
@@ -1604,8 +1705,9 @@ async def _stream_anthropic_passthrough(provider_info, messages, body, max_token
     if tools:
         # Strip type field — Anthropic-compatible endpoints (DeepSeek) reject type:"custom"
         req_body["tools"] = [{k: v for k, v in t.items() if k != "type"} for t in tools if isinstance(t, dict)]
-    # Force-disable thinking for non-Anthropic endpoints (DeepSeek etc.)
-    # to prevent thinking block continuity errors across multi-turn conversations.
+    # Force-disable thinking for non-Anthropic endpoints — DeepSeek requires
+    # thinking blocks to be echoed back in multi-turn conversations, which the
+    # gateway's passthrough doesn't handle yet. Without this, multi-turn breaks.
     if "api.anthropic.com" not in api_base:
         req_body["thinking"] = {"type": "disabled"}
     total_tokens = 0
@@ -1702,6 +1804,13 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
     else:
         is_anthropic_provider = False
         messages, _ = _anthropic_to_openai_messages(anthropic_msgs, system_prompt)
+        # Diagnostic: log converted message summary to find truncation root cause
+        _app_log.info(
+            "[messages] CONVERTED anthropic(%d msgs) -> openai(%d msgs) system_prompt_len=%d tools=%s stream=%s max_tokens=%s model=%s",
+            len(anthropic_msgs), len(messages), len(system_prompt) if system_prompt else 0,
+            str(body.get("tools", [])[:10]) if body.get("tools") else "none",
+            str(body.get("stream")), str(max_tokens), model
+        )
         system_prompt = ""  # already embedded in messages
 
     # Compute conversation cache key BEFORE preprocessing (see chat_completions for rationale)
@@ -1837,6 +1946,8 @@ async def _stream_responses(model, messages, provider_id, temperature, max_token
     input_tokens = 0
     output_tokens = 0
     error_msg = None
+    finish_reason = None
+    _flushed = False  # guard: finish_reason flush runs only once
     text_item_added = False
     text_content_added = False
     accumulated_text = ""
@@ -1899,7 +2010,9 @@ async def _stream_responses(model, messages, provider_id, temperature, max_token
                 continue
 
             delta = getattr(choice, "delta", None)
-            finish_reason = getattr(choice, "finish_reason", None)
+            chunk_finish = getattr(choice, "finish_reason", None)
+            if chunk_finish:
+                finish_reason = chunk_finish  # save first finish_reason, don't overwrite
 
             if delta:
                 # --- Handle text content ---
@@ -1999,7 +2112,8 @@ async def _stream_responses(model, messages, provider_id, temperature, max_token
                             yield f"data: {json.dumps({'type': 'response.function_call_arguments.delta', 'output_index': state['output_index'], 'call_id': state['call_id'], 'delta': args_chunk})}\n\n"
 
             # --- Handle finish ---
-            if finish_reason:
+            if finish_reason and not _flushed:
+                _flushed = True
                 # Flush text buffer
                 if text_buffer:
                     yield f"data: {json.dumps({'type': 'response.output_text.delta', 'output_index': text_output_index, 'content_index': 0, 'delta': text_buffer})}\n\n"
