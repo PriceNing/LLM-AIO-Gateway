@@ -1862,10 +1862,14 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
     stream = body.get("stream", False)
     raw_system = body.get("system", "")
     system_prompt = _strip_billing_header(raw_system)
+    _app_log.info("[messages_entry] system_type=%s empty=%s has_anthropic_billing=%s len=%d",
+                  type(raw_system).__name__, not raw_system,
+                  "x-anthropic-billing" in str(raw_system).lower() if raw_system else False,
+                  len(str(raw_system)) if raw_system else 0)
+    if raw_system and "x-anthropic-billing" in str(raw_system).lower():
+        _app_log.info("[messages_entry] raw_system=%s", str(raw_system)[:500])
     if raw_system and raw_system != system_prompt:
-        _app_log.info("BILLING_STRIPPED system len_before=%d len_after=%d", len(str(raw_system)), len(str(system_prompt)))
-    elif raw_system and "x-anthropic-billing" in str(raw_system).lower():
-        _app_log.info("BILLING_NOT_STRIPPED system=%s", str(raw_system)[:300])
+        _app_log.info("[messages_entry] BILLING_STRIPPED len_before=%d len_after=%d", len(str(raw_system)), len(str(system_prompt)))
     temperature = body.get("temperature")
 
     if not model:
