@@ -527,11 +527,14 @@ def ensure_model_allowed(user: dict, api_key: dict, model: str) -> None:
 def usage_dict(response) -> dict:
     usage = getattr(response, "usage", None)
     if not usage:
-        return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+                "prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 0}
     return {
         "prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
         "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
-        "total_tokens": getattr(usage, "total_tokens", 0) or 0
+        "total_tokens": getattr(usage, "total_tokens", 0) or 0,
+        "prompt_cache_hit_tokens": getattr(usage, "prompt_cache_hit_tokens", 0) or 0,
+        "prompt_cache_miss_tokens": getattr(usage, "prompt_cache_miss_tokens", 0) or 0,
     }
 
 @router.get("/models")
@@ -662,6 +665,8 @@ async def _stream_chat(model, messages, provider_id, temperature, max_tokens, us
     accumulated_reasoning = ""
     think_stripped = False  # Set to True once </think> is seen
     think_buf = ""          # Buffer content while inside <think> block
+    cache_hit = 0
+    cache_miss = 0
 
     # Tool-call circuit breaker: strip tools if too many consecutive tool-only turns
     if _tool_only_turns.get(conv_key, 0) >= TOOL_ONLY_LIMIT:
@@ -788,11 +793,11 @@ async def _stream_chat(model, messages, provider_id, temperature, max_tokens, us
                 total_tokens = getattr(chunk.usage, "total_tokens", 0) or 0
                 input_tokens = getattr(chunk.usage, "prompt_tokens", 0) or 0
                 output_tokens = getattr(chunk.usage, "completion_tokens", 0) or 0
-
-        # Store reasoning_content for next turn replay
+                cache_hit = getattr(chunk.usage, "prompt_cache_hit_tokens", 0) or 0
+                cache_miss = getattr(chunk.usage, "prompt_cache_miss_tokens", 0) or 0
         if accumulated_reasoning:
             _reasoning_cache[conv_key] = accumulated_reasoning
-            _app_log.info("[chat_stream] STORED rc key=%s len=%d", conv_key[:40], len(accumulated_reasoning))
+            _app_log.info("[chat_stream] STORED rc key=%s len=%d cache_hit=%d cache_miss=%d", conv_key[:40], len(accumulated_reasoning), cache_hit, cache_miss)
         else:
             _app_log.info("[chat_stream] no reasoning accumulated (think_stripped=%s)", think_stripped)
 
@@ -873,6 +878,8 @@ async def _stream_completions(model, prompt, provider_id, temperature, max_token
 
             if hasattr(chunk, "usage") and chunk.usage:
                 total_tokens = getattr(chunk.usage, "total_tokens", 0) or 0
+                cache_hit = getattr(chunk.usage, "prompt_cache_hit_tokens", 0) or 0
+                cache_miss = getattr(chunk.usage, "prompt_cache_miss_tokens", 0) or 0
 
         _log_request(username, api_key_value, model, provider_id or "", "completions", True, total_tokens, requested_model)
         if username != "legacy":
@@ -1018,6 +1025,10 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
         # Store reasoning_content for next turn
         if reasoning_content:
             _reasoning_cache[conv_key] = reasoning_content
+            usage = usage_dict(response)
+            _app_log.info("[chat_nonstream] STORED rc key=%s len=%d cache_hit=%d cache_miss=%d",
+                          conv_key[:40], len(reasoning_content),
+                          usage.get("prompt_cache_hit_tokens", 0), usage.get("prompt_cache_miss_tokens", 0))
 
         # Update tool-only counter for circuit breaker
         valid_tool_calls = []
@@ -1496,6 +1507,8 @@ async def _stream_anthropic_messages(model, messages, provider_id, temperature,
         conv_key = _conversation_cache_key(api_key_value, messages)
     msg_id = f"msg_{int(time.time())}"
     total_tokens = 0
+    cache_hit = 0
+    cache_miss = 0
     output_tokens = 0
     error_msg = None
     finish_reason = None
@@ -1613,6 +1626,8 @@ async def _stream_anthropic_messages(model, messages, provider_id, temperature,
             if hasattr(chunk, "usage") and chunk.usage:
                 total_tokens = getattr(chunk.usage, "total_tokens", 0) or 0
                 output_tokens = getattr(chunk.usage, "completion_tokens", 0) or 0
+                cache_hit = getattr(chunk.usage, "prompt_cache_hit_tokens", 0) or 0
+                cache_miss = getattr(chunk.usage, "prompt_cache_miss_tokens", 0) or 0
 
         # Fallback: if thinking consumed all tokens with no text/tool output,
         # render reasoning_content as the visible response (same as _stream_chat fallback).
@@ -1637,7 +1652,7 @@ async def _stream_anthropic_messages(model, messages, provider_id, temperature,
         _log_request(username, api_key_value, model, provider_id or "", "messages", True, total_tokens, requested_model)
         if accumulated_reasoning:
             _reasoning_cache[conv_key] = accumulated_reasoning
-            _app_log.info("[messages_stream] STORED rc key=%s len=%d", conv_key[:60], len(accumulated_reasoning))
+            _app_log.info("[messages_stream] STORED rc key=%s len=%d cache_hit=%d cache_miss=%d", conv_key[:60], len(accumulated_reasoning), cache_hit, cache_miss)
         if username != "legacy":
             increment_user_usage(username, api_key_value, True, total_tokens)
         increment_global_stats(success=True)
@@ -1951,14 +1966,18 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
         reasoning_content = getattr(message, "reasoning_content", None)
         if not message.get("content") and not message.get("tool_calls") and reasoning_content:
             message["content"] = reasoning_content
+
+        # Capture cache stats before converting message
+        usage = usage_dict(response)
+        cache_hit = usage.get("prompt_cache_hit_tokens", 0)
+        cache_miss = usage.get("prompt_cache_miss_tokens", 0)
+
         if reasoning_content:
             _reasoning_cache[conv_key] = reasoning_content
-            _app_log.info("[messages_nonstream] STORED rc key=%s len=%d", conv_key[:60], len(reasoning_content))
+            _app_log.info("[messages_nonstream] STORED rc key=%s len=%d cache_hit=%d cache_miss=%d", conv_key[:60], len(reasoning_content), cache_hit, cache_miss)
 
         # Convert OpenAI response to Anthropic format
         content_blocks = _openai_to_anthropic_content(message)
-
-        usage = usage_dict(response)
         _log_request(username, api_key_value, model, provider_id or "", "messages", True, usage.get("total_tokens", 0), requested_model)
         increment_global_stats(success=True)
         if username != "legacy":
@@ -1998,6 +2017,8 @@ async def _stream_responses(model, messages, provider_id, temperature, max_token
     input_tokens = 0
     output_tokens = 0
     error_msg = None
+    cache_hit = 0
+    cache_miss = 0
     finish_reason = None
     _flushed = False  # guard: finish_reason flush runs only once
     text_item_added = False
@@ -2192,13 +2213,15 @@ async def _stream_responses(model, messages, provider_id, temperature, max_token
                 total_tokens = getattr(chunk.usage, "total_tokens", 0) or 0
                 input_tokens = getattr(chunk.usage, "prompt_tokens", 0) or 0
                 output_tokens = getattr(chunk.usage, "completion_tokens", 0) or 0
+                cache_hit = getattr(chunk.usage, "prompt_cache_hit_tokens", 0) or 0
+                cache_miss = getattr(chunk.usage, "prompt_cache_miss_tokens", 0) or 0
 
         _app_log.info("[responses_stream] TOTAL chunks=%d text=%d tools=%d reasoning=%d", chunk_count, len(accumulated_text), len(tool_calls_state), len(accumulated_reasoning))
 
         # Store reasoning_content for next turn replay (DeepSeek thinking mode requires echo-back)
         if accumulated_reasoning:
             _reasoning_cache[conv_key] = accumulated_reasoning
-            _app_log.info("[responses_stream] STORED rc key=%s len=%d", conv_key, len(accumulated_reasoning))
+            _app_log.info("[responses_stream] STORED rc key=%s len=%d cache_hit=%d cache_miss=%d", conv_key, len(accumulated_reasoning), cache_hit, cache_miss)
 
         # Update tool-only counter for circuit breaker
         has_text = len(accumulated_text.strip()) > 0
@@ -2801,7 +2824,9 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
         # Cache reasoning_content for multi-turn replay (DeepSeek thinking mode requires echo-back)
         if reasoning_content:
             _reasoning_cache[conv_key] = reasoning_content
-            _app_log.info("[responses_nonstream] STORED rc key=%s len=%d", conv_key, len(reasoning_content))
+            _app_log.info("[responses_nonstream] STORED rc key=%s len=%d cache_hit=%d cache_miss=%d",
+                          conv_key, len(reasoning_content),
+                          usage.get("prompt_cache_hit_tokens", 0), usage.get("prompt_cache_miss_tokens", 0))
 
         resp_id = f"resp_{int(time.time())}"
         msg_id = f"msg_{int(time.time())}"
