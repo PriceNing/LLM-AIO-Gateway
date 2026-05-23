@@ -1606,37 +1606,58 @@ function _isAllZero(arr) {
 
 function _buildOrupdateTrendChart(canvasId, tmData, mode, chartArr, existing) {
     var data = mode === 'tokens' ? tmData.tokens : tmData.calls;
+    var useLine = tmData.labels.length > 12;
     var datasets = [];
     for (var i = 0; i < tmData.models.length; i++) {
         if (_isAllZero(data[i])) continue;
-        datasets.push({
+        var ds = {
             label: tmData.models[i],
             data: data[i],
             backgroundColor: _CHART_COLORS[i % _CHART_COLORS.length],
-            borderRadius: 2,
-        });
+        };
+        if (useLine) {
+            ds.borderColor = _CHART_COLORS[i % _CHART_COLORS.length];
+            ds.borderWidth = 2;
+            ds.pointRadius = 1;
+            ds.pointHoverRadius = 4;
+            ds.tension = 0.15;
+            ds.fill = false;
+        } else {
+            ds.borderRadius = 2;
+        }
+        datasets.push(ds);
     }
     if (existing) {
-        existing.data.labels = tmData.labels;
-        existing.data.datasets = datasets;
-        existing.options.plugins.title.text = t('stats.trendChart') + ' — ' + (mode === 'tokens' ? t('stats.trendTokens') : t('stats.trendCalls'));
-        existing.update();
-        return existing;
+        var curType = existing.config.type || 'bar';
+        var needType = useLine ? 'line' : 'bar';
+        if (curType !== needType) {
+            existing.destroy();
+            var idx = chartArr.indexOf(existing);
+            if (idx >= 0) chartArr.splice(idx, 1);
+        } else {
+            existing.data.labels = tmData.labels;
+            existing.data.datasets = datasets;
+            existing.options.plugins.title.text = t('stats.trendChart') + ' — ' + (mode === 'tokens' ? t('stats.trendTokens') : t('stats.trendCalls'));
+            existing.update();
+            return existing;
+        }
     }
     var ctx = document.getElementById(canvasId);
     if (!ctx) return null;
     var maxWidth = Math.max(30, Math.min(80, Math.floor(600 / Math.max(tmData.labels.length, 1))));
+    var scaleOpts = useLine
+        ? { x: { grid: { display: false }, ticks: { color: getComputedStyle(document.documentElement).getPropertyValue('--text-secondary').trim(), font: { size: 11 }, maxRotation: 45 } },
+            y: { beginAtZero: true, ticks: { color: getComputedStyle(document.documentElement).getPropertyValue('--text-secondary').trim(), font: { size: 11 } } } }
+        : { x: { stacked: true, grid: { display: false }, ticks: { color: getComputedStyle(document.documentElement).getPropertyValue('--text-secondary').trim(), font: { size: 11 }, maxRotation: 45 } },
+            y: { stacked: true, beginAtZero: true, ticks: { color: getComputedStyle(document.documentElement).getPropertyValue('--text-secondary').trim(), font: { size: 11 } } } };
     var chart = new Chart(ctx, {
-        type: 'bar',
+        type: useLine ? 'line' : 'bar',
         data: { labels: tmData.labels, datasets: datasets },
         options: {
             responsive: true, maintainAspectRatio: true,
             barPercentage: 0.85, categoryPercentage: 0.75, maxBarThickness: maxWidth,
             interaction: { mode: 'index', intersect: false },
-            scales: {
-                x: { stacked: true, grid: { display: false }, ticks: { color: getComputedStyle(document.documentElement).getPropertyValue('--text-secondary').trim(), font: { size: 11 }, maxRotation: 45 } },
-                y: { stacked: true, beginAtZero: true, ticks: { color: getComputedStyle(document.documentElement).getPropertyValue('--text-secondary').trim(), font: { size: 11 } } }
-            },
+            scales: scaleOpts,
             plugins: {
                 title: { display: true, text: t('stats.trendChart') + ' — ' + (mode === 'tokens' ? t('stats.trendTokens') : t('stats.trendCalls')), font: { size: 14, weight: '700' }, color: getComputedStyle(document.documentElement).getPropertyValue('--text-primary').trim(), padding: { bottom: 12 } },
                 legend: { position: 'bottom', labels: { usePointStyle: true, pointStyleWidth: 8, color: getComputedStyle(document.documentElement).getPropertyValue('--text-primary').trim(), font: { size: 11 }, padding: 12 }, filter: function(item) { return item.text !== undefined; } },
