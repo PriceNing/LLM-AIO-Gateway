@@ -30,6 +30,8 @@ def init_db(path: Optional[str] = None) -> None:
             conn.executescript(_SCHEMA)
             # Migration: add created_at to provider_models if missing
             _migrate_provider_models_created_at(conn)
+            # Migration: add extra_headers to providers if missing
+            _migrate_providers_extra_headers(conn)
         _initialized = True
 
 
@@ -40,6 +42,27 @@ def _migrate_provider_models_created_at(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE provider_models ADD COLUMN {col} TEXT NOT NULL DEFAULT {default}")
         except sqlite3.OperationalError:
             pass  # Column already exists
+
+
+def _migrate_providers_extra_headers(conn: sqlite3.Connection) -> None:
+    """Add extra_headers column to providers if missing, and initialize DeepSeek defaults."""
+    try:
+        conn.execute("ALTER TABLE providers ADD COLUMN extra_headers TEXT NOT NULL DEFAULT '{}'")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+    # Initialize extra_headers for existing DeepSeek providers that have empty value
+    rows = conn.execute(
+        "SELECT id, extra_headers FROM providers WHERE extra_headers IS NULL OR extra_headers = '{}'"
+    ).fetchall()
+    for row in rows:
+        pid = row["id"]
+        name = conn.execute("SELECT name FROM providers WHERE id = ?", (pid,)).fetchone()
+        provider_name = (name["name"] if name else "").lower()
+        if "deepseek" in pid.lower() or "deepseek" in provider_name:
+            conn.execute(
+                "UPDATE providers SET extra_headers = ? WHERE id = ?",
+                ('{"thinking": "enabled"}', pid)
+            )
 
 
 def _ensure_init() -> None:
@@ -105,7 +128,8 @@ CREATE TABLE IF NOT EXISTS providers (
     provider_type TEXT NOT NULL DEFAULT 'openai',
     api_base TEXT NOT NULL DEFAULT '',
     api_key TEXT NOT NULL DEFAULT '',
-    enabled INTEGER NOT NULL DEFAULT 1
+    enabled INTEGER NOT NULL DEFAULT 1,
+    extra_headers TEXT NOT NULL DEFAULT '{}'
 );
 
 CREATE TABLE IF NOT EXISTS provider_models (
@@ -585,6 +609,7 @@ def get_providers() -> list:
             p["enabled"] = _to_bool(p["enabled"])
             models_rows = db.execute("SELECT * FROM provider_models WHERE provider_id = ? ORDER BY model_id", (p["id"],)).fetchall()
             p["models"] = [{"id": m["model_id"], "name": m["model_name"], "enabled": _to_bool(m["enabled"]), "preprocessor": m["preprocessor"] or ""} for m in models_rows]
+            p["extra_headers"] = _json_loads(p.get("extra_headers", "{}")) or {}
             result.append(p)
         return result
 
@@ -598,17 +623,20 @@ def get_provider(provider_id: str) -> Optional[dict]:
         p["enabled"] = _to_bool(p["enabled"])
         models_rows = db.execute("SELECT * FROM provider_models WHERE provider_id = ? ORDER BY model_id", (provider_id,)).fetchall()
         p["models"] = [{"id": m["model_id"], "name": m["model_name"], "enabled": _to_bool(m["enabled"]), "preprocessor": m["preprocessor"] or ""} for m in models_rows]
+        p["extra_headers"] = _json_loads(p.get("extra_headers", "{}")) or {}
         return p
 
 
 def add_provider(provider: dict) -> dict:
     with get_db() as db:
         try:
+            extra_headers_json = json.dumps(provider.get("extra_headers", {}), ensure_ascii=False)
             db.execute(
-                "INSERT INTO providers (id, name, provider_type, api_base, api_key, enabled) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO providers (id, name, provider_type, api_base, api_key, enabled, extra_headers) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (provider["id"], provider["name"], provider.get("provider_type", "openai"),
                  provider.get("api_base", ""), provider.get("api_key", ""),
-                 1 if provider.get("enabled", True) else 0)
+                 1 if provider.get("enabled", True) else 0,
+                 extra_headers_json)
             )
         except sqlite3.IntegrityError:
             raise ValueError(f"Provider '{provider['id']}' already exists")
@@ -637,6 +665,9 @@ def update_provider(provider_id: str, updates: dict) -> Optional[dict]:
         for key in _updatable:
             if key in updates:
                 db.execute(f"UPDATE providers SET {key} = ? WHERE id = ?", (updates[key], provider_id))
+        if "extra_headers" in updates:
+            db.execute("UPDATE providers SET extra_headers = ? WHERE id = ?",
+                       (json.dumps(updates["extra_headers"], ensure_ascii=False), provider_id))
         if "enabled" in updates:
             db.execute("UPDATE providers SET enabled = ? WHERE id = ?", (1 if updates["enabled"] else 0, provider_id))
         if "models" in updates:

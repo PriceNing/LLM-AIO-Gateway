@@ -73,33 +73,10 @@ except Exception:
         "liteLLM monkey-patch for reasoning_content failed"
     )
 
-# ── Monkey-patch: force enable thinking mode for DeepSeek Anthropic endpoint ──
-# DeepSeek's Anthropic-compatible endpoint enables thinking by default, but
-# liteLLM's AnthropicChatCompletion may drop the parameter. Ensure thinking is
-# explicitly enabled so the gateway can capture and echo-back reasoning_content.
-# The gateway handles injection only into assistant messages with tool_calls.
-try:
-    from litellm.llms.anthropic.chat import AnthropicChatCompletion
-    _original_anthropic_completion = AnthropicChatCompletion.completion
-
-    def _patched_anthropic_completion(self, *args, **kwargs):
-        api_base = kwargs.get("api_base", "")
-        if not api_base and len(args) > 3:
-            api_base = args[3] or ""
-        if api_base and "api.deepseek.com" in api_base:
-            if "optional_params" in kwargs:
-                kwargs = {**kwargs}
-                kwargs["optional_params"] = {**kwargs["optional_params"], "thinking": {"type": "enabled"}}
-            elif len(args) > 10:
-                args = list(args)
-                args[10] = {**args[10], "thinking": {"type": "enabled"}}
-        return _original_anthropic_completion(self, *args, **kwargs)
-
-    AnthropicChatCompletion.completion = _patched_anthropic_completion
-except Exception:
-    logging.getLogger("llmgw.app").warning(
-        "liteLLM monkey-patch for AnthropicChatCompletion.completion (thinking enable) failed"
-    )
+# ── Monkey-patch removed: thinking mode is now configured via
+# provider.extra_headers in build_completion_args and passthrough paths.
+# The AnthropicChatCompletion path (used by MiniMax etc.) no longer needs
+# a monkey-patch — each provider's extra_headers controls thinking.
 
 # ── Monkey-patch: convert reasoning_content → thinking_blocks for Anthropic messages ──
 # liteLLM's anthropic_messages_pt (factory.py:2558) only looks for "thinking_blocks"
@@ -275,13 +252,13 @@ def build_completion_args(model: str, provider_id: Optional[str] = None) -> tupl
             params["api_base"] = api_base
 
     litellm_model = get_litellm_model_name(model, provider)
-    # Enable thinking mode for DeepSeek models so they produce reasoning_content.
-    # The gateway handles reasoning_content injection/echo-back in proxy.py,
-    # injecting only into assistant messages with tool_calls (per DeepSeek docs)
-    # to minimize prefix cache pollution.
-    if "api.deepseek.com" in api_base:
+    # Per-provider thinking mode: configured via provider.extra_headers.
+    # If not set, no thinking parameter is sent (each provider defaults).
+    extra_headers = provider.get("extra_headers", {}) or {}
+    thinking = extra_headers.get("thinking")
+    if thinking in ("enabled", "disabled"):
         params.setdefault("extra_body", {})
-        params["extra_body"]["thinking"] = {"type": "enabled"}
+        params["extra_body"]["thinking"] = {"type": thinking}
     get_logger("app").debug("route model=%s provider_type=%s api_base=%s -> litellm_model=%s",
                            model, provider.get("provider_type"), api_base, litellm_model)
     return litellm_model, params

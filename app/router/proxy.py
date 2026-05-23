@@ -1667,11 +1667,11 @@ async def _anthropic_passthrough(provider_info: dict, messages: list,
         req_body["tools"] = [{"name": t["name"], "description": t.get("description", ""),
                              "input_schema": t.get("input_schema", {"type": "object", "properties": {}})}
                             for t in tools if isinstance(t, dict) and t.get("name")]
-    # Force-disable thinking for non-Anthropic endpoints — DeepSeek requires
-    # thinking blocks to be echoed back in multi-turn conversations, which the
-    # gateway's passthrough doesn't handle yet. Without this, multi-turn breaks.
-    if "api.anthropic.com" not in api_base:
-        req_body["thinking"] = {"type": "disabled"}
+    # Per-provider thinking mode: configured via provider_info.extra_headers.
+    extra_headers = provider_info.get("extra_headers", {}) or {}
+    thinking = extra_headers.get("thinking")
+    if thinking in ("enabled", "disabled"):
+        req_body["thinking"] = {"type": thinking}
     async with httpx.AsyncClient(timeout=120) as client:
         resp = await client.post(
             f"{api_base}/v1/messages",
@@ -1731,11 +1731,11 @@ async def _stream_anthropic_passthrough(provider_info, messages, body, max_token
     if tools:
         # Strip type field — Anthropic-compatible endpoints (DeepSeek) reject type:"custom"
         req_body["tools"] = [{k: v for k, v in t.items() if k != "type"} for t in tools if isinstance(t, dict)]
-    # Force-disable thinking for non-Anthropic endpoints — DeepSeek requires
-    # thinking blocks to be echoed back in multi-turn conversations, which the
-    # gateway's passthrough doesn't handle yet. Without this, multi-turn breaks.
-    if "api.anthropic.com" not in api_base:
-        req_body["thinking"] = {"type": "disabled"}
+    # Per-provider thinking mode: configured via provider_info.extra_headers.
+    extra_headers = provider_info.get("extra_headers", {}) or {}
+    thinking = extra_headers.get("thinking")
+    if thinking in ("enabled", "disabled"):
+        req_body["thinking"] = {"type": thinking}
     total_tokens = 0
     provider_id = provider_info.get("id", "")
     try:

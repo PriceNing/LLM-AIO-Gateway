@@ -14,6 +14,7 @@ class ProviderBase(BaseModel):
     api_key: str
     enabled: bool = True
     models: list[ModelInfo] = Field(default_factory=list)
+    extra_headers: dict = Field(default_factory=dict)
 
 class ProviderCreate(ProviderBase):
     pass
@@ -25,6 +26,7 @@ class ProviderUpdate(BaseModel):
     api_key: Optional[str] = None
     enabled: Optional[bool] = None
     models: Optional[list[ModelInfo]] = None
+    extra_headers: Optional[dict] = None
 
 class ProviderResponse(ProviderBase):
     pass

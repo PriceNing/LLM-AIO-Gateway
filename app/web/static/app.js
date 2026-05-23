@@ -103,6 +103,7 @@ zh: {
     'providers.typeAnthropic': 'Anthropic 兼容',
     'providers.apiBase': 'API Base URL',
     'providers.apiKey': '上游 API Key',
+    'providers.extraHeaders': '扩展 Headers (JSON)',
     'providers.addFail': '新增失败',
     'providers.updateFail': '更新失败',
     'providers.deleteConfirm': '确定要删除这个提供商吗？',
@@ -333,6 +334,7 @@ en: {
     'providers.typeAnthropic': 'Anthropic Compatible',
     'providers.apiBase': 'API Base URL',
     'providers.apiKey': 'Upstream API Key',
+    'providers.extraHeaders': 'Extra Headers (JSON)',
     'providers.addFail': 'Failed to add',
     'providers.updateFail': 'Failed to update',
     'providers.deleteConfirm': 'Delete this provider?',
@@ -1153,19 +1155,25 @@ function providerFormHtml(title, provider, submitAction) {
         '<div class="form-group"><label>' + t('providers.apiKey') + '</label>' +
             '<input type="password" id="providerApiKey" value="' + escHtml(provider.api_key || '') + '"></div>' +
         '<div class="form-group"><label><input type="checkbox" id="providerEnabled"' + (provider.enabled === false ? '' : ' checked') + '> ' + t('providers.enabled') + '</label></div>' +
+        '<div class="form-group"><label>' + t('providers.extraHeaders') + '</label>' +
+            '<textarea id="providerExtraHeaders" rows="3" style="font-family:monospace;font-size:12px" placeholder=\'{"thinking": "enabled"}\'>' + escHtml(JSON.stringify(provider.extra_headers || {}, null, 2)) + '</textarea></div>' +
         '<div class="form-actions">' +
             '<button class="btn btn-secondary" onclick="closeModal()">' + t('common.cancel') + '</button>' +
             '<button class="btn btn-primary" onclick="' + submitAction + '">' + t('common.save') + '</button></div>';
 }
 
 function readProviderForm() {
+    var eh = document.getElementById('providerExtraHeaders').value.trim();
+    var extraHeaders = {};
+    if (eh) { try { extraHeaders = JSON.parse(eh); } catch(e) { toast('extra_headers JSON invalid: ' + e.message, 'error'); } }
     return {
         id: document.getElementById('providerId').value.trim(),
         name: document.getElementById('providerName').value.trim(),
         provider_type: document.getElementById('providerType').value,
         api_base: document.getElementById('providerApiBase').value.trim(),
         api_key: document.getElementById('providerApiKey').value.trim(),
-        enabled: document.getElementById('providerEnabled').checked
+        enabled: document.getElementById('providerEnabled').checked,
+        extra_headers: extraHeaders
     };
 }
 
