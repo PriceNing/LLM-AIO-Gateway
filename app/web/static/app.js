@@ -1688,15 +1688,26 @@ function _switchTrendMode(chartInstanceVar, tmDataVar, mode) {
     var tmData = window[tmDataVar];
     if (!chart || !tmData || !tmData.labels || tmData.labels.length === 0) return;
     var data = mode === 'tokens' ? tmData.tokens : tmData.calls;
+    var useLine = tmData.labels.length > 12;
     var datasets = [];
     for (var i = 0; i < tmData.models.length; i++) {
         if (_isAllZero(data[i])) continue;
-        datasets.push({
+        var ds = {
             label: tmData.models[i],
             data: data[i],
             backgroundColor: _CHART_COLORS[i % _CHART_COLORS.length],
-            borderRadius: 2,
-        });
+        };
+        if (useLine) {
+            ds.borderColor = _CHART_COLORS[i % _CHART_COLORS.length];
+            ds.borderWidth = 2;
+            ds.pointRadius = 1;
+            ds.pointHoverRadius = 4;
+            ds.tension = 0.15;
+            ds.fill = false;
+        } else {
+            ds.borderRadius = 2;
+        }
+        datasets.push(ds);
     }
     chart.data.datasets = datasets;
     chart.options.plugins.tooltip.filter = function(item) { return item.raw !== 0; };
