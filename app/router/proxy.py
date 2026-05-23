@@ -1242,6 +1242,7 @@ def _anthropic_to_openai_messages(anthropic_msgs: list, system_prompt: str = "")
         if role == "assistant":
             openai_content = None
             tool_calls = []
+            thinking_parts = []
             if isinstance(content, list):
                 text_parts = []
                 for block in content:
@@ -1259,12 +1260,25 @@ def _anthropic_to_openai_messages(anthropic_msgs: list, system_prompt: str = "")
                                 "arguments": json.dumps(block.get("input", {}))
                             }
                         })
+                    elif block.get("type") == "thinking":
+                        th_text = block.get("thinking", "")
+                        if th_text:
+                            thinking_parts.append(th_text)
                 openai_content = "\n".join(text_parts) or None
             else:
                 openai_content = str(content) if content else None
             msg = {"role": "assistant", "content": openai_content}
             if tool_calls:
                 msg["tool_calls"] = tool_calls
+            # Preserve reasoning_content for DeepSeek thinking mode multi-turn continuity.
+            # Anthropic format stores thinking in content blocks; OpenAI format uses
+            # the reasoning_content field. Without this, DeepSeek re-thinks from scratch
+            # and may enter empty-output loops (content_chars=0, finish_reason=stop).
+            rc = m.get("reasoning_content")
+            if rc:
+                msg["reasoning_content"] = rc
+            elif thinking_parts:
+                msg["reasoning_content"] = "\n".join(thinking_parts)
             openai_msgs.append(msg)
         elif role == "user":
             parts = _anthropic_content_to_openai(content)
