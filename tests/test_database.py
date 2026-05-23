@@ -1,5 +1,5 @@
 """
-Unit tests for app.database — stats, provider lookup, routing rules, TTLDict.
+Unit tests for app.database - stats, provider lookup, routing rules, TTLDict.
 """
 import time
 import pytest
@@ -24,7 +24,7 @@ def temp_db(tmp_path):
     db_mod._initialized = False
 
 
-# ── Global stats ──
+# -- Global stats --
 
 def test_increment_and_get_stats():
     increment_global_stats(success=True)
@@ -53,7 +53,7 @@ def test_reset_global_stats():
     assert stats["last_reset"] != ""
 
 
-# ── Provider CRUD ──
+# -- Provider CRUD --
 
 def test_add_and_get_provider():
     add_provider({
@@ -106,7 +106,7 @@ def test_delete_nonexistent_provider():
     assert delete_provider("ghost") is False
 
 
-# ── find_provider_by_model (ORDER BY fix verification) ──
+# -- find_provider_by_model (ORDER BY fix verification) --
 
 def test_find_provider_by_model_first_match_order():
     """When two providers have the same model, the one with lower id wins."""
@@ -118,7 +118,7 @@ def test_find_provider_by_model_first_match_order():
                   "models": [{"id": "shared", "name": "Shared", "enabled": True}]})
     provider = find_provider_by_model("shared")
     assert provider is not None
-    assert provider["id"] == "aaa"  # ORDER BY p.id → aaa before zzz
+    assert provider["id"] == "aaa"  # ORDER BY p.id -> aaa before zzz
 
 
 def test_find_provider_by_model_not_found():
@@ -132,7 +132,7 @@ def test_find_provider_by_model_disabled_provider_ignored():
     assert find_provider_by_model("hidden") is None
 
 
-# ── parse_model_id ──
+# -- parse_model_id --
 
 def test_parse_model_id_simple():
     mid = parse_model_id("gpt-4")
@@ -151,7 +151,7 @@ def test_parse_model_id_composite():
 
 
 def test_parse_model_id_nested_path():
-    """模型名本身含 / 的情况（如 openai/gpt-4/turbo）— 仅按第一个 / 分割。"""
+    """Test behavior."""
     mid = parse_model_id("deepseek/deepseek-v4/pro")
     assert mid.provider_id == "deepseek"
     assert mid.model_name == "deepseek-v4/pro"
@@ -165,17 +165,17 @@ def test_parse_model_id_empty():
     assert not mid.is_composite
 
 
-# ── find_provider_by_model with composite ID ──
+# -- find_provider_by_model with composite ID --
 
 def test_find_provider_by_model_composite_id():
-    """复合 ID provider/model 应精确匹配指定 provider 下的模型。"""
+    """Test behavior."""
     add_provider({"id": "p-a", "name": "A", "provider_type": "openai",
                   "api_base": "", "api_key": "", "enabled": True,
                   "models": [{"id": "shared", "name": "Shared A", "enabled": True}]})
     add_provider({"id": "p-b", "name": "B", "provider_type": "openai",
                   "api_base": "", "api_key": "", "enabled": True,
                   "models": [{"id": "shared", "name": "Shared B", "enabled": True}]})
-    # 复合 ID 精确匹配 p-b
+    # Test section
     provider = find_provider_by_model("p-b/shared")
     assert provider is not None
     assert provider["id"] == "p-b"
@@ -183,7 +183,7 @@ def test_find_provider_by_model_composite_id():
 
 
 def test_find_provider_by_model_composite_nonexistent_provider():
-    """复合 ID 中 provider 不存在时应返回 None。"""
+    """Test behavior."""
     add_provider({"id": "p-a", "name": "A", "provider_type": "openai",
                   "api_base": "", "api_key": "", "enabled": True,
                   "models": [{"id": "m1", "name": "M1", "enabled": True}]})
@@ -191,14 +191,14 @@ def test_find_provider_by_model_composite_nonexistent_provider():
 
 
 def test_find_provider_by_model_composite_nonexistent_model():
-    """复合 ID 中 model 不存在时应返回 None。"""
+    """Test behavior."""
     add_provider({"id": "p-a", "name": "A", "provider_type": "openai",
                   "api_base": "", "api_key": "", "enabled": True,
                   "models": [{"id": "m1", "name": "M1", "enabled": True}]})
     assert find_provider_by_model("p-a/nonexistent") is None
 
 
-# ── Routing rules CRUD ──
+# -- Routing rules CRUD --
 
 def test_add_and_list_routing_rules():
     rule = add_routing_rule({
@@ -234,7 +234,7 @@ def test_delete_routing_rule():
     assert delete_routing_rule(rule["id"]) is False  # already gone
 
 
-# ── TTLDict ──
+# -- TTLDict --
 
 def test_ttldict_basic():
     from app.router.proxy import TTLDict

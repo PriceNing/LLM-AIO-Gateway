@@ -4,6 +4,7 @@ import uuid
 import threading
 import time
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Optional
 from contextlib import contextmanager
 
@@ -12,7 +13,7 @@ _initialized = False
 
 DB_PATH: str = "data.db"
 
-# ── Connection management ──
+# -- Connection management --
 
 def _db_path() -> str:
     return DB_PATH
@@ -23,6 +24,9 @@ def init_db(path: Optional[str] = None) -> None:
     global DB_PATH, _initialized
     if path:
         DB_PATH = path
+    db_file = Path(_db_path())
+    if str(db_file) != ":memory:" and db_file.parent != Path("."):
+        db_file.parent.mkdir(parents=True, exist_ok=True)
     with _lock:
         with sqlite3.connect(_db_path()) as conn:
             conn.execute("PRAGMA journal_mode=WAL")
@@ -88,7 +92,7 @@ def get_db():
         conn.close()
 
 
-# ── Schema ──
+# -- Schema --
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS admins (
@@ -173,7 +177,7 @@ CREATE TABLE IF NOT EXISTS request_records (
 CREATE INDEX IF NOT EXISTS idx_req_ts ON request_records(timestamp);
 """
 
-# ── Helpers ──
+# -- Helpers --
 
 def _row_to_dict(row: sqlite3.Row) -> dict:
     if row is None:
@@ -183,7 +187,7 @@ def _row_to_dict(row: sqlite3.Row) -> dict:
 
 def _json_loads(s: str):
     if not s:
-        return None  # empty string is not valid JSON — treated as "not configured" by callers
+        return None  # empty string is not valid JSON - treated as "not configured" by callers
     try:
         return json.loads(s)
     except json.JSONDecodeError:
@@ -200,7 +204,7 @@ def _to_bool(v) -> bool:
     return False
 
 
-# ── Global stats ──
+# -- Global stats --
 
 def get_global_stats() -> dict:
     with get_db() as db:
@@ -229,7 +233,7 @@ def reset_global_stats() -> None:
         db.execute("INSERT OR REPLACE INTO global_stats (key, value) VALUES ('last_reset', ?)", (today,))
 
 
-# ── Admins ──
+# -- Admins --
 
 def get_admins() -> list:
     with get_db() as db:
@@ -265,7 +269,7 @@ def update_admin_password(username: str, password_hash: str) -> bool:
         return db.total_changes > 0
 
 
-# ── Users ──
+# -- Users --
 
 def _api_key_from_row(k: sqlite3.Row) -> dict:
     kd = _row_to_dict(k)
@@ -344,7 +348,7 @@ def delete_user(username: str) -> bool:
         return cursor.rowcount > 0
 
 
-# ── API Keys ──
+# -- API Keys --
 
 def add_user_api_key(username: str, name: str, allowed_models: Optional[list] = None) -> dict:
     from app.security import new_api_key
@@ -387,7 +391,7 @@ def delete_user_api_key(username: str, key: str) -> bool:
         return cursor.rowcount > 0
 
 
-# ── Find user by API key ──
+# -- Find user by API key --
 
 def find_user_by_api_key(key: str) -> Optional[tuple[dict, dict]]:
     with get_db() as db:
@@ -414,9 +418,9 @@ def find_user_by_api_key(key: str) -> Optional[tuple[dict, dict]]:
         return user, api_key
 
 
-# ── Increment usage stats ──
+# -- Increment usage stats --
 
-# ── Request history records ──
+# -- Request history records --
 
 def add_request_record(model: str, username: str, success: bool, tokens: int = 0) -> None:
     """Insert a request record for historical stats. Called from _log_request."""
@@ -452,7 +456,7 @@ def _zero_pad_timeline(rows, from_ts, to_ts, granularity, model_bucket_rows):
     start = datetime.strptime(from_ts[:19] if len(from_ts) > 10 else from_ts[:10], from_ts[:19].count(":") == 0 and "%Y-%m-%d" or "%Y-%m-%d %H:%M:%S")
     end = datetime.strptime(to_ts[:19] if len(to_ts) > 10 else to_ts[:10], to_ts[:19].count(":") == 0 and "%Y-%m-%d" or "%Y-%m-%d %H:%M:%S")
 
-    # Build a dict from bucket → row data
+    # Build a dict from bucket -> row data
     row_map = {r["bucket"] or "": r for r in rows}
     model_map = {}
     for r in model_bucket_rows:
@@ -483,7 +487,7 @@ def _zero_pad_timeline(rows, from_ts, to_ts, granularity, model_bucket_rows):
             padded_rows.append({"bucket": b, "total": 0, "failed": 0, "tokens": 0})
         for mr in model_map.get(b, []):
             padded_model_rows.append(mr)
-        # Missing bucket → no model rows needed (all zeros)
+        # Missing bucket -> no model rows needed (all zeros)
 
     return padded_rows, all_buckets, padded_model_rows
 
@@ -598,7 +602,7 @@ def reset_user_stats() -> None:
         db.execute("UPDATE user_api_keys SET total_calls = 0, failed_calls = 0, total_tokens = 0")
 
 
-# ── Providers ──
+# -- Providers --
 
 def get_providers() -> list:
     with get_db() as db:
@@ -701,10 +705,10 @@ def delete_provider(provider_id: str) -> bool:
 
 
 class ModelId:
-    """统一的模型标识符，封装 provider/model 复合格式的解析逻辑。
+    """Unified model identifier that encapsulates provider/model composite parsing.
 
-    支持简单格式 "model" 和复合格式 "provider/model"。
-    可与字符串比较：model_id in ["allowed-model", "provider/model"]。
+    Supports simple "model" format and composite "provider/model" format.
+    Can be compared with strings such as model_id in ["allowed-model", "provider/model"].
     """
 
     __slots__ = ("provider_id", "model_name")
@@ -742,10 +746,10 @@ class ModelId:
         if isinstance(other, str):
             if self.composite == other:
                 return True
-            # 复合 ID == 简单名：比较 model_name 部分
+            # Composite ID equals simple name: compare the model_name part
             if self.model_name == other:
                 return True
-            # 简单名 == 复合 ID 字符串：比较后缀 model 部分
+            # Simple name equals composite ID string: compare the model suffix
             if not self.is_composite and "/" in other:
                 return self.model_name == other.rsplit("/", 1)[-1]
             return False
@@ -759,14 +763,14 @@ class ModelId:
 
 
 def parse_model_id(model_id: str) -> ModelId:
-    """解析模型标识符为 ModelId 对象。"""
+    """Parse a model identifier into a ModelId object."""
     return ModelId.parse(model_id)
 
 
 def find_provider_by_model(model_id: str) -> Optional[dict]:
-    """查找提供指定模型的第一个启用的 provider。
+    """Find the first enabled provider that serves the given model.
 
-    支持 provider/model 复合格式精确匹配；无前缀时取第一个匹配的 provider。
+    Supports exact provider/model composite matching; without a prefix, returns the first matching provider.
     """
     mid = parse_model_id(model_id)
     with get_db() as db:
@@ -791,7 +795,7 @@ def find_provider_by_model(model_id: str) -> Optional[dict]:
         return p
 
 
-# ── Routing rules ──
+# -- Routing rules --
 
 def get_routing_rules() -> list:
     with get_db() as db:
@@ -844,4 +848,3 @@ def delete_routing_rule(rule_id: str) -> bool:
     with get_db() as db:
         cursor = db.execute("DELETE FROM routing_rules WHERE id = ?", (rule_id,))
         return cursor.rowcount > 0
-

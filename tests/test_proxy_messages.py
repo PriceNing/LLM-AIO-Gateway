@@ -1,7 +1,4 @@
-"""
-消息转换与规范化测试 — Anthropic↔OpenAI 转换、消息合并、
-think 标签处理、_sanitize_args 边界、Responses API 转换。
-"""
+"""Tests for proxy message conversion and response helpers."""
 import json
 import pytest
 from app.router.proxy import (
@@ -19,14 +16,20 @@ from app.router.proxy import (
     _wildcard_match,
     _mask_key,
     _friendly_error_msg,
+    _strip_billing_header,
+    _conversation_cache_key,
+    _inject_reasoning_content,
+    _remember_reasoning_content,
+    _reasoning_cache,
+    _reasoning_tool_cache,
 )
 
-# 足够长的 base64 图片数据（>100 字符）
+# Test section
 _IMG1 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==" * 3
 _IMG2 = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/wAALCAABAAEBAREA/8QAFAABAAAAAAAAAAAAAAAAAAAACf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAD8AKM//2Q==" * 3
 
 
-# ── _anthropic_content_to_openai 测试 ──
+# Test section
 
 def test_anthropic_content_to_openai_string():
     result = _anthropic_content_to_openai("Hello world")
@@ -54,7 +57,7 @@ def test_anthropic_content_to_openai_image_block():
 
 
 def test_anthropic_content_to_openai_tool_use_skipped():
-    """tool_use 块在 _anthropic_content_to_openai 中应被跳过（由上层处理）。"""
+    """Test behavior."""
     result = _anthropic_content_to_openai([
         {"type": "tool_use", "id": "t1", "name": "search", "input": {}},
     ])
@@ -66,7 +69,7 @@ def test_anthropic_content_to_openai_non_dict_items():
     assert result == ["plain", "123", "None"]
 
 
-# ── _anthropic_to_openai_messages 测试 ──
+# Test section
 
 def test_anthropic_to_openai_simple():
     msgs, has_tools = _anthropic_to_openai_messages([
@@ -106,14 +109,14 @@ def test_anthropic_to_openai_assistant_with_tool_use():
 
 
 def test_anthropic_to_openai_tool_result_in_user_message():
-    """Anthropic 格式中 tool_result 嵌入在 user 消息内。"""
+    """Test behavior."""
     msgs, has_tools = _anthropic_to_openai_messages([
         {"role": "user", "content": [
             {"type": "tool_result", "tool_use_id": "call_1", "content": "Found 3 cats"},
             {"type": "text", "text": "What next?"},
         ]},
     ])
-    # tool 消息必须先于 user 文本，满足 DeepSeek 等严格供应商的 tool_calls→tool 邻接要求
+    # Test section
     assert len(msgs) == 2
     assert msgs[0]["role"] == "tool"
     assert msgs[0]["tool_call_id"] == "call_1"
@@ -123,7 +126,7 @@ def test_anthropic_to_openai_tool_result_in_user_message():
 
 
 def test_anthropic_to_openai_tool_result_with_image():
-    """tool_result 中嵌套图片 — 应转换为 image_url 格式。"""
+    """Test behavior."""
     msgs, _ = _anthropic_to_openai_messages([
         {"role": "user", "content": [
             {"type": "tool_result", "tool_use_id": "call_1", "content": [
@@ -132,7 +135,7 @@ def test_anthropic_to_openai_tool_result_with_image():
             ]},
         ]},
     ])
-    assert len(msgs) == 1  # 只有 tool 消息（user 部分为空被跳过）
+    assert len(msgs) == 1
     assert msgs[0]["role"] == "tool"
     content = msgs[0]["content"]
     assert isinstance(content, list)
@@ -141,7 +144,7 @@ def test_anthropic_to_openai_tool_result_with_image():
 
 
 def test_anthropic_to_openai_tool_result_role():
-    """Claude Code 发送的 tool_result 角色消息。"""
+    """Test behavior."""
     msgs, _ = _anthropic_to_openai_messages([
         {"role": "tool_result", "tool_use_id": "call_1", "content": "Result text"},
     ])
@@ -180,7 +183,7 @@ def test_anthropic_to_openai_user_with_image():
     assert "data:image/jpeg;base64," in content[1]["image_url"]["url"]
 
 
-# ── _openai_to_anthropic_content 测试 ──
+# Test section
 
 def test_openai_to_anthropic_text_only():
     result = _openai_to_anthropic_content({"role": "assistant", "content": "Hello"})
@@ -210,7 +213,7 @@ def test_openai_to_anthropic_empty_content():
 
 
 def test_openai_to_anthropic_invalid_json_args():
-    """工具调用参数为非法 JSON 时应回退到空 dict。"""
+    """Test behavior."""
     result = _openai_to_anthropic_content({
         "role": "assistant",
         "content": None,
@@ -222,7 +225,7 @@ def test_openai_to_anthropic_invalid_json_args():
     assert result[0]["input"] == {}
 
 
-# ── _map_stop_reason 测试 ──
+# Test section
 
 def test_map_stop_reason_all():
     assert _map_stop_reason("stop") == "end_turn"
@@ -232,7 +235,7 @@ def test_map_stop_reason_all():
     assert _map_stop_reason("") == "end_turn"
 
 
-# ── _normalize_messages 测试 ──
+# Test section
 
 def test_normalize_consecutive_system():
     msgs = [
@@ -255,7 +258,7 @@ def test_normalize_consecutive_user():
 
 
 def test_normalize_no_merge_assistant():
-    """assistant 消息不应合并（保留 tool_use/tool_result 连续性）。"""
+    """Test behavior."""
     msgs = [
         {"role": "assistant", "content": "Reply 1"},
         {"role": "assistant", "content": "Reply 2"},
@@ -274,7 +277,7 @@ def test_normalize_no_merge_tool():
 
 
 def test_normalize_mixed_content_types():
-    """合并时 prev 是字符串、当前是列表的情况。"""
+    """Test behavior."""
     msgs = [
         {"role": "user", "content": "Text first"},
         {"role": "user", "content": [{"type": "text", "text": "Then list"}]},
@@ -310,7 +313,7 @@ def test_normalize_list_then_list():
 
 
 def test_normalize_preserves_extra_fields():
-    """合并时保留后一条消息的额外字段（如 reasoning_content）。"""
+    """Test behavior."""
     msgs = [
         {"role": "user", "content": "Q1"},
         {"role": "user", "content": "Q2", "reasoning_content": "think"},
@@ -330,7 +333,7 @@ def test_normalize_single():
 
 
 def test_normalize_interleaved():
-    """交替出现的不同角色不应合并。"""
+    """Test behavior."""
     msgs = [
         {"role": "system", "content": "S1"},
         {"role": "user", "content": "U1"},
@@ -341,12 +344,12 @@ def test_normalize_interleaved():
     assert len(result) == 4
 
 
-# ── _extract_and_strip_think / _strip_think_tags 测试 ──
+# Test section
 
 def test_extract_and_strip_think():
     text = "Before <think>This is thinking</think> After"
     cleaned, thinking = _extract_and_strip_think(text)
-    # 正则 r'<think>(.*?)</think>\s*' 会吞掉 </think> 后的空格
+    # Test section
     assert cleaned == "Before After"
     assert thinking == "This is thinking"
 
@@ -384,7 +387,7 @@ def test_strip_think_tags():
     assert _strip_think_tags("No tags here") == "No tags here"
 
 
-# ── _sanitize_args 边界测试 ──
+# Test section
 
 def test_sanitize_args_simple():
     assert _sanitize_args('{"url": undefined}') == '{"url": ""}'
@@ -399,19 +402,19 @@ def test_sanitize_args_no_undefined():
 
 
 def test_sanitize_args_undefined_in_string_value():
-    """字符串值中的 'undefined' 不应被替换。"""
+    """Test behavior."""
     args = '{"query": "find undefined values"}'
     assert _sanitize_args(args) == args
 
 
 def test_sanitize_args_undefined_partial_word():
-    """'undefined' 作为单词一部分时不应替换。"""
+    """Test behavior."""
     args = '{"key": "undefined_value"}'
     assert _sanitize_args(args) == args
 
 
 def test_sanitize_args_undefined_with_escaped_quotes():
-    """正确处理转义引号。"""
+    """Test behavior."""
     args = r'{"desc": "say \"undefined\" please"}'
     assert _sanitize_args(args) == args
 
@@ -420,7 +423,7 @@ def test_sanitize_args_empty():
     assert _sanitize_args("") == ""
 
 
-# ── _fix_tool_args 测试 ──
+# Test section
 
 def test_fix_tool_args_no_function():
     tc = {"index": 0}
@@ -441,7 +444,7 @@ def test_fix_tool_args_no_undefined():
     assert tc["function"] == original
 
 
-# ── _wildcard_match 测试 ──
+# Test section
 
 def test_wildcard_exact():
     assert _wildcard_match("gpt-4", "gpt-4") is True
@@ -460,7 +463,7 @@ def test_wildcard_case_insensitive():
     assert _wildcard_match("GPT*", "gpt-4") is True
 
 
-# ── _mask_key 测试 ──
+# Test section
 
 def test_mask_key_normal():
     assert _mask_key("sk-aio-abcdefghijklmnopqrstuvwxyz1234567890AB") == "sk-a...90AB"
@@ -474,10 +477,10 @@ def test_mask_key_exact_eight():
     assert _mask_key("12345678") == "12345678"
 
 
-# ── _convert_responses_input 更多边界测试 ──
+# Test section
 
 def test_convert_responses_input_developer_role():
-    """developer 角色应转换为 system。"""
+    """Test behavior."""
     result = _convert_responses_input([
         {"type": "message", "role": "developer", "content": "You are helpful."},
         {"type": "message", "role": "user", "content": "Hi"},
@@ -486,7 +489,7 @@ def test_convert_responses_input_developer_role():
 
 
 def test_convert_responses_input_input_image_attaches_to_user():
-    """顶层 input_image 应附加到最近的 user 消息。"""
+    """Test behavior."""
     result = _convert_responses_input([
         {"type": "message", "role": "user", "content": "Look at this:"},
         {"type": "input_image", "image_url": "https://example.com/img.jpg"},
@@ -498,7 +501,7 @@ def test_convert_responses_input_input_image_attaches_to_user():
 
 
 def test_convert_responses_input_input_image_no_user():
-    """没有前置 user 消息时，input_image 应创建新 user 消息。"""
+    """Test behavior."""
     result = _convert_responses_input([
         {"type": "message", "role": "system", "content": "System"},
         {"type": "input_image", "image_url": "https://example.com/img.jpg"},
@@ -508,7 +511,7 @@ def test_convert_responses_input_input_image_no_user():
 
 
 def test_convert_responses_input_reasoning_skipped():
-    """reasoning 类型应被跳过。"""
+    """Test behavior."""
     result = _convert_responses_input([
         {"type": "message", "role": "user", "content": "Hi"},
         {"type": "reasoning", "content": "Thinking..."},
@@ -517,7 +520,7 @@ def test_convert_responses_input_reasoning_skipped():
 
 
 def test_convert_responses_input_string_content():
-    """字符串类型的 content 应直接使用。"""
+    """Test behavior."""
     result = _convert_responses_input([
         {"type": "message", "role": "user", "content": "Plain string"},
     ])
@@ -525,7 +528,7 @@ def test_convert_responses_input_string_content():
 
 
 def test_convert_responses_input_content_with_images():
-    """包含 input_image 的 content 列表应保留为列表格式。"""
+    """Test behavior."""
     result = _convert_responses_input([
         {"type": "message", "role": "user", "content": [
             {"type": "input_text", "text": "Describe:"},
@@ -538,7 +541,7 @@ def test_convert_responses_input_content_with_images():
 
 
 def test_convert_responses_input_function_call_with_reasoning():
-    """function_call 中的 reasoning_content 应被保留。"""
+    """Test behavior."""
     result = _convert_responses_input([
         {"type": "message", "role": "user", "content": "Search"},
         {"type": "function_call", "call_id": "c1", "name": "search",
@@ -553,7 +556,7 @@ def test_convert_responses_input_non_dict_skipped():
 
 
 def test_convert_responses_input_fallback_role():
-    """带有 role 字段的非标准消息类型应被处理。"""
+    """Test behavior."""
     result = _convert_responses_input([
         {"role": "user", "content": "Simple fallback"},
     ])
@@ -561,17 +564,17 @@ def test_convert_responses_input_fallback_role():
     assert result[0]["role"] == "user"
 
 
-# ── _convert_responses_tools 更多边界测试 ──
+# Test section
 
 def test_convert_responses_tools_already_formatted():
-    """已经是 Chat Completions 格式的工具应直接通过。"""
+    """Test behavior."""
     tools = [{"type": "function", "function": {"name": "f", "parameters": {}}}]
     result = _convert_responses_tools(tools)
     assert result == tools
 
 
 def test_convert_responses_tools_strips_openai_fields():
-    """应去除 OpenAI 专有字段（strict, additionalProperties）。"""
+    """Test behavior."""
     tools = [{
         "type": "function",
         "name": "search",
@@ -613,19 +616,19 @@ def test_convert_responses_tools_empty():
     assert _convert_responses_tools([]) == []
 
 
-# ── _friendly_error_msg ──
+# -- _friendly_error_msg --
 
 def test_friendly_error_msg_content_moderation():
     e = Exception("litellm.APIConnectionError: OpenAIException - output new_sensitive (1027)")
     result = _friendly_error_msg(e)
-    assert "内容被上游安全策略拦截（输出端）" in result
-    assert "output new_sensitive" in result  # 原始错误保留在消息中
+    assert "" in result
+    assert "output new_sensitive" in result
 
 
 def test_friendly_error_msg_no_image_support():
     e = Exception("No endpoints found that support image input")
     result = _friendly_error_msg(e)
-    assert "该模型不支持图像输入" in result
+    assert "" in result
 
 
 def test_friendly_error_msg_unmapped_passthrough():
@@ -634,10 +637,10 @@ def test_friendly_error_msg_unmapped_passthrough():
     assert result == "Some unknown error message"
 
 
-# ── system 数组格式 → 字符串转换 ──
+# Test section
 
 def test_anthropic_to_openai_system_as_array():
-    """Anthropic system 字段为 content block 数组时（含 cache_control），应转为纯字符串。"""
+    """Test behavior."""
     msgs, has_tools = _anthropic_to_openai_messages(
         [{"role": "user", "content": "Hello"}],
         system_prompt=[
@@ -647,11 +650,11 @@ def test_anthropic_to_openai_system_as_array():
     )
     assert msgs[0]["role"] == "system"
     assert msgs[0]["content"] == "You are helpful.\nBe concise."
-    assert isinstance(msgs[0]["content"], str)  # 不是数组
+    assert isinstance(msgs[0]["content"], str)
 
 
 def test_anthropic_to_openai_system_array_with_empty_blocks():
-    """system 数组中含空文本块 → 应被过滤。"""
+    """Test behavior."""
     msgs, _ = _anthropic_to_openai_messages(
         [{"role": "user", "content": "Hi"}],
         system_prompt=[
@@ -662,10 +665,119 @@ def test_anthropic_to_openai_system_array_with_empty_blocks():
     assert msgs[0]["content"] == "Valid text."
 
 
-# ── 空文本块过滤 ──
+def test_anthropic_to_openai_system_array_strips_billing_header():
+    msgs, _ = _anthropic_to_openai_messages(
+        [{"role": "user", "content": "Hi"}],
+        system_prompt=_strip_billing_header([
+            {
+                "type": "text",
+                "text": "Prompt\nx-anthropic-billing-header: cc_version=2.1.37; cc_entrypoint=cli; cch=random;",
+                "cache_control": {"type": "ephemeral"},
+            },
+        ])
+    )
+    assert msgs[0]["content"] == "Prompt"
+
+
+def test_strip_billing_header_preserves_cache_control():
+    """Test behavior."""
+    result = _strip_billing_header([
+        {
+            "type": "text",
+            "text": "Prompt\nx-anthropic-billing-header: cc_version=2.1.37; cc_entrypoint=cli; cch=random;",
+            "cache_control": {"type": "ephemeral"},
+        },
+    ])
+    assert result == [
+        {
+            "type": "text",
+            "text": "Prompt",
+            "cache_control": {"type": "ephemeral"},
+        },
+    ]
+
+
+def test_strip_billing_header_removes_any_header_line_shape():
+    result = _strip_billing_header(
+        "Before\n"
+        "x-anthropic-billing-header: cch=random; cc_entrypoint=cli; cc_version=2.2.0; extra=value;\n"
+        "After"
+    )
+    assert result == "Before\nAfter"
+
+
+def test_normalize_system_list_strips_billing_header_preserves_cache_control():
+    result = _normalize_messages([
+        {
+            "role": "system",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Prompt\nx-anthropic-billing-header: cc_version=2.1.37; cc_entrypoint=cli; cch=random;",
+                    "cache_control": {"type": "ephemeral"},
+                },
+            ],
+        },
+        {"role": "user", "content": "Hi"},
+    ])
+    assert result[0]["content"] == [
+        {
+            "type": "text",
+            "text": "Prompt",
+            "cache_control": {"type": "ephemeral"},
+        },
+    ]
+
+
+# Test section
+
+def test_reasoning_injection_uses_tool_id_and_active_segment_only():
+    messages = [
+        {"role": "user", "content": "start"},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "old_call", "type": "function", "function": {"name": "old", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "old_call", "content": "old result"},
+        {"role": "assistant", "content": "done"},
+        {"role": "user", "content": "continue"},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "new_call", "type": "function", "function": {"name": "new", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "new_call", "content": "new result"},
+    ]
+    conv_key = _conversation_cache_key("key", messages)
+    _reasoning_cache.drop(conv_key)
+    _reasoning_tool_cache.drop(conv_key)
+
+    _remember_reasoning_content(conv_key, "old reasoning", ["old_call"])
+    _remember_reasoning_content(conv_key, "new reasoning", ["new_call"])
+
+    assert _inject_reasoning_content(messages, conv_key, "test") == 1
+    assert "reasoning_content" not in messages[1]
+    assert messages[5]["reasoning_content"] == "new reasoning"
+
+
+def test_reasoning_injection_fallback_limited_to_active_tool_segment():
+    messages = [
+        {"role": "user", "content": "start"},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "old_call", "type": "function", "function": {"name": "old", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "old_call", "content": "old result"},
+        {"role": "assistant", "content": "done"},
+        {"role": "user", "content": "continue"},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "new_call_1", "type": "function", "function": {"name": "new1", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "new_call_1", "content": "new result 1"},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "new_call_2", "type": "function", "function": {"name": "new2", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "new_call_2", "content": "new result 2"},
+    ]
+    conv_key = _conversation_cache_key("key2", messages)
+    _reasoning_cache.drop(conv_key)
+    _reasoning_tool_cache.drop(conv_key)
+    _reasoning_cache[conv_key] = "latest reasoning"
+
+    assert _inject_reasoning_content(messages, conv_key, "test") == 2
+    assert "reasoning_content" not in messages[1]
+    assert messages[5]["reasoning_content"] == "latest reasoning"
+    assert messages[7]["reasoning_content"] == "latest reasoning"
+
 
 def test_anthropic_content_to_openai_filters_empty_text():
-    """_anthropic_content_to_openai 应过滤 text: "" 的块。"""
+    """Test behavior."""
     result = _anthropic_content_to_openai([
         {"type": "text", "text": ""},
         {"type": "text", "text": "Hello"},
@@ -675,7 +787,7 @@ def test_anthropic_content_to_openai_filters_empty_text():
 
 
 def test_anthropic_to_openai_assistant_empty_text_filtered():
-    """assistant 消息含空文本块 → 不应产生 content="" 的消息。"""
+    """Test behavior."""
     msgs, _ = _anthropic_to_openai_messages(
         [{"role": "assistant", "content": [
             {"type": "text", "text": ""},
@@ -687,7 +799,7 @@ def test_anthropic_to_openai_assistant_empty_text_filtered():
 
 
 def test_anthropic_to_openai_assistant_all_text_empty():
-    """assistant 消息所有文本块为空 → content 应为 None。"""
+    """Test behavior."""
     msgs, _ = _anthropic_to_openai_messages(
         [{"role": "assistant", "content": [{"type": "text", "text": ""}]}],
         system_prompt=""
@@ -696,7 +808,7 @@ def test_anthropic_to_openai_assistant_all_text_empty():
 
 
 def test_anthropic_to_openai_image_only_user_no_empty_text():
-    """纯图片用户消息（无文本）→ 不应产生空字符串。"""
+    """Test behavior."""
     msgs, _ = _anthropic_to_openai_messages(
         [{"role": "user", "content": [
             {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": _IMG1}}

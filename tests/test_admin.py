@@ -26,7 +26,7 @@ def temp_db(tmp_path):
                 "api_key": "test-key",
                 "timeout": 30,
                 "max_images": 20,
-                "prompt": "请描述图片中的内容。",
+                "prompt": "Please describe the image content.",
                 "enabled": True,
             },
             "disabled-vision": {
@@ -119,7 +119,7 @@ def test_get_stats(temp_db):
     assert "success_rate" in data
 
 
-# ── Auth edge cases ──
+# -- Auth edge cases --
 
 def test_auth_status_returns_has_admin():
     response = client.get("/auth/status")
@@ -157,7 +157,7 @@ def test_me_endpoint(temp_db):
     assert response.json()["username"] == "admin"
 
 
-# ── Provider CRUD edge cases ──
+# -- Provider CRUD edge cases --
 
 def test_update_provider(temp_db):
     client.post("/admin/providers", json={
@@ -202,7 +202,7 @@ def test_create_duplicate_provider(temp_db):
     assert response.status_code == 400
 
 
-# ── User CRUD edge cases ──
+# -- User CRUD edge cases --
 
 def test_update_user(temp_db):
     client.post("/admin/users", json={"username": "bob", "display_name": "Bob", "enabled": True}, headers=temp_db["headers"])
@@ -239,7 +239,7 @@ def test_delete_user_api_key(temp_db):
     assert response.status_code == 200
 
 
-# ── Routing rules ──
+# -- Routing rules --
 
 def test_create_and_list_routing_rules(temp_db):
     response = client.post("/admin/routing-rules", json={
@@ -284,7 +284,7 @@ def test_delete_nonexistent_routing_rule(temp_db):
     assert response.status_code == 404
 
 
-# ── Stats reset ──
+# -- Stats reset --
 
 def test_reset_stats(temp_db):
     response = client.post("/admin/stats/reset", headers=temp_db["headers"])
@@ -292,7 +292,7 @@ def test_reset_stats(temp_db):
     assert response.json()["status"] == "ok"
 
 
-# ── Model listing ──
+# -- Model listing --
 
 def test_admin_list_models(temp_db):
     client.post("/admin/providers", json={
@@ -306,7 +306,7 @@ def test_admin_list_models(temp_db):
     assert "mp/m-a" in model_ids
 
 
-# ── Preprocessor endpoints ──
+# -- Preprocessor endpoints --
 
 def test_list_preprocessors(temp_db):
     response = client.get("/admin/preprocessors", headers=temp_db["headers"])
@@ -314,7 +314,7 @@ def test_list_preprocessors(temp_db):
     data = response.json()
     assert "preprocessors" in data
     assert "models" in data
-    # 预处理器配置应包含测试用的 vision-model
+    # Test section
     assert "vision-model" in data["preprocessors"]
 
 
@@ -324,16 +324,16 @@ def test_list_preprocessors_requires_auth():
 
 
 def test_update_preprocessor_enable_disables_others(temp_db):
-    """启用一个预处理器时应自动禁用其余所有。"""
+    """Test behavior."""
     headers = temp_db["headers"]
-    # 先确保有两个预处理器，且 vision-model 启用、disabled-vision 禁用
+    # Test section
     resp1 = client.put("/admin/preprocessors/disabled-vision", json={
         "enabled": True,
     }, headers=headers)
     assert resp1.status_code == 200
     assert resp1.json()["config"]["enabled"] is True
 
-    # 验证 vision-model 已被自动禁用
+    # Test section
     resp_list = client.get("/admin/preprocessors", headers=headers)
     preprocessors = resp_list.json()["preprocessors"]
     assert preprocessors["vision-model"]["enabled"] is False
@@ -341,7 +341,7 @@ def test_update_preprocessor_enable_disables_others(temp_db):
 
 
 def test_update_preprocessor_partial(temp_db):
-    """部分更新预处理器配置（只更新某些字段）。"""
+    """Test behavior."""
     headers = temp_db["headers"]
     resp = client.put("/admin/preprocessors/vision-model", json={
         "max_images": 10,
@@ -351,7 +351,7 @@ def test_update_preprocessor_partial(temp_db):
     config = resp.json()["config"]
     assert config["max_images"] == 10
     assert config["prompt"] == "New prompt"
-    # 未指定的字段应保持不变
+    # Test section
     assert config["model"] == "test-vision"
 
 
@@ -361,7 +361,7 @@ def test_delete_preprocessor(temp_db):
     assert resp.status_code == 200
     assert resp.json()["status"] == "deleted"
 
-    # 确认已删除
+    # Test section
     resp_list = client.get("/admin/preprocessors", headers=headers)
     assert "disabled-vision" not in resp_list.json()["preprocessors"]
 
@@ -372,16 +372,16 @@ def test_delete_nonexistent_preprocessor(temp_db):
 
 
 def test_toggle_model_preprocessor(temp_db):
-    """切换模型级别的预处理器开关（使用复合 ID）。"""
+    """Test behavior."""
     headers = temp_db["headers"]
-    # 先添加一个 provider 和 model
+    # Test section
     from app.database import add_provider
     add_provider({
         "id": "pp-test", "name": "PP Test", "provider_type": "openai",
         "api_base": "", "api_key": "", "enabled": True,
         "models": [{"id": "pp-model", "name": "PP Model", "enabled": True}]
     })
-    # 启用预处理器（使用复合 ID）
+    # Test section
     resp = client.put("/admin/models/preprocessor", json={
         "model_id": "pp-test/pp-model",
         "enabled": True
@@ -389,14 +389,14 @@ def test_toggle_model_preprocessor(temp_db):
     assert resp.status_code == 200
     assert resp.json()["preprocessor"] is True
 
-    # 验证 models 列表中反映了变更（复合 ID）
+    # Test section
     resp_list = client.get("/admin/preprocessors", headers=headers)
     models = resp_list.json()["models"]
     pp_model = next((m for m in models if m["model_id"] == "pp-test/pp-model"), None)
     assert pp_model is not None
     assert pp_model["preprocessor"] is True
 
-    # 禁用预处理器
+    # Test section
     resp2 = client.put("/admin/models/preprocessor", json={
         "model_id": "pp-test/pp-model",
         "enabled": False

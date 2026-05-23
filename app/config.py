@@ -89,7 +89,7 @@ def get_config() -> ConfigManager:
 
 
 def get_default(key: str, fallback=None):
-    """从 config.json 的 defaults 节读取配置值，不存在时返回 fallback。"""
+    """Read a value from config.json defaults, returning fallback when missing."""
     try:
         cfg = get_config()
         defaults = cfg.config.get("defaults")

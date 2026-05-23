@@ -1,5 +1,5 @@
 """
-Integration tests for proxy edge cases — routing, message conversion, circuit breaker.
+Integration tests for proxy edge cases - routing, message conversion, circuit breaker.
 """
 import json
 import pytest
@@ -44,7 +44,7 @@ def temp_db(tmp_path):
     db_mod._initialized = False
 
 
-# ── Conversation cache key ──
+# -- Conversation cache key --
 
 def test_cache_key_text_messages():
     messages = [{"role": "user", "content": "Hello world"}]
@@ -65,17 +65,17 @@ def test_cache_key_pure_image_isolation():
     img2 = [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "https://example.com/b.jpg"}}]}]
     key1 = _conversation_cache_key("k1", img1)
     key2 = _conversation_cache_key("k1", img2)
-    assert key1 != key2  # Fix #2: different images → different keys
+    assert key1 != key2  # Fix #2: different images -> different keys
 
 
 def test_cache_key_different_api_keys():
     messages = [{"role": "user", "content": "Hi"}]
     key1 = _conversation_cache_key("key-a", messages)
     key2 = _conversation_cache_key("key-b", messages)
-    assert key1 != key2  # Different API keys → different cache keys
+    assert key1 != key2  # Different API keys -> different cache keys
 
 
-# ── Wildcard matching ──
+# -- Wildcard matching --
 
 def test_wildcard_match_exact():
     assert _wildcard_match("deepseek-v4-pro", "deepseek-v4-pro") is True
@@ -96,14 +96,14 @@ def test_wildcard_match_case_insensitive():
     assert _wildcard_match("MINIMAX*", "minimax-M2.7") is True
 
 
-# ── Sanitize args ──
+# -- Sanitize args --
 
 def test_sanitize_args():
     assert _sanitize_args('{"url": undefined}') == '{"url": ""}'
     assert _sanitize_args('{"a": undefined, "b": undefined}') == '{"a": "", "b": ""}'
 
 
-# ── Fix tool args in-place ──
+# -- Fix tool args in-place --
 
 def test_fix_tool_args_no_function():
     tc = {"index": 0}
@@ -117,14 +117,14 @@ def test_fix_tool_args_replaces_undefined():
     assert tc["function"]["arguments"] == '{"q": ""}'
 
 
-# ── Key masking ──
+# -- Key masking --
 
 def test_mask_key():
     assert _mask_key("sk-aio-abcdefghijklmnopqrstuvwxyz1234567890AB") == "sk-a...90AB"
     assert _mask_key("short") == "short"
 
 
-# ── Responses input conversion ──
+# -- Responses input conversion --
 
 def test_convert_responses_input_simple():
     input_data = [
@@ -167,7 +167,7 @@ def test_convert_responses_tools():
     assert converted[0]["function"]["name"] == "search"
 
 
-# ── Routing rules ──
+# -- Routing rules --
 
 def test_routing_rules_match_model(temp_db):
     from app.database import add_routing_rule
@@ -185,7 +185,7 @@ def test_routing_rules_no_match(temp_db):
     assert target_model == "unmatched"
 
 
-# ── TTLDict ──
+# -- TTLDict --
 
 def test_ttldict_operations():
     d = TTLDict(ttl_seconds=60, max_size=100)
@@ -196,7 +196,7 @@ def test_ttldict_operations():
     assert set(d.keys()) == {"a", "b"}
 
 
-# ── API endpoint: model listing with routing ──
+# -- API endpoint: model listing with routing --
 
 def test_list_models_returns_all_when_wildcard(temp_db):
     add_provider({"id": "p1", "name": "P1", "provider_type": "openai",
@@ -208,7 +208,7 @@ def test_list_models_returns_all_when_wildcard(temp_db):
     assert "p1/m1" in model_ids
 
 
-# ── API endpoint: auth status ──
+# -- API endpoint: auth status --
 
 def test_auth_status():
     response = client.get("/auth/status")
@@ -217,53 +217,53 @@ def test_auth_status():
     assert "has_admin" in data
 
 
-# ── ensure_model_allowed with composite IDs ──
+# -- ensure_model_allowed with composite IDs --
 
 def test_ensure_model_allowed_wildcard_passes():
-    """通配符 allowed_models → 任何模型名都放行。"""
+    """Test behavior."""
     ensure_model_allowed({}, {"allowed_models": ["*"]}, "any-model")
 
 
 def test_ensure_model_allowed_exact_simple():
-    """简单模型名精确匹配。"""
+    """Test behavior."""
     ensure_model_allowed({}, {"allowed_models": ["gpt-4"]}, "gpt-4")
 
 
 def test_ensure_model_allowed_exact_composite():
-    """复合 ID 精确匹配。"""
+    """Test behavior."""
     ensure_model_allowed({}, {"allowed_models": ["opencode-go/deepseek-v4-flash"]}, "opencode-go/deepseek-v4-flash")
 
 
 def test_ensure_model_allowed_composite_extracts_simple():
-    """客户端传复合 ID，allowed 配的是简单 model_id → 放行。"""
+    """Test behavior."""
     ensure_model_allowed({}, {"allowed_models": ["deepseek-v4-flash"]}, "opencode-go/deepseek-v4-flash")
 
 
 def test_ensure_model_allowed_simple_in_composite_allowed():
-    """客户端传简单名，allowed 配的是复合 ID → 放行。"""
+    """Test behavior."""
     ensure_model_allowed({}, {"allowed_models": ["opencode-go/deepseek-v4-flash"]}, "deepseek-v4-flash")
 
 
 def test_ensure_model_allowed_blocked():
-    """不在 allowed 列表中 → 403。"""
+    """Test behavior."""
     from fastapi import HTTPException
     with pytest.raises(HTTPException) as exc:
         ensure_model_allowed({}, {"allowed_models": ["gpt-4"]}, "claude-3")
     assert exc.value.status_code == 403
 
 
-# ── Anthropic passthrough model extraction ──
+# -- Anthropic passthrough model extraction --
 
 @pytest.mark.asyncio
 async def test_anthropic_passthrough_model_extraction():
-    """_anthropic_passthrough 应从复合 ID 提取纯模型名发给上游。"""
+    """Test behavior."""
     from app.router.proxy import _anthropic_passthrough
     from unittest.mock import AsyncMock, patch, MagicMock
 
     provider = {"api_base": "https://api.deepseek.com/anthropic", "api_key": "sk-test"}
     body = {"system": "", "tools": []}
 
-    # 构造一个真实的 response mock（非 coroutine）
+    # Test section
     mock_resp = MagicMock()
     mock_resp.status_code = 200
     mock_resp.json.return_value = {
@@ -281,4 +281,4 @@ async def test_anthropic_passthrough_model_extraction():
             provider, [], body, 100, 0.7, "deepseek/deepseek-v4-pro"
         )
         sent_body = mock_fn.call_args[1]["json"]
-        assert sent_body["model"] == "deepseek-v4-pro"  # 不是 deepseek/deepseek-v4-pro
+        assert sent_body["model"] == "deepseek-v4-pro"  #  deepseek/deepseek-v4-pro

@@ -72,7 +72,7 @@ def test_parse_models_skips_non_dict_items():
     assert models[0]["id"] == "valid"
 
 
-# ── Auth headers ──
+# -- Auth headers --
 
 def test_auth_headers_with_key():
     headers = auth_headers("sk-test", "openai")
@@ -88,6 +88,6 @@ def test_auth_headers_anthropic_extra_header():
 
 
 def test_auth_headers_empty_key():
-    """Empty api_key should return [{}] — no auth header, not 'Bearer '."""
+    """Empty api_key should return [{}] - no auth header, not 'Bearer '."""
     headers = auth_headers("", "openai")
     assert headers == [{}]

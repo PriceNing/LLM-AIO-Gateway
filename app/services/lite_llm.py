@@ -8,7 +8,7 @@ from app.database import get_providers, get_provider, find_provider_by_model
 from app.services.logger import get_logger
 from app.config import get_default
 
-# ── Monkey-patch: MiniMax Anthropic responses may have non-string `id` fields ──
+# -- Monkey-patch: MiniMax Anthropic responses may have non-string `id` fields --
 # liteLLM's AnthropicResponse and related models require `id: str`, but MiniMax's
 # Anthropic-compatible endpoint returns `id` as a bare integer.  Coerce to str.
 try:
@@ -39,9 +39,9 @@ try:
             _model.model_fields["reasoning_content"] = Field(default=None)
             _model.model_rebuild(force=True)
 except Exception:
-    logging.getLogger("llmgw.app").warning("liteLLM monkey-patch for MiniMax id coercion failed — MiniMax Anthropic responses may have type errors")
+    logging.getLogger("llmgw.app").warning("liteLLM monkey-patch for MiniMax id coercion failed - MiniMax Anthropic responses may have type errors")
 
-# ── Monkey-patch: preserve reasoning_content in liteLLM responses ──
+# -- Monkey-patch: preserve reasoning_content in liteLLM responses --
 # liteLLM's convert_to_model_response_object (utils.py:5755) constructs Message
 # objects from the OpenAI response dict but only extracts known fields (content,
 # role, function_call, tool_calls).  reasoning_content is dropped even though the
@@ -84,16 +84,16 @@ except Exception:
         "liteLLM monkey-patch for reasoning_content failed"
     )
 
-# ── Monkey-patch removed: thinking mode is now configured via
+# -- Monkey-patch removed: thinking mode is now configured via
 # provider.extra_headers in build_completion_args and passthrough paths.
 # The AnthropicChatCompletion path (used by MiniMax etc.) no longer needs
-# a monkey-patch — each provider's extra_headers controls thinking.
+# a monkey-patch - each provider's extra_headers controls thinking.
 
-# ── Monkey-patch: convert reasoning_content → thinking_blocks for Anthropic messages ──
+# -- Monkey-patch: convert reasoning_content -> thinking_blocks for Anthropic messages --
 # liteLLM's anthropic_messages_pt (factory.py:2558) only looks for "thinking_blocks"
 # in assistant messages, ignoring "reasoning_content".  When the gateway injects
 # cached reasoning_content for multi-turn continuity, liteLLM drops it during
-# OpenAI→Anthropic message conversion.  Intercept the function to synthesize
+# OpenAI->Anthropic message conversion.  Intercept the function to synthesize
 # thinking_blocks from reasoning_content before liteLLM processes the messages.
 try:
     # liteLLM moved anthropic_messages_pt between versions; try both paths
@@ -115,7 +115,7 @@ try:
     _pt_factory.anthropic_messages_pt = _patched_anthropic_messages_pt
 except Exception:
     logging.getLogger("llmgw.app").warning(
-        "liteLLM monkey-patch for anthropic_messages_pt (reasoning_content→thinking) failed"
+        "liteLLM monkey-patch for anthropic_messages_pt (reasoning_content->thinking) failed"
     )
 
 litellm.drop_params = False  # Allow provider-specific params like DeepSeek's 'thinking'
@@ -235,7 +235,7 @@ def get_litellm_model_name(model: str, provider: dict) -> str:
     provider_id = provider.get("id", "")
     api_base = provider.get("api_base", "")
 
-    # 提取纯模型名（parse_model_id 自动处理简单/复合两种格式）
+    # Extract the plain model name; parse_model_id handles simple and composite formats
     from app.database import parse_model_id
     model = parse_model_id(model).model_name
 

@@ -178,7 +178,7 @@ async def get_stats(authorization: Optional[str] = Header(None)):
     )
 
 
-# ── Routing rules ──
+# -- Routing rules --
 
 @router.get("/routing-rules")
 async def list_routing_rules(authorization: Optional[str] = Header(None)):
@@ -235,10 +235,10 @@ async def reset_stats(authorization: Optional[str] = Header(None)):
     reset_user_stats()
     clear_request_log()
     _app_log.warning("Stats reset by admin '%s'", username)
-    return {"status": "ok", "message": "统计数据已清空"}
+    return {"status": "ok", "message": "Stats cleared"}
 
 
-# ── Preprocessor configuration ──
+# -- Preprocessor configuration --
 
 @router.get("/preprocessors")
 async def list_preprocessors(authorization: Optional[str] = Header(None)):
@@ -246,7 +246,7 @@ async def list_preprocessors(authorization: Optional[str] = Header(None)):
     from app.config import get_config
     cfg = get_config()
     preprocessors = cfg.config.get("preprocessors", {})
-    # Also return model preprocessor flags from DB（使用复合 ID 避免同名歧义）
+    # Also return model preprocessor flags from DB using composite IDs to avoid same-name ambiguity
     from app.database import get_db
     models = []
     with get_db() as db:
@@ -268,7 +268,7 @@ async def update_preprocessor(preprocessor_id: str, config: dict, authorization:
     preprocessors = cfg.config.setdefault("preprocessors", {})
     current = preprocessors.get(preprocessor_id, {})
     current.update({k: v for k, v in config.items() if v is not None})
-    # 只允许同时启用一个预处理器：当前启用时自动禁用其余
+    # Only one preprocessor can be enabled at a time; enabling this one disables the others
     if current.get("enabled", True):
         for pid, pcfg in preprocessors.items():
             if pid != preprocessor_id and isinstance(pcfg, dict):
@@ -324,7 +324,7 @@ async def toggle_model_preprocessor(body: dict, authorization: Optional[str] = H
         raise HTTPException(status_code=400, detail="model_id is required")
     enabled = bool(body.get("enabled", False))
     value = "1" if enabled else ""
-    # 解析复合 ID：provider/model 格式
+    # Parse composite ID in provider/model format
     mid = parse_model_id(model_id)
     with get_db() as db:
         if mid.is_composite:

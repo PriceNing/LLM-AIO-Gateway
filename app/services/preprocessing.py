@@ -1,5 +1,5 @@
 """
-Image preprocessing pipeline — intercepts image content, sends to a vision model
+Image preprocessing pipeline - intercepts image content, sends to a vision model
 for description, then replaces the image with text so non-multimodal models can
 "see" the image.
 
@@ -152,7 +152,7 @@ async def preprocess_messages(
         return messages
 
     if preprocessor_config.get("enabled") is False:
-        _log.info("[preprocess] SKIP preprocessor disabled — stripping images anyway")
+        _log.info("[preprocess] SKIP preprocessor disabled - stripping images anyway")
         _strip_all_images(messages)
         return messages
 
@@ -162,10 +162,10 @@ async def preprocess_messages(
         _log.info("[preprocess] no images detected, skipping")
         return messages
 
-    # 找到"当前 turn"的起始位置：向前查找最后一个有文本内容且无 tool_calls
-    # 的 assistant 消息（即上一轮的最终回复），该位置之后的消息属于当前轮次。
-    # 只对当前轮次的新图片进行描述；历史消息中的旧图片只做 strip 处理，
-    # 避免旧图片描述被重复追加到最新 user message 中造成模型混淆。
+    # Find the current turn start by scanning backward for the last assistant message with text and no tool_calls
+    # which marks the previous turn final answer; messages after it belong to the current turn.
+    # Only describe new images in the current turn; old images in history are only stripped,
+    # to avoid appending stale image descriptions to the latest user message.
     new_turn_start = 0
     for i in range(len(messages) - 1, -1, -1):
         msg = messages[i]
@@ -181,13 +181,13 @@ async def preprocess_messages(
             else:
                 has_text = False
             has_tool_calls = bool(msg.get("tool_calls"))
-            # 有文本但无 tool_calls → 上一轮的最终回复 → 以此为界
+            # Text without tool_calls marks the previous final answer and is the turn boundary
             if has_text and not has_tool_calls:
                 new_turn_start = i + 1
                 break
         elif msg.get("role") == "user":
-            # 如果消息中已经包含 <image_description>（之前预处理过的标记），
-            # 说明这是上一轮已经处理过的 user 消息，以此为界。
+            # If the message already contains <image_description>, a marker from earlier preprocessing,
+            # it marks a previously processed user message and is used as the boundary.
             c = msg.get("content", "")
             if isinstance(c, str) and "<image_description" in c:
                 new_turn_start = i + 1
@@ -204,7 +204,7 @@ async def preprocess_messages(
 
     _log.info("[preprocess] new_turn_start=%d total_msgs=%d", new_turn_start, len(messages))
 
-    # 只扫描当前轮次的消息中是否有图片
+    # Only scan current-turn messages for images
     has_new_images = False
     for i in range(new_turn_start, len(messages)):
         msg = messages[i]
@@ -238,7 +238,7 @@ async def preprocess_messages(
                 break
 
     if not has_new_images:
-        # 当前轮次无新图片，仅清理历史消息中的残留图片
+        # No new images in the current turn; only clean residual images from history
         if _has_image_content(messages):
             _log.info("[preprocess] images only in history (before turn %d), strip only", new_turn_start)
         else:
@@ -246,7 +246,7 @@ async def preprocess_messages(
         _strip_all_images(messages)
         return messages
 
-    # 从当前轮次消息中提取图片
+    # Extract images from current-turn messages
     images_to_describe: list[dict] = []
     last_user_msg_idx = None
 
@@ -300,7 +300,7 @@ async def preprocess_messages(
         _strip_all_images(messages)
         return messages
 
-    # 同一轮内去重：同一张图可能同时出现在 user message 和 tool_result 中
+    # Deduplicate within the same turn; one image may appear in both user messages and tool_result
     seen_keys = set()
     unique_images: list[dict] = []
     for img in images_to_describe:
@@ -327,7 +327,7 @@ async def preprocess_messages(
 
     _log.info("[preprocess] described %d images", len(descriptions))
 
-    # 将描述内联插入到每张图片的原位置之后，保留文件名/上下文关联
+    # Insert descriptions inline after each image position to preserve filename/context association
     _strip_images_with_descriptions(messages, descriptions, new_turn_start)
 
     return messages

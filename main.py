@@ -1,6 +1,6 @@
 import sys
 import io
-# Windows cmd.exe uses GBK by default, which can't encode emoji (e.g. ✅).
+# Windows cmd.exe uses GBK by default, which can't encode emoji (e.g. OK).
 # Reconfigure stdout/stderr to UTF-8 so diagnostic prints don't crash.
 for _stream in (sys.stdout, sys.stderr):
     try:

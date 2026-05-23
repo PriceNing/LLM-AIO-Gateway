@@ -1,5 +1,5 @@
 """
-Unit tests for app.security — password hashing, session management, API key generation.
+Unit tests for app.security - password hashing, session management, API key generation.
 """
 import time
 import pytest
@@ -8,7 +8,7 @@ from app.security import (
     create_session, get_session_username, delete_session,
 )
 
-# ── Password hashing ──
+# -- Password hashing --
 
 def test_hash_password_produces_expected_format():
     result = hash_password("mypassword")
@@ -50,7 +50,7 @@ def test_verify_password_wrong_scheme():
     assert verify_password("p", "md5$salt$hash") is False
 
 
-# ── API key generation ──
+# -- API key generation --
 
 def test_new_api_key_format():
     for _ in range(10):
@@ -69,7 +69,7 @@ def test_new_api_key_unique():
     assert len(keys) == 100  # no collisions in 100 keys
 
 
-# ── Session management ──
+# -- Session management --
 
 def test_create_and_get_session():
     token = create_session("admin")

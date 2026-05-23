@@ -6,7 +6,7 @@ def model_list_urls(api_base: str, provider_type: str) -> list[str]:
     """Return candidate model-list URLs for the given provider.
 
     For Anthropic-compatible endpoints (non api.anthropic.com), also try
-    the parent path — e.g. DeepSeek's /anthropic base has no /models,
+    the parent path - e.g. DeepSeek's /anthropic base has no /models,
     but the root /v1/models works."""
     api_base = api_base.rstrip("/")
     urls = []

@@ -16,11 +16,11 @@ Config (in config.json):
   }
 
 Log files per day (under logs/YYYY-MM-DD/):
-  access.log    – HTTP request summaries (with elapsed_ms)
-  error.log     – errors and exceptions
-  app.log       – general application messages + liteLLM internal logs
-  tool_calls.log – raw tool-call data for debugging
-  request.log   – raw request metadata for debugging (by default at DEBUG level)
+  access.log    - HTTP request summaries (with elapsed_ms)
+  error.log     - errors and exceptions
+  app.log       - general application messages + liteLLM internal logs
+  tool_calls.log - raw tool-call data for debugging
+  request.log   - raw request metadata for debugging (by default at DEBUG level)
 
 Each line is JSON with keys: ts, request_id, level, logger, msg
 """
@@ -75,7 +75,7 @@ class JsonFormatter(logging.Formatter):
 
 
 class LogManager:
-    # Map logger name suffix → log file name
+    # Map logger name suffix -> log file name
     _CHANNELS = {
         "access": "access.log",
         "error": "error.log",
@@ -147,8 +147,8 @@ class LogManager:
             self._ensure_handlers()
             handler = self._handlers.get(channel_key, self._handlers.get("app"))
         if handler and handler not in logger.handlers:
-            # 移除之前的 FileHandler（configure() 可能已创建新 handler，
-            # 旧 handler 还挂在 logger 上），防止日志重复输出。
+            # Remove previous FileHandlers because configure() may have created new handlers,
+            # while old handlers may still be attached to loggers, causing duplicate output.
             for h in list(logger.handlers):
                 if isinstance(h, logging.FileHandler):
                     logger.removeHandler(h)
@@ -225,7 +225,7 @@ class LogManager:
 def init_logging(config: Optional[dict] = None) -> LogManager:
     """Initialize the logging system. Called once at app startup."""
     global _LOG_MANAGER
-    mgr = get_log_manager()  # 复用导入期创建的实例，避免残留旧 handler
+    mgr = get_log_manager()  # Reuse the instance created at import time to avoid stale handlers
     mgr.configure(config)
     return mgr
 

@@ -28,6 +28,7 @@ _app_log = get_logger("app")
 router = APIRouter()
 
 _STREAM_SENTINEL = object()  # Sentinel value to signal end of streaming queue
+_BILLING_HEADER_RE = re.compile(r'^\s*x-anthropic-billing-header:.*(?:\r?\n)?', re.IGNORECASE | re.MULTILINE)
 
 # Rolling log of recent requests for the admin stats dashboard
 _request_log = deque(maxlen=get_default("request_log_max", 200))
@@ -35,18 +36,17 @@ _request_log_lock = threading.Lock()
 _max_log_len = get_default("request_log_max", 200)
 
 
-# ── 上游错误消息映射 ──
+# Error helpers
 
-# (匹配模式, 友好消息) 列表，按优先级排列
+# Upstream error message mapping.
 _UPSTREAM_ERROR_MAP = [
-    ("output new_sensitive (1027)", "内容被上游安全策略拦截（输出端）"),
-    ("input new_sensitive", "内容被上游安全策略拦截（输入端）"),
-    ("content_filter", "内容被上游安全策略拦截"),
-    ("content_policy_violation", "内容违反上游使用策略"),
-    ("safety_rating", "内容未通过上游安全评级"),
-    ("No endpoints found that support image input", "该模型不支持图像输入，请在管理面板开启图像预处理"),
+    ("output new_sensitive (1027)", "Content blocked by upstream safety policy on output"),
+    ("input new_sensitive", "Content blocked by upstream safety policy on input"),
+    ("content_filter", "Content blocked by upstream safety policy"),
+    ("content_policy_violation", "Content violates upstream usage policy"),
+    ("safety_rating", "Content failed upstream safety rating"),
+    ("No endpoints found that support image input", "This model does not support image input. Enable image preprocessing in the admin panel."),
 ]
-
 
 def _strip_billing_header(text):
     """Remove Anthropic billing header (x-anthropic-billing-header) injected by Claude Code.
@@ -67,28 +67,24 @@ def _strip_billing_header(text):
         for block in text:
             if isinstance(block, dict) and block.get("type") == "text":
                 t = block.get("text", "")
-                stripped = re.sub(
-                    r'^\s*x-anthropic-billing-header:\s*cc_version=[^;]+;\s*cc_entrypoint=[^;]+;\s*cch=[^;]+;?\s*$',
-                    '', t, flags=re.MULTILINE
-                ).strip()
-                cleaned.append({"type": "text", "text": stripped} if stripped else None)
+                stripped = _BILLING_HEADER_RE.sub('', t).strip()
+                if stripped:
+                    cleaned_block = dict(block)
+                    cleaned_block["text"] = stripped
+                    cleaned.append(cleaned_block)
             else:
                 cleaned.append(block)
-        return [b for b in cleaned if b is not None]
-    return re.sub(
-        r'^\s*x-anthropic-billing-header:\s*cc_version=[^;]+;\s*cc_entrypoint=[^;]+;\s*cch=[^;]+;?\s*$',
-        '', text, flags=re.MULTILINE
-    ).strip()
+        return cleaned
+    return _BILLING_HEADER_RE.sub('', text).strip()
 
 
 def _friendly_error_msg(e: Exception) -> str:
-    """将已知的上游错误映射为用户可读的友好消息，未匹配则返回原始错误。"""
+    """Map known upstream errors to clearer client-facing messages."""
     msg = str(e)
     for pattern, friendly in _UPSTREAM_ERROR_MAP:
         if pattern in msg:
-            return f"{friendly}（原始: {msg[:120]}）"
+            return f"{friendly} (original: {msg[:120]})"
     return msg
-
 
 def _mask_key(key: str) -> str:
     if len(key) <= 8:
@@ -173,8 +169,8 @@ def _log_request_body(username: str, model: str, endpoint: str, body: dict) -> N
 async def _maybe_preprocess(messages: list, model: str, provider_id: str = "", requested_model: str = ""):
     """Replace images with text descriptions if a vision preprocessor is configured.
 
-    视觉描述决策依据 requested_model（未传则回退到 model），
-    确保路由规则对用户透明——路由到哪个目标模型不影响是否生成描述。
+    Vision preprocessing is decided from requested_model, falling back to model when omitted,
+    so routing remains transparent and the target model does not affect whether descriptions are generated.
 
     Returns (messages, modified: bool).
     """
@@ -183,7 +179,7 @@ async def _maybe_preprocess(messages: list, model: str, provider_id: str = "", r
     check_model = requested_model or model
     _app_log.debug("[preprocess] CHECK req_model=%s target_model=%s has_image=%s msg_count=%d",
                    check_model, model, has_img, len(messages))
-    # 用请求模型查 preprocessor（而非路由后的目标模型）
+    # Look up the preprocessor by requested model, not routed target model
     mid = parse_model_id(check_model)
     with get_db() as db:
         if mid.provider_id:
@@ -399,7 +395,7 @@ class TTLDict:
                 self._timestamps[key] = time.time()
 
     def _evict_expired(self) -> None:
-        """Internal — caller must hold _lock."""
+        """Internal - caller must hold _lock."""
         now = time.time()
         expired = [k for k, ts in self._timestamps.items() if now - ts > self.ttl]
         for k in expired:
@@ -456,6 +452,10 @@ _reasoning_cache = TTLDict(
     ttl_seconds=get_default("reasoning_cache_ttl", 1800),
     max_size=get_default("reasoning_cache_max_size", 1000)
 )
+_reasoning_tool_cache = TTLDict(
+    ttl_seconds=get_default("reasoning_cache_ttl", 1800),
+    max_size=get_default("reasoning_cache_max_size", 1000)
+)
 
 
 
@@ -492,7 +492,7 @@ def _debug_msg_types(messages: list) -> None:
 
 
 def _attr(obj, key: str, default=None):
-    """从对象（getattr）或 dict（.get）中取值，兼容两种类型。"""
+    """Read a value from either an object via getattr or a dict via get."""
     if isinstance(obj, dict):
         return obj.get(key, default)
     return getattr(obj, key, default)
@@ -505,7 +505,7 @@ def _conversation_cache_key(api_key: str, messages: list) -> str:
         first_content = user_msgs[0].get("content")
         first_content_list = None
         if isinstance(first_content, list):
-            # Multimodal content — extract text parts for fingerprint
+            # Multimodal content - extract text parts for fingerprint
             first_content_list = first_content
             text_parts = []
             for p in first_content:
@@ -521,6 +521,91 @@ def _conversation_cache_key(api_key: str, messages: list) -> str:
         fingerprint = ""
     conv_hash = hashlib.md5(fingerprint.encode()).hexdigest()[:16]
     return f"{api_key}:{conv_hash}"
+
+
+def _message_text(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict) and part.get("type") == "text":
+                parts.append(part.get("text", ""))
+        return "\n".join(p for p in parts if p)
+    return ""
+
+
+def _tool_call_ids_from_message(msg: dict) -> list[str]:
+    ids = []
+    for tc in msg.get("tool_calls") or []:
+        if isinstance(tc, dict):
+            tc_id = tc.get("id")
+        else:
+            tc_id = getattr(tc, "id", None)
+        if tc_id:
+            ids.append(str(tc_id))
+    return ids
+
+
+def _remember_reasoning_content(conv_key: str, reasoning_content: str, tool_call_ids=None) -> None:
+    if not reasoning_content:
+        return
+    _reasoning_cache[conv_key] = reasoning_content
+    ids = [str(tid) for tid in (tool_call_ids or []) if tid]
+    if not ids:
+        return
+    tool_map = dict(_reasoning_tool_cache.get(conv_key, {}) or {})
+    for tid in ids:
+        tool_map[tid] = reasoning_content
+    while len(tool_map) > 200:
+        oldest = next(iter(tool_map))
+        tool_map.pop(oldest, None)
+    _reasoning_tool_cache[conv_key] = tool_map
+
+
+def _inject_reasoning_content(messages: list, conv_key: str, label: str, allow_empty: bool = True) -> int:
+    """Restore DeepSeek reasoning only where tool-call continuity requires it."""
+    cached_rc = _reasoning_cache.get(conv_key)
+    tool_map = _reasoning_tool_cache.get(conv_key, {}) or {}
+    candidate_indexes = []
+    for idx in range(len(messages) - 1, -1, -1):
+        msg = messages[idx]
+        if msg.get("role") == "assistant" and not msg.get("tool_calls") and _message_text(msg.get("content")).strip():
+            break
+        if msg.get("role") == "assistant" and msg.get("tool_calls") and not msg.get("reasoning_content"):
+            candidate_indexes.append(idx)
+
+    injected = 0
+    exact = 0
+    fallback = 0
+    empty = 0
+    for idx in reversed(candidate_indexes):
+        msg = messages[idx]
+        rc = None
+        for tid in _tool_call_ids_from_message(msg):
+            if tid in tool_map:
+                rc = tool_map[tid]
+                exact += 1
+                break
+        if rc is None and cached_rc is not None:
+            rc = cached_rc
+            fallback += 1
+        elif rc is None and allow_empty:
+            rc = ""
+            empty += 1
+        if rc is not None:
+            msg["reasoning_content"] = rc
+            injected += 1
+
+    if injected or cached_rc is not None:
+        rc_len = len(cached_rc) if cached_rc is not None else 0
+        _app_log.info(
+            "[%s] INJECTED rc total=%d exact=%d fallback=%d empty=%d candidates=%d len=%d conv_key=%s",
+            label, injected, exact, fallback, empty, len(candidate_indexes), rc_len, conv_key[:60]
+        )
+    return injected
 
 def verify_api_key(authorization: Optional[str] = Header(None)) -> tuple[dict, dict]:
     if not authorization:
@@ -543,7 +628,7 @@ def allowed_models_for(user: dict, api_key: dict) -> list:
     # Only key-level allowed_models matters. User is just enable/disable.
     key_models = api_key.get("allowed_models")
     if key_models is None:
-        return ["*"]  # not configured → unrestricted
+        return ["*"]  # not configured -> unrestricted
     if "*" in key_models:
         return ["*"]
     return key_models  # explicit list, empty = deny all
@@ -552,7 +637,7 @@ def ensure_model_allowed(user: dict, api_key: dict, model: str) -> None:
     allowed = allowed_models_for(user, api_key)
     if "*" in allowed:
         return
-    # ModelId.__eq__ 自动处理复合/简单四种方向的匹配
+    # ModelId.__eq__ handles composite/simple matching in both directions
     if parse_model_id(model) in allowed:
         return
     raise HTTPException(status_code=403, detail=f"Model '{model}' is not allowed for this API key")
@@ -581,7 +666,7 @@ def list_models(authorization: Optional[str] = Header(None)):
             for model in provider.get("models", []):
                 if model.get("enabled"):
                     composite_id = f"{provider['id']}/{model['id']}"
-                    # 检查允许列表：支持复合 ID、简单 model_id、通配符
+                    # Check allow-list support for composite IDs, simple model IDs, and wildcard
                     if "*" not in allowed and model["id"] not in allowed and composite_id not in allowed:
                         continue
                     entry = {
@@ -591,9 +676,9 @@ def list_models(authorization: Optional[str] = Header(None)):
                         "owned_by": provider["name"],
                         "provider": provider["id"]
                     }
-                    # 启用了视觉预处理器的模型声明支持图片，让客户端(Codex/OpenCode等)
-                    # 愿意发送图片数据，由网关拦截后交给视觉模型描述。
-                    # 尝试多种常用字段名，因为不同客户端检查不同的 key。
+                    # Models with a vision preprocessor advertise image support so clients such as Codex/OpenCode
+                    # will send images, which the gateway intercepts and describes with a vision model.
+                    # Set several common fields because different clients check different keys.
                     if model.get("preprocessor"):
                         entry["supports_vision"] = True
                         entry["image_support"] = True
@@ -696,6 +781,7 @@ async def _stream_chat(model, messages, provider_id, temperature, max_tokens, us
     has_text_content = False
     has_tool_calls = False
     accumulated_reasoning = ""
+    response_tool_call_ids = []
     think_stripped = False  # Set to True once </think> is seen
     think_buf = ""          # Buffer content while inside <think> block
     cache_hit = 0
@@ -730,7 +816,7 @@ async def _stream_chat(model, messages, provider_id, temperature, max_tokens, us
                         if not think_stripped:
                             think_buf += content
                             if '</think>' in think_buf:
-                                # <think> block(s) completed — extract thinking, flush rest
+                                # <think> block(s) completed - extract thinking, flush rest
                                 think_buf, think_content = _extract_and_strip_think(think_buf)
                                 if think_content:
                                     accumulated_reasoning = think_content
@@ -747,9 +833,9 @@ async def _stream_chat(model, messages, provider_id, temperature, max_tokens, us
                                     delta["content"] = think_buf
                                     has_text_content = True
                                     think_buf = ""
-                                # else: Still inside a <think> block — suppress for now
+                                # else: Still inside a <think> block - suppress for now
                             else:
-                                # No <think> tag — not a thinking-mode response.
+                                # No <think> tag - not a thinking-mode response.
                                 # Flush buffer as regular text immediately.
                                 think_stripped = True
                                 delta["content"] = think_buf
@@ -793,11 +879,11 @@ async def _stream_chat(model, messages, provider_id, temperature, max_tokens, us
                             # Filter out spurious tool-calls from non-standard content
                             # blocks (e.g. MiniMax "thinking") misread as empty tool uses.
                             # Only filter when index<0.  id=None with non-empty arguments
-                            # is a valid arguments delta chunk — must NOT be filtered.
+                            # is a valid arguments delta chunk - must NOT be filtered.
                             if tc_idx < 0:
                                 _tool_log.info("[_stream_chat] FILTERED spurious: id=%s idx=%s", tc_dict.get("id"), tc_idx)
                                 continue
-                            # Fix malformed tool-call arguments — MiniMax may emit
+                            # Fix malformed tool-call arguments - MiniMax may emit
                             # invalid JSON with bare `undefined` values (e.g. url:undefined)
                             _fix_tool_args(tc_dict)
                             _tool_log.info("[_stream_chat] after _fix_tool_args: %s", json.dumps(tc_dict, ensure_ascii=False, default=str))
@@ -805,6 +891,7 @@ async def _stream_chat(model, messages, provider_id, temperature, max_tokens, us
                         if serialized:
                             has_tool_calls = True
                             delta["tool_calls"] = serialized
+                            response_tool_call_ids.extend([str(tc["id"]) for tc in serialized if tc.get("id")])
                             _tool_log.info("[_stream_chat] SSE delta payload: %s", json.dumps(serialized, ensure_ascii=False, default=str))
                         else:
                             _tool_log.info("[_stream_chat] all tool_calls filtered out, no tool_calls in delta")
@@ -829,7 +916,7 @@ async def _stream_chat(model, messages, provider_id, temperature, max_tokens, us
                 cache_hit = getattr(chunk.usage, "prompt_cache_hit_tokens", 0) or 0
                 cache_miss = getattr(chunk.usage, "prompt_cache_miss_tokens", 0) or 0
         if accumulated_reasoning:
-            _reasoning_cache[conv_key] = accumulated_reasoning
+            _remember_reasoning_content(conv_key, accumulated_reasoning, response_tool_call_ids)
             _app_log.info("[chat_stream] STORED rc key=%s len=%d cache_hit=%d cache_miss=%d", conv_key[:40], len(accumulated_reasoning), cache_hit, cache_miss)
         else:
             _app_log.info("[chat_stream] no reasoning accumulated (think_stripped=%s)", think_stripped)
@@ -863,7 +950,7 @@ async def _stream_chat(model, messages, provider_id, temperature, max_tokens, us
             if not has_text_content and accumulated_reasoning:
                 yield f"data: {json.dumps({'id': chat_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': model, 'choices': [{'index': 0, 'delta': {'content': accumulated_reasoning}, 'finish_reason': 'stop'}]})}\n\n"
             # If think_buf has buffered content but </think> was never seen (model
-            # doesn't use <think> tags — e.g. DeepSeek via Anthropic endpoint), flush
+            # doesn't use <think> tags - e.g. DeepSeek via Anthropic endpoint), flush
             # the buffer as regular text so the client receives the response.
             elif not has_text_content and think_buf:
                 yield f"data: {json.dumps({'id': chat_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': model, 'choices': [{'index': 0, 'delta': {'content': think_buf}, 'finish_reason': 'stop'}]})}\n\n"
@@ -976,7 +1063,7 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
     messages = _normalize_messages(messages)
 
     # Compute conversation cache key BEFORE preprocessing, since preprocessing
-    # modifies the first user message (images → text) which changes the key.
+    # modifies the first user message (images -> text) which changes the key.
     # All cache operations (reasoning, tool counter) must use this stable key.
     conv_key = _conversation_cache_key(api_key_value, messages)
 
@@ -993,29 +1080,7 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
         }
         extra = {key: body[key] for key in allowed_params if key in body}
 
-        # DeepSeek reasoning_content cache injection for multi-turn continuity
-        cached_rc = _reasoning_cache.get(conv_key)
-        if cached_rc is not None:
-            injected = 0
-            for msg in messages:
-                # Only inject reasoning_content into assistant messages that made tool calls.
-                # Per DeepSeek docs: reasoning_content only needs to be passed back when
-                # the previous turn included a tool call. Messages without tool_calls don't
-                # need it — injecting would only break prefix cache.
-                if (msg.get("role") == "assistant"
-                    and not msg.get("reasoning_content")
-                    and msg.get("tool_calls")):
-                    msg["reasoning_content"] = cached_rc
-                    injected += 1
-            _app_log.info("[chat] INJECTED rc key=%s len=%d into %d asst-with-tool msgs", conv_key[:40], len(cached_rc), injected)
-        else:
-            # First turn: inject empty reasoning_content only into assistant messages
-            # with tool_calls, to satisfy DeepSeek's requirement without breaking cache.
-            for msg in messages:
-                if (msg.get('role') == 'assistant'
-                    and 'reasoning_content' not in msg
-                    and msg.get('tool_calls')):
-                    msg['reasoning_content'] = ''
+        _inject_reasoning_content(messages, conv_key, "chat")
 
         # Tool-call circuit breaker: strip tools if too many consecutive tool-only turns
         if _tool_only_turns.get(conv_key, 0) >= TOOL_ONLY_LIMIT:
@@ -1057,7 +1122,7 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
 
         # Store reasoning_content for next turn
         if reasoning_content:
-            _reasoning_cache[conv_key] = reasoning_content
+            _remember_reasoning_content(conv_key, reasoning_content, _tool_call_ids_from_message({"tool_calls": tool_calls}))
             usage = usage_dict(response)
             _app_log.info("[chat_nonstream] STORED rc key=%s len=%d cache_hit=%d cache_miss=%d",
                           conv_key[:40], len(reasoning_content),
@@ -1236,7 +1301,7 @@ async def completions(request: Request, authorization: Optional[str] = Header(No
         _error_log.error("FAILED: %s", str(e))
         raise HTTPException(status_code=500, detail=_friendly_error_msg(e))
 
-# ── Anthropic Messages API conversion ──
+# -- Anthropic Messages API conversion --
 
 def _anthropic_content_to_openai(content) -> list:
     """Convert Anthropic content blocks to OpenAI chat content format."""
@@ -1250,7 +1315,7 @@ def _anthropic_content_to_openai(content) -> list:
             parts.append(str(block))
         elif block.get("type") == "text":
             text = block.get("text", "")
-            if text:  # 过滤空文本块，避免下游模型拒绝
+            if text:  # Filter empty text blocks to avoid downstream rejection
                 parts.append(text)
         elif block.get("type") == "image":
             source = block.get("source", {})
@@ -1266,7 +1331,7 @@ def _anthropic_content_to_openai(content) -> list:
             # Already handled by _anthropic_to_openai_messages, skip here
             pass
         elif block.get("type") == "tool_result":
-            # Tool_result in conversation — handled by message role conversion
+            # Tool_result in conversation - handled by message role conversion
             pass
     # Return string if only text, list if has images
     if all(isinstance(p, str) for p in parts):
@@ -1281,7 +1346,7 @@ def _anthropic_to_openai_messages(anthropic_msgs: list, system_prompt: str = "")
     openai_msgs = []
     has_tools = False
     if system_prompt:
-        # Anthropic system field 可以是字符串或 content block 数组（含 cache_control 等）
+        # Anthropic system can be a string or content block array, including cache_control.
         if isinstance(system_prompt, list):
             text_parts = []
             for block in system_prompt:
@@ -1346,7 +1411,7 @@ def _anthropic_to_openai_messages(anthropic_msgs: list, system_prompt: str = "")
                     tool_results.append(block)
                 else:
                     other_parts.append(block)
-            # Tool results MUST come first (before user text) — DeepSeek and other
+            # Tool results MUST come first (before user text) - DeepSeek and other
             # strict providers require tool messages immediately after assistant tool_calls.
             # See: "An assistant message with 'tool_calls' must be followed by tool messages"
             for tr in tool_results:
@@ -1402,7 +1467,7 @@ def _anthropic_to_openai_messages(anthropic_msgs: list, system_prompt: str = "")
                             formatted.append(p)
                     openai_msgs.append({"role": "user", "content": formatted})
         elif role == "tool_result":
-            # Claude Code sends tool results (like file_read output) — convert to tool role
+            # Claude Code sends tool results (like file_read output) - convert to tool role
             tool_use_id = m.get("tool_use_id", "")
             result_content = m.get("content", "")
             # Handle Anthropic tool_result content format (string or array of blocks)
@@ -1467,8 +1532,8 @@ def _openai_to_anthropic_content(message: dict) -> list:
 
 
 def _openai_messages_to_anthropic(messages: list, system_prompt: str = "") -> tuple:
-    """将 OpenAI Chat Completions 消息转换为 Anthropic Messages 格式。
-    返回 (anthropic_messages, system_prompt, tools) 三元组。
+    """Convert OpenAI Chat Completions messages to Anthropic Messages format.
+    Return the (anthropic_messages, system_prompt, tools) tuple.
     """
     anthropic_msgs = []
     system_texts = []
@@ -1509,7 +1574,7 @@ def _openai_messages_to_anthropic(messages: list, system_prompt: str = "") -> tu
         elif role == "assistant":
             content_blocks = _openai_to_anthropic_content(msg)
             anthropic_msgs.append({"role": "assistant", "content": content_blocks})
-            # 从消息中提取 tool_calls 信息（已在 _openai_to_anthropic_content 中处理）
+            # Extract tool_calls information, already handled by _openai_to_anthropic_content
 
         elif role == "tool":
             tool_call_id = msg.get("tool_call_id", "")
@@ -1519,7 +1584,7 @@ def _openai_messages_to_anthropic(messages: list, system_prompt: str = "") -> tu
                 "content": [{"type": "tool_result", "tool_use_id": tool_call_id, "content": tool_content}]
             })
 
-    # 合并 system 文本
+    # Merge system text
     if system_prompt:
         system_texts.insert(0, system_prompt)
     final_system = "\n\n".join(system_texts) if system_texts else ""
@@ -1598,7 +1663,7 @@ async def _stream_anthropic_messages(model, messages, provider_id, temperature,
                 if reasoning_delta:
                     accumulated_reasoning += reasoning_delta
 
-                # Handle tool call deltas (OpenAI streaming format → Anthropic tool_use events)
+                # Handle tool call deltas (OpenAI streaming format -> Anthropic tool_use events)
                 tool_calls_delta = getattr(delta, "tool_calls", None)
                 if tool_calls_delta:
                     for tc in tool_calls_delta:
@@ -1684,7 +1749,11 @@ async def _stream_anthropic_messages(model, messages, provider_id, temperature,
 
         _log_request(username, api_key_value, model, provider_id or "", "messages", True, total_tokens, requested_model)
         if accumulated_reasoning:
-            _reasoning_cache[conv_key] = accumulated_reasoning
+            _remember_reasoning_content(
+                conv_key,
+                accumulated_reasoning,
+                [tu.get("id") for tu in tool_uses.values()]
+            )
             _app_log.info("[messages_stream] STORED rc key=%s len=%d cache_hit=%d cache_miss=%d", conv_key[:60], len(accumulated_reasoning), cache_hit, cache_miss)
         if username != "legacy":
             increment_user_usage(username, api_key_value, True, total_tokens)
@@ -1710,10 +1779,10 @@ async def _anthropic_passthrough(provider_info: dict, messages: list,
     import httpx
     api_base = (provider_info.get("api_base") or "").rstrip("/")
     api_key = provider_info.get("api_key") or "sk-no-auth"
-    # 从复合 ID 提取实际模型名（上游不认识 provider/model 格式）
+    # Extract the actual model name from composite IDs because upstream does not know provider/model format
     mid = parse_model_id(model)
     upstream_model = mid.model_name
-    # Build Anthropic-format request — use routed model, not body.get("model")
+    # Build Anthropic-format request - use routed model, not body.get("model")
     req_body = {"model": upstream_model, "messages": messages, "max_tokens": max_tokens}
     if temperature is not None:
         req_body["temperature"] = temperature
@@ -1776,7 +1845,7 @@ async def _stream_anthropic_passthrough(provider_info, messages, body, max_token
     import httpx
     api_base = (provider_info.get("api_base") or "").rstrip("/")
     api_key = provider_info.get("api_key") or "sk-no-auth"
-    # 从复合 ID 提取实际模型名（上游不认识 provider/model 格式）
+    # Extract the actual model name from composite IDs because upstream does not know provider/model format
     mid = parse_model_id(model)
     upstream_model = mid.model_name
     req_body = {"model": upstream_model, "messages": messages, "max_tokens": max_tokens, "stream": True}
@@ -1787,7 +1856,7 @@ async def _stream_anthropic_passthrough(provider_info, messages, body, max_token
         req_body["system"] = system
     tools = body.get("tools")
     if tools:
-        # Strip type field — Anthropic-compatible endpoints (DeepSeek) reject type:"custom"
+        # Strip type field - Anthropic-compatible endpoints (DeepSeek) reject type:"custom"
         req_body["tools"] = [{k: v for k, v in t.items() if k != "type"} for t in tools if isinstance(t, dict)]
     # Per-provider thinking mode: configured via provider_info.extra_headers.
     extra_headers = provider_info.get("extra_headers", {}) or {}
@@ -1879,7 +1948,7 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
     if route_provider:
         provider_id = route_provider
 
-    # Check if target provider is Anthropic-native — pass through directly
+    # Check if target provider is Anthropic-native - pass through directly
     # to avoid double-formatting which loses tool_use IDs
     from app.database import get_provider as _get_prov, find_provider_by_model as _find
     if provider_id:
@@ -1935,31 +2004,12 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
         tool_choice = body.get("tool_choice")
         if not is_anthropic_provider:
             if isinstance(tool_choice, dict) and not tool_choice.get("name"):
-                tool_choice = None  # Anthropic "auto"/"any" → let provider default
+                tool_choice = None  # Anthropic "auto"/"any" -> let provider default
             elif tool_choice == "auto":
                 tool_choice = None  # MiniMax rejects "auto"
 
-        # Stream or non-stream
-        # Inject DeepSeek reasoning_content for multi-turn continuity
         if not is_anthropic_provider:
-            cached_rc = _reasoning_cache.get(conv_key)
-            if cached_rc is not None:
-                count = 0
-                for msg in messages:
-                    if (msg.get("role") == "assistant"
-                        and not msg.get("reasoning_content")
-                        and msg.get("tool_calls")):
-                        msg["reasoning_content"] = cached_rc
-                        count += 1
-                _app_log.info("[messages] INJECTED rc injected=%d asst-with-tool msgs len=%d conv_key=%s", count, len(cached_rc), conv_key)
-            else:
-                # First turn: inject empty reasoning_content only into assistant
-                # messages with tool_calls.
-                for msg in messages:
-                    if (msg.get('role') == 'assistant'
-                        and 'reasoning_content' not in msg
-                        and msg.get('tool_calls')):
-                        msg['reasoning_content'] = ''
+            _inject_reasoning_content(messages, conv_key, "messages")
 
         if stream:
             if provider_info and provider_info.get("provider_type") == "anthropic":
@@ -2012,7 +2062,7 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
         cache_miss = usage.get("prompt_cache_miss_tokens", 0)
 
         if reasoning_content:
-            _reasoning_cache[conv_key] = reasoning_content
+            _remember_reasoning_content(conv_key, reasoning_content, _tool_call_ids_from_message(message))
             _app_log.info("[messages_nonstream] STORED rc key=%s len=%d cache_hit=%d cache_miss=%d", conv_key[:60], len(reasoning_content), cache_hit, cache_miss)
         # Convert OpenAI response to Anthropic format
         content_blocks = _openai_to_anthropic_content(message)
@@ -2146,9 +2196,9 @@ async def _stream_responses(model, messages, provider_id, temperature, max_token
                                 accumulated_text = accumulated_text.replace('<think>', '', 1)
                                 think_stripped = True
                                 text_buffer = accumulated_text
-                            # else: still inside <think> block — don't yield yet
+                            # else: still inside <think> block - don't yield yet
                         elif len(accumulated_text) >= 5:
-                            # No think tag detected — model doesn't use thinking mode
+                            # No think tag detected - model doesn't use thinking mode
                             think_stripped = True
                             text_buffer = accumulated_text
                     else:
@@ -2210,7 +2260,7 @@ async def _stream_responses(model, messages, provider_id, temperature, max_token
                         if args_chunk:
                             _tool_log.info("[_stream_responses] args_chunk RAW: %s", args_chunk)
                             state["arguments_buffer"] += args_chunk
-                            # Fix malformed JSON (e.g. MiniMax sends url:undefined) — both in buffer and in the chunk being sent
+                            # Fix malformed JSON (e.g. MiniMax sends url:undefined) - both in buffer and in the chunk being sent
                             if "undefined" in args_chunk:
                                 args_chunk = _sanitize_args(args_chunk)
                                 _tool_log.info("[_stream_responses] args_chunk SANITIZED -> %s", args_chunk)
@@ -2258,7 +2308,11 @@ async def _stream_responses(model, messages, provider_id, temperature, max_token
 
         # Store reasoning_content for next turn replay (DeepSeek thinking mode requires echo-back)
         if accumulated_reasoning:
-            _reasoning_cache[conv_key] = accumulated_reasoning
+            _remember_reasoning_content(
+                conv_key,
+                accumulated_reasoning,
+                [state.get("id") for state in tool_calls_state.values()]
+            )
             _app_log.info("[responses_stream] STORED rc key=%s len=%d cache_hit=%d cache_miss=%d", conv_key, len(accumulated_reasoning), cache_hit, cache_miss)
 
         # Update tool-only counter for circuit breaker
@@ -2339,7 +2393,7 @@ def _normalize_messages(messages: list) -> list:
     Consecutive same-role messages cause "invalid chat setting" errors.
 
     Also strips Anthropic billing headers (x-anthropic-billing-header; cch=xxx)
-    from system message content — injected by Claude Code since v2.1.37, these
+    from system message content - injected by Claude Code since v2.1.37, these
     contain a random `cch` value that breaks DeepSeek's prefix cache.
     """
     if not messages:
@@ -2351,7 +2405,7 @@ def _normalize_messages(messages: list) -> list:
         content = msg.get("content", "")
 
         # Strip billing header from system message text
-        if role == "system" and isinstance(content, str):
+        if role == "system" and isinstance(content, (str, list)):
             msg["content"] = _strip_billing_header(content)
             content = msg["content"]
 
@@ -2383,7 +2437,7 @@ def _extract_and_strip_think(text: str) -> tuple[str, str]:
 
     Uses a depth counter rather than a non-greedy regex so that nested
     <think> blocks (e.g. <think>A<think>B</think>C</think>) are handled
-    correctly — the outermost block is extracted whole.
+    correctly - the outermost block is extracted whole.
     """
     if not text:
         return text, ""
@@ -2403,7 +2457,7 @@ def _extract_and_strip_think(text: str) -> tuple[str, str]:
             next_open = text.find("<think>", pos)
             next_close = text.find("</think>", pos)
             if next_close == -1:
-                # Unclosed <think> — treat rest as think content
+                # Unclosed <think> - treat rest as think content
                 pos = -1
                 break
             if next_open != -1 and next_open < next_close:
@@ -2530,7 +2584,7 @@ def _convert_responses_input(input_list: list) -> list:
             else:
                 _app_log.info("[responses FCO] call_id=%s output=%s",
                              fc_output.get('call_id','?')[:30], type(output).__name__)
-            # Convert content parts (input_image → image_url) so preprocessing can
+            # Convert content parts (input_image -> image_url) so preprocessing can
             # detect and describe images embedded in tool call outputs.
             converted_output = _convert_content(output)
             messages.append({
@@ -2541,7 +2595,7 @@ def _convert_responses_input(input_list: list) -> list:
             i += 1
 
         elif item_type == "reasoning":
-            # Skip reasoning items — they are summaries, not full conversation context
+            # Skip reasoning items - they are summaries, not full conversation context
             i += 1
 
         elif item_type == "input_image":
@@ -2596,7 +2650,7 @@ def _convert_responses_tools(tools: list) -> list:
         # Only pass through function-type tools; skip built-in types like web_search, custom
         if tool_type != "function":
             continue
-        # Responses API flat format — wrap non-type fields under 'function'
+        # Responses API flat format - wrap non-type fields under 'function'
         # Strip OpenAI-specific fields (strict, additionalProperties) that
         # non-OpenAI providers (MiniMax) reject as "invalid chat setting (2013)".
         # Always copy nested structures before modifying to avoid mutating the
@@ -2637,7 +2691,7 @@ def _apply_routing_rules(username: str, api_key_value: str, requested_model: str
         if key_pat and key_pat not in api_key_value:
             continue
         # Match model: the requested_model (before resolution), supports * wildcard
-        # 同时尝试匹配复合 ID 和简单 model_id，兼容两种格式
+        # Try both composite ID and simple model_id matches for compatibility
         match_model = rule.get("match_model", "")
         if not match_model:
             continue
@@ -2645,7 +2699,7 @@ def _apply_routing_rules(username: str, api_key_value: str, requested_model: str
         if not (_wildcard_match(match_model, requested_model) or
                 (mid.is_composite and _wildcard_match(match_model, mid.model_name))):
             continue
-        # Rule matched — return target
+        # Rule matched - return target
         target = rule.get("target_model", resolved_model)
         provider = rule.get("target_provider", "")
         if target and target != resolved_model:
@@ -2742,26 +2796,8 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
     if modified:
         _reasoning_cache.drop(conv_key)
 
-    # Inject cached reasoning_content into ALL assistant messages missing it (DeepSeek requirement)
     if isinstance(input_data, list):
-        cached_rc = _reasoning_cache.get(conv_key)
-        if cached_rc is not None:
-            injected_count = 0
-            for msg in messages:
-                if (msg.get("role") == "assistant"
-                    and not msg.get("reasoning_content")
-                    and msg.get("tool_calls")):
-                    msg["reasoning_content"] = cached_rc
-                    injected_count += 1
-            if injected_count:
-                _app_log.info("[responses] INJECTED rc key=%s into %d asst-with-tool msgs len=%d", conv_key, injected_count, len(cached_rc))
-        else:
-            for msg in messages:
-                if (msg.get('role') == 'assistant'
-                    and 'reasoning_content' not in msg
-                    and msg.get('tool_calls')):
-                    msg['reasoning_content'] = ''
-            _app_log.debug("[responses] CACHE MISS key=%s available_keys=%s", conv_key, str(list(_reasoning_cache.keys())))
+        _inject_reasoning_content(messages, conv_key, "responses")
 
     try:
         allowed_params = {
@@ -2777,7 +2813,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
         if extra.get("tool_choice") == "auto":
             extra.pop("tool_choice")
 
-        # 检测目标提供商是否为 Anthropic 类型，若是则使用直通避开 liteLLM 双重格式转换
+        # Detect Anthropic target providers and use passthrough to avoid liteLLM double conversion
         from app.database import get_provider as _get_prov, find_provider_by_model as _find
         if provider_id:
             provider_info = _get_prov(provider_id)
@@ -2786,9 +2822,9 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
         is_anthropic = provider_info and provider_info.get("provider_type") == "anthropic"
 
         if is_anthropic:
-            # 将 Chat Completions 消息转换为 Anthropic 原生格式
+            # Convert Chat Completions messages to native Anthropic format
             anthropic_msgs, system_text = _openai_messages_to_anthropic(messages, instructions or "")
-            # 构建 Anthropic 请求体
+            # Build Anthropic request body
             anthropic_body = {"system": system_text} if system_text else {}
             anthropic_tools = extra.get("tools")
             if anthropic_tools and isinstance(anthropic_tools, list):
@@ -2800,9 +2836,9 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                     if isinstance(t, dict) and t.get("function", {}).get("name")
                 ]
 
-            # 流式：liteLLM 的 Anthropic 路径会输出 OpenAI 格式 chunk，
-            # _stream_responses 能正确处理。直通输出的是 Anthropic SSE 而非
-            # Responses SSE，Codex 无法解析。
+            # Streaming: liteLLM Anthropic path emits OpenAI-format chunks,
+            # _stream_responses can handle them. Passthrough emits Anthropic SSE, not
+            # Responses SSE, which Codex cannot parse.
             if stream:
                 return StreamingResponse(
                     _stream_responses(
@@ -2821,7 +2857,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                     media_type="text/event-stream"
                 )
 
-            # 非流式：直接 HTTP 调用 Anthropic 端点，避开 liteLLM 双重格式转换
+            # Non-streaming: call the Anthropic endpoint directly to avoid liteLLM double conversion
             response = await _anthropic_passthrough(
                 provider_info, anthropic_msgs, anthropic_body,
                 max_tokens, temperature, model
@@ -2857,8 +2893,8 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
             )
         choice = response.choices[0]
         message = getattr(choice, "message", {})
-        # _anthropic_passthrough 返回 dict 类型 message，liteLLM 返回对象类型，
-        # 统一用 _attr 兼容两种取值方式
+        # _anthropic_passthrough returns dict messages, while liteLLM returns objects,
+        # so use _attr to support both access styles
         content = _strip_think_tags(_attr(message, "content", "") or "")
         reasoning_content = _attr(message, "reasoning_content", None)
         tool_calls = _attr(message, "tool_calls", None)
@@ -2870,7 +2906,9 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
 
         # Cache reasoning_content for multi-turn replay (DeepSeek thinking mode requires echo-back)
         if reasoning_content:
-            _reasoning_cache[conv_key] = reasoning_content
+            _remember_reasoning_content(conv_key, reasoning_content, _tool_call_ids_from_message({
+                "tool_calls": tool_calls
+            }))
             _app_log.info("[responses_nonstream] STORED rc key=%s len=%d cache_hit=%d cache_miss=%d",
                           conv_key, len(reasoning_content),
                           usage.get("prompt_cache_hit_tokens", 0), usage.get("prompt_cache_miss_tokens", 0))
