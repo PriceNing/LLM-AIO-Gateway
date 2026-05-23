@@ -1870,9 +1870,12 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
         if not is_anthropic_provider:
             cached_rc = _reasoning_cache.get(conv_key)
             if cached_rc is not None:
+                count = 0
                 for msg in messages:
                     if msg.get("role") == "assistant" and not msg.get("reasoning_content"):
                         msg["reasoning_content"] = cached_rc
+                        count += 1
+                _app_log.info("[messages] REASONING injected=%d msgs len=%d conv_key=%s", count, len(cached_rc), conv_key)
             else:
                 # First turn: inject empty reasoning_content into ALL assistant messages
                 # to satisfy DeepSeek's requirement (messages from other providers lack it)
