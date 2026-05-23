@@ -48,21 +48,36 @@ _UPSTREAM_ERROR_MAP = [
 ]
 
 
-def _strip_billing_header(text) -> str:
+def _strip_billing_header(text):
     """Remove Anthropic billing header (x-anthropic-billing-header) injected by Claude Code.
 
     Claude Code 2.1.37+ injects a random `cch=xxxxx` value into the system prompt as an
     x-anthropic-billing-header text block.  Since `cch` changes on every request, this
     breaks DeepSeek's prefix cache (request body becomes non-deterministic).
     Strip lines matching the pattern so the system prompt stays stable across requests.
+
+    Handles both string and Anthropic array format (list of content blocks).
     """
     if not text:
-        return text or ""
+        if isinstance(text, list):
+            return []
+        return ""
+    if isinstance(text, list):
+        cleaned = []
+        for block in text:
+            if isinstance(block, dict) and block.get("type") == "text":
+                t = block.get("text", "")
+                stripped = re.sub(
+                    r'^\s*x-anthropic-billing-header:\s*cc_version=[^;]+;\s*cc_entrypoint=[^;]+;\s*cch=[^;]+;?\s*$',
+                    '', t, flags=re.MULTILINE
+                ).strip()
+                cleaned.append({"type": "text", "text": stripped} if stripped else None)
+            else:
+                cleaned.append(block)
+        return [b for b in cleaned if b is not None]
     return re.sub(
         r'^\s*x-anthropic-billing-header:\s*cc_version=[^;]+;\s*cc_entrypoint=[^;]+;\s*cch=[^;]+;?\s*$',
-        '',
-        text,
-        flags=re.MULTILINE
+        '', text, flags=re.MULTILINE
     ).strip()
 
 
@@ -1993,7 +2008,6 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
         if reasoning_content:
             _reasoning_cache[conv_key] = reasoning_content
             _app_log.info("[messages_nonstream] STORED rc key=%s len=%d cache_hit=%d cache_miss=%d", conv_key[:60], len(reasoning_content), cache_hit, cache_miss)
-
         # Convert OpenAI response to Anthropic format
         content_blocks = _openai_to_anthropic_content(message)
         _log_request(username, api_key_value, model, provider_id or "", "messages", True, usage.get("total_tokens", 0), requested_model)
