@@ -173,6 +173,28 @@ zh: {
     'stats.loadUsersFail': '加载用户失败',
     'stats.loadProvidersFail': '加载提供商失败',
 
+    'stats.tabRealtime': '实时监控',
+    'stats.tabHistory': '历史记录',
+    'stats.historyFrom': '起始日期',
+    'stats.historyTo': '结束日期',
+    'stats.granularity': '粒度',
+    'stats.granHour': '小时',
+    'stats.granDay': '天',
+    'stats.granWeek': '周',
+    'stats.granMonth': '月',
+    'stats.query': '查询',
+    'stats.periodSummary': '时段汇总',
+    'stats.periodCalls': '调用次数',
+    'stats.periodTokens': '总 Tokens',
+    'stats.periodSuccessRate': '成功率',
+    'stats.modelBreakdown': '模型用量明细',
+    'stats.userBreakdown': '用户用量明细',
+    'stats.historyNoData': '所选时段暂无数据',
+    'stats.historyNoDataHint': '尝试调整时间范围或粒度设置',
+    'stats.trendChart': '调用趋势',
+    'stats.trendCalls': '调用次数',
+    'stats.trendTokens': 'Token 数',
+
     'preprocessors.title': '视觉模型注入',
     'preprocessors.add': '新增预处理器',
     'preprocessors.empty': '暂无配置的预处理器',
@@ -380,6 +402,29 @@ en: {
     'stats.chartFail': 'Failed',
     'stats.loadUsersFail': 'Failed to load users',
     'stats.loadProvidersFail': 'Failed to load providers',
+
+    'stats.tabRealtime': 'Realtime',
+    'stats.tabHistory': 'History',
+    'stats.historyFrom': 'From',
+    'stats.historyTo': 'To',
+    'stats.granularity': 'Granularity',
+    'stats.granHour': 'Hour',
+    'stats.granDay': 'Day',
+    'stats.granWeek': 'Week',
+    'stats.granMonth': 'Month',
+    'stats.query': 'Query',
+    'stats.periodSummary': 'Period Summary',
+    'stats.periodCalls': 'Total Calls',
+    'stats.periodTokens': 'Total Tokens',
+    'stats.periodSuccessRate': 'Success Rate',
+    'stats.modelBreakdown': 'Model Breakdown',
+    'stats.userBreakdown': 'User Breakdown',
+    'stats.historyNoData': 'No data for selected period',
+    'stats.historyNoDataHint': 'Try adjusting the date range or granularity',
+    'stats.loading': 'Loading...',
+    'stats.trendChart': 'Call Trend',
+    'stats.trendCalls': 'Calls',
+    'stats.trendTokens': 'Tokens',
 
     'preprocessors.title': 'Vision Model Injection',
     'preprocessors.add': 'Add Preprocessor',
@@ -1527,12 +1572,145 @@ async function toggleModelPreprocessor(modelId, enabled) {
 
 var _statsTimer = null;
 var _statsCharts = [];
+var _historyCharts = [];
+var _statsTab = 'realtime'; // 'realtime' or 'history'
+var _realtimeTrendMode = 'calls'; // 'calls' or 'tokens' — survives polling refreshes
+var _CHART_COLORS = ['#818cf8','#34d399','#fbbf24','#f472b6','#f87171','#38bdf8','#a78bfa','#fb923c','#6366f1','#4ade80',
+    '#ec4899','#14b8a6','#f59e0b','#6366f1','#10b981','#e11d48','#0ea5e9','#d946ef','#84cc16','#f97316'];
 
 function _destroyCharts() {
     for (var i = 0; i < _statsCharts.length; i++) {
         try { _statsCharts[i].destroy(); } catch (e) {}
     }
     _statsCharts = [];
+}
+
+function _destroyHistoryCharts() {
+    for (var i = 0; i < _historyCharts.length; i++) {
+        try { _historyCharts[i].destroy(); } catch (e) {}
+    }
+    _historyCharts = [];
+}
+
+/* Build or update a per-model stacked bar chart for trend visualization.
+   canvasId  — <canvas> element id
+   tmData    — { labels, models, calls, tokens }
+   mode      — 'calls' or 'tokens'
+   chartArr  — array to push the Chart instance into
+   existing  — if provided, update this chart in-place instead of creating new */
+/* Return true if every value in arr is 0 */
+function _isAllZero(arr) {
+    for (var i = 0; i < arr.length; i++) { if (arr[i] !== 0) return false; }
+    return !!arr.length;
+}
+
+function _buildOrupdateTrendChart(canvasId, tmData, mode, chartArr, existing) {
+    var data = mode === 'tokens' ? tmData.tokens : tmData.calls;
+    var datasets = [];
+    for (var i = 0; i < tmData.models.length; i++) {
+        if (_isAllZero(data[i])) continue;
+        datasets.push({
+            label: tmData.models[i],
+            data: data[i],
+            backgroundColor: _CHART_COLORS[i % _CHART_COLORS.length],
+            borderRadius: 2,
+        });
+    }
+    if (existing) {
+        existing.data.labels = tmData.labels;
+        existing.data.datasets = datasets;
+        existing.options.plugins.title.text = t('stats.trendChart') + ' — ' + (mode === 'tokens' ? t('stats.trendTokens') : t('stats.trendCalls'));
+        existing.update();
+        return existing;
+    }
+    var ctx = document.getElementById(canvasId);
+    if (!ctx) return null;
+    var maxWidth = Math.max(30, Math.min(80, Math.floor(600 / Math.max(tmData.labels.length, 1))));
+    var chart = new Chart(ctx, {
+        type: 'bar',
+        data: { labels: tmData.labels, datasets: datasets },
+        options: {
+            responsive: true, maintainAspectRatio: true,
+            barPercentage: 0.85, categoryPercentage: 0.75, maxBarThickness: maxWidth,
+            interaction: { mode: 'index', intersect: false },
+            scales: {
+                x: { stacked: true, grid: { display: false }, ticks: { color: getComputedStyle(document.documentElement).getPropertyValue('--text-secondary').trim(), font: { size: 11 }, maxRotation: 45 } },
+                y: { stacked: true, beginAtZero: true, ticks: { color: getComputedStyle(document.documentElement).getPropertyValue('--text-secondary').trim(), font: { size: 11 } } }
+            },
+            plugins: {
+                title: { display: true, text: t('stats.trendChart') + ' — ' + (mode === 'tokens' ? t('stats.trendTokens') : t('stats.trendCalls')), font: { size: 14, weight: '700' }, color: getComputedStyle(document.documentElement).getPropertyValue('--text-primary').trim(), padding: { bottom: 12 } },
+                legend: { position: 'bottom', labels: { usePointStyle: true, pointStyleWidth: 8, color: getComputedStyle(document.documentElement).getPropertyValue('--text-primary').trim(), font: { size: 11 }, padding: 12 }, filter: function(item) { return item.text !== undefined; } },
+                tooltip: {
+                    mode: 'index', intersect: false,
+                    filter: function(item) { return item.raw !== 0; },
+                    itemSort: function(a, b) { return b.raw - a.raw; },
+                    callbacks: {
+                        footer: function(items) {
+                            if (!items || items.length === 0) return '';
+                            var sum = 0;
+                            for (var i = 0; i < items.length; i++) { sum += items[i].raw; }
+                            return '∑ ' + sum.toLocaleString();
+                        }
+                    }
+                }
+            }
+        }
+    });
+    chartArr.push(chart);
+    return chart;
+}
+
+/* Toggle trend chart between calls/tokens mode.
+   Simply updates datasets and title on the existing chart — no destroy/recreate needed. */
+function _switchTrendMode(chartInstanceVar, tmDataVar, mode) {
+    var chart = window[chartInstanceVar];
+    var tmData = window[tmDataVar];
+    if (!chart || !tmData || !tmData.labels || tmData.labels.length === 0) return;
+    var data = mode === 'tokens' ? tmData.tokens : tmData.calls;
+    var datasets = [];
+    for (var i = 0; i < tmData.models.length; i++) {
+        if (_isAllZero(data[i])) continue;
+        datasets.push({
+            label: tmData.models[i],
+            data: data[i],
+            backgroundColor: _CHART_COLORS[i % _CHART_COLORS.length],
+            borderRadius: 2,
+        });
+    }
+    chart.data.datasets = datasets;
+    chart.options.plugins.tooltip.filter = function(item) { return item.raw !== 0; };
+    chart.options.plugins.title.text = t('stats.trendChart') + ' — ' + (mode === 'tokens' ? t('stats.trendTokens') : t('stats.trendCalls'));
+    chart.update();
+}
+
+function switchRealtimeTrend(mode) {
+    _realtimeTrendMode = mode;
+    document.getElementById('realtimeTrendCalls').className = 'trend-btn' + (mode === 'calls' ? ' active' : '');
+    document.getElementById('realtimeTrendTokens').className = 'trend-btn' + (mode === 'tokens' ? ' active' : '');
+    _switchTrendMode('_realtimeTrendChart', '_realtimeTmData', mode);
+}
+
+function switchHistoryTrend(mode) {
+    document.getElementById('historyTrendCalls').className = 'trend-btn' + (mode === 'calls' ? ' active' : '');
+    document.getElementById('historyTrendTokens').className = 'trend-btn' + (mode === 'tokens' ? ' active' : '');
+    _switchTrendMode('_historyTrendChart', '_historyTmData', mode);
+}
+
+function switchStatsTab(tab) {
+    _statsTab = tab;
+    var realtimeBtn = document.getElementById('statsTabRealtime');
+    var historyBtn = document.getElementById('statsTabHistory');
+    var realtimePanel = document.getElementById('statsRealtimePanel');
+    var historyPanel = document.getElementById('statsHistoryPanel');
+    if (realtimeBtn) realtimeBtn.className = tab === 'realtime' ? 'stats-tab active' : 'stats-tab';
+    if (historyBtn) historyBtn.className = tab === 'history' ? 'stats-tab active' : 'stats-tab';
+    if (realtimePanel) realtimePanel.style.display = tab === 'realtime' ? '' : 'none';
+    if (historyPanel) historyPanel.style.display = tab === 'history' ? '' : 'none';
+    if (tab === 'history') loadHistoryStats();
+}
+
+function _onHistoryKeydown(e) {
+    if (e.key === 'Enter') { e.preventDefault(); loadHistoryStats(); }
 }
 
 async function loadStats() {
@@ -1558,6 +1736,7 @@ function _startStatsPolling() {
 function stopStatsTimer() {
     if (_statsTimer) { clearInterval(_statsTimer); _statsTimer = null; }
     _destroyCharts();
+    _destroyHistoryCharts();
 }
 
 async function confirmResetStats() {
@@ -1568,23 +1747,128 @@ async function confirmResetStats() {
     } catch (e) { toast(t('stats.resetFail') + ': ' + e.message, 'error'); }
 }
 
-function renderStats(stats, createCharts) {
-    var activeModels = Object.keys(stats.stats_by_model || {}).length;
-    var hasData = stats.total_calls > 0;
+var _lastHistoryData = null;
 
-    // Always update summary cards and toolbar (cheap DOM update)
-    var summaryHTML = '<div class="dashboard-toolbar">' +
-        '<span>' + t('stats.reset') + ': ' + (stats.last_reset || '-') + '  |  ' + t('stats.autoRefresh') + '</span>' +
-        '<button class="btn btn-danger btn-sm" onclick="confirmResetStats()">' + t('stats.resetBtn') + '</button>' +
-        '</div>' +
-        '<div class="summary-cards">' +
-        '<div class="summary-card card-purple"><div class="card-icon">&#9636;</div><div class="card-value">' + stats.total_calls.toLocaleString() + '</div><div class="card-label">' + t('stats.totalCalls') + '</div></div>' +
-        '<div class="summary-card card-green"><div class="card-icon">&#10003;</div><div class="card-value">' + stats.success_rate + '%</div><div class="card-label">' + t('stats.successRate') + '</div></div>' +
-        '<div class="summary-card card-red"><div class="card-icon">&#9888;</div><div class="card-value">' + stats.failed_calls.toLocaleString() + '</div><div class="card-label">' + t('stats.failedCalls') + '</div></div>' +
-        '<div class="summary-card card-blue"><div class="card-icon">&#9881;</div><div class="card-value">' + activeModels + '</div><div class="card-label">' + t('stats.activeModels') + '</div></div>' +
+async function loadHistoryStats() {
+    var fromInput = document.getElementById('historyFrom');
+    var toInput = document.getElementById('historyTo');
+    var granSelect = document.getElementById('historyGranularity');
+    if (!fromInput || !toInput || !granSelect) return;
+    var fromVal = fromInput.value;
+    var toVal = toInput.value;
+    var gran = granSelect.value;
+    if (!fromVal || !toVal) return;
+    var container = document.getElementById('historyContent');
+    if (container) container.innerHTML = '<div class="loading-spinner"><span class="spinner"></span><p>' + t('stats.loading') + '</p></div>';
+    try {
+        var data = await api('/admin/stats/history?from_ts=' + encodeURIComponent(fromVal) + '&to_ts=' + encodeURIComponent(toVal) + '&granularity=' + gran);
+        _lastHistoryData = data;
+        renderHistoryStats(data);
+    } catch (e) {
+        if (_lastHistoryData) {
+            renderHistoryStats(_lastHistoryData);
+        } else if (container) {
+            container.innerHTML = '<div class="empty-state"><div class="empty-icon">&#9888;</div><p>' + t('stats.loadFail') + '</p></div>';
+        }
+        toast(t('stats.loadFail') + ': ' + e.message, 'error');
+    }
+}
+
+function renderHistoryStats(data) {
+    var overall = data.overall || {};
+    var models = data.models || [];
+    var users = data.users || [];
+    var timeline = data.timeline || {};
+    var total = overall.total_calls || 0;
+    var failed = overall.failed_calls || 0;
+    var tokens = overall.total_tokens || 0;
+    var successRate = total > 0 ? ((total - failed) / total * 100).toFixed(1) : '100.0';
+
+    // Inline summary line
+    var summaryLine = '<div class="history-summary">' +
+        '<span class="history-stat"><strong>' + total.toLocaleString() + '</strong> ' + t('stats.periodCalls') + '</span>' +
+        '<span class="history-stat success"><strong>' + successRate + '%</strong> ' + t('stats.periodSuccessRate') + '</span>' +
+        '<span class="history-stat danger"><strong>' + failed.toLocaleString() + '</strong> ' + t('stats.failedCalls') + '</span>' +
+        '<span class="history-stat"><strong>' + tokens.toLocaleString() + '</strong> ' + t('stats.periodTokens') + '</span>' +
         '</div>';
 
-    // Update activity table
+    var container = document.getElementById('historyContent');
+    if (!container) return;
+
+    _destroyHistoryCharts();
+    var hasData = total > 0;
+
+    if (!hasData) {
+        container.innerHTML = summaryLine +
+            '<div class="empty-state"><div class="empty-icon">&#128202;</div><p>' + t('stats.historyNoData') + '</p><p class="empty-sub">' + t('stats.historyNoDataHint') + '</p></div>';
+        return;
+    }
+
+    var html = summaryLine;
+
+    // Trend chart
+    var htmDataAvail = timeline.labels && timeline.labels.length > 0;
+    if (htmDataAvail) {
+        html += '<div class="chart-card glass"><div class="trend-header"><h3>' + t('stats.trendChart') + '</h3><div class="trend-toggle"><button class="trend-btn active" id="historyTrendCalls" onclick="switchHistoryTrend(\'calls\')">' + t('stats.trendCalls') + '</button><button class="trend-btn" id="historyTrendTokens" onclick="switchHistoryTrend(\'tokens\')">' + t('stats.trendTokens') + '</button></div></div><div class="chart-wrap"><canvas id="historyTrendChart"></canvas></div></div>';
+    }
+
+    // Model breakdown table
+    html += '<div class="table-card glass"><h3>' + t('stats.modelBreakdown') + '</h3>';
+    html += '<table class="modern-table"><thead><tr><th>' + t('stats.model') + '</th><th>' + t('stats.totalCalls') + '</th><th>' + t('stats.failedCalls') + '</th><th>' + t('stats.tokens') + '</th></tr></thead><tbody>';
+    for (var i = 0; i < models.length; i++) {
+        var m = models[i];
+        html += '<tr><td>' + escHtml(m.model) + '</td><td>' + m.total.toLocaleString() + '</td><td>' + m.failed.toLocaleString() + '</td><td>' + m.tokens.toLocaleString() + '</td></tr>';
+    }
+    if (models.length === 0) {
+        html += '<tr><td colspan="4" style="text-align:center;color:var(--text-tertiary);padding:16px">' + t('stats.noRecords') + '</td></tr>';
+    }
+    html += '</tbody></table></div>';
+
+    // User breakdown table
+    html += '<div class="table-card glass"><h3>' + t('stats.userBreakdown') + '</h3>';
+    html += '<table class="modern-table"><thead><tr><th>' + t('stats.client') + '</th><th>' + t('stats.totalCalls') + '</th><th>' + t('stats.failedCalls') + '</th><th>' + t('stats.tokens') + '</th></tr></thead><tbody>';
+    for (var j = 0; j < users.length; j++) {
+        var u = users[j];
+        html += '<tr><td>' + escHtml(u.username) + '</td><td>' + u.total.toLocaleString() + '</td><td>' + u.failed.toLocaleString() + '</td><td>' + u.tokens.toLocaleString() + '</td></tr>';
+    }
+    if (users.length === 0) {
+        html += '<tr><td colspan="4" style="text-align:center;color:var(--text-tertiary);padding:16px">' + t('stats.noRecords') + '</td></tr>';
+    }
+    html += '</tbody></table></div>';
+
+    container.innerHTML = html;
+
+    // Create trend chart
+    if (timeline.labels && timeline.labels.length > 0) {
+        var tmData = data.timeline_models || null;
+        if (tmData && tmData.models && tmData.models.length > 0) {
+            window._historyTmData = tmData;
+            var hChart = _buildOrupdateTrendChart('historyTrendChart', tmData, 'calls', _historyCharts, null);
+            window._historyTrendChart = hChart;
+        } else {
+            window._historyTmData = null;
+            window._historyTrendChart = null;
+            var trendCtx = document.getElementById('historyTrendChart');
+            if (trendCtx) {
+                _historyCharts.push(new Chart(trendCtx, {
+                    type: 'bar',
+                    data: { labels: timeline.labels, datasets: [
+                        { label: t('stats.chartSuccess'), data: timeline.total.map(function(v, idx) { return v - (timeline.failed[idx] || 0); }), backgroundColor: '#34d399', borderRadius: 4 },
+                        { label: t('stats.chartFail'), data: timeline.failed, backgroundColor: '#f87171', borderRadius: 4 }
+                    ] },
+                    options: { responsive: true, maintainAspectRatio: true, scales: { x: { stacked: true }, y: { stacked: true, beginAtZero: true } } }
+                }));
+            }
+        }
+    } else {
+        window._historyTmData = null;
+        window._historyTrendChart = null;
+    }
+}
+
+function _buildRealtimePanel(stats) {
+    var activeModels = Object.keys(stats.stats_by_model || {}).length;
+    var hasData = stats.total_calls > 0;
     var log = stats.request_log || [];
     var tableHTML = '<div class="table-card glass"><h3>' + t('stats.realtime') + '</h3>' +
         '<table class="modern-table"><thead><tr>' +
@@ -1613,91 +1897,152 @@ function renderStats(stats, createCharts) {
     }
     tableHTML += '</tbody></table></div>';
 
-    if (!hasData) {
-        _destroyCharts();
-        document.getElementById('statsContent').innerHTML = '<div class="dashboard">' + summaryHTML +
-            '<div class="empty-state"><div class="empty-icon">&#128202;</div><p>' + t('stats.noData') + '</p><p class="empty-sub">' + t('stats.noDataHint') + '</p></div>' +
-            '</div>';
-        return;
-    }
+    return { activeModels: activeModels, hasData: hasData, tableHTML: tableHTML };
+}
+
+function renderStats(stats, createCharts) {
+    var summaryHTML = '<div class="dashboard-toolbar">' +
+        '<span>' + t('stats.reset') + ': ' + (stats.last_reset || '-') + '  |  ' + t('stats.autoRefresh') + '</span>' +
+        '<button class="btn btn-danger btn-sm" onclick="confirmResetStats()">' + t('stats.resetBtn') + '</button>' +
+        '</div>' +
+        '<div class="summary-cards">' +
+        '<div class="summary-card card-purple"><div class="card-icon">&#9636;</div><div class="card-value">' + stats.total_calls.toLocaleString() + '</div><div class="card-label">' + t('stats.totalCalls') + '</div></div>' +
+        '<div class="summary-card card-green"><div class="card-icon">&#10003;</div><div class="card-value">' + stats.success_rate + '%</div><div class="card-label">' + t('stats.successRate') + '</div></div>' +
+        '<div class="summary-card card-red"><div class="card-icon">&#9888;</div><div class="card-value">' + stats.failed_calls.toLocaleString() + '</div><div class="card-label">' + t('stats.failedCalls') + '</div></div>' +
+        '<div class="summary-card card-blue"><div class="card-icon">&#9881;</div><div class="card-value">' + Object.keys(stats.stats_by_model || {}).length + '</div><div class="card-label">' + t('stats.activeModels') + '</div></div>' +
+        '</div>';
+
+    var rt = _buildRealtimePanel(stats);
+    var hasData = rt.hasData;
+
+    // Today's date for default history range
+    var today = new Date();
+    var todayStr = today.toISOString().split('T')[0];
+    var monthAgo = new Date(today.getTime() - 30 * 86400000);
+    var monthAgoStr = monthAgo.toISOString().split('T')[0];
 
     if (createCharts) {
-        // Full render: build chart containers and create new Chart instances
         _destroyCharts();
+        _destroyHistoryCharts();
         var dist = stats.distribution || {};
         var tl = stats.timeline || {};
 
-        var html = '<div class="dashboard">' + summaryHTML;
-        html += '<div class="charts-row">';
-        if (dist.labels && dist.labels.length > 0) {
-            html += '<div class="chart-card glass"><h3>' + t('stats.modelDist') + '</h3><div class="chart-wrap"><canvas id="chartPie"></canvas></div></div>';
+        var html = '<div class="dashboard">' + summaryHTML +
+            '<div class="stats-tabs">' +
+            '<button id="statsTabRealtime" class="stats-tab active" onclick="switchStatsTab(\'realtime\')">' + t('stats.tabRealtime') + '</button>' +
+            '<button id="statsTabHistory" class="stats-tab" onclick="switchStatsTab(\'history\')">' + t('stats.tabHistory') + '</button>' +
+            '</div>' +
+            '<div id="statsRealtimePanel">';
+
+        if (!hasData) {
+            html += '<div class="empty-state"><div class="empty-icon">&#128202;</div><p>' + t('stats.noData') + '</p><p class="empty-sub">' + t('stats.noDataHint') + '</p></div>';
+        } else {
+            html += '<div class="charts-row">';
+            if (dist.labels && dist.labels.length > 0) {
+                html += '<div class="chart-card glass"><h3>' + t('stats.modelDist') + '</h3><div class="chart-wrap"><canvas id="chartPie"></canvas></div></div>';
+            }
+            if (tl.labels && tl.labels.length > 0) {
+                html += '<div class="chart-card glass"><div class="trend-header"><h3>' + t('stats.trendChart') + '</h3><div class="trend-toggle"><button class="trend-btn active" id="realtimeTrendCalls" onclick="switchRealtimeTrend(\'calls\')">' + t('stats.trendCalls') + '</button><button class="trend-btn" id="realtimeTrendTokens" onclick="switchRealtimeTrend(\'tokens\')">' + t('stats.trendTokens') + '</button></div></div><div class="chart-wrap"><canvas id="chartLine"></canvas></div></div>';
+            }
+            html += '</div>' + rt.tableHTML;
         }
-        if (tl.labels && tl.labels.length > 0) {
-            html += '<div class="chart-card glass"><h3>' + t('stats.timeline') + '</h3><div class="chart-wrap"><canvas id="chartLine"></canvas></div></div>';
-        }
-        html += '</div>' + tableHTML + '</div>';
+        html += '</div>'; // end realtimePanel
+
+        // History panel
+        html += '<div id="statsHistoryPanel" style="display:none">' +
+            '<div class="history-toolbar">' +
+            '<label>' + t('stats.historyFrom') + ' <input type="date" id="historyFrom" value="' + todayStr + '"></label>' +
+            '<label>' + t('stats.historyTo') + ' <input type="date" id="historyTo" value="' + todayStr + '"></label>' +
+            '<label>' + t('stats.granularity') + ' <select id="historyGranularity">' +
+            '<option value="hour" selected>' + t('stats.granHour') + '</option>' +
+            '<option value="day">' + t('stats.granDay') + '</option>' +
+            '<option value="week">' + t('stats.granWeek') + '</option>' +
+            '<option value="month">' + t('stats.granMonth') + '</option>' +
+            '</select></label>' +
+            '<button class="btn btn-primary btn-sm" onclick="loadHistoryStats()">' + t('stats.query') + '</button>' +
+            '</div>' +
+            '<div id="historyContent"></div>' +
+            '</div>'; // end historyPanel
+
+        html += '</div>'; // end dashboard
         document.getElementById('statsContent').innerHTML = html;
 
-        // Create charts
-        var chartColors = ['#818cf8','#34d399','#fbbf24','#f472b6','#f87171','#38bdf8','#a78bfa','#fb923c','#6366f1','#4ade80'];
-        if (dist.labels && dist.labels.length > 0) {
-            var pieCtx = document.getElementById('chartPie');
-            if (pieCtx) {
-                _statsCharts.push(new Chart(pieCtx, {
-                    type: 'doughnut',
-                    data: { labels: dist.labels, datasets: [{ data: dist.counts, backgroundColor: chartColors.slice(0, dist.labels.length), borderWidth: 0 }] },
-                    options: {
-                        responsive: true, maintainAspectRatio: true,
-                        plugins: { legend: { position: 'right', labels: { padding: 16, usePointStyle: true, pointStyleWidth: 8,
-                            color: getComputedStyle(document.documentElement).getPropertyValue('--text-primary').trim(), font: { size: 12 } } } }
-                    }
-                }));
-            }
+        // Bind Enter key for history query controls
+        var histFrom = document.getElementById('historyFrom');
+        var histTo = document.getElementById('historyTo');
+        var histGran = document.getElementById('historyGranularity');
+        if (histFrom) histFrom.addEventListener('keydown', _onHistoryKeydown);
+        if (histTo) histTo.addEventListener('keydown', _onHistoryKeydown);
+        if (histGran) histGran.addEventListener('keydown', _onHistoryKeydown);
+
+        // Restore tab state
+        if (_statsTab === 'history') {
+            switchStatsTab('history');
         }
-        if (tl.labels && tl.labels.length > 0) {
-            var lineCtx = document.getElementById('chartLine');
-            if (lineCtx) {
-                _statsCharts.push(new Chart(lineCtx, {
-                    type: 'bar',
-                    data: {
-                        labels: tl.labels,
-                        datasets: [
-                            { label: t('stats.chartSuccess'), data: tl.success, backgroundColor: '#34d399', borderRadius: 4 },
-                            { label: t('stats.chartFail'), data: tl.failed, backgroundColor: '#f87171', borderRadius: 4 }
-                        ]
-                    },
-                    options: {
-                        responsive: true, maintainAspectRatio: true,
-                        scales: {
-                            x: { stacked: true, grid: { display: false }, ticks: { color: getComputedStyle(document.documentElement).getPropertyValue('--text-secondary').trim(), font: { size: 11 } } },
-                            y: { stacked: true, beginAtZero: true, ticks: { stepSize: 1, color: getComputedStyle(document.documentElement).getPropertyValue('--text-secondary').trim(), font: { size: 11 } } }
-                        },
-                        plugins: { legend: { labels: { usePointStyle: true, pointStyleWidth: 8,
-                            color: getComputedStyle(document.documentElement).getPropertyValue('--text-primary').trim(), font: { size: 12 }, padding: 16 } } }
+
+        // Create realtime charts
+        var chartColors = ['#818cf8','#34d399','#fbbf24','#f472b6','#f87171','#38bdf8','#a78bfa','#fb923c','#6366f1','#4ade80'];
+        if (hasData) {
+            if (dist.labels && dist.labels.length > 0) {
+                var pieCtx = document.getElementById('chartPie');
+                if (pieCtx) {
+                    _statsCharts.push(new Chart(pieCtx, {
+                        type: 'doughnut',
+                        data: { labels: dist.labels, datasets: [{ data: dist.counts, backgroundColor: chartColors.slice(0, dist.labels.length), borderWidth: 0 }] },
+                        options: {
+                            responsive: true, maintainAspectRatio: true,
+                            plugins: { legend: { position: 'right', labels: { padding: 16, usePointStyle: true, pointStyleWidth: 8,
+                                color: getComputedStyle(document.documentElement).getPropertyValue('--text-primary').trim(), font: { size: 12 } } } }
+                        }
+                    }));
+                }
+            }
+            if (tl.labels && tl.labels.length > 0) {
+                var tlModels = stats.timeline_models || {};
+                if (tlModels.models && tlModels.models.length > 0) {
+                    window._realtimeTmData = tlModels;
+                    var rtChart = _buildOrupdateTrendChart('chartLine', tlModels, 'calls', _statsCharts, null);
+                    window._realtimeTrendChart = rtChart;
+                } else {
+                    // Fallback: no model breakdown, use simple success/fail
+                    window._realtimeTmData = null;
+                    window._realtimeTrendChart = null;
+                    var lineCtx = document.getElementById('chartLine');
+                    if (lineCtx) {
+                        _statsCharts.push(new Chart(lineCtx, {
+                            type: 'bar',
+                            data: { labels: tl.labels, datasets: [
+                                { label: t('stats.chartSuccess'), data: tl.success, backgroundColor: '#34d399', borderRadius: 4 },
+                                { label: t('stats.chartFail'), data: tl.failed, backgroundColor: '#f87171', borderRadius: 4 }
+                            ] },
+                            options: { responsive: true, maintainAspectRatio: true, scales: { x: { stacked: true, grid: { display: false } }, y: { stacked: true, beginAtZero: true } } }
+                        }));
                     }
-                }));
+                }
+            } else {
+                window._realtimeTmData = null;
+                window._realtimeTrendChart = null;
             }
         }
     } else {
-        // Update mode: only update summary + table via innerHTML, update chart data in-place
+        // Update mode: only update summary + realtime table + chart data in-place
         var toolbarEl = document.querySelector('#statsContent .dashboard-toolbar');
         var cardsEl = document.querySelector('#statsContent .summary-cards');
-        var tableEl = document.querySelector('#statsContent .table-card');
+        var tableEl = document.querySelector('#statsRealtimePanel .table-card');
 
         var temp = document.createElement('div');
         temp.innerHTML = summaryHTML;
         if (toolbarEl) toolbarEl.replaceWith(temp.querySelector('.dashboard-toolbar'));
         if (cardsEl) cardsEl.replaceWith(temp.querySelector('.summary-cards'));
 
-        if (tableEl) {
+        if (tableEl && rt.hasData) {
             var newTable = document.createElement('div');
-            newTable.innerHTML = tableHTML;
+            newTable.innerHTML = rt.tableHTML;
             tableEl.replaceWith(newTable.firstElementChild);
         }
 
         // Update chart data in-place
         var dist = stats.distribution || {};
-        var tl = stats.timeline || {};
         for (var c = 0; c < _statsCharts.length; c++) {
             var chart = _statsCharts[c];
             try {
@@ -1705,13 +2050,17 @@ function renderStats(stats, createCharts) {
                     chart.data.labels = dist.labels;
                     chart.data.datasets[0].data = dist.counts;
                     chart.update('none');
-                } else if (chart.canvas.id === 'chartLine' && tl.labels) {
-                    chart.data.labels = tl.labels;
-                    chart.data.datasets[0].data = tl.success;
-                    chart.data.datasets[1].data = tl.failed;
-                    chart.update('none');
                 }
             } catch (e) {}
+        }
+        // Trend chart with model stacking needs full rebuild on data change
+        var tmData = stats.timeline_models || {};
+        if (tmData.models && tmData.models.length > 0 && window._realtimeTrendChart) {
+            var currentMode = _realtimeTrendMode;
+            window._realtimeTmData = tmData;
+            var chartIdx = _statsCharts.indexOf(window._realtimeTrendChart);
+            _buildOrupdateTrendChart('chartLine', tmData, currentMode, _statsCharts, window._realtimeTrendChart);
+            if (chartIdx < 0) _statsCharts.push(window._realtimeTrendChart);
         }
     }
 }
