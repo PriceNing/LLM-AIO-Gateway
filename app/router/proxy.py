@@ -48,6 +48,24 @@ _UPSTREAM_ERROR_MAP = [
 ]
 
 
+def _strip_billing_header(text) -> str:
+    """Remove Anthropic billing header (x-anthropic-billing-header) injected by Claude Code.
+
+    Claude Code 2.1.37+ injects a random `cch=xxxxx` value into the system prompt as an
+    x-anthropic-billing-header text block.  Since `cch` changes on every request, this
+    breaks DeepSeek's prefix cache (request body becomes non-deterministic).
+    Strip lines matching the pattern so the system prompt stays stable across requests.
+    """
+    if not text:
+        return text or ""
+    return re.sub(
+        r'^\s*x-anthropic-billing-header:\s*cc_version=[^;]+;\s*cc_entrypoint=[^;]+;\s*cch=[^;]+;?\s*$',
+        '',
+        text,
+        flags=re.MULTILINE
+    ).strip()
+
+
 def _friendly_error_msg(e: Exception) -> str:
     """将已知的上游错误映射为用户可读的友好消息，未匹配则返回原始错误。"""
     msg = str(e)
@@ -1446,7 +1464,7 @@ def _openai_messages_to_anthropic(messages: list, system_prompt: str = "") -> tu
         content = msg.get("content", "")
 
         if role == "system":
-            system_texts.append(content if isinstance(content, str) else str(content))
+            system_texts.append(_strip_billing_header(content if isinstance(content, str) else str(content)))
             continue
 
         if role == "user":
@@ -1684,7 +1702,7 @@ async def _anthropic_passthrough(provider_info: dict, messages: list,
     req_body = {"model": upstream_model, "messages": messages, "max_tokens": max_tokens}
     if temperature is not None:
         req_body["temperature"] = temperature
-    system = body.get("system")
+    system = _strip_billing_header(body.get("system"))
     if system:
         req_body["system"] = system
     tools = body.get("tools")
@@ -1749,7 +1767,7 @@ async def _stream_anthropic_passthrough(provider_info, messages, body, max_token
     req_body = {"model": upstream_model, "messages": messages, "max_tokens": max_tokens, "stream": True}
     if temperature is not None:
         req_body["temperature"] = temperature
-    system = body.get("system")
+    system = _strip_billing_header(body.get("system"))
     if system:
         req_body["system"] = system
     tools = body.get("tools")
@@ -1825,7 +1843,7 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
         max_tokens = get_default("max_tokens", 16384)
     provider_id = body.get("provider_id")
     stream = body.get("stream", False)
-    system_prompt = body.get("system", "")
+    system_prompt = _strip_billing_header(body.get("system", ""))
     temperature = body.get("temperature")
 
     if not model:
@@ -2299,6 +2317,10 @@ def _normalize_messages(messages: list) -> list:
     Many OpenAI-compatible providers (MiniMax, DeepSeek, etc.) require strict
     user/assistant/tool alternation and only one system message at the start.
     Consecutive same-role messages cause "invalid chat setting" errors.
+
+    Also strips Anthropic billing headers (x-anthropic-billing-header; cch=xxx)
+    from system message content — injected by Claude Code since v2.1.37, these
+    contain a random `cch` value that breaks DeepSeek's prefix cache.
     """
     if not messages:
         return messages
@@ -2307,6 +2329,11 @@ def _normalize_messages(messages: list) -> list:
     for msg in messages:
         role = msg.get("role", "user")
         content = msg.get("content", "")
+
+        # Strip billing header from system message text
+        if role == "system" and isinstance(content, str):
+            msg["content"] = _strip_billing_header(content)
+            content = msg["content"]
 
         if merged and merged[-1].get("role") == role and role in ("system", "user"):
             # Merge content into previous same-role message
