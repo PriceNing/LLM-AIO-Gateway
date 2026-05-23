@@ -55,9 +55,9 @@ def _migrate_providers_extra_headers(conn: sqlite3.Connection) -> None:
         "SELECT id, extra_headers FROM providers WHERE extra_headers IS NULL OR extra_headers = '{}'"
     ).fetchall()
     for row in rows:
-        pid = row["id"]
-        name = conn.execute("SELECT name FROM providers WHERE id = ?", (pid,)).fetchone()
-        provider_name = (name["name"] if name else "").lower()
+        pid = row[0]
+        name_row = conn.execute("SELECT name FROM providers WHERE id = ?", (pid,)).fetchone()
+        provider_name = (name_row[0] if name_row else "").lower()
         if "deepseek" in pid.lower() or "deepseek" in provider_name:
             conn.execute(
                 "UPDATE providers SET extra_headers = ? WHERE id = ?",
