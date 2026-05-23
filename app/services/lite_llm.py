@@ -278,6 +278,12 @@ def build_completion_args(model: str, provider_id: Optional[str] = None) -> tupl
             params["api_base"] = api_base
 
     litellm_model = get_litellm_model_name(model, provider)
+    # DeepSeek enables thinking mode by default on both Anthropic and OpenAI endpoints.
+    # Monkey-patch #3 handles the Anthropic path; handle the OpenAI path here by
+    # passing thinking={"type": "disabled"} via extra_body for non-official endpoints.
+    if "api.deepseek.com" in api_base:
+        params.setdefault("extra_body", {})
+        params["extra_body"]["thinking"] = {"type": "disabled"}
     get_logger("app").debug("route model=%s provider_type=%s api_base=%s -> litellm_model=%s",
                            model, provider.get("provider_type"), api_base, litellm_model)
     return litellm_model, params

@@ -2,7 +2,8 @@ import sqlite3
 import json
 import uuid
 import threading
-from datetime import date
+import time
+from datetime import date, datetime, timedelta
 from typing import Optional
 from contextlib import contextmanager
 
@@ -136,6 +137,16 @@ CREATE TABLE IF NOT EXISTS global_stats (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL DEFAULT '0'
 );
+
+CREATE TABLE IF NOT EXISTS request_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    model TEXT NOT NULL,
+    username TEXT NOT NULL DEFAULT '',
+    success INTEGER NOT NULL DEFAULT 1,
+    tokens INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_req_ts ON request_records(timestamp);
 """
 
 # ── Helpers ──
@@ -380,6 +391,172 @@ def find_user_by_api_key(key: str) -> Optional[tuple[dict, dict]]:
 
 
 # ── Increment usage stats ──
+
+# ── Request history records ──
+
+def add_request_record(model: str, username: str, success: bool, tokens: int = 0) -> None:
+    """Insert a request record for historical stats. Called from _log_request."""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with get_db() as db:
+        db.execute(
+            "INSERT INTO request_records (timestamp, model, username, success, tokens) VALUES (?, ?, ?, ?, ?)",
+            (now, model, username, 1 if success else 0, tokens)
+        )
+
+
+_HISTORY_GRANULARITY = {
+    "hour":  "%Y-%m-%d %H:00",
+    "day":   "%Y-%m-%d",
+    "week":  "%Y-%W",
+    "month": "%Y-%m",
+}
+
+_HISTORY_DELTA = {"hour": timedelta(hours=1), "day": timedelta(days=1),
+                   "week": timedelta(weeks=1), "month": timedelta(days=31)}
+
+_HISTORY_STEP_FMT = {"hour": "%Y-%m-%d %H:00", "day": "%Y-%m-%d",
+                      "week": "%Y-%U", "month": "%Y-%m"}
+
+
+def _zero_pad_timeline(rows, from_ts, to_ts, granularity, model_bucket_rows):
+    """Fill in missing buckets so the timeline has no gaps."""
+    fmt = _HISTORY_GRANULARITY[granularity]
+    step_fmt = _HISTORY_STEP_FMT[granularity]
+    delta = _HISTORY_DELTA[granularity]
+
+    # Parse from/to boundaries in the bucket format
+    start = datetime.strptime(from_ts[:19] if len(from_ts) > 10 else from_ts[:10], from_ts[:19].count(":") == 0 and "%Y-%m-%d" or "%Y-%m-%d %H:%M:%S")
+    end = datetime.strptime(to_ts[:19] if len(to_ts) > 10 else to_ts[:10], to_ts[:19].count(":") == 0 and "%Y-%m-%d" or "%Y-%m-%d %H:%M:%S")
+
+    # Build a dict from bucket → row data
+    row_map = {r["bucket"] or "": r for r in rows}
+    model_map = {}
+    for r in model_bucket_rows:
+        model_map.setdefault(r["bucket"] or "", []).append(r)
+
+    all_buckets = []
+    cur = start
+    while cur <= end:
+        b = cur.strftime(step_fmt)
+        all_buckets.append(b)
+        if granularity == "month":
+            # Advance to first day of next month
+            if cur.month == 12:
+                cur = cur.replace(year=cur.year + 1, month=1)
+            else:
+                cur = cur.replace(month=cur.month + 1)
+        else:
+            cur += delta
+
+    zero_row = {"total": 0, "failed": 0, "tokens": 0}
+    padded_rows = []
+    padded_model_rows = []
+    for b in all_buckets:
+        existing = row_map.get(b)
+        if existing:
+            padded_rows.append(existing)
+        else:
+            padded_rows.append({"bucket": b, "total": 0, "failed": 0, "tokens": 0})
+        for mr in model_map.get(b, []):
+            padded_model_rows.append(mr)
+        # Missing bucket → no model rows needed (all zeros)
+
+    return padded_rows, all_buckets, padded_model_rows
+
+
+def get_history_stats(from_ts: str, to_ts: str, granularity: str = "day") -> dict:
+    """Aggregate historical stats by granularity. Returns timeline + model breakdown."""
+    fmt = _HISTORY_GRANULARITY.get(granularity, "%Y-%m-%d")
+    with get_db() as db:
+        # Timeline: total calls, failures, tokens per bucket
+        rows = db.execute("""
+            SELECT strftime(?, timestamp) AS bucket,
+                   COUNT(*) AS total,
+                   SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) AS failed,
+                   SUM(tokens) AS tokens
+            FROM request_records
+            WHERE timestamp >= ? AND timestamp <= ?
+            GROUP BY bucket
+            ORDER BY bucket
+        """, (fmt, from_ts, to_ts)).fetchall()
+
+        # Model breakdown for the period
+        model_rows = db.execute("""
+            SELECT model, COUNT(*) AS total,
+                   SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) AS failed,
+                   SUM(tokens) AS tokens
+            FROM request_records
+            WHERE timestamp >= ? AND timestamp <= ?
+            GROUP BY model
+            ORDER BY total DESC
+        """, (from_ts, to_ts)).fetchall()
+
+        # User breakdown for the period
+        user_rows = db.execute("""
+            SELECT username, COUNT(*) AS total,
+                   SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) AS failed,
+                   SUM(tokens) AS tokens
+            FROM request_records
+            WHERE timestamp >= ? AND timestamp <= ?
+            GROUP BY username
+            ORDER BY total DESC
+        """, (from_ts, to_ts)).fetchall()
+
+        # Per-model per-bucket breakdown for trend chart
+        model_bucket_rows = db.execute("""
+            SELECT strftime(?, timestamp) AS bucket, model,
+                   COUNT(*) AS total,
+                   SUM(tokens) AS tokens
+            FROM request_records
+            WHERE timestamp >= ? AND timestamp <= ?
+            GROUP BY bucket, model
+            ORDER BY bucket, model
+        """, (fmt, from_ts, to_ts)).fetchall()
+
+    # Zero-pad the timeline so every bucket is present
+    rows, bucket_labels, model_bucket_rows = _zero_pad_timeline(rows, from_ts, to_ts, granularity, model_bucket_rows)
+
+    timeline = {
+        "labels": [r["bucket"] or "" for r in rows],
+        "total":  [r["total"] for r in rows],
+        "failed": [r["failed"] for r in rows],
+        "tokens": [r["tokens"] for r in rows],
+    }
+
+    # Build per-model timeline matrix for stacked bar chart
+    all_models = sorted({r["model"] for r in model_bucket_rows})
+    model_bucket_map = {}
+    for r in model_bucket_rows:
+        model_bucket_map[(r["bucket"] or "", r["model"])] = {"total": r["total"], "tokens": r["tokens"]}
+    timeline_models = {
+        "labels": bucket_labels,
+        "models": all_models,
+        "calls": [[model_bucket_map.get((b, m), {}).get("total", 0) for b in bucket_labels] for m in all_models],
+        "tokens": [[model_bucket_map.get((b, m), {}).get("tokens", 0) for b in bucket_labels] for m in all_models],
+    }
+
+    models = [
+        {"model": r["model"], "total": r["total"], "failed": r["failed"], "tokens": r["tokens"]}
+        for r in model_rows
+    ]
+    users = [
+        {"username": r["username"], "total": r["total"], "failed": r["failed"], "tokens": r["tokens"]}
+        for r in user_rows
+    ]
+    overall = {
+        "total_calls": sum(r["total"] for r in rows),
+        "failed_calls": sum(r["failed"] for r in rows),
+        "total_tokens": sum(r["tokens"] for r in rows),
+    }
+    return {"timeline": timeline, "timeline_models": timeline_models, "models": models, "users": users, "overall": overall}
+
+
+def delete_request_records_before(ts: str) -> int:
+    """Delete request records older than ts. Returns number of deleted rows."""
+    with get_db() as db:
+        cursor = db.execute("DELETE FROM request_records WHERE timestamp < ?", (ts,))
+        return cursor.rowcount
+
 
 def increment_user_usage(username: str, api_key_value: str, success: bool, tokens: int = 0) -> None:
     with get_db() as db:

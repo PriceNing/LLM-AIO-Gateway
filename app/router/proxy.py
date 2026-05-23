@@ -963,7 +963,9 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
                     injected += 1
             _app_log.debug("[chat] INJECTED rc key=%s len=%d into %d msgs", conv_key[:40], len(cached_rc), injected)
         else:
-            _app_log.debug("[chat] CACHE MISS rc key=%s available=%s", conv_key[:40], str(list(_reasoning_cache.keys())[:5]))
+            for msg in messages:
+                if msg.get('role') == 'assistant' and 'reasoning_content' not in msg:
+                    msg['reasoning_content'] = ''
 
         # Tool-call circuit breaker: strip tools if too many consecutive tool-only turns
         if _tool_only_turns.get(conv_key, 0) >= TOOL_ONLY_LIMIT:
@@ -2649,6 +2651,9 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
             if injected_count:
                 _app_log.debug("[responses] INJECTED key=%s into %d msgs len(rc)=%d", conv_key, injected_count, len(cached_rc))
         else:
+            for msg in messages:
+                if msg.get('role') == 'assistant' and 'reasoning_content' not in msg:
+                    msg['reasoning_content'] = ''
             _app_log.debug("[responses] CACHE MISS key=%s available_keys=%s", conv_key, str(list(_reasoning_cache.keys())))
 
     try:

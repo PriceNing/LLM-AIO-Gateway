@@ -7,7 +7,7 @@
 
 > 统一的 OpenAI / Anthropic / Responses 三协议 API 网关，内置视觉模型注入——让任意文本模型也能"看见"图片。
 
-[![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.109+-green.svg)](https://fastapi.tiangolo.com/)
 [![License](https://img.shields.io/badge/license-MIT-brightgreen.svg)](LICENSE)
 
@@ -94,7 +94,7 @@
 
 ### 环境要求
 
-- Python 3.11+
+- Python 3.10+
 - pip
 
 ### Docker 部署（推荐）
@@ -179,7 +179,7 @@ curl http://localhost:8000/chat/completions \
 
 ## ⚙️ 配置参考
 
-`config.json` 首次启动自动生成，修改后 uvicorn 自动重载。
+`config.json` 首次启动自动生成，修改后需重启服务生效。
 
 ### 顶层设置
 

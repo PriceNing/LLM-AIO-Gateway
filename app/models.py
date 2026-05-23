@@ -39,6 +39,7 @@ class StatsResponse(BaseModel):
     users: list = []
     timeline: dict = {}
     distribution: dict = {}
+    timeline_models: dict = {}
 
 class ChatMessage(BaseModel):
     role: str

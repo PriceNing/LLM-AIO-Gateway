@@ -7,7 +7,7 @@
 
 > A unified OpenAI / Anthropic / Responses API gateway with built-in vision model injection — let any text-only model "see" images.
 
-[![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.109+-green.svg)](https://fastapi.tiangolo.com/)
 [![License](https://img.shields.io/badge/license-MIT-brightgreen.svg)](LICENSE)
 
@@ -95,7 +95,7 @@ You can also use online multimodal models as preprocessors for other models to a
 
 ### Requirements
 
-- Python 3.11+
+- Python 3.10+
 - pip
 
 ### Docker Deployment (Recommended)
@@ -180,7 +180,7 @@ All proxy endpoints are mounted at both the root path and under the `/v1/` prefi
 
 ## ⚙️ Configuration Reference
 
-`config.json` is auto-generated on first startup. Changes trigger auto-reload via uvicorn.
+`config.json` is auto-generated on first startup. A restart is required for changes to take effect.
 
 ### Top-Level Settings
 

@@ -1,18 +1,20 @@
 from fastapi import APIRouter, HTTPException, Header
 from typing import Optional
+from datetime import datetime, timedelta
 from app.database import (
     get_providers, get_provider, add_provider, update_provider, delete_provider,
     get_users, get_user, add_user, update_user, delete_user,
     add_user_api_key, update_user_api_key, delete_user_api_key,
     get_routing_rules, get_routing_rule, add_routing_rule, update_routing_rule, delete_routing_rule,
     get_global_stats, reset_global_stats, reset_user_stats,
+    get_history_stats,
 )
-from app.models import ProviderCreate, ProviderUpdate, StatsResponse
 from app.router.auth import require_admin_session
 from app.services.discovery import refresh_provider_models, refresh_all_providers
 from app.services.lite_llm import get_available_models
-from app.router.proxy import get_request_log, get_model_stats, clear_request_log, get_timeline_data, get_model_distribution
+from app.router.proxy import get_request_log, get_model_stats, clear_request_log, get_timeline_data, get_model_distribution, get_timeline_model_data
 from app.services.logger import get_logger
+from app.models import ProviderCreate, ProviderUpdate, StatsResponse
 
 router = APIRouter()
 _app_log = get_logger("app")
@@ -172,6 +174,7 @@ async def get_stats(authorization: Optional[str] = Header(None)):
         users=users_summary,
         timeline=get_timeline_data(),
         distribution=get_model_distribution(),
+        timeline_models=get_timeline_model_data(),
     )
 
 
@@ -207,6 +210,22 @@ async def delete_routing_rule_endpoint(rule_id: str, authorization: Optional[str
     if not delete_routing_rule(rule_id):
         raise HTTPException(status_code=404, detail="Rule not found")
     return {"status": "deleted"}
+
+
+@router.get("/stats/history")
+async def get_stats_history(from_ts: Optional[str] = None, to_ts: Optional[str] = None, granularity: Optional[str] = "day", authorization: Optional[str] = Header(None)):
+    await require_admin_session(authorization)
+    if not to_ts:
+        to_ts = datetime.now().strftime("%Y-%m-%d 23:59:59")
+    else:
+        to_ts = to_ts + " 23:59:59" if len(to_ts) == 10 else to_ts
+    if not from_ts:
+        from_ts = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d 00:00:00")
+    else:
+        from_ts = from_ts + " 00:00:00" if len(from_ts) == 10 else from_ts
+    if granularity not in ("hour", "day", "week", "month"):
+        granularity = "day"
+    return get_history_stats(from_ts, to_ts, granularity)
 
 
 @router.post("/stats/reset")
