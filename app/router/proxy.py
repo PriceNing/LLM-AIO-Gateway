@@ -967,7 +967,7 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
                     and msg.get("tool_calls")):
                     msg["reasoning_content"] = cached_rc
                     injected += 1
-            _app_log.debug("[chat] INJECTED rc key=%s len=%d into %d asst-with-tool msgs", conv_key[:40], len(cached_rc), injected)
+            _app_log.info("[chat] INJECTED rc key=%s len=%d into %d asst-with-tool msgs", conv_key[:40], len(cached_rc), injected)
         else:
             # First turn: inject empty reasoning_content only into assistant messages
             # with tool_calls, to satisfy DeepSeek's requirement without breaking cache.
@@ -1637,6 +1637,7 @@ async def _stream_anthropic_messages(model, messages, provider_id, temperature,
         _log_request(username, api_key_value, model, provider_id or "", "messages", True, total_tokens, requested_model)
         if accumulated_reasoning:
             _reasoning_cache[conv_key] = accumulated_reasoning
+            _app_log.info("[messages_stream] STORED rc key=%s len=%d", conv_key[:60], len(accumulated_reasoning))
         if username != "legacy":
             increment_user_usage(username, api_key_value, True, total_tokens)
         increment_global_stats(success=True)
@@ -1898,7 +1899,7 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
                         and msg.get("tool_calls")):
                         msg["reasoning_content"] = cached_rc
                         count += 1
-                _app_log.debug("[messages] REASONING injected=%d asst-with-tool msgs len=%d conv_key=%s", count, len(cached_rc), conv_key)
+                _app_log.info("[messages] INJECTED rc injected=%d asst-with-tool msgs len=%d conv_key=%s", count, len(cached_rc), conv_key)
             else:
                 # First turn: inject empty reasoning_content only into assistant
                 # messages with tool_calls.
@@ -1950,6 +1951,9 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
         reasoning_content = getattr(message, "reasoning_content", None)
         if not message.get("content") and not message.get("tool_calls") and reasoning_content:
             message["content"] = reasoning_content
+        if reasoning_content:
+            _reasoning_cache[conv_key] = reasoning_content
+            _app_log.info("[messages_nonstream] STORED rc key=%s len=%d", conv_key[:60], len(reasoning_content))
 
         # Convert OpenAI response to Anthropic format
         content_blocks = _openai_to_anthropic_content(message)
@@ -2680,7 +2684,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                     msg["reasoning_content"] = cached_rc
                     injected_count += 1
             if injected_count:
-                _app_log.debug("[responses] INJECTED key=%s into %d asst-with-tool msgs len(rc)=%d", conv_key, injected_count, len(cached_rc))
+                _app_log.info("[responses] INJECTED rc key=%s into %d asst-with-tool msgs len=%d", conv_key, injected_count, len(cached_rc))
         else:
             for msg in messages:
                 if (msg.get('role') == 'assistant'
