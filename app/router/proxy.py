@@ -1614,8 +1614,17 @@ async def _stream_anthropic_messages(model, messages, provider_id, temperature,
                 total_tokens = getattr(chunk.usage, "total_tokens", 0) or 0
                 output_tokens = getattr(chunk.usage, "completion_tokens", 0) or 0
 
+        # Fallback: if thinking consumed all tokens with no text/tool output,
+        # render reasoning_content as the visible response (same as _stream_chat fallback).
+        if content_total == 0 and not tool_uses and accumulated_reasoning:
+            _app_log.info("[messages_stream] fallback: reasoning_content (%s chars) as response", len(accumulated_reasoning))
+            if not text_content_started:
+                block_index += 1
+                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'text_delta', 'text': accumulated_reasoning}})}\n\n"
+            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
+
         stop_reason = _map_stop_reason(finish_reason) if finish_reason else "end_turn"
-        # Diagnostic: log accumulated content stats before sending final events
         _app_log.debug(
             "[messages_stream] DONE finish_reason=%s stop_reason=%s total_chunks=%d content_chars=%d accumulated_text_len=%d text_buffer_len=%d tool_uses_count=%d reasoning_chars=%d max_tokens_param=%s",
             finish_reason or "None", stop_reason, chunk_count, content_total,
@@ -1935,6 +1944,12 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
         choice = response.choices[0]
         message = getattr(choice, "message", {})
         finish_reason = getattr(choice, "finish_reason", "stop") or "stop"
+
+        # Fallback: if thinking consumed all tokens with no text/tool output,
+        # render reasoning_content as the visible response.
+        reasoning_content = getattr(message, "reasoning_content", None)
+        if not message.get("content") and not message.get("tool_calls") and reasoning_content:
+            message["content"] = reasoning_content
 
         # Convert OpenAI response to Anthropic format
         content_blocks = _openai_to_anthropic_content(message)

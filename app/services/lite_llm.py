@@ -85,7 +85,11 @@ except Exception:
 # OpenAI→Anthropic message conversion.  Intercept the function to synthesize
 # thinking_blocks from reasoning_content before liteLLM processes the messages.
 try:
-    from litellm.llms.prompt_templates import factory as _pt_factory
+    # liteLLM moved anthropic_messages_pt between versions; try both paths
+    try:
+        from litellm.llms.prompt_templates import factory as _pt_factory
+    except (ImportError, ModuleNotFoundError):
+        from litellm.litellm_core_utils.prompt_templates import factory as _pt_factory
     _original_anthropic_messages_pt = _pt_factory.anthropic_messages_pt
 
     def _patched_anthropic_messages_pt(messages, model, llm_provider):
