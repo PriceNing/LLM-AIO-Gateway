@@ -596,7 +596,7 @@ async def _iter_stream_async(stream_func):
                     break
                 _chunk_idx += 1
                 chunk_queue.put(chunk)
-            _app_log.info("[_iter_stream_async] generator finished, total_chunks=%d", _chunk_idx)
+            _app_log.debug("[_iter_stream_async] generator finished, total_chunks=%d", _chunk_idx)
         except GeneratorExit:
             pass
         except Exception as e:
@@ -961,9 +961,9 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
                 if msg.get("role") == "assistant" and not msg.get("reasoning_content"):
                     msg["reasoning_content"] = cached_rc
                     injected += 1
-            _app_log.info("[chat] INJECTED rc key=%s len=%d into %d msgs", conv_key[:40], len(cached_rc), injected)
+            _app_log.debug("[chat] INJECTED rc key=%s len=%d into %d msgs", conv_key[:40], len(cached_rc), injected)
         else:
-            _app_log.info("[chat] CACHE MISS rc key=%s available=%s", conv_key[:40], str(list(_reasoning_cache.keys())[:5]))
+            _app_log.debug("[chat] CACHE MISS rc key=%s available=%s", conv_key[:40], str(list(_reasoning_cache.keys())[:5]))
 
         # Tool-call circuit breaker: strip tools if too many consecutive tool-only turns
         if _tool_only_turns.get(conv_key, 0) >= TOOL_ONLY_LIMIT:
@@ -1498,7 +1498,7 @@ async def _stream_anthropic_messages(model, messages, provider_id, temperature,
     try:
         # Diagnostic: log message structure summary
         msg_roles = [m.get("role", "?") if isinstance(m, dict) else "?" for m in messages]
-        _app_log.info("[messages_stream] START model=%s msg_count=%d roles=%s max_tokens=%s tools=%s",
+        _app_log.debug("[messages_stream] START model=%s msg_count=%d roles=%s max_tokens=%s tools=%s",
                       model, len(messages), str(msg_roles), str(max_tokens),
                       str(extra.get("tools", [])[:10]) if extra.get("tools") else "none")
         stream_func = lambda: create_chat_completion_stream(
@@ -1518,7 +1518,7 @@ async def _stream_anthropic_messages(model, messages, provider_id, temperature,
             chunk_finish = getattr(choice, "finish_reason", None)
             if chunk_finish:
                 finish_reason = chunk_finish  # save first finish_reason, don't overwrite
-                _app_log.info(
+                _app_log.debug(
                     "[messages_stream] GOT finish_reason=%s at chunk=%d content_chars=%d",
                     finish_reason, chunk_count, content_total
                 )
@@ -1604,7 +1604,7 @@ async def _stream_anthropic_messages(model, messages, provider_id, temperature,
 
         stop_reason = _map_stop_reason(finish_reason) if finish_reason else "end_turn"
         # Diagnostic: log accumulated content stats before sending final events
-        _app_log.info(
+        _app_log.debug(
             "[messages_stream] DONE finish_reason=%s stop_reason=%s total_chunks=%d content_chars=%d accumulated_text_len=%d text_buffer_len=%d tool_uses_count=%d reasoning_chars=%d max_tokens_param=%s",
             finish_reason or "None", stop_reason, chunk_count, content_total,
             len(accumulated_text), len(text_buffer), len(tool_uses),
@@ -1819,7 +1819,7 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
         is_anthropic_provider = False
         messages, _ = _anthropic_to_openai_messages(anthropic_msgs, system_prompt)
         # Diagnostic: log converted message summary to find truncation root cause
-        _app_log.info(
+        _app_log.debug(
             "[messages] CONVERTED anthropic(%d msgs) -> openai(%d msgs) system_prompt_len=%d tools=%s stream=%s max_tokens=%s model=%s",
             len(anthropic_msgs), len(messages), len(system_prompt) if system_prompt else 0,
             str(body.get("tools", [])[:10]) if body.get("tools") else "none",
@@ -1875,7 +1875,7 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
                     if msg.get("role") == "assistant" and not msg.get("reasoning_content"):
                         msg["reasoning_content"] = cached_rc
                         count += 1
-                _app_log.info("[messages] REASONING injected=%d msgs len=%d conv_key=%s", count, len(cached_rc), conv_key)
+                _app_log.debug("[messages] REASONING injected=%d msgs len=%d conv_key=%s", count, len(cached_rc), conv_key)
             else:
                 # First turn: inject empty reasoning_content into ALL assistant messages
                 # to satisfy DeepSeek's requirement (messages from other providers lack it)
@@ -2647,9 +2647,9 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                     msg["reasoning_content"] = cached_rc
                     injected_count += 1
             if injected_count:
-                _app_log.info("[responses] INJECTED key=%s into %d msgs len(rc)=%d", conv_key, injected_count, len(cached_rc))
+                _app_log.debug("[responses] INJECTED key=%s into %d msgs len(rc)=%d", conv_key, injected_count, len(cached_rc))
         else:
-            _app_log.info("[responses] CACHE MISS key=%s available_keys=%s", conv_key, str(list(_reasoning_cache.keys())))
+            _app_log.debug("[responses] CACHE MISS key=%s available_keys=%s", conv_key, str(list(_reasoning_cache.keys())))
 
     try:
         allowed_params = {
