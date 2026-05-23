@@ -73,14 +73,11 @@ except Exception:
         "liteLLM monkey-patch for reasoning_content failed"
     )
 
-# ── Monkey-patch: force disable thinking mode for non-Anthropic endpoints ──
-# liteLLM 的 AnthropicChatCompletion.completion() 构建最终的 request body。
-# DeepSeek 等非官方 Anthropic 端点启用 thinking 后，litetLLM 的流式适配器
-# (ModelResponseIterator.chunk_parser) 只处理 text/tool_use 块，完全忽略
-# thinking 块，导致 reasoning_content 无法被缓存和回传，下一轮多轮对话报
-# "thinking must be passed back to the API" 错误。
-# 在 completion() 入口处拦截 optional_params，对非官方端点强制注入
-# thinking={"type": "disabled"}。
+# ── Monkey-patch: force enable thinking mode for DeepSeek Anthropic endpoint ──
+# DeepSeek's Anthropic-compatible endpoint enables thinking by default, but
+# liteLLM's AnthropicChatCompletion may drop the parameter. Ensure thinking is
+# explicitly enabled so the gateway can capture and echo-back reasoning_content.
+# The gateway handles injection only into assistant messages with tool_calls.
 try:
     from litellm.llms.anthropic.chat import AnthropicChatCompletion
     _original_anthropic_completion = AnthropicChatCompletion.completion
@@ -89,19 +86,19 @@ try:
         api_base = kwargs.get("api_base", "")
         if not api_base and len(args) > 3:
             api_base = args[3] or ""
-        if api_base and "api.anthropic.com" not in api_base:
+        if api_base and "api.deepseek.com" in api_base:
             if "optional_params" in kwargs:
                 kwargs = {**kwargs}
-                kwargs["optional_params"] = {**kwargs["optional_params"], "thinking": {"type": "disabled"}}
+                kwargs["optional_params"] = {**kwargs["optional_params"], "thinking": {"type": "enabled"}}
             elif len(args) > 10:
                 args = list(args)
-                args[10] = {**args[10], "thinking": {"type": "disabled"}}
+                args[10] = {**args[10], "thinking": {"type": "enabled"}}
         return _original_anthropic_completion(self, *args, **kwargs)
 
     AnthropicChatCompletion.completion = _patched_anthropic_completion
 except Exception:
     logging.getLogger("llmgw.app").warning(
-        "liteLLM monkey-patch for AnthropicChatCompletion.completion (thinking disable) failed"
+        "liteLLM monkey-patch for AnthropicChatCompletion.completion (thinking enable) failed"
     )
 
 # ── Monkey-patch: convert reasoning_content → thinking_blocks for Anthropic messages ──
@@ -278,12 +275,13 @@ def build_completion_args(model: str, provider_id: Optional[str] = None) -> tupl
             params["api_base"] = api_base
 
     litellm_model = get_litellm_model_name(model, provider)
-    # DeepSeek enables thinking mode by default on both Anthropic and OpenAI endpoints.
-    # Monkey-patch #3 handles the Anthropic path; handle the OpenAI path here by
-    # passing thinking={"type": "disabled"} via extra_body for non-official endpoints.
+    # Enable thinking mode for DeepSeek models so they produce reasoning_content.
+    # The gateway handles reasoning_content injection/echo-back in proxy.py,
+    # injecting only into assistant messages with tool_calls (per DeepSeek docs)
+    # to minimize prefix cache pollution.
     if "api.deepseek.com" in api_base:
         params.setdefault("extra_body", {})
-        params["extra_body"]["thinking"] = {"type": "disabled"}
+        params["extra_body"]["thinking"] = {"type": "enabled"}
     get_logger("app").debug("route model=%s provider_type=%s api_base=%s -> litellm_model=%s",
                            model, provider.get("provider_type"), api_base, litellm_model)
     return litellm_model, params

@@ -958,13 +958,23 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
         if cached_rc is not None:
             injected = 0
             for msg in messages:
-                if msg.get("role") == "assistant" and not msg.get("reasoning_content"):
+                # Only inject reasoning_content into assistant messages that made tool calls.
+                # Per DeepSeek docs: reasoning_content only needs to be passed back when
+                # the previous turn included a tool call. Messages without tool_calls don't
+                # need it — injecting would only break prefix cache.
+                if (msg.get("role") == "assistant"
+                    and not msg.get("reasoning_content")
+                    and msg.get("tool_calls")):
                     msg["reasoning_content"] = cached_rc
                     injected += 1
-            _app_log.debug("[chat] INJECTED rc key=%s len=%d into %d msgs", conv_key[:40], len(cached_rc), injected)
+            _app_log.debug("[chat] INJECTED rc key=%s len=%d into %d asst-with-tool msgs", conv_key[:40], len(cached_rc), injected)
         else:
+            # First turn: inject empty reasoning_content only into assistant messages
+            # with tool_calls, to satisfy DeepSeek's requirement without breaking cache.
             for msg in messages:
-                if msg.get('role') == 'assistant' and 'reasoning_content' not in msg:
+                if (msg.get('role') == 'assistant'
+                    and 'reasoning_content' not in msg
+                    and msg.get('tool_calls')):
                     msg['reasoning_content'] = ''
 
         # Tool-call circuit breaker: strip tools if too many consecutive tool-only turns
@@ -1874,15 +1884,19 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
             if cached_rc is not None:
                 count = 0
                 for msg in messages:
-                    if msg.get("role") == "assistant" and not msg.get("reasoning_content"):
+                    if (msg.get("role") == "assistant"
+                        and not msg.get("reasoning_content")
+                        and msg.get("tool_calls")):
                         msg["reasoning_content"] = cached_rc
                         count += 1
-                _app_log.debug("[messages] REASONING injected=%d msgs len=%d conv_key=%s", count, len(cached_rc), conv_key)
+                _app_log.debug("[messages] REASONING injected=%d asst-with-tool msgs len=%d conv_key=%s", count, len(cached_rc), conv_key)
             else:
-                # First turn: inject empty reasoning_content into ALL assistant messages
-                # to satisfy DeepSeek's requirement.
+                # First turn: inject empty reasoning_content only into assistant
+                # messages with tool_calls.
                 for msg in messages:
-                    if msg.get('role') == 'assistant' and 'reasoning_content' not in msg:
+                    if (msg.get('role') == 'assistant'
+                        and 'reasoning_content' not in msg
+                        and msg.get('tool_calls')):
                         msg['reasoning_content'] = ''
 
         if stream:
@@ -2645,14 +2659,18 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
         if cached_rc is not None:
             injected_count = 0
             for msg in messages:
-                if msg.get("role") == "assistant" and not msg.get("reasoning_content"):
+                if (msg.get("role") == "assistant"
+                    and not msg.get("reasoning_content")
+                    and msg.get("tool_calls")):
                     msg["reasoning_content"] = cached_rc
                     injected_count += 1
             if injected_count:
-                _app_log.debug("[responses] INJECTED key=%s into %d msgs len(rc)=%d", conv_key, injected_count, len(cached_rc))
+                _app_log.debug("[responses] INJECTED key=%s into %d asst-with-tool msgs len(rc)=%d", conv_key, injected_count, len(cached_rc))
         else:
             for msg in messages:
-                if msg.get('role') == 'assistant' and 'reasoning_content' not in msg:
+                if (msg.get('role') == 'assistant'
+                    and 'reasoning_content' not in msg
+                    and msg.get('tool_calls')):
                     msg['reasoning_content'] = ''
             _app_log.debug("[responses] CACHE MISS key=%s available_keys=%s", conv_key, str(list(_reasoning_cache.keys())))
 
