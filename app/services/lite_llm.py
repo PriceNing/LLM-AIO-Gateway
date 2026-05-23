@@ -66,6 +66,16 @@ try:
                           .get("reasoning_content"))
                     if rc:
                         choice.message.reasoning_content = rc
+            # Inject cache stats into usage from raw response
+            if hasattr(result, "usage") and result.usage:
+                usage_raw = response_object.get("usage", {})
+                if isinstance(usage_raw, dict):
+                    hit = usage_raw.get("prompt_cache_hit_tokens")
+                    miss = usage_raw.get("prompt_cache_miss_tokens")
+                    if hit is not None:
+                        result.usage.prompt_cache_hit_tokens = hit
+                    if miss is not None:
+                        result.usage.prompt_cache_miss_tokens = miss
         return result
 
     _litellm_utils.convert_to_model_response_object = _patched_convert
