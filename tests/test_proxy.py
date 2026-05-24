@@ -78,6 +78,73 @@ def test_chat_completion_forbidden_model():
     assert response.status_code == 403
 
 
+def test_chat_completion_accepts_request_without_previous_response_id(monkeypatch):
+    from app.router import proxy
+
+    class Usage:
+        prompt_tokens = 1
+        completion_tokens = 1
+        total_tokens = 2
+
+    class Message:
+        content = "ok"
+        tool_calls = None
+        reasoning_content = None
+
+    class Choice:
+        message = Message()
+        finish_reason = "stop"
+
+    class Response:
+        choices = [Choice()]
+        usage = Usage()
+
+    monkeypatch.setattr(proxy, "create_chat_completion", lambda **kwargs: Response())
+
+    response = client.post("/v1/chat/completions", headers=headers, json={
+        "model": "allowed-model",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "stream": False,
+    })
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "ok"
+
+
+def test_anthropic_messages_accepts_request_without_previous_response_id(monkeypatch):
+    from app.router import proxy
+
+    def fake_stream(**kwargs):
+        class Delta:
+            content = "ok"
+            reasoning_content = None
+            tool_calls = None
+
+        class Choice:
+            delta = Delta()
+            finish_reason = "stop"
+
+        class Chunk:
+            choices = [Choice()]
+            usage = None
+
+        yield Chunk()
+
+    monkeypatch.setattr(proxy, "create_chat_completion_stream", fake_stream)
+
+    with client.stream("POST", "/v1/messages", headers=headers, json={
+        "model": "allowed-model",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "stream": True,
+        "max_tokens": 32,
+    }) as response:
+        body = response.read().decode()
+
+    assert response.status_code == 200
+    assert "message_start" in body
+    assert "message_stop" in body
+
+
 def test_static_admin_page_loads():
     response = client.get("/")
     assert response.status_code == 200

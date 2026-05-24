@@ -857,6 +857,39 @@ def test_reasoning_cache_survives_image_preprocess_flow():
     assert messages[5]["reasoning_content"] == "cached reasoning"
 
 
+def test_conversation_cache_key_prefers_response_chain_id():
+    from app.router.proxy import _remember_response_chain_key
+
+    messages_a = [{"role": "user", "content": "Same first message"}]
+    messages_b = [{"role": "user", "content": "Same first message"}]
+    key_a = _conversation_cache_key("api", messages_a)
+    key_b = _conversation_cache_key("api", messages_b)
+    assert key_a == key_b
+
+    _remember_response_chain_key("resp_chain_1", "stable-conv-key")
+    key_c = _conversation_cache_key("api", [{"role": "user", "content": "Different"}], "resp_chain_1")
+    assert key_c == "stable-conv-key"
+
+
+def test_conversation_cache_key_uses_followup_user_messages():
+    first_turn = [
+        {"role": "user", "content": "Do the task"},
+    ]
+    followup_a = [
+        {"role": "user", "content": "Do the task"},
+        {"role": "assistant", "content": "Done"},
+        {"role": "user", "content": "Other docs?"},
+    ]
+    followup_b = [
+        {"role": "user", "content": "Do the task"},
+        {"role": "assistant", "content": "Done"},
+        {"role": "user", "content": "Run tests"},
+    ]
+
+    assert _conversation_cache_key("api", first_turn) != _conversation_cache_key("api", followup_a)
+    assert _conversation_cache_key("api", followup_a) != _conversation_cache_key("api", followup_b)
+
+
 def test_anthropic_content_to_openai_filters_empty_text():
     """Test behavior."""
     result = _anthropic_content_to_openai([

@@ -4,6 +4,7 @@ import time
 import re
 import queue
 import threading
+import uuid
 from fastapi import APIRouter, HTTPException, Header, Request
 from fastapi.responses import StreamingResponse
 from typing import Optional
@@ -456,6 +457,10 @@ _reasoning_tool_cache = TTLDict(
     ttl_seconds=get_default("reasoning_cache_ttl", 1800),
     max_size=get_default("reasoning_cache_max_size", 1000)
 )
+_response_chain_cache = TTLDict(
+    ttl_seconds=get_default("reasoning_cache_ttl", 1800),
+    max_size=get_default("reasoning_cache_max_size", 1000)
+)
 
 
 
@@ -498,27 +503,28 @@ def _attr(obj, key: str, default=None):
     return getattr(obj, key, default)
 
 
-def _conversation_cache_key(api_key: str, messages: list) -> str:
+def _remember_response_chain_key(response_id: str, conv_key: str) -> None:
+    if response_id and conv_key:
+        _response_chain_cache[str(response_id)] = conv_key
+
+
+def _conversation_cache_key(api_key: str, messages: list, response_chain_id: str = "") -> str:
     """Build a cache key that isolates different conversations sharing the same API key."""
-    user_msgs = [m for m in messages if isinstance(m, dict) and m.get("role") == "user"]
-    if user_msgs:
-        first_content = user_msgs[0].get("content")
-        first_content_list = None
-        if isinstance(first_content, list):
-            # Multimodal content - extract text parts for fingerprint
-            first_content_list = first_content
-            text_parts = []
-            for p in first_content:
-                if isinstance(p, dict) and p.get("type") == "text":
-                    text_parts.append(p.get("text", ""))
-                elif isinstance(p, str):
-                    text_parts.append(p)
-            first_content = "\n".join(text_parts)
-            if not first_content and first_content_list:
-                first_content = json.dumps(first_content_list, sort_keys=True, default=str)[:200]
-        fingerprint = (first_content or "")[:200]
-    else:
-        fingerprint = ""
+    if response_chain_id:
+        chained_key = _response_chain_cache.get(str(response_chain_id))
+        if chained_key:
+            return chained_key
+    user_fingerprints = []
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        text = _message_text(content)
+        if not text and isinstance(content, list):
+            text = json.dumps(content, sort_keys=True, default=str)
+        if text:
+            user_fingerprints.append(text[:200])
+    fingerprint = "\n---\n".join(user_fingerprints)[:2000]
     conv_hash = hashlib.md5(fingerprint.encode()).hexdigest()[:16]
     return f"{api_key}:{conv_hash}"
 
@@ -1051,6 +1057,7 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
         max_tokens = get_default("max_tokens", 16384)
     provider_id = body.get("provider_id")
     stream = body.get("stream", False)
+    previous_response_id = body.get("previous_response_id") or ""
 
     username = user.get("username", "legacy")
     api_key_value = api_key.get("key", "")
@@ -1080,7 +1087,7 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
     # Compute conversation cache key BEFORE preprocessing, since preprocessing
     # modifies the first user message (images -> text) which changes the key.
     # All cache operations (reasoning, tool counter) must use this stable key.
-    conv_key = _conversation_cache_key(api_key_value, messages)
+    conv_key = _conversation_cache_key(api_key_value, messages, previous_response_id)
 
     # Preprocessor: replace images with text
     msg, modified = await _maybe_preprocess(messages, model, provider_id, requested_model=requested_model)
@@ -1949,6 +1956,7 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
         max_tokens = get_default("max_tokens", 16384)
     provider_id = body.get("provider_id")
     stream = body.get("stream", False)
+    previous_response_id = body.get("previous_response_id") or ""
     system_prompt = _strip_billing_header(body.get("system", ""))
     _app_log.info("[ANTHRO_ENTRY] model=%s msgs=%d system=%s tools=%s",
                   model, len(anthropic_msgs),
@@ -1993,10 +2001,10 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
         system_prompt = ""  # already embedded in messages
 
     # Compute conversation cache key BEFORE preprocessing (see chat_completions for rationale)
-    conv_key = _conversation_cache_key(api_key_value, messages)
+    conv_key = _conversation_cache_key(api_key_value, messages, previous_response_id)
 
     # Preprocessor: replace images with text descriptions
-    msg_list, modified = await _maybe_preprocess(messages, model, requested_model=requested_model)
+    msg_list, modified = await _maybe_preprocess(messages, model, provider_id, requested_model=requested_model)
     messages = msg_list
 
     try:
@@ -2114,9 +2122,10 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
 
 
 async def _stream_responses(model, messages, provider_id, temperature, max_tokens, username, api_key_value, instructions, requested_model="", conv_key="", **extra):
-    resp_id = f"resp_{int(time.time())}"
-    msg_id = f"msg_{int(time.time())}"
+    resp_id = f"resp_{uuid.uuid4().hex}"
+    msg_id = f"msg_{uuid.uuid4().hex}"
     created_at = int(time.time())
+    _remember_response_chain_key(resp_id, conv_key)
 
     if not conv_key:
         conv_key = _conversation_cache_key(api_key_value, messages)
@@ -2174,7 +2183,7 @@ async def _stream_responses(model, messages, provider_id, temperature, max_token
             "status": "in_progress",
             "model": model,
             "output": [],
-            "previous_response_id": None,
+            "previous_response_id": extra.get("previous_response_id") or None,
             "metadata": {},
             "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
         }
@@ -2389,7 +2398,7 @@ async def _stream_responses(model, messages, provider_id, temperature, max_token
                 'id': resp_id, 'object': 'response', 'created_at': created_at,
                 'status': 'failed' if error_msg else 'completed',
                 'model': model, 'output': completion_output,
-                'previous_response_id': None, 'metadata': {},
+                'previous_response_id': extra.get("previous_response_id") or None, 'metadata': {},
                 'usage': {'input_tokens': input_tokens, 'output_tokens': output_tokens, 'total_tokens': total_tokens}
             }
         }
@@ -2797,6 +2806,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
         max_tokens = get_default("max_tokens", 16384)
     provider_id = body.get("provider_id")
     stream = body.get("stream", False)
+    previous_response_id = body.get("previous_response_id") or ""
 
     if not model:
         raise HTTPException(status_code=400, detail="model is required")
@@ -2861,7 +2871,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
     _app_log.info("[responses NORM] messages %d -> %d roles=%s", _pre_norm, len(messages), [m['role'] for m in messages])
 
     # Compute conversation cache key BEFORE preprocessing (see chat_completions for rationale)
-    conv_key = _conversation_cache_key(api_key_value, messages)
+    conv_key = _conversation_cache_key(api_key_value, messages, previous_response_id)
 
     # Preprocessor: replace images with text
     msg, modified = await _maybe_preprocess(messages, model, provider_id, requested_model=requested_model)
@@ -2884,6 +2894,8 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
             "tools", "tool_choice", "response_format", "user"
         }
         extra = {key: body[key] for key in allowed_params if key in body}
+        if previous_response_id:
+            extra["previous_response_id"] = previous_response_id
         # Convert tools from Responses API format to Chat Completions format
         if "tools" in extra and isinstance(extra["tools"], list):
             extra["tools"] = _convert_responses_tools(extra["tools"])
@@ -2992,8 +3004,9 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                           conv_key, len(reasoning_content),
                           usage.get("prompt_cache_hit_tokens", 0), usage.get("prompt_cache_miss_tokens", 0))
 
-        resp_id = f"resp_{int(time.time())}"
-        msg_id = f"msg_{int(time.time())}"
+        resp_id = f"resp_{uuid.uuid4().hex}"
+        msg_id = f"msg_{uuid.uuid4().hex}"
+        _remember_response_chain_key(resp_id, conv_key)
         output = []
         # When thinking mode consumed all tokens before generating visible content,
         # fall back to reasoning_content as the response.
@@ -3042,6 +3055,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
             "created_at": int(time.time()),
             "status": "completed",
             "model": model,
+            "previous_response_id": previous_response_id or None,
             "output": output,
             "usage": {
                 "input_tokens": usage.get("prompt_tokens", 0),
