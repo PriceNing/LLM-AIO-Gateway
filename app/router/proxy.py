@@ -549,6 +549,21 @@ def _tool_call_ids_from_message(msg: dict) -> list[str]:
     return ids
 
 
+def _anthropic_tool_block_index(text_block_started: bool, tool_uses: dict) -> int:
+    """Return the next Anthropic content block index after text and tool blocks."""
+    used = set()
+    if text_block_started:
+        used.add(0)
+        used.add(1)
+    for tool_use in tool_uses.values():
+        if isinstance(tool_use, dict) and "block_index" in tool_use:
+            used.add(int(tool_use["block_index"]))
+    idx = 0
+    while idx in used:
+        idx += 1
+    return idx
+
+
 def _remember_reasoning_content(conv_key: str, reasoning_content: str, tool_call_ids=None) -> None:
     if not reasoning_content:
         return
@@ -1070,8 +1085,6 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
     # Preprocessor: replace images with text
     msg, modified = await _maybe_preprocess(messages, model, provider_id, requested_model=requested_model)
     messages = msg
-    if modified:
-        _reasoning_cache.drop(conv_key)
 
     try:
         allowed_params = {
@@ -1744,6 +1757,15 @@ async def _stream_anthropic_messages(model, messages, provider_id, temperature,
             len(accumulated_text), len(text_buffer), len(tool_uses),
             len(accumulated_reasoning), str(max_tokens)
         )
+        _app_log.info(
+            "[messages_stream] END finish_reason=%s stop_reason=%s text=%s tools=%d reasoning=%d conv_key=%s",
+            finish_reason or "None",
+            stop_reason,
+            content_total > 0,
+            len(tool_uses),
+            len(accumulated_reasoning),
+            conv_key[:60],
+        )
         yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': stop_reason, 'stop_sequence': None}, 'usage': {'output_tokens': output_tokens}})}\n\n"
         yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
 
@@ -1976,8 +1998,6 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
     # Preprocessor: replace images with text descriptions
     msg_list, modified = await _maybe_preprocess(messages, model, requested_model=requested_model)
     messages = msg_list
-    if modified:
-        _reasoning_cache.drop(conv_key)
 
     try:
         # Collect Anthropic tool definitions: top-level tools + tools from body
@@ -2138,7 +2158,6 @@ async def _stream_responses(model, messages, provider_id, temperature, max_token
                         prop.pop("additionalProperties", None)
 
     try:
-        _app_log.info("[responses_stream] START model=%s", model)
         stream_func = lambda: create_chat_completion_stream(
             model=model,
             messages=messages,
@@ -2304,8 +2323,6 @@ async def _stream_responses(model, messages, provider_id, temperature, max_token
                 cache_hit = getattr(chunk.usage, "prompt_cache_hit_tokens", 0) or 0
                 cache_miss = getattr(chunk.usage, "prompt_cache_miss_tokens", 0) or 0
 
-        _app_log.info("[responses_stream] TOTAL chunks=%d text=%d tools=%d reasoning=%d", chunk_count, len(accumulated_text), len(tool_calls_state), len(accumulated_reasoning))
-
         # Store reasoning_content for next turn replay (DeepSeek thinking mode requires echo-back)
         if accumulated_reasoning:
             _remember_reasoning_content(
@@ -2366,7 +2383,6 @@ async def _stream_responses(model, messages, provider_id, temperature, max_token
                 state = tool_calls_state[idx]
                 if state["item_added"]:
                     completion_output.append({'type': 'function_call', 'id': state['id'], 'call_id': state['call_id'], 'name': state['name'], 'arguments': state['arguments_buffer'], 'status': 'completed'})
-        _app_log.info("[responses_stream] SENT response.completed error=%s output_items=%d", str(error_msg is not None), len(completion_output))
         response_completed = {
             'type': 'response.completed',
             'response': {
@@ -2793,8 +2809,6 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
     # Preprocessor: replace images with text
     msg, modified = await _maybe_preprocess(messages, model, provider_id, requested_model=requested_model)
     messages = msg
-    if modified:
-        _reasoning_cache.drop(conv_key)
 
     if isinstance(input_data, list):
         _inject_reasoning_content(messages, conv_key, "responses")

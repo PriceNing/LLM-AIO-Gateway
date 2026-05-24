@@ -352,13 +352,40 @@ def _join_text_parts(parts: list) -> str | list:
     return parts
 
 
-def _build_inline_replacement(desc_idx: int, descriptions: list, is_current: bool) -> str:
+def _cached_image_replacement(image_url: str = "", image_data: str = "") -> str:
+    """Return a cached image description replacement, or the removal marker."""
+    cached = _get_cached_description(image_url or image_data)
+    if cached:
+        return f"[Image cached]: {cached}"
+    return "[image: removed]"
+
+
+def _image_part_payload(part: dict) -> tuple[str, str]:
+    """Extract (url, data_uri) from an OpenAI or Anthropic image block."""
+    if part.get("type") in ("image_url", "input_image"):
+        url = part.get("image_url", {})
+        if isinstance(url, dict):
+            url = url.get("url", "")
+        elif not isinstance(url, str):
+            url = ""
+        return url, ""
+    if part.get("type") == "image":
+        source = part.get("source", {})
+        if isinstance(source, dict) and source.get("type") == "base64":
+            media = source.get("media_type", "image/png")
+            data = source.get("data", "")
+            return "", f"data:{media};base64,{data}"
+    return "", ""
+
+
+def _build_inline_replacement(desc_idx: int, descriptions: list, is_current: bool,
+                              image_url: str = "", image_data: str = "") -> str:
     """Build replacement text for an image. Current-turn images get description
     immediately after the placeholder so the LLM doesn't need remote index mapping."""
     if is_current and desc_idx < len(descriptions):
         desc = descriptions[desc_idx]
         return f"[Image #{desc_idx + 1}]: {desc}"
-    return "[image: removed]"
+    return _cached_image_replacement(image_url, image_data)
 
 
 def _strip_images_with_descriptions(messages: list, descriptions: list, turn_start: int) -> None:
@@ -379,7 +406,10 @@ def _strip_images_with_descriptions(messages: list, descriptions: list, turn_sta
                     continue
 
                 if part.get("type") in ("image_url", "input_image", "image"):
-                    replacement = _build_inline_replacement(desc_idx, descriptions, is_current)
+                    image_url, image_data = _image_part_payload(part)
+                    replacement = _build_inline_replacement(
+                        desc_idx, descriptions, is_current, image_url, image_data
+                    )
                     stripped.append({"type": "text", "text": replacement})
                     if is_current:
                         desc_idx += 1
@@ -391,7 +421,10 @@ def _strip_images_with_descriptions(messages: list, descriptions: list, turn_sta
                         clean_inner = []
                         for ip in inner:
                             if isinstance(ip, dict) and ip.get("type") == "image":
-                                replacement = _build_inline_replacement(desc_idx, descriptions, is_current)
+                                image_url, image_data = _image_part_payload(ip)
+                                replacement = _build_inline_replacement(
+                                    desc_idx, descriptions, is_current, image_url, image_data
+                                )
                                 clean_inner.append({"type": "text", "text": replacement})
                                 if is_current:
                                     desc_idx += 1
@@ -408,7 +441,9 @@ def _strip_images_with_descriptions(messages: list, descriptions: list, turn_sta
             uris = _extract_image_data_uris(content)
             cleaned = content
             for _mime, data_uri in uris:
-                replacement = _build_inline_replacement(desc_idx, descriptions, is_current)
+                replacement = _build_inline_replacement(
+                    desc_idx, descriptions, is_current, image_data=data_uri
+                )
                 cleaned = cleaned.replace(data_uri, replacement)
                 if is_current:
                     desc_idx += 1
@@ -428,7 +463,8 @@ def _strip_all_images(messages: list) -> None:
             for part in content:
                 if isinstance(part, dict):
                     if part.get("type") in ("image_url", "input_image", "image"):
-                        stripped.append({"type": "text", "text": "[image: removed]"})
+                        image_url, image_data = _image_part_payload(part)
+                        stripped.append({"type": "text", "text": _cached_image_replacement(image_url, image_data)})
                         _log.debug("[preprocess] stripped image from message")
                     elif part.get("type") == "tool_result":
                         # Strip nested images from tool_result content
@@ -437,7 +473,8 @@ def _strip_all_images(messages: list) -> None:
                             clean_inner = []
                             for ip in inner:
                                 if isinstance(ip, dict) and ip.get("type") == "image":
-                                    clean_inner.append({"type": "text", "text": "[image: removed]"})
+                                    image_url, image_data = _image_part_payload(ip)
+                                    clean_inner.append({"type": "text", "text": _cached_image_replacement(image_url, image_data)})
                                 else:
                                     clean_inner.append(ip)
                             part = dict(part)
@@ -453,7 +490,7 @@ def _strip_all_images(messages: list) -> None:
             uris = _extract_image_data_uris(content)
             cleaned = content
             for _mime, data_uri in uris:
-                cleaned = cleaned.replace(data_uri, "[image: removed]")
+                cleaned = cleaned.replace(data_uri, _cached_image_replacement(image_data=data_uri))
             if cleaned != content:
                 msg["content"] = cleaned
                 _log.debug("[preprocess] stripped data URI from text")

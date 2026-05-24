@@ -394,6 +394,33 @@ async def test_preprocess_images_in_history_only():
 
 
 @pytest.mark.asyncio
+async def test_preprocess_history_image_uses_cached_description():
+    msgs = [
+        {"role": "user", "content": [
+            {"type": "text", "text": "Old image:"},
+            {"type": "image_url", "image_url": {"url": "https://example.com/old.jpg"}}
+        ]},
+        {"role": "assistant", "content": "I see an old photo."},
+        {"role": "user", "content": "Please check that image again."},
+    ]
+
+    _set_cached_description("https://example.com/old.jpg", "A cached description")
+
+    result = await preprocess_messages(
+        msgs,
+        preprocessor_config={
+            "id": "vision", "api_base": "http://x/v1", "model": "v",
+            "api_key": "", "timeout": 30, "max_images": 20, "enabled": True,
+        }
+    )
+
+    old_content = result[0]["content"]
+    assert isinstance(old_content, str)
+    assert "A cached description" in old_content
+    assert "[image: removed]" not in old_content
+
+
+@pytest.mark.asyncio
 async def test_preprocess_multi_turn_with_description_tag():
     """Test behavior."""
     msgs = [

@@ -616,6 +616,16 @@ def test_convert_responses_tools_empty():
     assert _convert_responses_tools([]) == []
 
 
+def test_anthropic_tool_block_indexes_unique():
+    from app.router.proxy import _anthropic_tool_block_index
+
+    tool_uses = {}
+    assert _anthropic_tool_block_index(False, tool_uses) == 0
+    tool_uses[0] = {"block_index": 0}
+    assert _anthropic_tool_block_index(False, tool_uses) == 1
+    assert _anthropic_tool_block_index(True, tool_uses) == 2
+
+
 # -- _friendly_error_msg --
 
 def test_friendly_error_msg_content_moderation():
@@ -788,6 +798,27 @@ def test_reasoning_injection_does_not_add_empty_fields_by_default():
 
     assert _inject_reasoning_content(messages, conv_key, "test") == 0
     assert "reasoning_content" not in messages[1]
+
+
+def test_reasoning_cache_survives_image_preprocess_flow():
+    messages = [
+        {"role": "user", "content": "start"},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "tool", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+        {"role": "assistant", "content": "done"},
+        {"role": "user", "content": [
+            {"type": "text", "text": "Describe:"},
+            {"type": "image_url", "image_url": {"url": "https://example.com/image.png"}},
+        ]},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "call_2", "type": "function", "function": {"name": "tool2", "arguments": "{}"}}]},
+    ]
+    conv_key = _conversation_cache_key("key4", messages)
+    _reasoning_cache.drop(conv_key)
+    _reasoning_tool_cache.drop(conv_key)
+    _remember_reasoning_content(conv_key, "cached reasoning", ["call_2"])
+
+    assert _inject_reasoning_content(messages, conv_key, "test") == 1
+    assert messages[5]["reasoning_content"] == "cached reasoning"
 
 
 def test_anthropic_content_to_openai_filters_empty_text():
