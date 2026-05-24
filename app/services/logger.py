@@ -74,6 +74,14 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(entry, ensure_ascii=False, default=str)
 
 
+class SafeFileHandler(logging.FileHandler):
+    """FileHandler that recreates missing parent directories before opening."""
+
+    def _open(self):
+        Path(self.baseFilename).parent.mkdir(parents=True, exist_ok=True)
+        return super()._open()
+
+
 class LogManager:
     # Map logger name suffix -> log file name
     _CHANNELS = {
@@ -181,7 +189,7 @@ class LogManager:
 
         for channel, filename in self._CHANNELS.items():
             path = day_dir / filename
-            handler = logging.FileHandler(str(path), encoding="utf-8")
+            handler = SafeFileHandler(str(path), encoding="utf-8")
             handler.setFormatter(JsonFormatter())
             handler.setLevel(logging.DEBUG)  # let logger level control filtering
             self._handlers[channel] = handler

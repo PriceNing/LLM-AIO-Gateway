@@ -1,5 +1,6 @@
 import pytest
 from app.config import ConfigManager
+from app.services.logger import LogManager
 
 
 @pytest.fixture
@@ -33,3 +34,27 @@ def test_defaults_filled(tmp_path):
     assert manager.config["host"] == "127.0.0.1"
     assert manager.config["port"] == 8000  # default
     assert "logging" in manager.config
+
+
+def test_logger_recreates_missing_log_dir(tmp_path):
+    log_root = tmp_path / "logs"
+    mgr = LogManager()
+    mgr.configure({
+        "enabled": True,
+        "level": "INFO",
+        "log_dir": str(log_root),
+        "retention_days": 30,
+        "console": False,
+    })
+    day_dir = log_root / __import__("datetime").datetime.utcnow().strftime("%Y-%m-%d")
+    assert day_dir.exists()
+    for item in day_dir.iterdir():
+        item.unlink()
+    day_dir.rmdir()
+    log_root.rmdir()
+
+    logger = mgr.get_logger("app")
+    logger.info("hello")
+
+    assert day_dir.exists()
+    assert (day_dir / "app.log").exists()

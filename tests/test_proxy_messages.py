@@ -890,6 +890,20 @@ def test_conversation_cache_key_uses_followup_user_messages():
     assert _conversation_cache_key("api", followup_a) != _conversation_cache_key("api", followup_b)
 
 
+def test_anthropic_tool_block_index_assigns_unique_indexes():
+    from app.router.proxy import _anthropic_tool_block_index
+
+    tool_uses = {}
+    first = _anthropic_tool_block_index(False, tool_uses)
+    tool_uses[0] = {"block_index": first}
+    second = _anthropic_tool_block_index(False, tool_uses)
+    tool_uses[1] = {"block_index": second}
+
+    assert first == 0
+    assert second == 1
+    assert _anthropic_tool_block_index(True, tool_uses) == 2
+
+
 def test_anthropic_content_to_openai_filters_empty_text():
     """Test behavior."""
     result = _anthropic_content_to_openai([

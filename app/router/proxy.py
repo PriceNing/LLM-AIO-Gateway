@@ -193,7 +193,7 @@ async def _maybe_preprocess(messages: list, model: str, provider_id: str = "", r
                 "SELECT preprocessor FROM provider_models WHERE model_id = ? AND enabled = 1 ORDER BY provider_id LIMIT 1",
                 (mid.model_name,)
             ).fetchone()
-    _app_log.info("[preprocess] DB lookup model='%s' -> row=%s", check_model, dict(row) if row else None)
+    _app_log.debug("[preprocess] DB lookup model='%s' -> row=%s", check_model, dict(row) if row else None)
     if not row or not row["preprocessor"]:
         if has_img:
             _app_log.warning("[preprocess] images detected for model=%s but preprocessor not enabled", check_model)
@@ -622,7 +622,7 @@ def _inject_reasoning_content(messages: list, conv_key: str, label: str, allow_e
 
     if injected or cached_rc is not None:
         rc_len = len(cached_rc) if cached_rc is not None else 0
-        _app_log.info(
+        _app_log.debug(
             "[%s] INJECTED rc total=%d exact=%d fallback=%d empty=%d candidates=%d len=%d conv_key=%s",
             label, injected, exact, fallback, empty, len(candidate_indexes), rc_len, conv_key[:60]
         )
@@ -874,7 +874,7 @@ async def _stream_chat(model, messages, provider_id, temperature, max_tokens, us
                         delta["role"] = role
                     tool_calls = getattr(message, "tool_calls", None)
                     if tool_calls:
-                        _tool_log.info("[_stream_chat] raw tool_calls count=%d model=%s", len(tool_calls), model)
+                        _tool_log.debug("[_stream_chat] raw tool_calls count=%d model=%s", len(tool_calls), model)
                         serialized = []
                         for tc in tool_calls:
                             _tool_log.debug("[_stream_chat] raw tc type=%s repr=%s", type(tc).__name__, repr(tc))
@@ -892,7 +892,7 @@ async def _stream_chat(model, messages, provider_id, temperature, max_tokens, us
                                         "arguments": getattr(tc.function, "arguments", "") if hasattr(tc, "function") and tc.function else ""
                                     }
                                 }
-                            _tool_log.info("[_stream_chat] after dict convert: %s", json.dumps(tc_dict, ensure_ascii=False, default=str))
+                            _tool_log.debug("[_stream_chat] after dict convert: %s", json.dumps(tc_dict, ensure_ascii=False, default=str))
                             # Coerce id to str (MiniMax returns bare integers)
                             if tc_dict.get("id") is not None and not isinstance(tc_dict["id"], str):
                                 tc_dict["id"] = str(tc_dict["id"])
@@ -902,20 +902,20 @@ async def _stream_chat(model, messages, provider_id, temperature, max_tokens, us
                             # Only filter when index<0.  id=None with non-empty arguments
                             # is a valid arguments delta chunk - must NOT be filtered.
                             if tc_idx < 0:
-                                _tool_log.info("[_stream_chat] FILTERED spurious: id=%s idx=%s", tc_dict.get("id"), tc_idx)
+                                _tool_log.debug("[_stream_chat] FILTERED spurious: id=%s idx=%s", tc_dict.get("id"), tc_idx)
                                 continue
                             # Fix malformed tool-call arguments - MiniMax may emit
                             # invalid JSON with bare `undefined` values (e.g. url:undefined)
                             _fix_tool_args(tc_dict)
-                            _tool_log.info("[_stream_chat] after _fix_tool_args: %s", json.dumps(tc_dict, ensure_ascii=False, default=str))
+                            _tool_log.debug("[_stream_chat] after _fix_tool_args: %s", json.dumps(tc_dict, ensure_ascii=False, default=str))
                             serialized.append(tc_dict)
                         if serialized:
                             has_tool_calls = True
                             delta["tool_calls"] = serialized
                             response_tool_call_ids.extend([str(tc["id"]) for tc in serialized if tc.get("id")])
-                            _tool_log.info("[_stream_chat] SSE delta payload: %s", json.dumps(serialized, ensure_ascii=False, default=str))
+                            _tool_log.debug("[_stream_chat] SSE delta payload: %s", json.dumps(serialized, ensure_ascii=False, default=str))
                         else:
-                            _tool_log.info("[_stream_chat] all tool_calls filtered out, no tool_calls in delta")
+                            _tool_log.debug("[_stream_chat] all tool_calls filtered out, no tool_calls in delta")
 
             sse_data = {
                 "id": chat_id,
@@ -938,9 +938,9 @@ async def _stream_chat(model, messages, provider_id, temperature, max_tokens, us
                 cache_miss = getattr(chunk.usage, "prompt_cache_miss_tokens", 0) or 0
         if accumulated_reasoning:
             _remember_reasoning_content(conv_key, accumulated_reasoning, response_tool_call_ids)
-            _app_log.info("[chat_stream] STORED rc key=%s len=%d cache_hit=%d cache_miss=%d", conv_key[:40], len(accumulated_reasoning), cache_hit, cache_miss)
+            _app_log.debug("[chat_stream] STORED rc key=%s len=%d cache_hit=%d cache_miss=%d", conv_key[:40], len(accumulated_reasoning), cache_hit, cache_miss)
         else:
-            _app_log.info("[chat_stream] no reasoning accumulated (think_stripped=%s)", think_stripped)
+            _app_log.debug("[chat_stream] no reasoning accumulated (think_stripped=%s)", think_stripped)
 
         # Update tool-only counter for circuit breaker
         if has_tool_calls and not has_text_content:
@@ -1076,7 +1076,7 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
     requested_model = model
     route_model, route_provider = _apply_routing_rules(username, api_key_value, model, model)
     if route_model != model:
-        _app_log.info("[chat] ROUTED model=%s -> %s", model, route_model)
+        _app_log.debug("[chat] ROUTED model=%s -> %s", model, route_model)
         model = route_model
     if route_provider:
         provider_id = route_provider
@@ -1144,14 +1144,14 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
         if reasoning_content:
             _remember_reasoning_content(conv_key, reasoning_content, _tool_call_ids_from_message({"tool_calls": tool_calls}))
             usage = usage_dict(response)
-            _app_log.info("[chat_nonstream] STORED rc key=%s len=%d cache_hit=%d cache_miss=%d",
+            _app_log.debug("[chat_nonstream] STORED rc key=%s len=%d cache_hit=%d cache_miss=%d",
                           conv_key[:40], len(reasoning_content),
                           usage.get("prompt_cache_hit_tokens", 0), usage.get("prompt_cache_miss_tokens", 0))
 
         # Update tool-only counter for circuit breaker
         valid_tool_calls = []
         if tool_calls:
-            _tool_log.info("[chat_completions] raw tool_calls count=%d model=%s", len(tool_calls), model)
+            _tool_log.debug("[chat_completions] raw tool_calls count=%d model=%s", len(tool_calls), model)
             for tc in tool_calls:
                 _tool_log.debug("[chat_completions] raw tc type=%s repr=%s", type(tc).__name__, repr(tc))
                 tc_id = getattr(tc, "id", None) if hasattr(tc, "id") else tc.get("id")
@@ -1159,7 +1159,7 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
                 if int(tc_idx) >= 0:
                     valid_tool_calls.append(tc)
                 else:
-                    _tool_log.info("[chat_completions] FILTERED spurious in valid check: id=%s idx=%s", tc_id, tc_idx)
+                    _tool_log.debug("[chat_completions] FILTERED spurious in valid check: id=%s idx=%s", tc_id, tc_idx)
             tool_calls = valid_tool_calls if valid_tool_calls else None
         if tool_calls and not content:
             _tool_only_turns.increment(conv_key)
@@ -1195,20 +1195,20 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
                             "arguments": getattr(tc.function, "arguments", "") if hasattr(tc, "function") and tc.function else ""
                         }
                     }
-                _tool_log.info("[chat_completions] after dict convert: %s", json.dumps(tc_dict, ensure_ascii=False, default=str))
+                _tool_log.debug("[chat_completions] after dict convert: %s", json.dumps(tc_dict, ensure_ascii=False, default=str))
                 if tc_dict.get("id") is not None and not isinstance(tc_dict["id"], str):
                     tc_dict["id"] = str(tc_dict["id"])
                 if int(tc_dict.get("index", 0)) < 0:
-                    _tool_log.info("[chat_completions] FILTERED spurious: id=%s idx=%s", tc_dict.get("id"), tc_dict.get("index", 0))
+                    _tool_log.debug("[chat_completions] FILTERED spurious: id=%s idx=%s", tc_dict.get("id"), tc_dict.get("index", 0))
                     continue
                 _fix_tool_args(tc_dict)
-                _tool_log.info("[chat_completions] after _fix_tool_args: %s", json.dumps(tc_dict, ensure_ascii=False, default=str))
+                _tool_log.debug("[chat_completions] after _fix_tool_args: %s", json.dumps(tc_dict, ensure_ascii=False, default=str))
                 serialized.append(tc_dict)
             if serialized:
                 resp_msg["tool_calls"] = serialized
-                _tool_log.info("[chat_completions] FINAL tool_calls: %s", json.dumps(serialized, ensure_ascii=False, default=str))
+                _tool_log.debug("[chat_completions] FINAL tool_calls: %s", json.dumps(serialized, ensure_ascii=False, default=str))
             else:
-                _tool_log.info("[chat_completions] all tool_calls filtered out")
+                _tool_log.debug("[chat_completions] all tool_calls filtered out")
         return {
             "id": f"chatcmpl-{int(time.time())}",
             "object": "chat.completion",
@@ -1256,7 +1256,7 @@ async def completions(request: Request, authorization: Optional[str] = Header(No
     requested_model = model
     route_model, route_provider = _apply_routing_rules(username, api_key_value, model, model)
     if route_model != model:
-        _app_log.info("[completions] ROUTED model=%s -> %s", model, route_model)
+        _app_log.debug("[completions] ROUTED model=%s -> %s", model, route_model)
         model = route_model
     if route_provider:
         provider_id = route_provider
@@ -1518,7 +1518,7 @@ def _anthropic_to_openai_messages(anthropic_msgs: list, system_prompt: str = "")
             else:
                 result_content = str(result_content)
             openai_msgs.append({"role": "tool", "tool_call_id": tool_use_id, "content": result_content})
-    _app_log.info("[messages] converted %d msgs has_tools=%s",
+    _app_log.debug("[messages] converted %d msgs has_tools=%s",
                  len(openai_msgs),
                  has_tools)
     return openai_msgs, has_tools
@@ -1694,7 +1694,7 @@ async def _stream_anthropic_messages(model, messages, provider_id, temperature,
                         tc_args = getattr(tc_func, "arguments", "") if hasattr(tc_func, "arguments") else tc_func.get("arguments", "")
 
                         if idx not in tool_uses:
-                            tu_block_idx = block_index if not text_content_started else block_index + 1
+                            tu_block_idx = _anthropic_tool_block_index(text_content_started, tool_uses)
                             tu_id = tc_id if tc_id else f"toolu_{idx}"
                             tool_uses[idx] = {"id": tu_id, "name": tc_name, "arguments": tc_args, "started": False, "block_index": tu_block_idx}
                         else:
@@ -1750,7 +1750,7 @@ async def _stream_anthropic_messages(model, messages, provider_id, temperature,
         # Fallback: if thinking consumed all tokens with no text/tool output,
         # render reasoning_content as the visible response (same as _stream_chat fallback).
         if content_total == 0 and not tool_uses and accumulated_reasoning:
-            _app_log.info("[messages_stream] fallback: reasoning_content (%s chars) as response", len(accumulated_reasoning))
+            _app_log.debug("[messages_stream] fallback: reasoning_content (%s chars) as response", len(accumulated_reasoning))
             if not text_content_started:
                 block_index += 1
                 yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
@@ -1783,7 +1783,7 @@ async def _stream_anthropic_messages(model, messages, provider_id, temperature,
                 accumulated_reasoning,
                 [tu.get("id") for tu in tool_uses.values()]
             )
-            _app_log.info("[messages_stream] STORED rc key=%s len=%d cache_hit=%d cache_miss=%d", conv_key[:60], len(accumulated_reasoning), cache_hit, cache_miss)
+            _app_log.debug("[messages_stream] STORED rc key=%s len=%d cache_hit=%d cache_miss=%d", conv_key[:60], len(accumulated_reasoning), cache_hit, cache_miss)
         if username != "legacy":
             increment_user_usage(username, api_key_value, True, total_tokens)
         increment_global_stats(success=True)
@@ -1958,7 +1958,7 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
     stream = body.get("stream", False)
     previous_response_id = body.get("previous_response_id") or ""
     system_prompt = _strip_billing_header(body.get("system", ""))
-    _app_log.info("[ANTHRO_ENTRY] model=%s msgs=%d system=%s tools=%s",
+    _app_log.debug("[ANTHRO_ENTRY] model=%s msgs=%d system=%s tools=%s",
                   model, len(anthropic_msgs),
                   "yes" if system_prompt else "no",
                   "yes" if body.get("tools") else "no")
@@ -1973,7 +1973,7 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
     requested_model = model
     route_model, route_provider = _apply_routing_rules(username, api_key_value, model, model)
     if route_model != model:
-        _app_log.info("[messages] ROUTED model=%s -> %s", model, route_model)
+        _app_log.debug("[messages] ROUTED model=%s -> %s", model, route_model)
         model = route_model
     if route_provider:
         provider_id = route_provider
@@ -2065,7 +2065,7 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
             response = await _anthropic_passthrough(
                 provider_info, messages, body, max_tokens, temperature, model)
         else:
-            _app_log.info("[OPENAI_EXIT] model=%s msgs=%d tools=%s tool_choice=%s conv_key=%s",
+            _app_log.debug("[OPENAI_EXIT] model=%s msgs=%d tools=%s tool_choice=%s conv_key=%s",
                           model, len(messages), "yes" if tools else "no", str(tool_choice), conv_key)
             response = await anyio.to_thread.run_sync(
                 lambda: create_chat_completion(
@@ -2091,7 +2091,7 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
 
         if reasoning_content:
             _remember_reasoning_content(conv_key, reasoning_content, _tool_call_ids_from_message(message))
-            _app_log.info("[messages_nonstream] STORED rc key=%s len=%d cache_hit=%d cache_miss=%d", conv_key[:60], len(reasoning_content), cache_hit, cache_miss)
+            _app_log.debug("[messages_nonstream] STORED rc key=%s len=%d cache_hit=%d cache_miss=%d", conv_key[:60], len(reasoning_content), cache_hit, cache_miss)
         # Convert OpenAI response to Anthropic format
         content_blocks = _openai_to_anthropic_content(message)
         _log_request(username, api_key_value, model, provider_id or "", "messages", True, usage.get("total_tokens", 0), requested_model)
@@ -2263,7 +2263,7 @@ async def _stream_responses(model, messages, provider_id, temperature, max_token
                         # Skip spurious tool-calls from non-standard content blocks (e.g. MiniMax "thinking")
                         # Only filter when index<0.  id=None is normal for arguments-only delta chunks.
                         if int(idx) < 0:
-                            _tool_log.info("[_stream_responses] FILTERED spurious: id=%s idx=%s", tc_id, idx)
+                            _tool_log.debug("[_stream_responses] FILTERED spurious: id=%s idx=%s", tc_id, idx)
                             continue
                         tc_func = getattr(tc, "function", None) if hasattr(tc, "function") else tc.get("function", {})
 
@@ -2281,20 +2281,20 @@ async def _stream_responses(model, messages, provider_id, temperature, max_token
                                 "item_added": False,
                                 "output_index": tc_output_index
                             }
-                            _tool_log.info("[_stream_responses] NEW tool_call idx=%d name=%s id=%s", idx, fn_name, tc_id)
+                            _tool_log.debug("[_stream_responses] NEW tool_call idx=%d name=%s id=%s", idx, fn_name, tc_id)
 
                         state = tool_calls_state[idx]
                         args_chunk = getattr(tc_func, "arguments", "") if hasattr(tc_func, "arguments") else tc_func.get("arguments", "")
                         if args_chunk:
-                            _tool_log.info("[_stream_responses] args_chunk RAW: %s", args_chunk)
+                            _tool_log.debug("[_stream_responses] args_chunk RAW: %s", args_chunk)
                             state["arguments_buffer"] += args_chunk
                             # Fix malformed JSON (e.g. MiniMax sends url:undefined) - both in buffer and in the chunk being sent
                             if "undefined" in args_chunk:
                                 args_chunk = _sanitize_args(args_chunk)
-                                _tool_log.info("[_stream_responses] args_chunk SANITIZED -> %s", args_chunk)
+                                _tool_log.debug("[_stream_responses] args_chunk SANITIZED -> %s", args_chunk)
                             if "undefined" in state["arguments_buffer"]:
                                 state["arguments_buffer"] = _sanitize_args(state["arguments_buffer"])
-                                _tool_log.info("[_stream_responses] buffer SANITIZED -> %s", state["arguments_buffer"])
+                                _tool_log.debug("[_stream_responses] buffer SANITIZED -> %s", state["arguments_buffer"])
                             if not state["item_added"]:
                                 yield f"data: {json.dumps({'type': 'response.output_item.added', 'output_index': state['output_index'], 'item': {'type': 'function_call', 'id': state['id'], 'call_id': state['call_id'], 'name': state['name'], 'arguments': '', 'status': 'in_progress'}})}\n\n"
                                 state["item_added"] = True
@@ -2339,7 +2339,7 @@ async def _stream_responses(model, messages, provider_id, temperature, max_token
                 accumulated_reasoning,
                 [state.get("id") for state in tool_calls_state.values()]
             )
-            _app_log.info("[responses_stream] STORED rc key=%s len=%d cache_hit=%d cache_miss=%d", conv_key, len(accumulated_reasoning), cache_hit, cache_miss)
+            _app_log.debug("[responses_stream] STORED rc key=%s len=%d cache_hit=%d cache_miss=%d", conv_key, len(accumulated_reasoning), cache_hit, cache_miss)
 
         # Update tool-only counter for circuit breaker
         has_text = len(accumulated_text.strip()) > 0
@@ -2823,9 +2823,9 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
         for item in body["input"]:
             t = item.get("type", "unknown") if isinstance(item, dict) else "non-dict"
             item_types[t] = item_types.get(t, 0) + 1
-        _app_log.info("[responses] model=%s stream=%s tools=%d input_len=%d instructions_len=%d input_types=%s", model, stream, tools_count, input_len, instructions_len, str(item_types))
+        _app_log.debug("[responses] model=%s stream=%s tools=%d input_len=%d instructions_len=%d input_types=%s", model, stream, tools_count, input_len, instructions_len, str(item_types))
     else:
-        _app_log.info("[responses] model=%s stream=%s tools=%d input_len=%d instructions_len=%d", model, stream, tools_count, input_len, instructions_len)
+        _app_log.debug("[responses] model=%s stream=%s tools=%d input_len=%d instructions_len=%d", model, stream, tools_count, input_len, instructions_len)
 
     # Check permission on requested model BEFORE routing
     requested_model = model
@@ -2835,7 +2835,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
     api_key_value = api_key.get("key", "")
     route_model, route_provider = _apply_routing_rules(username, api_key_value, requested_model, model)
     if route_model != model:
-        _app_log.info("[responses] ROUTED model=%s -> %s", model, route_model)
+        _app_log.debug("[responses] ROUTED model=%s -> %s", model, route_model)
         model = route_model
     if route_provider:
         provider_id = route_provider
@@ -2850,7 +2850,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
             messages = [{"role": "user", "content": input_data}]
     elif isinstance(input_data, list):
         messages = _convert_responses_input(input_data)
-        _app_log.info(
+        _app_log.debug(
             "[responses CONVERT] input_items=%d messages=%d roles=%s tool_msgs=%d rc_msgs=%d",
             len(input_data),
             len(messages),
@@ -2868,7 +2868,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
     # reject consecutive same-role messages as "invalid chat setting (2013)".
     _pre_norm = len(messages)
     messages = _normalize_messages(messages)
-    _app_log.info("[responses NORM] messages %d -> %d roles=%s", _pre_norm, len(messages), [m['role'] for m in messages])
+    _app_log.debug("[responses NORM] messages %d -> %d roles=%s", _pre_norm, len(messages), [m['role'] for m in messages])
 
     # Compute conversation cache key BEFORE preprocessing (see chat_completions for rationale)
     conv_key = _conversation_cache_key(api_key_value, messages, previous_response_id)
@@ -2879,7 +2879,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
 
     if isinstance(input_data, list):
         injected = _inject_reasoning_content(messages, conv_key, "responses")
-        _app_log.info(
+        _app_log.debug(
             "[responses REASONING] injected=%d messages=%d tool_msgs=%d rc_msgs=%d conv_key=%s",
             injected,
             len(messages),
@@ -3000,7 +3000,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
             _remember_reasoning_content(conv_key, reasoning_content, _tool_call_ids_from_message({
                 "tool_calls": tool_calls
             }))
-            _app_log.info("[responses_nonstream] STORED rc key=%s len=%d cache_hit=%d cache_miss=%d",
+            _app_log.debug("[responses_nonstream] STORED rc key=%s len=%d cache_hit=%d cache_miss=%d",
                           conv_key, len(reasoning_content),
                           usage.get("prompt_cache_hit_tokens", 0), usage.get("prompt_cache_miss_tokens", 0))
 
@@ -3024,7 +3024,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                 msg_out["reasoning_content"] = reasoning_content
             output.append(msg_out)
         if tool_calls:
-            _tool_log.info("[responses_endpoint] raw tool_calls count=%d model=%s", len(tool_calls), model)
+            _tool_log.debug("[responses_endpoint] raw tool_calls count=%d model=%s", len(tool_calls), model)
             for tc in tool_calls:
                 _tool_log.debug("[responses_endpoint] raw tc type=%s repr=%s", type(tc).__name__, repr(tc))
                 tc_id = getattr(tc, "id", "") if hasattr(tc, "id") else tc.get("id", "")
@@ -3032,15 +3032,15 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                     tc_id = str(tc_id)
                 tc_idx = getattr(tc, "index", 0) if hasattr(tc, "index") else tc.get("index", 0)
                 if int(tc_idx) < 0:
-                    _tool_log.info("[responses_endpoint] FILTERED spurious: id=%s idx=%s", tc_id, tc_idx)
+                    _tool_log.debug("[responses_endpoint] FILTERED spurious: id=%s idx=%s", tc_id, tc_idx)
                     continue
                 tc_func = getattr(tc, "function", None) if hasattr(tc, "function") else tc.get("function", {})
                 fn_name = getattr(tc_func, "name", "") if hasattr(tc_func, "name") else tc_func.get("name", "")
                 fn_args = getattr(tc_func, "arguments", "") if hasattr(tc_func, "arguments") else tc_func.get("arguments", "")
-                _tool_log.info("[responses_endpoint] fn_name=%s args_raw=%s", fn_name, fn_args)
+                _tool_log.debug("[responses_endpoint] fn_name=%s args_raw=%s", fn_name, fn_args)
                 if fn_args and "undefined" in fn_args:
                     fn_args = _sanitize_args(fn_args)
-                    _tool_log.info("[responses_endpoint] args SANITIZED -> %s", fn_args)
+                    _tool_log.debug("[responses_endpoint] args SANITIZED -> %s", fn_args)
                 output.append({
                     "type": "function_call",
                     "id": tc_id or f"fc_{int(time.time())}",
