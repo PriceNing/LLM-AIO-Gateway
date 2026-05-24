@@ -299,6 +299,79 @@ async def test_anthropic_passthrough_model_extraction():
         assert sent_body["model"] == "deepseek-v4-pro"  #  deepseek/deepseek-v4-pro
 
 
+@pytest.mark.asyncio
+async def test_responses_anthropic_stream_uses_passthrough(monkeypatch):
+    from app.router import proxy
+    import types
+    import sys
+
+    provider = {
+        "id": "pixel-api",
+        "provider_type": "anthropic",
+        "api_base": "https://ai-pixel.online",
+        "api_key": "sk-test",
+        "extra_headers": {},
+    }
+
+    class FakeStream:
+        status_code = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def aiter_lines(self):
+            yield "event: message_start"
+            yield "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3}}}"
+            yield "event: content_block_start"
+            yield "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}"
+            yield "event: content_block_delta"
+            yield "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}"
+            yield "event: message_delta"
+            yield "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":2}}"
+            yield "event: message_stop"
+            yield "data: {\"type\":\"message_stop\"}"
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def stream(self, *args, **kwargs):
+            self.called = {"args": args, "kwargs": kwargs}
+            return FakeStream()
+
+    fake_httpx = types.SimpleNamespace(AsyncClient=FakeClient)
+    monkeypatch.setitem(sys.modules, "httpx", fake_httpx)
+
+    chunks = []
+    async for line in proxy._stream_responses_anthropic_passthrough(
+        provider,
+        [{"role": "user", "content": "Hi"}],
+        {"system": "", "tools": []},
+        16,
+        0.7,
+        "alice",
+        "user-key",
+        "gpt-5.5",
+        "gpt-5.5",
+        conv_key="conv-1",
+    ):
+        chunks.append(line)
+
+    joined = "".join(chunks)
+    assert "response.created" in joined
+    assert "response.completed" in joined
+    assert "hello" in joined
+
+
 def test_openai_messages_to_anthropic_does_not_duplicate_system_prompt():
     messages = [
         {"role": "system", "content": "You are helpful."},

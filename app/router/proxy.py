@@ -1868,6 +1868,296 @@ async def _anthropic_passthrough(provider_info: dict, messages: list,
         })()
 
 
+async def _stream_responses_anthropic_passthrough(provider_info: dict, messages: list,
+                                                   body: dict, max_tokens: int,
+                                                   temperature, username: str,
+                                                   api_key_value: str, model: str,
+                                                   requested_model: str, conv_key: str = ""):
+    """Stream Responses API SSE by calling an Anthropic-compatible upstream directly."""
+    import httpx
+
+    api_base = (provider_info.get("api_base") or "").rstrip("/")
+    api_key = provider_info.get("api_key") or "sk-no-auth"
+    mid = parse_model_id(model)
+    upstream_model = mid.model_name
+    provider_id = provider_info.get("id", "")
+
+    if not conv_key:
+        conv_key = _conversation_cache_key(api_key_value, messages)
+
+    resp_id = f"resp_{uuid.uuid4().hex}"
+    msg_id = f"msg_{uuid.uuid4().hex}"
+    created_at = int(time.time())
+
+    total_tokens = 0
+    input_tokens = 0
+    output_tokens = 0
+    cache_hit = 0
+    cache_miss = 0
+    error_msg = None
+    accumulated_text = ""
+    accumulated_reasoning = ""
+    text_buffer = ""
+    text_item_added = False
+    text_content_added = False
+    text_output_index = 0
+    output_index_counter = 0
+    tool_calls_state = {}
+    block_states = {}
+
+    response_base = {
+        "id": resp_id,
+        "object": "response",
+        "created_at": created_at,
+        "status": "in_progress",
+        "model": model,
+        "output": [],
+        "previous_response_id": body.get("previous_response_id") or None,
+        "metadata": {},
+        "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+    }
+
+    yield f"data: {json.dumps({'type': 'response.created', 'response': response_base})}\n\n"
+    yield f"data: {json.dumps({'type': 'response.in_progress', 'response': response_base})}\n\n"
+
+    req_body = {"model": upstream_model, "messages": messages, "max_tokens": max_tokens, "stream": True}
+    if temperature is not None:
+        req_body["temperature"] = temperature
+    system = _strip_billing_header(body.get("system"))
+    if system:
+        req_body["system"] = system
+    tools = body.get("tools")
+    if tools:
+        req_body["tools"] = [
+            {"name": t["name"], "description": t.get("description", ""),
+             "input_schema": t.get("input_schema", {"type": "object", "properties": {}})}
+            for t in tools if isinstance(t, dict) and t.get("name")
+        ]
+    extra_headers = provider_info.get("extra_headers", {}) or {}
+    thinking = extra_headers.get("thinking")
+    if thinking in ("enabled", "disabled"):
+        req_body["thinking"] = {"type": thinking}
+
+    try:
+        async with httpx.AsyncClient(timeout=300) as client:
+            async with client.stream(
+                "POST",
+                f"{api_base}/v1/messages",
+                headers={
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                    "Content-Type": "application/json",
+                },
+                json=req_body,
+            ) as resp:
+                if resp.status_code != 200:
+                    try:
+                        err_body = await resp.aread()
+                        err_data = json.loads(err_body)
+                        err_msg = err_data.get("error", {}).get("message", str(err_body)[:300])
+                    except Exception:
+                        err_msg = f"HTTP {resp.status_code}"
+                    error_msg = f"Upstream {resp.status_code}: {err_msg}"
+                else:
+                    current_event = None
+                    async for line in resp.aiter_lines():
+                        if not line:
+                            continue
+                        if line.startswith("event: "):
+                            current_event = line[7:].strip()
+                            continue
+                        if not line.startswith("data: "):
+                            continue
+                        raw = line[6:]
+                        if raw == "[DONE]":
+                            break
+                        try:
+                            data = json.loads(raw)
+                        except Exception:
+                            continue
+
+                        event_type = current_event or data.get("type")
+                        current_event = None
+
+                        if event_type == "message_start":
+                            usage = data.get("message", {}).get("usage", {}) or {}
+                            input_tokens = usage.get("input_tokens", input_tokens) or 0
+                            total_tokens = input_tokens + output_tokens
+                        elif event_type == "content_block_start":
+                            block_index = data.get("index", 0)
+                            block = data.get("content_block", {}) or {}
+                            block_type = block.get("type", "")
+                            block_states[block_index] = {
+                                "type": block_type,
+                                "id": block.get("id", ""),
+                                "name": block.get("name", ""),
+                                "arguments_buffer": "",
+                                "item_added": False,
+                                "output_index": None,
+                            }
+
+                            if block_type == "text":
+                                if not text_item_added:
+                                    yield f"data: {json.dumps({'type': 'response.output_item.added', 'output_index': output_index_counter, 'item': {'type': 'message', 'id': msg_id, 'status': 'in_progress', 'role': 'assistant', 'content': []}})}\n\n"
+                                    text_item_added = True
+                                    text_output_index = output_index_counter
+                                    output_index_counter += 1
+                                if not text_content_added:
+                                    yield f"data: {json.dumps({'type': 'response.content_part.added', 'output_index': text_output_index, 'content_index': 0, 'part': {'type': 'output_text', 'text': '', 'annotations': []}})}\n\n"
+                                    text_content_added = True
+                            elif block_type == "tool_use":
+                                tu_id = block.get("id", "") or f"toolu_{block_index}"
+                                call_id = tu_id if isinstance(tu_id, str) and tu_id.startswith("call_") else f"call_{tu_id}"
+                                block_states[block_index].update({
+                                    "id": tu_id,
+                                    "call_id": call_id,
+                                    "name": block.get("name", ""),
+                                    "output_index": output_index_counter,
+                                    "item_added": True,
+                                })
+                                tool_calls_state[block_index] = block_states[block_index]
+                                yield f"data: {json.dumps({'type': 'response.output_item.added', 'output_index': output_index_counter, 'item': {'type': 'function_call', 'id': tu_id, 'call_id': call_id, 'name': block.get('name', ''), 'arguments': '', 'status': 'in_progress'}})}\n\n"
+                                output_index_counter += 1
+                            elif block_type in ("thinking", "redacted_thinking"):
+                                pass
+
+                        elif event_type == "content_block_delta":
+                            block_index = data.get("index", 0)
+                            delta = data.get("delta", {}) or {}
+                            delta_type = delta.get("type", "")
+                            state = block_states.get(block_index)
+
+                            if delta_type == "text_delta":
+                                text = delta.get("text", "")
+                                if text:
+                                    accumulated_text += text
+                                    text_buffer += text
+                                    if len(text_buffer) >= 16 and text_content_added:
+                                        yield f"data: {json.dumps({'type': 'response.output_text.delta', 'output_index': text_output_index, 'content_index': 0, 'delta': text_buffer})}\n\n"
+                                        text_buffer = ""
+                            elif delta_type == "input_json_delta":
+                                partial_json = delta.get("partial_json", "")
+                                if state and state.get("item_added"):
+                                    state["arguments_buffer"] += partial_json
+                                    yield f"data: {json.dumps({'type': 'response.function_call_arguments.delta', 'output_index': state['output_index'], 'call_id': state['call_id'], 'delta': partial_json})}\n\n"
+                            elif delta_type in ("thinking_delta", "redacted_thinking_delta"):
+                                thinking_text = delta.get("thinking", "") or delta.get("text", "")
+                                if thinking_text:
+                                    accumulated_reasoning += thinking_text
+
+                        elif event_type == "message_delta":
+                            usage = data.get("usage", {}) or {}
+                            output_tokens = usage.get("output_tokens", output_tokens) or output_tokens
+                            total_tokens = input_tokens + output_tokens
+
+                    # finished stream normally
+    except Exception as e:
+        import traceback
+        error_msg = _friendly_error_msg(e)
+        _error_log.error("[responses_stream_anthropic] %s", traceback.format_exc())
+        _error_log.error("[responses_stream_anthropic] %s", error_msg)
+
+    if text_buffer:
+        yield f"data: {json.dumps({'type': 'response.output_text.delta', 'output_index': text_output_index, 'content_index': 0, 'delta': text_buffer})}\n\n"
+        text_buffer = ""
+
+    completion_output = []
+    if text_item_added:
+        if text_content_added:
+            yield f"data: {json.dumps({'type': 'response.output_text.done', 'output_index': text_output_index, 'content_index': 0, 'text': accumulated_text})}\n\n"
+            yield f"data: {json.dumps({'type': 'response.content_part.done', 'output_index': text_output_index, 'content_index': 0, 'part': {'type': 'output_text', 'text': accumulated_text, 'annotations': []}})}\n\n"
+        msg_out = {
+            "type": "message",
+            "id": msg_id,
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": accumulated_text, "annotations": []}],
+        }
+        if accumulated_reasoning:
+            msg_out["reasoning_content"] = accumulated_reasoning
+        yield f"data: {json.dumps({'type': 'response.output_item.done', 'output_index': text_output_index, 'item': msg_out})}\n\n"
+        completion_output.append(msg_out)
+    elif accumulated_reasoning:
+        completion_output.append({
+            "type": "message",
+            "id": msg_id,
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": accumulated_reasoning, "annotations": []}],
+        })
+    elif accumulated_text:
+        flushed = accumulated_text.replace("<think>", "", 1) if "<think>" in accumulated_text else accumulated_text
+        if flushed.strip():
+            completion_output.append({
+                "type": "message",
+                "id": msg_id,
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": flushed, "annotations": []}],
+            })
+
+    for idx in sorted(tool_calls_state.keys()):
+        state = tool_calls_state[idx]
+        if state["item_added"]:
+            yield f"data: {json.dumps({'type': 'response.function_call_arguments.done', 'output_index': state['output_index'], 'call_id': state['call_id'], 'arguments': state['arguments_buffer']})}\n\n"
+            yield f"data: {json.dumps({'type': 'response.output_item.done', 'output_index': state['output_index'], 'item': {'type': 'function_call', 'id': state['id'], 'call_id': state['call_id'], 'name': state['name'], 'arguments': state['arguments_buffer'], 'status': 'completed'}})}\n\n"
+            completion_output.append({
+                "type": "function_call",
+                "id": state["id"],
+                "call_id": state["call_id"],
+                "name": state["name"],
+                "arguments": state["arguments_buffer"],
+                "status": "completed",
+            })
+
+    if accumulated_reasoning:
+        _remember_reasoning_content(
+            conv_key,
+            accumulated_reasoning,
+            [state.get("id") for state in tool_calls_state.values()],
+        )
+
+    has_text = len(accumulated_text.strip()) > 0
+    has_tools = len(tool_calls_state) > 0
+    if has_tools and not has_text:
+        _tool_only_turns.increment(conv_key)
+    else:
+        _tool_only_turns.reset(conv_key)
+
+    if error_msg:
+        _log_request(username, api_key_value, "-", provider_id, "responses", False, 0, requested_model)
+        increment_global_stats(success=False)
+        if username != "legacy":
+            increment_user_usage(username, api_key_value, False, 0)
+        yield f"data: {json.dumps({'type': 'error', 'error': {'message': error_msg, 'type': 'server_error'}})}\n\n"
+        response_completed = {
+            "type": "response.completed",
+            "response": {
+                "id": resp_id,
+                "object": "response",
+                "created_at": created_at,
+                "status": "failed",
+                "model": model,
+                "output": completion_output,
+                "previous_response_id": body.get("previous_response_id") or None,
+                "metadata": {},
+                "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens, "total_tokens": total_tokens},
+                "status_details": {"error": {"type": "server_error", "message": error_msg}},
+            },
+        }
+        yield f"data: {json.dumps(response_completed)}\n\n"
+        yield "data: [DONE]\n\n"
+        return
+
+    _log_request(username, api_key_value, model, provider_id, "responses", True, total_tokens, requested_model)
+    if username != "legacy":
+        increment_user_usage(username, api_key_value, True, total_tokens)
+    increment_global_stats(success=True)
+
+    yield f"data: {json.dumps({'type': 'response.completed', 'response': {'id': resp_id, 'object': 'response', 'created_at': created_at, 'status': 'completed', 'model': model, 'output': completion_output, 'previous_response_id': body.get('previous_response_id') or None, 'metadata': {}, 'usage': {'input_tokens': input_tokens, 'output_tokens': output_tokens, 'total_tokens': total_tokens}}})}\n\n"
+    yield "data: [DONE]\n\n"
+
+
 async def _stream_anthropic_passthrough(provider_info, messages, body, max_tokens, temperature,
                                          username, api_key_value, model, requested_model):
     """Stream SSE events directly from an Anthropic-compatible upstream."""
@@ -2927,23 +3217,19 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                     if isinstance(t, dict) and t.get("function", {}).get("name")
                 ]
 
-            # Streaming: liteLLM Anthropic path emits OpenAI-format chunks,
-            # _stream_responses can handle them. Passthrough emits Anthropic SSE, not
-            # Responses SSE, which Codex cannot parse.
             if stream:
                 return StreamingResponse(
-                    _stream_responses(
-                        model=model,
-                        messages=messages,
-                        provider_id=provider_id,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                        username=username,
-                        api_key_value=api_key_value,
-                        instructions=instructions,
-                        requested_model=requested_model,
+                    _stream_responses_anthropic_passthrough(
+                        provider_info,
+                        anthropic_msgs,
+                        anthropic_body,
+                        max_tokens,
+                        temperature,
+                        username,
+                        api_key_value,
+                        model,
+                        requested_model,
                         conv_key=conv_key,
-                        **extra
                     ),
                     media_type="text/event-stream"
                 )
