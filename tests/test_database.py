@@ -267,3 +267,15 @@ def test_ttldict_get_default():
     from app.router.proxy import TTLDict
     d = TTLDict(ttl_seconds=3600, max_size=10)
     assert d.get("missing", "default") == "default"
+
+
+def test_zero_pad_timeline_month_does_not_overflow():
+    from app.database import _zero_pad_timeline
+    rows = [{"bucket": "2026-01", "total": 1, "failed": 0, "tokens": 5}]
+    model_rows = [{"bucket": "2026-01", "model": "m1", "total": 1, "failed": 0, "tokens": 5}]
+    padded_rows, labels, padded_model_rows = _zero_pad_timeline(
+        rows, "2026-01-31 00:00:00", "2026-03-31 23:59:59", "month", model_rows
+    )
+    assert labels == ["2026-01", "2026-02", "2026-03"]
+    assert len(padded_rows) == 3
+    assert len(padded_model_rows) == 1

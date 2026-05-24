@@ -12,6 +12,7 @@ from app.router.proxy import (
     _fix_tool_args, _convert_responses_input, _convert_responses_tools,
     _mask_key, _apply_routing_rules,
     TTLDict, ensure_model_allowed, allowed_models_for,
+    _openai_messages_to_anthropic, _remember_response_chain_key, _response_chain_cache,
 )
 
 client = TestClient(app)
@@ -296,3 +297,20 @@ async def test_anthropic_passthrough_model_extraction():
         )
         sent_body = mock_fn.call_args[1]["json"]
         assert sent_body["model"] == "deepseek-v4-pro"  #  deepseek/deepseek-v4-pro
+
+
+def test_openai_messages_to_anthropic_does_not_duplicate_system_prompt():
+    messages = [
+        {"role": "system", "content": "You are helpful."},
+        {"role": "user", "content": "Hi"},
+    ]
+    anthropic_msgs, system_text = _openai_messages_to_anthropic(messages)
+    assert len(anthropic_msgs) == 1
+    assert anthropic_msgs[0]["role"] == "user"
+    assert system_text == "You are helpful."
+
+
+def test_remember_response_chain_key_uses_final_conv_key():
+    _response_chain_cache.drop("resp-test")
+    _remember_response_chain_key("resp-test", "conv-123")
+    assert _response_chain_cache.get("resp-test") == "conv-123"

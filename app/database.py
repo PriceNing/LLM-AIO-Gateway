@@ -468,11 +468,11 @@ def _zero_pad_timeline(rows, from_ts, to_ts, granularity, model_bucket_rows):
         b = cur.strftime(step_fmt)
         all_buckets.append(b)
         if granularity == "month":
-            # Advance to first day of next month
+            # Advance to the first day of the next month; avoid day overflow
             if cur.month == 12:
-                cur = cur.replace(year=cur.year + 1, month=1)
+                cur = cur.replace(year=cur.year + 1, month=1, day=1)
             else:
-                cur = cur.replace(month=cur.month + 1)
+                cur = cur.replace(month=cur.month + 1, day=1)
         else:
             cur += delta
 

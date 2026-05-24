@@ -2125,10 +2125,10 @@ async def _stream_responses(model, messages, provider_id, temperature, max_token
     resp_id = f"resp_{uuid.uuid4().hex}"
     msg_id = f"msg_{uuid.uuid4().hex}"
     created_at = int(time.time())
-    _remember_response_chain_key(resp_id, conv_key)
 
     if not conv_key:
         conv_key = _conversation_cache_key(api_key_value, messages)
+    _remember_response_chain_key(resp_id, conv_key)
 
     total_tokens = 0
     input_tokens = 0
@@ -2914,7 +2914,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
 
         if is_anthropic:
             # Convert Chat Completions messages to native Anthropic format
-            anthropic_msgs, system_text = _openai_messages_to_anthropic(messages, instructions or "")
+            anthropic_msgs, system_text = _openai_messages_to_anthropic(messages)
             # Build Anthropic request body
             anthropic_body = {"system": system_text} if system_text else {}
             anthropic_tools = extra.get("tools")
