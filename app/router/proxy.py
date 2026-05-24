@@ -2507,6 +2507,8 @@ def _convert_responses_input(input_list: list) -> list:
     Handles: message, function_call, function_call_output, reasoning.
     """
     messages = []
+    last_tool_assistant_idx = None
+    tool_call_assistant_idx = {}
 
     def _convert_content(content_parts):
         """Convert Responses API content parts to Chat Completions content format.
@@ -2583,7 +2585,30 @@ def _convert_responses_input(input_list: list) -> list:
                 if isinstance(fc_item, dict) and fc_item.get("reasoning_content"):
                     msg["reasoning_content"] = fc_item["reasoning_content"]
                     break
-            messages.append(msg)
+            if messages and messages[-1].get("role") == "assistant" and not messages[-1].get("tool_calls"):
+                prev = messages[-1]
+                prev_text = _message_text(prev.get("content")).strip()
+                if prev_text:
+                    if prev.get("reasoning_content"):
+                        prev["reasoning_content"] = f"{prev['reasoning_content']}\n{prev_text}"
+                    else:
+                        prev["reasoning_content"] = prev_text
+                prev["content"] = None
+                prev["tool_calls"] = tool_calls
+                if msg.get("reasoning_content") and not prev.get("reasoning_content"):
+                    prev["reasoning_content"] = msg["reasoning_content"]
+                last_tool_assistant_idx = len(messages) - 1
+                for tc in tool_calls:
+                    tc_id = tc.get("id")
+                    if tc_id:
+                        tool_call_assistant_idx[str(tc_id)] = last_tool_assistant_idx
+            else:
+                messages.append(msg)
+                last_tool_assistant_idx = len(messages) - 1
+                for tc in tool_calls:
+                    tc_id = tc.get("id")
+                    if tc_id:
+                        tool_call_assistant_idx[str(tc_id)] = last_tool_assistant_idx
 
         elif item_type == "function_call_output":
             fc_output = item
@@ -2603,6 +2628,12 @@ def _convert_responses_input(input_list: list) -> list:
             # Convert content parts (input_image -> image_url) so preprocessing can
             # detect and describe images embedded in tool call outputs.
             converted_output = _convert_content(output)
+            fc_reasoning = fc_output.get("reasoning_content")
+            assistant_idx = tool_call_assistant_idx.get(str(fc_output.get("call_id", "")), last_tool_assistant_idx)
+            if fc_reasoning and assistant_idx is not None:
+                assistant_msg = messages[assistant_idx]
+                if assistant_msg.get("role") == "assistant" and assistant_msg.get("tool_calls") and not assistant_msg.get("reasoning_content"):
+                    assistant_msg["reasoning_content"] = fc_reasoning
             messages.append({
                 "role": "tool",
                 "tool_call_id": fc_output.get("call_id", ""),
@@ -2611,7 +2642,25 @@ def _convert_responses_input(input_list: list) -> list:
             i += 1
 
         elif item_type == "reasoning":
-            # Skip reasoning items - they are summaries, not full conversation context
+            # Preserve reasoning summaries when they can be associated with the
+            # current assistant turn. Some Responses clients emit a standalone
+            # reasoning item between tool call items, and dropping it can break
+            # multi-turn thinking continuity.
+            rc = item.get("reasoning_content") or item.get("summary") or item.get("text") or item.get("content")
+            if isinstance(rc, list):
+                parts = []
+                for part in rc:
+                    if isinstance(part, dict):
+                        parts.append(part.get("text", "") or part.get("reasoning", ""))
+                    elif isinstance(part, str):
+                        parts.append(part)
+                rc = "\n".join(p for p in parts if p)
+            elif isinstance(rc, dict):
+                rc = rc.get("text") or rc.get("reasoning") or rc.get("summary") or ""
+            if rc and last_tool_assistant_idx is not None:
+                assistant_msg = messages[last_tool_assistant_idx]
+                if assistant_msg.get("role") == "assistant" and not assistant_msg.get("reasoning_content"):
+                    assistant_msg["reasoning_content"] = rc
             i += 1
 
         elif item_type == "input_image":
@@ -2791,6 +2840,14 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
             messages = [{"role": "user", "content": input_data}]
     elif isinstance(input_data, list):
         messages = _convert_responses_input(input_data)
+        _app_log.info(
+            "[responses CONVERT] input_items=%d messages=%d roles=%s tool_msgs=%d rc_msgs=%d",
+            len(input_data),
+            len(messages),
+            [m.get("role", "?") for m in messages],
+            sum(1 for m in messages if m.get("tool_calls")),
+            sum(1 for m in messages if m.get("reasoning_content")),
+        )
         if instructions:
             messages.insert(0, {"role": "system", "content": instructions})
     else:
@@ -2811,7 +2868,15 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
     messages = msg
 
     if isinstance(input_data, list):
-        _inject_reasoning_content(messages, conv_key, "responses")
+        injected = _inject_reasoning_content(messages, conv_key, "responses")
+        _app_log.info(
+            "[responses REASONING] injected=%d messages=%d tool_msgs=%d rc_msgs=%d conv_key=%s",
+            injected,
+            len(messages),
+            sum(1 for m in messages if m.get("tool_calls")),
+            sum(1 for m in messages if m.get("reasoning_content")),
+            conv_key[:60],
+        )
 
     try:
         allowed_params = {

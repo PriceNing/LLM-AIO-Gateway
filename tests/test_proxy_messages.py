@@ -519,6 +519,17 @@ def test_convert_responses_input_reasoning_skipped():
     assert len(result) == 1
 
 
+def test_convert_responses_input_reasoning_item_backfills_assistant():
+    """Test behavior."""
+    result = _convert_responses_input([
+        {"type": "message", "role": "user", "content": "Search"},
+        {"type": "function_call", "call_id": "call_1", "name": "search", "arguments": '{"q":"x"}'},
+        {"type": "reasoning", "content": "Need to search"},
+        {"type": "function_call_output", "call_id": "call_1", "output": "Found"},
+    ])
+    assert result[1].get("reasoning_content") == "Need to search"
+
+
 def test_convert_responses_input_string_content():
     """Test behavior."""
     result = _convert_responses_input([
@@ -548,6 +559,31 @@ def test_convert_responses_input_function_call_with_reasoning():
          "arguments": '{"q":"x"}', "reasoning_content": "Need to search"},
     ])
     assert result[1].get("reasoning_content") == "Need to search"
+
+
+def test_convert_responses_input_merges_assistant_text_before_function_call():
+    """Test behavior."""
+    result = _convert_responses_input([
+        {"type": "message", "role": "user", "content": "Search"},
+        {"type": "message", "role": "assistant", "content": "Let me check."},
+        {"type": "function_call", "call_id": "c1", "name": "search", "arguments": '{"q":"x"}'},
+    ])
+    assert len(result) == 2
+    assert result[1]["role"] == "assistant"
+    assert result[1]["tool_calls"][0]["id"] == "c1"
+    assert result[1]["content"] is None
+    assert result[1]["reasoning_content"] == "Let me check."
+
+
+def test_convert_responses_input_function_call_output_with_reasoning_backfills_assistant():
+    """Test behavior."""
+    result = _convert_responses_input([
+        {"type": "message", "role": "user", "content": "Search"},
+        {"type": "function_call", "call_id": "c1", "name": "search", "arguments": '{"q":"x"}'},
+        {"type": "function_call_output", "call_id": "c1", "output": "Found", "reasoning_content": "Need to search"},
+    ])
+    assert result[1].get("reasoning_content") == "Need to search"
+    assert result[2]["role"] == "tool"
 
 
 def test_convert_responses_input_non_dict_skipped():
