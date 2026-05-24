@@ -1,4 +1,5 @@
 import pytest
+from datetime import datetime, timezone
 from app.config import ConfigManager
 from app.services.logger import LogManager
 
@@ -46,8 +47,10 @@ def test_logger_recreates_missing_log_dir(tmp_path):
         "retention_days": 30,
         "console": False,
     })
-    day_dir = log_root / __import__("datetime").datetime.utcnow().strftime("%Y-%m-%d")
+    day_dir = log_root / datetime.now(timezone.utc).strftime("%Y-%m-%d")
     assert day_dir.exists()
+    for handler in list(mgr._handlers.values()):
+        handler.close()
     for item in day_dir.iterdir():
         item.unlink()
     day_dir.rmdir()
