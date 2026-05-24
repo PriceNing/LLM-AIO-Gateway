@@ -100,6 +100,11 @@ def test_cache_key_empty():
     assert len(k) == 16
 
 
+def test_build_inline_replacement_has_no_timestamp():
+    result = _build_inline_replacement(0, ["A cat"], True)
+    assert result == "[Image #1]: A cat"
+
+
 def test_cache_get_set():
     _set_cached_description("test-url", "A test description")
     assert _get_cached_description("test-url") == "A test description"

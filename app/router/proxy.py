@@ -500,7 +500,7 @@ def _attr(obj, key: str, default=None):
 
 def _conversation_cache_key(api_key: str, messages: list) -> str:
     """Build a cache key that isolates different conversations sharing the same API key."""
-    user_msgs = [m for m in messages if m.get("role") == "user"]
+    user_msgs = [m for m in messages if isinstance(m, dict) and m.get("role") == "user"]
     if user_msgs:
         first_content = user_msgs[0].get("content")
         first_content_list = None
@@ -565,7 +565,7 @@ def _remember_reasoning_content(conv_key: str, reasoning_content: str, tool_call
     _reasoning_tool_cache[conv_key] = tool_map
 
 
-def _inject_reasoning_content(messages: list, conv_key: str, label: str, allow_empty: bool = True) -> int:
+def _inject_reasoning_content(messages: list, conv_key: str, label: str, allow_empty: bool = False) -> int:
     """Restore DeepSeek reasoning only where tool-call continuity requires it."""
     cached_rc = _reasoning_cache.get(conv_key)
     tool_map = _reasoning_tool_cache.get(conv_key, {}) or {}

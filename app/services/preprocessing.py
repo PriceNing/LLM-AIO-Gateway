@@ -19,7 +19,6 @@ import hashlib
 import json
 import logging
 import threading
-import time
 from typing import Optional
 
 import httpx
@@ -358,8 +357,7 @@ def _build_inline_replacement(desc_idx: int, descriptions: list, is_current: boo
     immediately after the placeholder so the LLM doesn't need remote index mapping."""
     if is_current and desc_idx < len(descriptions):
         desc = descriptions[desc_idx]
-        ts = time.strftime("%H:%M:%S")
-        return f"[Image #{desc_idx + 1} at {ts}]: {desc}"
+        return f"[Image #{desc_idx + 1}]: {desc}"
     return "[image: removed]"
 
 

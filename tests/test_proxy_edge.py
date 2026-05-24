@@ -75,6 +75,20 @@ def test_cache_key_different_api_keys():
     assert key1 != key2  # Different API keys -> different cache keys
 
 
+def test_cache_key_same_first_user_with_different_tool_history():
+    base = [
+        {"role": "user", "content": "same start"},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "call_a", "type": "function", "function": {"name": "read", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "call_a", "content": "A"},
+    ]
+    other = [
+        {"role": "user", "content": "same start"},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "call_b", "type": "function", "function": {"name": "read", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "call_b", "content": "B"},
+    ]
+    assert _conversation_cache_key("k1", base) == _conversation_cache_key("k1", other)
+
+
 # -- Wildcard matching --
 
 def test_wildcard_match_exact():

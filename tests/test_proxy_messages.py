@@ -776,6 +776,20 @@ def test_reasoning_injection_fallback_limited_to_active_tool_segment():
     assert messages[7]["reasoning_content"] == "latest reasoning"
 
 
+def test_reasoning_injection_does_not_add_empty_fields_by_default():
+    messages = [
+        {"role": "user", "content": "start"},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "tool", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+    ]
+    conv_key = _conversation_cache_key("key3", messages)
+    _reasoning_cache.drop(conv_key)
+    _reasoning_tool_cache.drop(conv_key)
+
+    assert _inject_reasoning_content(messages, conv_key, "test") == 0
+    assert "reasoning_content" not in messages[1]
+
+
 def test_anthropic_content_to_openai_filters_empty_text():
     """Test behavior."""
     result = _anthropic_content_to_openai([
