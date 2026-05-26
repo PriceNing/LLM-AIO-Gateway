@@ -375,6 +375,144 @@ async def test_responses_anthropic_stream_uses_internal_events(monkeypatch):
     assert "hello" in joined
 
 
+@pytest.mark.asyncio
+async def test_chat_sse_tool_call_done_includes_finish_reason():
+    from app.core.output import InternalOutputEvent
+    from app.protocols.egress import render_chat_completions_sse
+
+    async def events():
+        yield InternalOutputEvent(kind="message_start", role="assistant")
+        yield InternalOutputEvent(kind="tool_call_start", tool_index=0, tool_call_id="call_1", name="run")
+        yield InternalOutputEvent(kind="tool_call_arguments_delta", tool_index=0, tool_call_id="call_1", name="run", arguments_delta="{}", arguments="{}")
+        yield InternalOutputEvent(kind="message_done", finish_reason="tool_calls")
+
+    chunks = []
+    async for line in render_chat_completions_sse(events(), model="gpt-test"):
+        chunks.append(line)
+
+    assert '"finish_reason": "tool_calls"' in "".join(chunks)
+
+
+@pytest.mark.asyncio
+async def test_anthropic_messages_sse_includes_input_tokens():
+    from app.core.output import InternalOutputEvent
+    from app.protocols.egress import render_anthropic_messages_sse
+
+    async def events():
+        yield InternalOutputEvent(kind="usage", usage={"input_tokens": 7, "output_tokens": 2, "total_tokens": 9})
+        yield InternalOutputEvent(kind="message_done", finish_reason="stop")
+
+    chunks = []
+    async for line in render_anthropic_messages_sse(events(), model="claude-test"):
+        chunks.append(line)
+
+    joined = "".join(chunks)
+    assert '"input_tokens": 7' in joined
+    assert '"output_tokens": 2' in joined
+
+
+@pytest.mark.asyncio
+async def test_anthropic_stream_accumulates_tool_delta_without_block_start(monkeypatch):
+    from app.adapters import anthropic_streaming
+    from app.adapters.anthropic_streaming import iter_anthropic_output_events
+    import types
+
+    class FakeStream:
+        status_code = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def aiter_lines(self):
+            yield 'event: content_block_delta'
+            yield 'data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"a\\":"}}'
+            yield 'event: content_block_delta'
+            yield 'data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"1}"}}'
+            yield 'event: content_block_stop'
+            yield 'data: {"type":"content_block_stop","index":0}'
+            yield 'event: message_delta'
+            yield 'data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":1}}'
+            yield 'event: message_stop'
+            yield 'data: {"type":"message_stop"}'
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def stream(self, *args, **kwargs):
+            return FakeStream()
+
+    monkeypatch.setattr(anthropic_streaming, "httpx", types.SimpleNamespace(AsyncClient=FakeClient))
+
+    seen = []
+    async for event in iter_anthropic_output_events(
+        provider_info={"id": "anth", "api_base": "https://anth.example", "api_key": "key"},
+        messages=[{"role": "user", "content": "hi"}],
+        body={},
+        max_tokens=16,
+        temperature=0.7,
+        model="claude-test",
+    ):
+        seen.append(event)
+
+    assert any(event.kind == "tool_call_arguments_delta" and event.arguments == '{"a":1}' for event in seen)
+
+
+@pytest.mark.asyncio
+async def test_anthropic_stream_raises_on_upstream_error_event(monkeypatch):
+    from app.adapters import anthropic_streaming
+    from app.adapters.anthropic_streaming import iter_anthropic_output_events
+    import types
+
+    class FakeStream:
+        status_code = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def aiter_lines(self):
+            yield 'event: error'
+            yield 'data: {"type":"error","error":{"message":"bad stream"}}'
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def stream(self, *args, **kwargs):
+            return FakeStream()
+
+    monkeypatch.setattr(anthropic_streaming, "httpx", types.SimpleNamespace(AsyncClient=FakeClient))
+
+    with pytest.raises(Exception, match="bad stream"):
+        async for _ in iter_anthropic_output_events(
+            provider_info={"id": "anth", "api_base": "https://anth.example", "api_key": "key"},
+            messages=[{"role": "user", "content": "hi"}],
+            body={},
+            max_tokens=16,
+            temperature=0.7,
+            model="claude-test",
+        ):
+            pass
+
+
 def test_ir_projects_openai_system_to_anthropic_system_without_duplication():
     messages = [
         {"role": "system", "content": "You are helpful."},

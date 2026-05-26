@@ -58,6 +58,8 @@ async def render_chat_completions_sse(events, *, model: str):
         elif event.kind == "message_done":
             if not has_text and accumulated_reasoning:
                 yield _chat_chunk(chat_id, model, {"content": accumulated_reasoning}, event.finish_reason or "stop")
+            else:
+                yield _chat_chunk(chat_id, model, {}, event.finish_reason or ("tool_calls" if tool_calls else "stop"))
             _app_log.debug(
                 "[egress_chat_stream] DONE model=%s finish_reason=%s text_chars=%d reasoning_chars=%d tool_calls=%d",
                 model,
@@ -239,6 +241,7 @@ async def render_anthropic_messages_sse(events, *, model: str):
     next_block_index = 0
     accumulated_text = ""
     accumulated_reasoning = ""
+    input_tokens = 0
     output_tokens = 0
     finish_reason = "stop"
     tool_states: dict[int, dict] = {}
@@ -275,6 +278,7 @@ async def render_anthropic_messages_sse(events, *, model: str):
             if state["block_index"] == next_block_index:
                 next_block_index += 1
         elif event.kind == "usage":
+            input_tokens = event.usage.get("input_tokens", input_tokens) or input_tokens
             output_tokens = event.usage.get("output_tokens", output_tokens) or output_tokens
         elif event.kind == "message_done":
             finish_reason = event.finish_reason or finish_reason
@@ -296,15 +300,16 @@ async def render_anthropic_messages_sse(events, *, model: str):
         yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': state['block_index'], 'delta': {'type': 'input_json_delta', 'partial_json': json.dumps(tool_input, ensure_ascii=False)}})}\n\n"
         yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': state['block_index']})}\n\n"
 
-    yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': _anthropic_stop_reason(finish_reason), 'stop_sequence': None}, 'usage': {'output_tokens': output_tokens}})}\n\n"
+    yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': _anthropic_stop_reason(finish_reason), 'stop_sequence': None}, 'usage': {'input_tokens': input_tokens, 'output_tokens': output_tokens}})}\n\n"
     yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
     _app_log.debug(
-        "[egress_messages_stream] DONE model=%s message_id=%s text_chars=%d reasoning_chars=%d tool_calls=%d output_tokens=%d stop_reason=%s",
+        "[egress_messages_stream] DONE model=%s message_id=%s text_chars=%d reasoning_chars=%d tool_calls=%d input_tokens=%d output_tokens=%d stop_reason=%s",
         model,
         msg_id,
         len(accumulated_text),
         len(accumulated_reasoning),
         len(tool_states),
+        input_tokens,
         output_tokens,
         _anthropic_stop_reason(finish_reason),
     )

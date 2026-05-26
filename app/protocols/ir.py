@@ -404,7 +404,7 @@ def ir_to_openai_messages(messages: list[InternalMessage]) -> list[dict[str, Any
 
         out = {"role": msg.role}
         content = _parts_to_openai_content(msg.parts)
-        out["content"] = content or None if msg.role == "assistant" else content
+        out["content"] = (content or None) if msg.role == "assistant" else content
 
         tool_calls = []
         for part in msg.parts:
@@ -472,6 +472,8 @@ def _parts_to_anthropic_content(parts: list[InternalPart]) -> list[dict[str, Any
                 media = url.split(";")[0].replace("data:", "")
                 data = url.split(",", 1)[1] if "," in url else ""
                 content.append({"type": "image", "source": {"type": "base64", "media_type": media, "data": data}})
+            elif source.get("url"):
+                content.append({"type": "text", "text": f"[image URL: {source.get('url')}]"})
         elif part.kind == "tool_call":
             args = part.arguments if part.arguments is not None else _parse_arguments(part.raw_arguments)
             content.append({"type": "tool_use", "id": part.tool_call_id, "name": part.name, "input": args or {}})

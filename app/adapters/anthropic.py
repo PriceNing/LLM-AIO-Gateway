@@ -64,6 +64,14 @@ def _build_anthropic_request_body(
                 if isinstance(tool, dict) and tool.get("name")
             ]
 
+    tool_choice = body.get("tool_choice")
+    if isinstance(tool_choice, dict):
+        choice_type = tool_choice.get("type")
+        if choice_type in ("auto", "any"):
+            req_body["tool_choice"] = {"type": choice_type}
+        elif choice_type == "tool" and tool_choice.get("name"):
+            req_body["tool_choice"] = {"type": "tool", "name": tool_choice["name"]}
+
     extra_headers = provider_info.get("extra_headers", {}) or {}
     thinking = extra_headers.get("thinking")
     if thinking in ("enabled", "disabled"):
@@ -155,6 +163,8 @@ def anthropic_body_from_internal(internal: InternalRequest) -> tuple[list, dict]
     tools = internal.anthropic_tools()
     if tools:
         body["tools"] = tools
+    if internal.tool_choice is not None:
+        body["tool_choice"] = internal.tool_choice
     return anthropic_messages, body
 
 

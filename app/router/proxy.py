@@ -486,7 +486,6 @@ async def _record_streaming_events(
     *,
     conv_key: str,
     tool_only_turns=None,
-    tool_only_limit: int = TOOL_ONLY_LIMIT,
     remember_reasoning_content=None,
 ):
     accumulated_reasoning = ""
@@ -544,7 +543,6 @@ async def _stream_internal_output(
     remember_response_chain_key=None,
     remember_reasoning_content=None,
     tool_only_turns=None,
-    tool_only_limit: int = TOOL_ONLY_LIMIT,
 ):
     total_tokens = 0
     _app_log.debug(
@@ -564,7 +562,6 @@ async def _stream_internal_output(
             conv_key=conv_key,
             remember_reasoning_content=remember_reasoning_content,
             tool_only_turns=tool_only_turns,
-            tool_only_limit=tool_only_limit,
         ):
             if event.kind == "usage":
                 total_tokens = event.usage.get("total_tokens", total_tokens) or total_tokens
@@ -764,7 +761,6 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
                     conv_key=conv_key,
                     remember_reasoning_content=_remember_reasoning_content,
                     tool_only_turns=_tool_only_turns,
-                    tool_only_limit=TOOL_ONLY_LIMIT,
                 ),
                 media_type="text/event-stream"
             )
@@ -1184,7 +1180,6 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                         remember_response_chain_key=_remember_response_chain_key,
                         remember_reasoning_content=_remember_reasoning_content,
                         tool_only_turns=_tool_only_turns,
-                        tool_only_limit=TOOL_ONLY_LIMIT,
                     ),
                     media_type="text/event-stream"
                 )
@@ -1216,7 +1211,6 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                         remember_response_chain_key=_remember_response_chain_key,
                         remember_reasoning_content=_remember_reasoning_content,
                         tool_only_turns=_tool_only_turns,
-                        tool_only_limit=TOOL_ONLY_LIMIT,
                     ),
                     media_type="text/event-stream"
                 )

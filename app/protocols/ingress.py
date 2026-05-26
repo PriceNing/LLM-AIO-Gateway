@@ -113,7 +113,7 @@ def anthropic_messages_to_internal(body: dict[str, Any]) -> InternalRequest:
     messages = anthropic_messages_to_ir(anthropic_messages, system_prompt)
 
     tool_choice = body.get("tool_choice")
-    if isinstance(tool_choice, dict) and not tool_choice.get("name"):
+    if isinstance(tool_choice, dict) and tool_choice.get("type") in ("auto",):
         tool_choice = None
     elif tool_choice == "auto":
         tool_choice = None

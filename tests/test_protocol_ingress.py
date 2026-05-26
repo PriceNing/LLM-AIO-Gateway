@@ -82,6 +82,20 @@ def test_anthropic_messages_to_internal_converts_for_openai_provider():
     assert req.tool_choice is None
 
 
+def test_anthropic_messages_to_internal_preserves_any_tool_choice():
+    req = anthropic_messages_to_internal({
+        "model": "claude-test",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"name": "run", "input_schema": {"type": "object"}}],
+        "tool_choice": {"type": "any"},
+    })
+    messages, body = anthropic_body_from_internal(req)
+
+    assert messages[0]["content"][0]["text"] == "hi"
+    assert req.tool_choice == {"type": "any"}
+    assert body["tool_choice"] == {"type": "any"}
+
+
 def test_ir_preserves_anthropic_cache_control_tool_use_tool_result_and_images():
     req = anthropic_messages_to_internal({
         "model": "claude-test",
@@ -190,6 +204,19 @@ def test_ir_preserves_responses_images_and_reasoning_content():
     openai_messages = ir_to_openai_messages(req.messages)
     assert openai_messages[1]["content"][1]["image_url"]["url"] == "data:image/png;base64,abc"
     assert openai_messages[2]["reasoning_content"] == "hidden"
+
+
+def test_ir_preserves_external_image_url_for_anthropic_as_text_placeholder():
+    req = chat_completions_to_internal({
+        "model": "claude-test",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "see"},
+            {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}},
+        ]}],
+    })
+
+    anthropic_messages, _ = ir_to_anthropic_messages(req.messages)
+    assert anthropic_messages[0]["content"][1] == {"type": "text", "text": "[image URL: https://example.com/a.png]"}
 
 
 def test_policy_inject_reasoning_content_active_tool_segment_only():

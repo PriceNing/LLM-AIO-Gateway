@@ -87,6 +87,10 @@ async def iter_anthropic_output_events(
                     event_type = current_event or data.get("type")
                     current_event = None
 
+                    if event_type == "error":
+                        err = data.get("error", {}) or {}
+                        err_msg = err.get("message") or json.dumps(data, ensure_ascii=False)
+                        raise HTTPException(status_code=502, detail=f"Upstream: {err_msg}")
                     if event_type == "message_start":
                         usage = data.get("message", {}).get("usage", {}) or {}
                         input_tokens = usage.get("input_tokens", input_tokens) or 0
@@ -124,7 +128,7 @@ async def iter_anthropic_output_events(
                         block_index = int(data.get("index", 0))
                         delta = data.get("delta", {}) or {}
                         delta_type = delta.get("type", "")
-                        state = block_states.get(block_index, {})
+                        state = block_states.setdefault(block_index, {"type": "", "id": "", "name": "", "arguments": ""})
                         if delta_type == "text_delta":
                             text = delta.get("text", "")
                             if text:
