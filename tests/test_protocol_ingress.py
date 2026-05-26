@@ -15,6 +15,21 @@ from app.adapters.openai import chat_kwargs_from_internal, chat_messages_from_in
 from app.services.preprocessing import preprocess_messages
 
 
+def test_ingress_uses_config_temperature_default(monkeypatch):
+    monkeypatch.setattr("app.protocols.ingress.get_default", lambda key, fallback=None: 0.25 if key == "temperature" else fallback)
+
+    assert chat_completions_to_internal({"model": "m", "messages": [{"role": "user", "content": "hi"}]}).temperature == 0.25
+    assert completions_to_internal({"model": "m", "prompt": "hi"}).temperature == 0.25
+    assert anthropic_messages_to_internal({"model": "m", "messages": [{"role": "user", "content": "hi"}]}).temperature == 0.25
+    assert responses_to_internal({"model": "m", "input": "hi"}).temperature == 0.25
+
+
+def test_ingress_preserves_explicit_null_temperature():
+    req = chat_completions_to_internal({"model": "m", "messages": [{"role": "user", "content": "hi"}], "temperature": None})
+
+    assert req.temperature is None
+
+
 def test_chat_completions_to_internal_normalizes_tools():
     req = chat_completions_to_internal({
         "model": "gpt-test",

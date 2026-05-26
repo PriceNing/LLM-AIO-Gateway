@@ -4,6 +4,33 @@ from app.config import ConfigManager
 from app.services.logger import LogManager
 
 
+def test_main_uses_configured_host_port_for_uvicorn(monkeypatch, tmp_path):
+    import runpy
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        '{"host":"127.0.0.2","port":8765,"database":"test.db","logging":{"enabled":false}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("LLM_GATEWAY_CONFIG", str(config_path))
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "")
+
+    captured = {}
+
+    def fake_run(app_path, **kwargs):
+        captured["app_path"] = app_path
+        captured.update(kwargs)
+
+    monkeypatch.setattr("uvicorn.run", fake_run)
+
+    runpy.run_path("main.py", run_name="__main__")
+
+    assert captured["app_path"] == "main:app"
+    assert captured["host"] == "127.0.0.2"
+    assert captured["port"] == 8765
+    assert captured["reload"] is True
+
+
 @pytest.fixture
 def temp_config(tmp_path):
     path = tmp_path / "config.json"

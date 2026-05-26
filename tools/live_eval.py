@@ -103,11 +103,13 @@ class GatewayClient:
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 status = resp.status
+                if stream:
+                    payload = read_sse_stream(resp, self.timeout, started)
+                    latency_ms = int((time.perf_counter() - started) * 1000)
+                    return status, payload, latency_ms
                 raw = resp.read()
                 latency_ms = int((time.perf_counter() - started) * 1000)
                 text = raw.decode("utf-8", errors="replace")
-                if stream:
-                    return status, parse_sse(text), latency_ms
                 try:
                     return status, json.loads(text), latency_ms
                 except json.JSONDecodeError:
@@ -190,6 +192,66 @@ def parse_sse(text: str) -> dict[str, Any]:
             parsed = data
         events.append({"event": event_name, "data": parsed})
     return {"events": events, "done": done, "raw_excerpt": text[:2000]}
+
+
+def read_sse_stream(resp, timeout: float, started: float) -> dict[str, Any]:
+    events = []
+    done = False
+    raw_parts = []
+    block_lines = []
+    first_event_ms = 0
+
+    def flush_block() -> None:
+        nonlocal done, first_event_ms, block_lines
+        if not block_lines:
+            return
+        event_name = ""
+        data_lines = []
+        for raw_line in block_lines:
+            line = raw_line.rstrip("\r\n")
+            if line.startswith("event:"):
+                event_name = line[6:].strip()
+            elif line.startswith("data:"):
+                data_lines.append(line[5:].strip())
+        block_lines = []
+        if not data_lines:
+            return
+        data = "\n".join(data_lines)
+        if first_event_ms == 0:
+            first_event_ms = int((time.perf_counter() - started) * 1000)
+        if data == "[DONE]":
+            done = True
+            events.append({"event": event_name or "done", "data": "[DONE]"})
+            return
+        try:
+            parsed: Any = json.loads(data)
+        except json.JSONDecodeError:
+            parsed = data
+        events.append({"event": event_name, "data": parsed})
+
+    while True:
+        if timeout and time.perf_counter() - started > timeout:
+            raise TimeoutError(f"SSE stream exceeded {timeout:.1f}s")
+        raw = resp.readline()
+        if not raw:
+            flush_block()
+            break
+        line = raw.decode("utf-8", errors="replace")
+        if sum(len(part) for part in raw_parts) < 2000:
+            raw_parts.append(line)
+        if line in ("\n", "\r\n"):
+            flush_block()
+            if done:
+                break
+            continue
+        block_lines.append(line)
+
+    return {
+        "events": events,
+        "done": done,
+        "raw_excerpt": "".join(raw_parts)[:2000],
+        "first_event_ms": first_event_ms,
+    }
 
 
 def compact_json(value: Any, limit: int = 1200) -> str:

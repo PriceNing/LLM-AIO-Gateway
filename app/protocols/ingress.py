@@ -19,6 +19,12 @@ def _max_tokens_from_body(body: dict[str, Any]) -> int:
     return max_tokens
 
 
+def _temperature_from_body(body: dict[str, Any]):
+    if "temperature" in body:
+        return body.get("temperature")
+    return get_default("temperature", 0.7)
+
+
 def _completion_prompt_to_text(prompt: Any) -> str:
     if isinstance(prompt, list):
         return "\n".join(str(item) for item in prompt)
@@ -77,7 +83,7 @@ def chat_completions_to_internal(body: dict[str, Any]) -> InternalRequest:
         tools=tools_from_chat(body.get("tools")),
         tool_choice=tool_choice,
         stream=body.get("stream", False),
-        temperature=body.get("temperature", 0.7),
+        temperature=_temperature_from_body(body),
         max_tokens=_max_tokens_from_body(body),
         previous_response_id=body.get("previous_response_id") or "",
         extra=extra,
@@ -98,7 +104,7 @@ def completions_to_internal(body: dict[str, Any]) -> InternalRequest:
         messages=messages,
         provider_id=body.get("provider_id", ""),
         stream=body.get("stream", False),
-        temperature=body.get("temperature", 0.7),
+        temperature=_temperature_from_body(body),
         max_tokens=_max_tokens_from_body(body),
         extra=extra,
         raw_body=body,
@@ -128,7 +134,7 @@ def anthropic_messages_to_internal(body: dict[str, Any]) -> InternalRequest:
         tools=tools_from_chat(body.get("tools")),
         tool_choice=tool_choice,
         stream=body.get("stream", False),
-        temperature=body.get("temperature"),
+        temperature=_temperature_from_body(body),
         max_tokens=_max_tokens_from_body(body),
         previous_response_id=body.get("previous_response_id") or "",
         raw_body=body,
@@ -167,7 +173,7 @@ def responses_to_internal(body: dict[str, Any]) -> InternalRequest:
         tools=tools_from_chat(converted_tools),
         tool_choice=tool_choice,
         stream=body.get("stream", False),
-        temperature=body.get("temperature", 0.7),
+        temperature=_temperature_from_body(body),
         max_tokens=_max_tokens_from_body(body),
         previous_response_id=body.get("previous_response_id") or "",
         extra=extra,

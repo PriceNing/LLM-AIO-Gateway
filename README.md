@@ -223,7 +223,7 @@ curl http://localhost:8000/v1/responses \
 pytest tests/ -q
 ```
 
-当前预期结果：`298 passed`。
+当前预期结果：`308 passed`。
 
 真实烟测建议：
 

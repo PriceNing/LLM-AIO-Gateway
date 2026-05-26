@@ -223,7 +223,7 @@ Main code boundaries:
 pytest tests/ -q
 ```
 
-Expected current result: `298 passed`.
+Expected current result: `308 passed`.
 
 Live smoke matrix:
 

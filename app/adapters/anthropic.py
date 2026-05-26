@@ -16,6 +16,8 @@ _app_log = get_logger("app")
 
 def _anthropic_message_url(api_base: str) -> str:
     base = (api_base or "").rstrip("/")
+    if base.endswith("/v1"):
+        return f"{base}/messages"
     return f"{base}/v1/messages"
 
 

@@ -463,6 +463,13 @@ async def test_anthropic_stream_usage_accepts_openai_compatible_keys(monkeypatch
     assert usage_events[-1] == {"input_tokens": 11, "output_tokens": 5, "total_tokens": 16}
 
 
+def test_anthropic_message_url_avoids_duplicate_v1():
+    from app.adapters.anthropic import _anthropic_message_url
+
+    assert _anthropic_message_url("https://anth.example/v1") == "https://anth.example/v1/messages"
+    assert _anthropic_message_url("https://anth.example") == "https://anth.example/v1/messages"
+
+
 def test_adapter_provider_id_prefers_resolved_provider():
     assert _adapter_provider_id({"id": "NewAPI"}, "") == "NewAPI"
     assert _adapter_provider_id(None, "pixel-api") == "pixel-api"
@@ -484,6 +491,34 @@ async def test_chat_sse_tool_call_done_includes_finish_reason():
         chunks.append(line)
 
     assert '"finish_reason": "tool_calls"' in "".join(chunks)
+
+
+@pytest.mark.asyncio
+async def test_responses_sse_adds_tool_item_when_arguments_arrive_first():
+    from app.core.output import InternalOutputEvent
+    from app.protocols.egress import render_responses_sse
+
+    async def events():
+        yield InternalOutputEvent(
+            kind="tool_call_arguments_delta",
+            tool_index=0,
+            tool_call_id="call_1",
+            call_id="call_1",
+            name="run",
+            arguments_delta="{}",
+            arguments="{}",
+        )
+        yield InternalOutputEvent(kind="message_done", finish_reason="tool_calls")
+
+    chunks = []
+    async for line in render_responses_sse(events(), model="gpt-test"):
+        chunks.append(line)
+
+    joined = "".join(chunks)
+    added_pos = joined.index('"type": "response.output_item.added"')
+    delta_pos = joined.index('"type": "response.function_call_arguments.delta"')
+    assert added_pos < delta_pos
+    assert '"type": "function_call"' in joined
 
 
 @pytest.mark.asyncio

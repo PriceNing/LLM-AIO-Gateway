@@ -16,6 +16,7 @@ data.db-shm
 data.db-wal
 config.json
 tools/live-eval.config.json
+tools/live-eval.config.local.json
 *.log
 data/
 

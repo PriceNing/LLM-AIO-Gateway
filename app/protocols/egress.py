@@ -112,6 +112,12 @@ def _completion_chunk(cmpl_id: str, model: str, text: str, finish_reason):
     return f"data: {json.dumps({'id': cmpl_id, 'object': 'text_completion.chunk', 'created': int(time.time()), 'model': model, 'choices': [{'index': 0, 'text': text, 'finish_reason': finish_reason}]}, ensure_ascii=False)}\n\n"
 
 
+def _responses_tool_ids(event: InternalOutputEvent) -> tuple[str, str]:
+    tool_id = event.tool_call_id or f"fc_{int(time.time())}_{event.tool_index}"
+    call_id = event.call_id or (tool_id if str(tool_id).startswith("call_") else f"call_{tool_id}")
+    return tool_id, call_id
+
+
 async def render_responses_sse(events, *, model: str, previous_response_id: str | None = None, response_id: str | None = None):
     resp_id = response_id or f"resp_{uuid.uuid4().hex}"
     msg_id = f"msg_{uuid.uuid4().hex}"
@@ -157,9 +163,10 @@ async def render_responses_sse(events, *, model: str, previous_response_id: str 
         elif event.kind == "reasoning_delta":
             accumulated_reasoning += event.reasoning
         elif event.kind == "tool_call_start":
+            tool_id, call_id = _responses_tool_ids(event)
             state = tool_states.setdefault(event.tool_index, {
-                "id": event.tool_call_id or f"fc_{int(time.time())}_{event.tool_index}",
-                "call_id": event.call_id or (event.tool_call_id if event.tool_call_id.startswith("call_") else f"call_{event.tool_call_id}"),
+                "id": tool_id,
+                "call_id": call_id,
                 "name": event.name,
                 "arguments": "",
                 "output_index": output_index_counter,
@@ -169,14 +176,19 @@ async def render_responses_sse(events, *, model: str, previous_response_id: str 
             _tool_log.debug("[egress_responses_stream] tool_start index=%d id=%s call_id=%s name=%s output_index=%d", event.tool_index, state["id"], state["call_id"], state["name"], state["output_index"])
             yield f"data: {json.dumps({'type': 'response.output_item.added', 'output_index': state['output_index'], 'item': {'type': 'function_call', 'id': state['id'], 'call_id': state['call_id'], 'name': state['name'], 'arguments': '', 'status': 'in_progress'}})}\n\n"
         elif event.kind == "tool_call_arguments_delta":
+            tool_id, call_id = _responses_tool_ids(event)
             state = tool_states.setdefault(event.tool_index, {
-                "id": event.tool_call_id,
-                "call_id": event.call_id,
+                "id": tool_id,
+                "call_id": call_id,
                 "name": event.name,
                 "arguments": "",
                 "output_index": output_index_counter,
                 "item_added": False,
             })
+            if not state.get("item_added"):
+                output_index_counter = max(output_index_counter, state["output_index"] + 1)
+                state["item_added"] = True
+                yield f"data: {json.dumps({'type': 'response.output_item.added', 'output_index': state['output_index'], 'item': {'type': 'function_call', 'id': state['id'], 'call_id': state['call_id'], 'name': state['name'], 'arguments': '', 'status': 'in_progress'}})}\n\n"
             state["arguments"] = event.arguments or (state["arguments"] + event.arguments_delta)
             yield f"data: {json.dumps({'type': 'response.function_call_arguments.delta', 'output_index': state['output_index'], 'call_id': state['call_id'], 'delta': event.arguments_delta})}\n\n"
         elif event.kind == "usage":
