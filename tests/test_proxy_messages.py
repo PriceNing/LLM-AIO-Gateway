@@ -12,17 +12,18 @@ from app.core.think import strip_think_tags as _strip_think_tags
 from app.core.tool_args import fix_tool_args as _fix_tool_args
 from app.core.tool_args import sanitize_args as _sanitize_args
 from app.core.types import InternalRequest
+from app.core.state import (
+    conversation_cache_key as _conversation_cache_key,
+    reasoning_cache as _reasoning_cache,
+    reasoning_context as _reasoning_context,
+    reasoning_tool_cache as _reasoning_tool_cache,
+    reasoning_tool_global_cache as _reasoning_tool_global_cache,
+    remember_reasoning_content as _remember_reasoning_content,
+    remember_response_chain_key as _remember_response_chain_key,
+)
 from app.protocols.ingress import responses_tools_to_chat_tools
 from app.protocols.ir import anthropic_messages_to_ir, ir_to_anthropic_messages, ir_to_openai_messages, openai_messages_to_ir, responses_input_to_ir
 from app.adapters.openai import chat_messages_from_internal
-from app.router.proxy import (
-    _conversation_cache_key,
-    _remember_reasoning_content,
-    _reasoning_cache,
-    _reasoning_tool_cache,
-    _reasoning_context,
-    _reasoning_tool_global_cache,
-)
 
 
 def _normalize_internal_messages_for_test(messages):
@@ -900,8 +901,6 @@ def test_reasoning_cache_survives_image_preprocess_flow():
 
 
 def test_conversation_cache_key_prefers_response_chain_id():
-    from app.router.proxy import _remember_response_chain_key
-
     messages_a = [{"role": "user", "content": "Same first message"}]
     messages_b = [{"role": "user", "content": "Same first message"}]
     key_a = _conversation_cache_key("api", messages_a)

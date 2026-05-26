@@ -7,7 +7,7 @@
 
 LLM AIO Gateway is a unified FastAPI gateway for OpenAI-compatible and Anthropic-compatible LLM providers. It exposes OpenAI Chat Completions, legacy Completions, Anthropic Messages, and OpenAI Responses endpoints through one service, with routing, API-key management, reasoning continuity, tool-call repair, and vision-model image preprocessing.
 
-The current proxy core is built around a provider-neutral internal representation: every client protocol is normalized into `InternalRequest` / `InternalMessage`, processed by shared policy logic, sent through an upstream adapter, then rendered back to the requested client protocol.
+The current proxy core is built around a provider-neutral internal representation: every client protocol is normalized into `InternalRequest` / `InternalMessage`, processed by shared policy logic that produces a structured `RoutingDecision`, sent through an upstream adapter, then rendered back to the requested client protocol.
 
 ## Features
 
@@ -16,6 +16,7 @@ The current proxy core is built around a provider-neutral internal representatio
 | Unified protocol gateway | Supports `/chat/completions`, `/completions`, `/messages`, `/responses`, and `/models`, mounted at both root and `/v1` paths. |
 | OpenAI and Anthropic providers | OpenAI-compatible providers go through liteLLM; Anthropic-compatible providers use a direct Anthropic Messages adapter from the internal IR. |
 | Shared IR pipeline | Routing, preprocessing, reasoning cache, tool repair, and circuit-breaking run once on internal messages instead of duplicated endpoint-specific conversions. |
+| Structured routing | The policy layer returns `RoutingDecision` with requested/resolved/target model, target provider, matched rule, and reason. |
 | Vision model injection | Images can be described by a configured vision model, then replaced with text so text-only models can handle visual context. |
 | Tool-call reliability | Preserves tool IDs across protocol conversions, repairs malformed tool JSON, and includes a tool-only loop circuit breaker. |
 | Reasoning continuity | Caches and replays `reasoning_content` for DeepSeek-style thinking models across multi-turn tool flows. |
@@ -154,6 +155,8 @@ Then enable preprocessing for the target model in the admin panel. The decision 
 
 Routing rules can transparently redirect requests by username, API-key substring, and requested model pattern. The first matching enabled rule wins.
 
+Routing runs in the shared policy layer and is represented as a `RoutingDecision`. Logs include requested model, resolved model, target model, target provider, matched rule, and reason, making route debugging explicit.
+
 Rule structure:
 
 ```json
@@ -192,7 +195,7 @@ Important defaults:
 Client endpoint
   -> protocol ingress
   -> internal IR
-  -> shared policy layer
+  -> shared policy layer (RoutingDecision, preprocessing, reasoning, tool repair)
   -> OpenAI/liteLLM adapter or direct Anthropic adapter
   -> internal output
   -> protocol egress
@@ -200,13 +203,27 @@ Client endpoint
 
 This design keeps endpoint-specific protocol details at ingress/egress while routing, preprocessing, reasoning cache, tool repair, and adapter selection operate on one internal format.
 
+Main code boundaries:
+
+| Module | Responsibility |
+|---|---|
+| `app/router/proxy.py` | FastAPI endpoints, auth, provider resolution, adapter dispatch, non-streaming request stats. |
+| `app/protocols/ingress.py` | Converts `/chat/completions`, `/completions`, `/messages`, and `/responses` request bodies into internal IR. |
+| `app/core/policy.py` | Routing decisions, message normalization, preprocessing hook, reasoning injection, tool argument repair, tool-only limit. |
+| `app/core/state.py` | TTL caches, reasoning cache, tool-only counter, response-chain cache. |
+| `app/core/streaming.py` | Streaming event metering, reasoning storage, tool-only counting, stream error rendering, stats callback. |
+| `app/core/images.py` | Data URI extraction, image-content detection, and OpenAI image-content normalization. |
+| `app/adapters/` | Sends internal requests to OpenAI/liteLLM or direct Anthropic Messages and converts responses to internal output/events. |
+| `app/protocols/egress.py` | Renders internal output back into Chat, Completions, Messages, and Responses protocols. |
+| `app/services/lite_llm.py` | OpenAI-compatible liteLLM wrapper only, plus minimal reasoning compatibility patches. |
+
 ## Testing
 
 ```bash
 pytest tests/ -q
 ```
 
-Expected current result: `290 passed`.
+Expected current result: `298 passed`.
 
 Live smoke matrix:
 

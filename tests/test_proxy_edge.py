@@ -14,10 +14,15 @@ from app.core.tool_args import fix_tool_args as _fix_tool_args
 from app.core.tool_args import sanitize_args as _sanitize_args
 from app.protocols.ingress import responses_tools_to_chat_tools
 from app.protocols.ir import ir_to_anthropic_messages, ir_to_openai_messages, openai_messages_to_ir, responses_input_to_ir
+from app.core.state import (
+    TTLDict,
+    conversation_cache_key as _conversation_cache_key,
+    remember_response_chain_key as _remember_response_chain_key,
+    response_chain_cache as _response_chain_cache,
+)
 from app.router.proxy import (
-    _conversation_cache_key,
-    TTLDict, ensure_model_allowed, allowed_models_for,
-    _remember_response_chain_key, _response_chain_cache,
+    _adapter_provider_id,
+    ensure_model_allowed, allowed_models_for,
 )
 
 client = TestClient(app)
@@ -196,13 +201,51 @@ def test_routing_rules_match_model(temp_db):
         "username": "", "api_key_pattern": "",
         "match_model": "old-model", "target_model": "new-model", "target_provider": ""
     })
-    target_model, target_provider = _apply_routing_rules("alice", "user-key", "old-model", "old-model")
-    assert target_model == "new-model"
+    decision = _apply_routing_rules("alice", "user-key", "old-model", "old-model")
+
+    assert decision.matched is True
+    assert decision.target_model == "new-model"
+    assert decision.target_provider == ""
+    assert decision.rule_name == "reroute"
+    assert decision.source == "routing_rule"
 
 
 def test_routing_rules_no_match(temp_db):
-    target_model, target_provider = _apply_routing_rules("alice", "user-key", "unmatched", "unmatched")
-    assert target_model == "unmatched"
+    decision = _apply_routing_rules("alice", "user-key", "unmatched", "unmatched")
+
+    assert decision.matched is False
+    assert decision.target_model == "unmatched"
+    assert decision.target_provider == ""
+    assert decision.source == "default"
+
+
+def test_routing_rules_match_wildcard_and_provider(temp_db):
+    from app.database import add_routing_rule
+    add_routing_rule({
+        "name": "wild-provider", "enabled": True,
+        "username": "alice", "api_key_pattern": "user",
+        "match_model": "old-*", "target_model": "new-model", "target_provider": "target-provider"
+    })
+    decision = _apply_routing_rules("alice", "user-key", "source/old-model", "old-model")
+
+    assert decision.matched is True
+    assert decision.target_model == "new-model"
+    assert decision.target_provider == "target-provider"
+    assert decision.rule_name == "wild-provider"
+
+
+def test_routing_rules_can_set_provider_only(temp_db):
+    from app.database import add_routing_rule
+    add_routing_rule({
+        "name": "provider-only", "enabled": True,
+        "username": "", "api_key_pattern": "",
+        "match_model": "same-model", "target_model": "", "target_provider": "target-provider"
+    })
+    decision = _apply_routing_rules("alice", "user-key", "same-model", "same-model")
+
+    assert decision.matched is True
+    assert decision.target_model == "same-model"
+    assert decision.target_provider == "target-provider"
 
 
 # -- TTLDict --
@@ -365,6 +408,64 @@ async def test_responses_anthropic_stream_uses_internal_events(monkeypatch):
     assert "response.created" in joined
     assert "response.completed" in joined
     assert "hello" in joined
+
+
+@pytest.mark.asyncio
+async def test_anthropic_stream_usage_accepts_openai_compatible_keys(monkeypatch):
+    from app.adapters import anthropic_streaming
+    from app.adapters.anthropic_streaming import iter_anthropic_output_events
+    import types
+
+    class FakeStream:
+        status_code = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def aiter_lines(self):
+            yield 'event: message_start'
+            yield 'data: {"type":"message_start","usage":{"prompt_tokens":11}}'
+            yield 'event: message_delta'
+            yield 'data: {"type":"message_delta","usage":{"completion_tokens":5}}'
+            yield 'event: message_stop'
+            yield 'data: {"type":"message_stop"}'
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def stream(self, *args, **kwargs):
+            return FakeStream()
+
+    monkeypatch.setattr(anthropic_streaming, "httpx", types.SimpleNamespace(AsyncClient=FakeClient))
+
+    usage_events = []
+    async for event in iter_anthropic_output_events(
+        provider_info={"id": "anth", "api_base": "https://anth.example", "api_key": "key"},
+        messages=[{"role": "user", "content": "hi"}],
+        body={},
+        max_tokens=16,
+        temperature=0.7,
+        model="claude-test",
+    ):
+        if event.kind == "usage":
+            usage_events.append(event.usage)
+
+    assert usage_events[-1] == {"input_tokens": 11, "output_tokens": 5, "total_tokens": 16}
+
+
+def test_adapter_provider_id_prefers_resolved_provider():
+    assert _adapter_provider_id({"id": "NewAPI"}, "") == "NewAPI"
+    assert _adapter_provider_id(None, "pixel-api") == "pixel-api"
 
 
 @pytest.mark.asyncio

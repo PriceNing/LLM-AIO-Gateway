@@ -180,11 +180,38 @@ def inject_reasoning_content(
 
 
 @dataclass(slots=True)
+class RouteTarget:
+    model: str
+    provider_id: str = ""
+
+
+@dataclass(slots=True)
+class RoutingDecision:
+    requested_model: str
+    resolved_model: str
+    target: RouteTarget
+    matched: bool = False
+    rule_id: int | None = None
+    rule_name: str = ""
+    source: str = "default"
+    reason: str = "no routing rule matched"
+
+    @property
+    def target_model(self) -> str:
+        return self.target.model
+
+    @property
+    def target_provider(self) -> str:
+        return self.target.provider_id
+
+
+@dataclass(slots=True)
 class RequestPolicyResult:
     request: InternalRequest
     conv_key: str
     route_model: str
     route_provider: str
+    routing: RoutingDecision
     modified_by_preprocessor: bool
     reasoning_injected: int = 0
     tool_only_limited: bool = False
@@ -196,8 +223,8 @@ def wildcard_match(pattern: str, value: str) -> bool:
     return bool(re.fullmatch(regex, value, re.IGNORECASE))
 
 
-def apply_routing_rules(username: str, api_key_value: str, requested_model: str, resolved_model: str) -> tuple[str, str]:
-    """Apply user-defined routing rules. Returns (final_model, provider_id)."""
+def apply_routing_rules(username: str, api_key_value: str, requested_model: str, resolved_model: str) -> RoutingDecision:
+    """Apply user-defined routing rules and return a structured decision."""
     rules = get_routing_rules()
     for rule in rules:
         if not rule.get("enabled", True):
@@ -217,12 +244,37 @@ def apply_routing_rules(username: str, api_key_value: str, requested_model: str,
             continue
         target = rule.get("target_model", resolved_model)
         provider = rule.get("target_provider", "")
-        if target and target != resolved_model:
-            _app_log.info("[routing] rule='%s' matched: %s@%s requested '%s', routing to '%s'",
-                          rule.get("name", ""), username, mask_key(api_key_value),
-                          requested_model, target)
-        return target or resolved_model, provider or ""
-    return resolved_model, ""
+        target_model = target or resolved_model
+        target_provider = provider or ""
+        decision = RoutingDecision(
+            requested_model=requested_model,
+            resolved_model=resolved_model,
+            target=RouteTarget(model=target_model, provider_id=target_provider),
+            matched=True,
+            rule_id=rule.get("id"),
+            rule_name=rule.get("name", ""),
+            source="routing_rule",
+            reason=f"matched rule '{rule.get('name', '') or rule.get('id', '')}' for model '{match_model}'",
+        )
+        _app_log.info(
+            "[routing] matched=%s rule_id=%s rule='%s' user=%s key=%s requested=%s resolved=%s target=%s provider=%s reason=%s",
+            decision.matched,
+            decision.rule_id,
+            decision.rule_name,
+            username,
+            mask_key(api_key_value),
+            decision.requested_model,
+            decision.resolved_model,
+            decision.target_model,
+            decision.target_provider or "-",
+            decision.reason,
+        )
+        return decision
+    return RoutingDecision(
+        requested_model=requested_model,
+        resolved_model=resolved_model,
+        target=RouteTarget(model=resolved_model, provider_id=""),
+    )
 
 
 async def prepare_request_policy(
@@ -240,14 +292,29 @@ async def prepare_request_policy(
 ) -> RequestPolicyResult:
     """Apply request-side policy while keeping endpoint-specific output unchanged."""
     requested_model = request.requested_model
-    route_model, route_provider = apply_routing_rules(
+    routing = apply_routing_rules(
         username, api_key_value, requested_model, request.target_model
     )
+    route_model = routing.target_model
+    route_provider = routing.target_provider
     if route_model != request.target_model:
         _app_log.debug("[%s] ROUTED model=%s -> %s", log_label, request.target_model, route_model)
         request.target_model = route_model
     if route_provider:
         request.provider_id = route_provider
+    _app_log.debug(
+        "[%s ROUTE] matched=%s source=%s rule_id=%s rule='%s' requested=%s resolved=%s target=%s provider=%s reason=%s",
+        log_label,
+        routing.matched,
+        routing.source,
+        routing.rule_id,
+        routing.rule_name,
+        routing.requested_model,
+        routing.resolved_model,
+        routing.target_model,
+        routing.target_provider or "-",
+        routing.reason,
+    )
 
     if normalize:
         pre_norm = len(request.messages)
@@ -286,6 +353,7 @@ async def prepare_request_policy(
         conv_key=conv_key,
         route_model=route_model,
         route_provider=route_provider,
+        routing=routing,
         modified_by_preprocessor=modified,
         reasoning_injected=injected,
         tool_only_limited=limited,

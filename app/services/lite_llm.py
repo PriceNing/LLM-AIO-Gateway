@@ -1,6 +1,5 @@
 import json
 import logging
-import re
 import litellm
 from litellm import completion
 from typing import Optional, Any
@@ -9,6 +8,7 @@ from litellm.types.utils import ModelResponse, Message, Delta
 from app.database import get_providers, get_provider, find_provider_by_model
 from app.services.logger import get_logger
 from app.config import get_default
+from app.core.images import has_image_content, normalize_image_content
 
 # -- liteLLM compatibility: expose reasoning_content on response models --
 # Several OpenAI-compatible providers return reasoning_content, but some liteLLM
@@ -77,107 +77,6 @@ OPENAI_HOSTS = ("api.openai.com", "azure.com")
 MIN_IMAGE_MAX_TOKENS = get_default("min_image_max_tokens", 2000)
 
 
-def _extract_image_data_uris(content) -> list:
-    """Extract image data URIs from string content, returning list of (mime_type, data_uri)."""
-    if not isinstance(content, str):
-        return []
-    # Match data:image/<type>;base64,<data>
-    pattern = r'data:image/(\w+);base64,([A-Za-z0-9+/=]+)'
-    matches = re.findall(pattern, content)
-    result = []
-    for mime_subtype, data in matches:
-        if len(data) > 100:  # Minimum length to be a real image
-            result.append((f'image/{mime_subtype}', f'data:image/{mime_subtype};base64,{data}'))
-    return result
-
-
-def _normalize_image_content(messages: list) -> list:
-    """Convert image data URIs found in text content to proper image_url content parts.
-
-    OpenCode and other agent SDKs may include image data as data URIs within text
-    content (e.g. from file-read tools) rather than as image_url content parts.
-    Without image_url parts, multimodal models won't activate their vision encoder.
-    """
-    fixed = False
-    for msg in messages:
-        content = msg.get("content")
-        if isinstance(content, list):
-            new_parts = []
-            for part in content:
-                if isinstance(part, dict) and part.get("type") == "text":
-                    text = part.get("text", "")
-                    image_uris = _extract_image_data_uris(text)
-                    if image_uris:
-                        fixed = True
-                        # Remove the data URI from text to avoid duplication
-                        cleaned = re.sub(
-                            r'data:image/\w+;base64,[A-Za-z0-9+/=]{100,}',
-                            '',
-                            text
-                        ).strip()
-                        if cleaned:
-                            new_parts.append({"type": "text", "text": cleaned})
-                        for mime_type, data_uri in image_uris:
-                            new_parts.append({
-                                "type": "image_url",
-                                "image_url": {"url": data_uri}
-                            })
-                    else:
-                        new_parts.append(part)
-                else:
-                    new_parts.append(part)
-            msg["content"] = new_parts
-        elif isinstance(content, str):
-            image_uris = _extract_image_data_uris(content)
-            if image_uris:
-                fixed = True
-                cleaned = re.sub(
-                    r'data:image/\w+;base64,[A-Za-z0-9+/=]{100,}',
-                    '',
-                    content
-                ).strip()
-                new_parts = []
-                if cleaned:
-                    new_parts.append({"type": "text", "text": cleaned})
-                for mime_type, data_uri in image_uris:
-                    new_parts.append({
-                        "type": "image_url",
-                        "image_url": {"url": data_uri}
-                    })
-                msg["content"] = new_parts
-    if fixed:
-        logging.getLogger("llmgw.app").info("Normalized image data URIs to image_url content parts")
-    return messages
-
-
-def _has_image_content(messages: list) -> bool:
-    """Check if any message contains image content (including nested in tool_result)."""
-    for msg in messages:
-        content = msg.get("content")
-        if isinstance(content, list):
-            for part in content:
-                if isinstance(part, dict):
-                    if part.get("type") in ("image_url", "input_image", "image"):
-                        return True
-                    # Anthropic tool_result may contain nested image blocks
-                    if part.get("type") == "tool_result":
-                        inner = part.get("content")
-                        if isinstance(inner, list):
-                            for ip in inner:
-                                if isinstance(ip, dict) and ip.get("type") == "image":
-                                    return True
-                        elif isinstance(inner, str):
-                            if _extract_image_data_uris(inner):
-                                return True
-                    if part.get("type") == "text" and isinstance(part.get("text"), str):
-                        if _extract_image_data_uris(part["text"]):
-                            return True
-        elif isinstance(content, str):
-            if _extract_image_data_uris(content):
-                return True
-    return False
-
-
 def get_litellm_model_name(model: str, provider: dict) -> str:
     """Build the liteLLM model name for OpenAI-compatible providers."""
     provider_type = provider.get("provider_type", "openai")
@@ -241,8 +140,8 @@ def create_chat_completion(
 ) -> dict:
     litellm_model, extra_params = build_completion_args(model, provider_id)
     kwargs.update(extra_params)
-    _normalize_image_content(messages)
-    if _has_image_content(messages):
+    normalize_image_content(messages)
+    if has_image_content(messages):
         kwargs["max_tokens"] = max(kwargs.get("max_tokens", 0), MIN_IMAGE_MAX_TOKENS)
     response = completion(model=litellm_model, messages=messages, **clean_params(kwargs))
     return response
@@ -259,8 +158,8 @@ def create_chat_completion_stream(
     kwargs["stream"] = True
     if "stream_options" not in kwargs:
         kwargs["stream_options"] = {"include_usage": True}
-    _normalize_image_content(messages)
-    if _has_image_content(messages):
+    normalize_image_content(messages)
+    if has_image_content(messages):
         kwargs["max_tokens"] = max(kwargs.get("max_tokens", 0), MIN_IMAGE_MAX_TOKENS)
     return completion(model=litellm_model, messages=messages, **clean_params(kwargs))
 

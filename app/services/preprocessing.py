@@ -24,7 +24,7 @@ import httpx
 
 from app.config import get_default
 from app.core.types import InternalMessage, InternalPart, text_part, tool_result_part
-from app.services.lite_llm import _extract_image_data_uris
+from app.core.images import extract_image_data_uris
 
 _log = logging.getLogger("llmgw.app")
 
@@ -195,7 +195,7 @@ def has_image_content(messages: list[InternalMessage]) -> bool:
                 return True
             if part.kind == "tool_result" and has_image_content([InternalMessage(role="tool", parts=part.parts)]):
                 return True
-            if part.kind == "text" and _extract_image_data_uris(part.text):
+            if part.kind == "text" and extract_image_data_uris(part.text):
                 return True
     return False
 
@@ -230,7 +230,7 @@ def _collect_images_from_parts(parts: list[InternalPart], out: list[dict]) -> No
         elif part.kind == "tool_result":
             _collect_images_from_parts(part.parts, out)
         elif part.kind == "text":
-            for _mime, data_uri in _extract_image_data_uris(part.text):
+            for _mime, data_uri in extract_image_data_uris(part.text):
                 out.append({"url": "", "data": data_uri})
 
 
@@ -268,7 +268,7 @@ def _replace_images_in_parts(parts: list[InternalPart], descriptions: list, is_c
             replaced.append(tool_result_part(part.tool_call_id, inner, raw=part.raw, extensions=part.extensions))
         elif part.kind == "text":
             text = part.text
-            for _mime, data_uri in _extract_image_data_uris(text):
+            for _mime, data_uri in extract_image_data_uris(text):
                 text = text.replace(data_uri, _build_inline_replacement(desc_idx, descriptions, is_current, image_data=data_uri))
                 if is_current:
                     desc_idx += 1

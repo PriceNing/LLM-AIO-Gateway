@@ -7,6 +7,7 @@ from app.protocols.ingress import (
     responses_to_internal,
 )
 from app.core.policy import prepare_request_policy
+from app.core.policy import RouteTarget, RoutingDecision
 from app.core.policy import fix_tool_args, inject_reasoning_content, request_has_tools, strip_tools
 from app.protocols.ir import ir_to_anthropic_messages, ir_to_openai_messages, openai_messages_to_ir
 from app.adapters.anthropic import anthropic_body_from_internal
@@ -289,7 +290,16 @@ def _fake_conv_key(api_key, messages, previous_response_id):
 async def test_prepare_request_policy_routes_normalizes_preprocesses_and_injects(monkeypatch):
     from app.core import policy
 
-    monkeypatch.setattr(policy, "apply_routing_rules", lambda *_: ("target-model", "target-provider"))
+    monkeypatch.setattr(policy, "apply_routing_rules", lambda *_: RoutingDecision(
+        requested_model="source-model",
+        resolved_model="source-model",
+        target=RouteTarget(model="target-model", provider_id="target-provider"),
+        matched=True,
+        rule_id=7,
+        rule_name="route-test",
+        source="routing_rule",
+        reason="test route",
+    ))
     req = chat_completions_to_internal({
         "model": "source-model",
         "messages": [
@@ -313,6 +323,11 @@ async def test_prepare_request_policy_routes_normalizes_preprocesses_and_injects
     projected = chat_messages_from_internal(req)
     assert projected[0] == {"role": "user", "content": "a\n\nb"}
     assert projected[-1]["content"] == "request-target=target-model;requested=source-model"
+    assert result.routing.matched is True
+    assert result.routing.rule_id == 7
+    assert result.routing.rule_name == "route-test"
+    assert result.routing.target_model == "target-model"
+    assert result.routing.target_provider == "target-provider"
     assert result.modified_by_preprocessor is True
     assert result.reasoning_injected == 0
 
@@ -321,7 +336,12 @@ async def test_prepare_request_policy_routes_normalizes_preprocesses_and_injects
 async def test_prepare_request_policy_can_preprocess_request_and_update_internal(monkeypatch):
     from app.core import policy
 
-    monkeypatch.setattr(policy, "apply_routing_rules", lambda *_: ("target-model", "target-provider"))
+    monkeypatch.setattr(policy, "apply_routing_rules", lambda *_: RoutingDecision(
+        requested_model="source-model",
+        resolved_model="source-model",
+        target=RouteTarget(model="target-model", provider_id="target-provider"),
+        matched=True,
+    ))
     req = chat_completions_to_internal({
         "model": "source-model",
         "messages": [{"role": "user", "content": "a"}],

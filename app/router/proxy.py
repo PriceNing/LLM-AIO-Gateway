@@ -1,4 +1,3 @@
-import hashlib
 import json
 import threading
 import time
@@ -14,15 +13,25 @@ from app.database import (
     increment_global_stats, increment_user_usage, get_db,
     parse_model_id, add_request_record,
 )
-from app.core.text import friendly_error_msg, mask_key, message_text
+from app.core.text import friendly_error_msg, mask_key
+from app.core.state import (
+    TOOL_ONLY_LIMIT,
+    conversation_cache_key as _conversation_cache_key,
+    ir_reasoning_message_count as _ir_reasoning_message_count,
+    ir_tool_message_count as _ir_tool_message_count,
+    reasoning_context as _reasoning_context,
+    remember_reasoning_content as _remember_reasoning_content,
+    remember_response_chain_key as _remember_response_chain_key,
+    tool_only_turns as _tool_only_turns,
+)
+from app.core.streaming import stream_internal_output as _stream_internal_output
 from app.protocols.ingress import (
     anthropic_messages_to_internal,
     chat_completions_to_internal,
     completions_to_internal,
     responses_to_internal,
 )
-from app.core.types import InternalMessage
-from app.core.policy import apply_routing_rules, prepare_request_policy
+from app.core.policy import prepare_request_policy
 from app.adapters.anthropic import (
     anthropic_body_from_internal,
     anthropic_messages_completion_for_internal,
@@ -32,15 +41,10 @@ from app.adapters.output import response_to_internal_output
 from app.adapters.anthropic_streaming import iter_anthropic_output_events
 from app.adapters.openai_streaming import iter_openai_chat_output_events
 from app.protocols.egress import (
-    render_anthropic_messages_sse,
     render_anthropic_message,
     render_chat_completion,
-    render_chat_completions_sse,
     render_completion,
-    render_completions_sse,
     render_response,
-    render_responses_error_sse,
-    render_responses_sse,
 )
 from app.services.lite_llm import create_chat_completion
 from app.services.preprocessing import has_image_content, preprocess_messages
@@ -58,6 +62,14 @@ router = APIRouter()
 # Rolling log of recent requests for the admin stats dashboard
 _request_log = deque(maxlen=get_default("request_log_max", 200))
 _request_log_lock = threading.Lock()
+
+
+def _adapter_provider_id(provider_info: dict | None, provider_id: str = "") -> str:
+    return (provider_info or {}).get("id") or provider_id or ""
+
+
+def _provider_for_log(provider_info: dict | None, provider_id: str = "") -> str:
+    return _adapter_provider_id(provider_info, provider_id)
 
 
 def _log_request(username: str, api_key: str, model: str, provider_id: str,
@@ -268,350 +280,6 @@ def get_timeline_model_data() -> dict:
     }
 
 
-class TTLDict:
-    """Dict with TTL-based expiration and max-size eviction. Thread-safe.
-
-    Prevents unbounded memory growth for caches of short-lived conversations.
-    Entries older than ttl_seconds are lazily evicted on access; when max_size
-    is exceeded the oldest entry is evicted.
-    """
-
-    def __init__(self, ttl_seconds: int = 1800, max_size: int = 1000):
-        self.ttl = ttl_seconds
-        self.max_size = max_size
-        self._data: dict = {}
-        self._timestamps: dict = {}
-        self._lock = threading.Lock()
-
-    def _expired(self, key: str) -> bool:
-        return time.time() - self._timestamps.get(key, 0) > self.ttl
-
-    def _drop_locked(self, key: str) -> None:
-        self._data.pop(key, None)
-        self._timestamps.pop(key, None)
-
-    def drop(self, key: str) -> None:
-        """Public method to remove a cache entry."""
-        with self._lock:
-            self._drop_locked(key)
-
-    def increment(self, key: str, delta: int = 1) -> int:
-        """Atomically increment a counter and return the new value."""
-        with self._lock:
-            if key in self._data:
-                if self._expired(key):
-                    self._drop_locked(key)
-                    val = delta
-                else:
-                    val = self._data[key] + delta
-            else:
-                if len(self._data) >= self.max_size:
-                    self._evict_expired()
-                    if len(self._data) >= self.max_size and self._timestamps:
-                        oldest = min(self._timestamps, key=lambda k: self._timestamps[k])
-                        self._drop_locked(oldest)
-                val = delta
-            self._data[key] = val
-            self._timestamps[key] = time.time()
-            return val
-
-    def reset(self, key: str) -> None:
-        """Atomically reset a counter to 0."""
-        with self._lock:
-            if key in self._data and not self._expired(key):
-                self._data[key] = 0
-                self._timestamps[key] = time.time()
-
-    def _evict_expired(self) -> None:
-        """Internal - caller must hold _lock."""
-        now = time.time()
-        expired = [k for k, ts in self._timestamps.items() if now - ts > self.ttl]
-        for k in expired:
-            self._drop_locked(k)
-
-    def get(self, key: str, default=None):
-        with self._lock:
-            if key not in self._data:
-                return default
-            if self._expired(key):
-                self._drop_locked(key)
-                return default
-            return self._data[key]
-
-    def __setitem__(self, key: str, value) -> None:
-        with self._lock:
-            if len(self._data) >= self.max_size and key not in self._data:
-                self._evict_expired()
-                if len(self._data) >= self.max_size and self._timestamps:
-                    oldest = min(self._timestamps, key=lambda k: self._timestamps[k])
-                    self._drop_locked(oldest)
-            self._data[key] = value
-            self._timestamps[key] = time.time()
-
-    def __getitem__(self, key: str):
-        with self._lock:
-            if key not in self._data:
-                raise KeyError(key)
-            if self._expired(key):
-                self._drop_locked(key)
-                raise KeyError(key)
-            return self._data[key]
-
-    def keys(self):
-        with self._lock:
-            self._evict_expired()
-            return list(self._data.keys())
-
-    def __len__(self) -> int:
-        with self._lock:
-            return len(self._data)
-
-
-# Tool-call circuit breaker: track consecutive tool-only turns per conversation
-_tool_only_turns = TTLDict(
-    ttl_seconds=get_default("tool_only_turns_ttl", 600),
-    max_size=get_default("tool_only_turns_max_size", 2000)
-)
-TOOL_ONLY_LIMIT = get_default("tool_only_limit", 20)
-
-# Reasoning content cache: DeepSeek requires reasoning_content echoed back in multi-turn
-# Keyed by "{api_key}:{conversation_hash}", stores reasoning_content for replay
-_reasoning_cache = TTLDict(
-    ttl_seconds=get_default("reasoning_cache_ttl", 1800),
-    max_size=get_default("reasoning_cache_max_size", 1000)
-)
-_reasoning_tool_cache = TTLDict(
-    ttl_seconds=get_default("reasoning_cache_ttl", 1800),
-    max_size=get_default("reasoning_cache_max_size", 1000)
-)
-_reasoning_tool_global_cache = TTLDict(
-    ttl_seconds=get_default("reasoning_cache_ttl", 1800),
-    max_size=get_default("reasoning_cache_max_size", 1000)
-)
-_response_chain_cache = TTLDict(
-    ttl_seconds=get_default("reasoning_cache_ttl", 1800),
-    max_size=get_default("reasoning_cache_max_size", 1000)
-)
-def _ir_tool_message_count(messages: list[InternalMessage]) -> int:
-    return sum(1 for msg in messages if any(part.kind == "tool_call" for part in msg.parts))
-
-
-def _ir_reasoning_message_count(messages: list[InternalMessage]) -> int:
-    return sum(1 for msg in messages if any(part.kind == "reasoning" for part in msg.parts))
-
-
-def _remember_response_chain_key(response_id: str, conv_key: str) -> None:
-    if response_id and conv_key:
-        _response_chain_cache[str(response_id)] = conv_key
-
-
-def _conversation_cache_key(api_key: str, messages: list, response_chain_id: str = "") -> str:
-    """Build a cache key that isolates different conversations sharing the same API key."""
-    if response_chain_id:
-        chained_key = _response_chain_cache.get(str(response_chain_id))
-        if chained_key:
-            return chained_key
-    user_fingerprints = []
-    for msg in messages:
-        if isinstance(msg, InternalMessage):
-            if msg.role != "user":
-                continue
-            text = _ir_text_for_cache(msg)
-            if not text and msg.parts:
-                text = json.dumps([part.raw if part.raw is not None else part.kind for part in msg.parts], sort_keys=True, default=str)
-            if text:
-                user_fingerprints.append(text[:200])
-            continue
-        if not isinstance(msg, dict) or msg.get("role") != "user":
-            continue
-        content = msg.get("content")
-        text = message_text(content)
-        if not text and isinstance(content, list):
-            text = json.dumps(content, sort_keys=True, default=str)
-        if text:
-            user_fingerprints.append(text[:200])
-    fingerprint = "\n---\n".join(user_fingerprints)[:2000]
-    conv_hash = hashlib.md5(fingerprint.encode()).hexdigest()[:16]
-    return f"{api_key}:{conv_hash}"
-
-
-def _ir_text_for_cache(message: InternalMessage) -> str:
-    parts = []
-    for part in message.parts:
-        if part.kind == "text" and part.text:
-            parts.append(part.text)
-    return "\n".join(parts)
-
-
-def _remember_reasoning_content(conv_key: str, reasoning_content: str, tool_call_ids=None) -> None:
-    if not reasoning_content:
-        return
-    _reasoning_cache[conv_key] = reasoning_content
-    ids = [str(tid) for tid in (tool_call_ids or []) if tid]
-    if not ids:
-        return
-    tool_map = dict(_reasoning_tool_cache.get(conv_key, {}) or {})
-    for tid in ids:
-        tool_map[tid] = reasoning_content
-        _reasoning_tool_global_cache[tid] = reasoning_content
-    while len(tool_map) > 200:
-        oldest = next(iter(tool_map))
-        tool_map.pop(oldest, None)
-    _reasoning_tool_cache[conv_key] = tool_map
-
-
-def _reasoning_context(conv_key: str, messages: list[InternalMessage] | None = None) -> tuple[str | None, dict]:
-    tool_map = _reasoning_tool_cache.get(conv_key, {}) or {}
-    if messages:
-        tool_map = _merge_global_reasoning_context(messages, tool_map)
-    return _reasoning_cache.get(conv_key), tool_map
-
-
-def _merge_global_reasoning_context(messages: list[InternalMessage], tool_map: dict) -> dict:
-    merged = dict(tool_map or {})
-    for msg in messages or []:
-        if not isinstance(msg, InternalMessage):
-            continue
-        for part in msg.parts:
-            if part.kind != "tool_result" or not part.tool_call_id or part.tool_call_id in merged:
-                continue
-            rc = _reasoning_tool_global_cache.get(part.tool_call_id)
-            if rc:
-                merged[part.tool_call_id] = rc
-    return merged
-
-
-async def _record_streaming_events(
-    events,
-    *,
-    conv_key: str,
-    tool_only_turns=None,
-    remember_reasoning_content=None,
-):
-    accumulated_reasoning = ""
-    has_text = False
-    has_tools = False
-    tool_ids = []
-    usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 0}
-
-    def finalize() -> None:
-        nonlocal accumulated_reasoning
-        if accumulated_reasoning and remember_reasoning_content is not None:
-            remember_reasoning_content(conv_key, accumulated_reasoning, tool_ids)
-            _app_log.debug("[stream_policy] STORED rc key=%s len=%d tool_ids=%d", conv_key[:60], len(accumulated_reasoning), len(tool_ids))
-            accumulated_reasoning = ""
-        if tool_only_turns is not None:
-            if has_tools and not has_text:
-                count = tool_only_turns.increment(conv_key)
-                _app_log.debug("[stream_policy] tool_only_increment key=%s count=%d", conv_key[:60], count)
-            else:
-                tool_only_turns.reset(conv_key)
-                _app_log.debug("[stream_policy] tool_only_reset key=%s has_tools=%s has_text=%s", conv_key[:60], has_tools, has_text)
-
-    finalized = False
-    async for event in events:
-        if event.kind == "text_delta" and event.text:
-            has_text = True
-        elif event.kind == "reasoning_delta" and event.reasoning:
-            accumulated_reasoning += event.reasoning
-        elif event.kind == "tool_call_start":
-            has_tools = True
-            if event.tool_call_id:
-                tool_ids.append(event.tool_call_id)
-        elif event.kind == "usage":
-            usage.update(event.usage)
-        elif event.kind == "message_done":
-            finalize()
-            finalized = True
-        yield event
-
-    if not finalized:
-        finalize()
-
-
-async def _stream_internal_output(
-    *,
-    events,
-    endpoint: str,
-    model: str,
-    username: str,
-    api_key_value: str,
-    provider_id: str,
-    requested_model: str,
-    previous_response_id: str | None = None,
-    conv_key: str = "",
-    remember_response_chain_key=None,
-    remember_reasoning_content=None,
-    tool_only_turns=None,
-):
-    total_tokens = 0
-    _app_log.debug(
-        "[stream_orchestrator] START endpoint=%s provider=%s model=%s requested=%s conv_key=%s previous_response_id=%s",
-        endpoint,
-        provider_id or "",
-        model,
-        requested_model,
-        conv_key[:60],
-        previous_response_id or "",
-    )
-
-    async def metered_events():
-        nonlocal total_tokens
-        async for event in _record_streaming_events(
-            events,
-            conv_key=conv_key,
-            remember_reasoning_content=remember_reasoning_content,
-            tool_only_turns=tool_only_turns,
-        ):
-            if event.kind == "usage":
-                total_tokens = event.usage.get("total_tokens", total_tokens) or total_tokens
-            yield event
-
-    response_id = f"resp_{uuid.uuid4().hex}" if endpoint == "responses" else None
-    if endpoint == "responses" and remember_response_chain_key is not None and conv_key:
-        remember_response_chain_key(response_id, conv_key)
-
-    try:
-        if endpoint == "chat_completions":
-            async for line in render_chat_completions_sse(metered_events(), model=model):
-                yield line
-        elif endpoint == "completions":
-            async for line in render_completions_sse(metered_events(), model=model):
-                yield line
-        elif endpoint == "messages":
-            async for line in render_anthropic_messages_sse(metered_events(), model=model):
-                yield line
-        elif endpoint == "responses":
-            async for line in render_responses_sse(
-                metered_events(),
-                model=model,
-                previous_response_id=previous_response_id,
-                response_id=response_id,
-            ):
-                yield line
-        _log_request(username, api_key_value, model, provider_id or "", endpoint, True, total_tokens, requested_model)
-        increment_global_stats(success=True)
-        if username != "legacy":
-            increment_user_usage(username, api_key_value, True, total_tokens)
-        _app_log.debug("[stream_orchestrator] DONE endpoint=%s provider=%s model=%s total_tokens=%d", endpoint, provider_id or "", model, total_tokens)
-    except Exception as e:
-        error_msg = friendly_error_msg(e)
-        _error_log.error("[%s_stream] %s", endpoint, str(e))
-        _log_request(username, api_key_value, "-", provider_id or "", endpoint, False, 0, requested_model)
-        increment_global_stats(success=False)
-        if username != "legacy":
-            increment_user_usage(username, api_key_value, False, 0)
-        if tool_only_turns is not None and conv_key:
-            tool_only_turns.reset(conv_key)
-        if endpoint == "responses":
-            async for line in render_responses_error_sse(model=model, message=error_msg, previous_response_id=previous_response_id):
-                yield line
-        elif endpoint == "messages":
-            yield f"event: error\ndata: {json.dumps({'type': 'error', 'error': {'type': 'server_error', 'message': error_msg}})}\n\n"
-        else:
-            yield f"data: {json.dumps({'error': {'message': error_msg, 'type': 'server_error'}})}\n\n"
-            yield "data: [DONE]\n\n"
-
 def verify_api_key(authorization: Optional[str] = Header(None)) -> tuple[dict, dict]:
     if not authorization:
         raise HTTPException(status_code=401, detail="Missing Authorization header")
@@ -717,6 +385,8 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
     model = internal.target_model
     provider_id = internal.provider_id
     conv_key = policy.conv_key
+    provider_info = None
+    adapter_provider_id = provider_id or ""
 
     try:
         extra = chat_kwargs_from_internal(internal)
@@ -726,12 +396,12 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
         else:
             provider_info = _find(model)
         is_anthropic = provider_info and provider_info.get("provider_type") == "anthropic"
-        adapter_provider_id = provider_info.get("id", provider_id or "") if provider_info else provider_id
+        adapter_provider_id = _adapter_provider_id(provider_info, provider_id)
 
         if stream:
             if is_anthropic:
                 anthropic_msgs, anthropic_body = anthropic_body_from_internal(internal)
-                adapter_provider_id = provider_info.get("id", provider_id or "")
+                adapter_provider_id = _adapter_provider_id(provider_info, provider_id)
                 events = iter_anthropic_output_events(
                     provider_info=provider_info,
                     messages=anthropic_msgs,
@@ -744,7 +414,7 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
                 events = iter_openai_chat_output_events(
                     model=model,
                     messages=chat_messages_from_internal(internal),
-                    provider_id=provider_id,
+                    provider_id=adapter_provider_id,
                     temperature=temperature,
                     max_tokens=max_tokens,
                     extra=extra,
@@ -758,6 +428,7 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
                     api_key_value=api_key_value,
                     provider_id=adapter_provider_id,
                     requested_model=requested_model,
+                    log_request=_log_request,
                     conv_key=conv_key,
                     remember_reasoning_content=_remember_reasoning_content,
                     tool_only_turns=_tool_only_turns,
@@ -767,13 +438,13 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
 
         if is_anthropic:
             output = await anthropic_messages_completion_for_internal(provider_info, internal)
-            adapter_provider_id = provider_info.get("id", provider_id or "")
+            adapter_provider_id = _adapter_provider_id(provider_info, provider_id)
         else:
             response = await anyio.to_thread.run_sync(
                 lambda: create_chat_completion(
                     model=model,
                     messages=chat_messages_from_internal(internal),
-                    provider_id=provider_id,
+                    provider_id=adapter_provider_id,
                     temperature=temperature,
                     max_tokens=max_tokens,
                     **extra
@@ -839,6 +510,8 @@ async def completions(request: Request, authorization: Optional[str] = Header(No
     model = internal.target_model
     provider_id = internal.provider_id
     conv_key = policy.conv_key
+    provider_info = None
+    adapter_provider_id = provider_id or ""
 
     try:
         from app.database import get_provider as _get_prov, find_provider_by_model as _find
@@ -847,12 +520,12 @@ async def completions(request: Request, authorization: Optional[str] = Header(No
         else:
             provider_info = _find(model)
         is_anthropic = provider_info and provider_info.get("provider_type") == "anthropic"
-        adapter_provider_id = provider_info.get("id", provider_id or "") if provider_info else provider_id
+        adapter_provider_id = _adapter_provider_id(provider_info, provider_id)
 
         if stream:
             if is_anthropic:
                 anthropic_msgs, anthropic_body = anthropic_body_from_internal(internal)
-                adapter_provider_id = provider_info.get("id", provider_id or "")
+                adapter_provider_id = _adapter_provider_id(provider_info, provider_id)
                 events = iter_anthropic_output_events(
                     provider_info=provider_info,
                     messages=anthropic_msgs,
@@ -879,6 +552,7 @@ async def completions(request: Request, authorization: Optional[str] = Header(No
                     api_key_value=api_key_value,
                     provider_id=adapter_provider_id,
                     requested_model=requested_model,
+                    log_request=_log_request,
                     conv_key=conv_key,
                 ),
                 media_type="text/event-stream"
@@ -886,7 +560,7 @@ async def completions(request: Request, authorization: Optional[str] = Header(No
 
         if is_anthropic:
             output = await anthropic_messages_completion_for_internal(provider_info, internal)
-            adapter_provider_id = provider_info.get("id", provider_id or "")
+            adapter_provider_id = _adapter_provider_id(provider_info, provider_id)
         else:
             response = await anyio.to_thread.run_sync(
                 lambda: create_chat_completion(
@@ -940,19 +614,6 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
     api_key_value = api_key.get("key", "")
     requested_model = model
 
-    route_model, route_provider = apply_routing_rules(username, api_key_value, model, model)
-    routed_model = route_model
-    routed_provider_id = route_provider or provider_id
-
-    # Resolve the upstream adapter after ingress has normalized the client protocol.
-    from app.database import get_provider as _get_prov, find_provider_by_model as _find
-    if routed_provider_id:
-        provider_info = _get_prov(routed_provider_id)
-    else:
-        provider_info = _find(routed_model)
-    internal.target_model = routed_model
-    if routed_provider_id:
-        internal.provider_id = routed_provider_id
     policy = await prepare_request_policy(
         internal,
         username=username,
@@ -965,6 +626,12 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
     )
     model = internal.target_model
     provider_id = internal.provider_id
+    from app.database import get_provider as _get_prov, find_provider_by_model as _find
+    if provider_id:
+        provider_info = _get_prov(provider_id)
+    else:
+        provider_info = _find(model)
+    adapter_provider_id = _adapter_provider_id(provider_info, provider_id)
     previous_response_id = internal.previous_response_id
     max_tokens = internal.max_tokens
     temperature = internal.temperature
@@ -998,8 +665,9 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
                         model=model,
                         username=username,
                         api_key_value=api_key_value,
-                        provider_id=provider_id,
+                        provider_id=adapter_provider_id,
                         requested_model=requested_model,
+                        log_request=_log_request,
                         conv_key=conv_key,
                         remember_reasoning_content=_remember_reasoning_content,
                     ),
@@ -1010,7 +678,7 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
             events = iter_openai_chat_output_events(
                 model=model,
                 messages=adapter_messages,
-                provider_id=provider_id,
+                provider_id=adapter_provider_id,
                 temperature=temperature,
                 max_tokens=max_tokens,
                 extra=adapter_extra,
@@ -1023,8 +691,9 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
                     model=model,
                     username=username,
                     api_key_value=api_key_value,
-                    provider_id=provider_id,
+                    provider_id=adapter_provider_id,
                     requested_model=requested_model,
+                    log_request=_log_request,
                     conv_key=conv_key,
                     remember_reasoning_content=_remember_reasoning_content,
                 ),
@@ -1041,7 +710,7 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
                           str(adapter_extra.get("tool_choice")), conv_key)
             response = await anyio.to_thread.run_sync(
                 lambda: create_chat_completion(
-                    model=model, messages=adapter_messages, provider_id=provider_id,
+                    model=model, messages=adapter_messages, provider_id=adapter_provider_id,
                     max_tokens=max_tokens, temperature=temperature,
                     **adapter_extra,
                 )
@@ -1052,13 +721,13 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
             _app_log.debug("[messages_nonstream] STORED rc key=%s len=%d cache_hit=%d cache_miss=%d",
                           conv_key[:60], len(output.reasoning),
                           output.usage.get("prompt_cache_hit_tokens", 0), output.usage.get("prompt_cache_miss_tokens", 0))
-        _log_request(username, api_key_value, model, provider_id or "", "messages", True, output.usage.get("total_tokens", 0), requested_model)
+        _log_request(username, api_key_value, model, adapter_provider_id, "messages", True, output.usage.get("total_tokens", 0), requested_model)
         increment_global_stats(success=True)
         if username != "legacy":
             increment_user_usage(username, api_key_value, True, output.usage.get("total_tokens", 0))
         return render_anthropic_message(output, model=model)
     except Exception as e:
-        _log_request(username, api_key_value, "-", provider_id or "", "messages", False, 0, requested_model)
+        _log_request(username, api_key_value, "-", adapter_provider_id, "messages", False, 0, requested_model)
         increment_global_stats(success=False)
         if username != "legacy":
             increment_user_usage(username, api_key_value, False, 0)
@@ -1132,6 +801,8 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
     model = internal.target_model
     provider_id = internal.provider_id
     conv_key = policy.conv_key
+    provider_info = None
+    adapter_provider_id = provider_id or ""
 
     if isinstance(input_data, list):
         _app_log.debug(
@@ -1152,6 +823,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
             provider_info = _get_prov(provider_id)
         else:
             provider_info = _find(model)
+        adapter_provider_id = _adapter_provider_id(provider_info, provider_id)
         is_anthropic = provider_info and provider_info.get("provider_type") == "anthropic"
 
         if is_anthropic:
@@ -1173,8 +845,9 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                         model=model,
                         username=username,
                         api_key_value=api_key_value,
-                        provider_id=provider_id,
+                        provider_id=adapter_provider_id,
                         requested_model=requested_model,
+                        log_request=_log_request,
                         previous_response_id=previous_response_id,
                         conv_key=conv_key,
                         remember_response_chain_key=_remember_response_chain_key,
@@ -1192,7 +865,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                 events = iter_openai_chat_output_events(
                     model=model,
                     messages=adapter_messages,
-                    provider_id=provider_id,
+                    provider_id=adapter_provider_id,
                     temperature=temperature,
                     max_tokens=max_tokens,
                     extra=adapter_extra,
@@ -1204,8 +877,9 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                         model=model,
                         username=username,
                         api_key_value=api_key_value,
-                        provider_id=provider_id,
+                        provider_id=adapter_provider_id,
                         requested_model=requested_model,
+                        log_request=_log_request,
                         previous_response_id=previous_response_id,
                         conv_key=conv_key,
                         remember_response_chain_key=_remember_response_chain_key,
@@ -1219,7 +893,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                 lambda: create_chat_completion(
                     model=model,
                     messages=adapter_messages,
-                    provider_id=provider_id,
+                    provider_id=adapter_provider_id,
                     temperature=temperature,
                     max_tokens=max_tokens,
                     **adapter_extra
@@ -1234,13 +908,13 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
 
         resp_id = f"resp_{uuid.uuid4().hex}"
         _remember_response_chain_key(resp_id, conv_key)
-        _log_request(username, api_key_value, model, provider_id or "", "responses", True, output.usage.get("total_tokens", 0), requested_model)
+        _log_request(username, api_key_value, model, adapter_provider_id, "responses", True, output.usage.get("total_tokens", 0), requested_model)
         increment_global_stats(success=True)
         if username != "legacy":
             increment_user_usage(username, api_key_value, True, output.usage.get("total_tokens", 0))
         return render_response(output, model=model, previous_response_id=previous_response_id, response_id=resp_id)
     except Exception as e:
-        _log_request(username, api_key_value, "-", provider_id or "", "responses", False, 0, requested_model)
+        _log_request(username, api_key_value, "-", _provider_for_log(provider_info, provider_id), "responses", False, 0, requested_model)
         increment_global_stats(success=False)
         if username != "legacy":
             increment_user_usage(username, api_key_value, False, 0)

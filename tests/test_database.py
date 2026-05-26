@@ -237,7 +237,7 @@ def test_delete_routing_rule():
 # -- TTLDict --
 
 def test_ttldict_basic():
-    from app.router.proxy import TTLDict
+    from app.core.state import TTLDict
     d = TTLDict(ttl_seconds=10, max_size=10)
     d["key1"] = "value1"
     assert d["key1"] == "value1"
@@ -246,7 +246,7 @@ def test_ttldict_basic():
 
 
 def test_ttldict_expiry():
-    from app.router.proxy import TTLDict
+    from app.core.state import TTLDict
     d = TTLDict(ttl_seconds=0, max_size=10)  # instant expiry
     d["ephemeral"] = "gone"
     time.sleep(0.01)
@@ -256,7 +256,7 @@ def test_ttldict_expiry():
 
 
 def test_ttldict_max_size_eviction():
-    from app.router.proxy import TTLDict
+    from app.core.state import TTLDict
     d = TTLDict(ttl_seconds=3600, max_size=3)
     for i in range(5):
         d[f"key{i}"] = f"value{i}"
@@ -264,7 +264,7 @@ def test_ttldict_max_size_eviction():
 
 
 def test_ttldict_get_default():
-    from app.router.proxy import TTLDict
+    from app.core.state import TTLDict
     d = TTLDict(ttl_seconds=3600, max_size=10)
     assert d.get("missing", "default") == "default"
 

@@ -7,7 +7,7 @@
 
 LLM AIO Gateway 是一个基于 FastAPI 的统一 LLM API 网关，用一个服务代理多个 OpenAI 兼容和 Anthropic 兼容的上游提供商。它同时暴露 OpenAI Chat Completions、旧版 Completions、Anthropic Messages、OpenAI Responses 等接口，并提供路由规则、API Key 管理、reasoning 连续性、工具调用修复和视觉模型注入。
 
-当前代理核心基于统一内部消息格式：所有客户端协议先转换为 `InternalRequest` / `InternalMessage`，再进入共享策略层，随后由上游适配器发送给 OpenAI/liteLLM 或 Anthropic 兼容接口，最后再渲染回客户端需要的协议格式。
+当前代理核心基于统一内部消息格式：所有客户端协议先转换为 `InternalRequest` / `InternalMessage`，再进入共享策略层。策略层会产出结构化 `RoutingDecision`，随后由上游适配器发送给 OpenAI/liteLLM 或 Anthropic 兼容接口，最后再渲染回客户端需要的协议格式。
 
 ## 功能特性
 
@@ -16,6 +16,7 @@ LLM AIO Gateway 是一个基于 FastAPI 的统一 LLM API 网关，用一个服�
 | 统一协议网关 | 支持 `/chat/completions`、`/completions`、`/messages`、`/responses`、`/models`，同时挂载在根路径和 `/v1` 前缀。 |
 | OpenAI / Anthropic 提供商 | OpenAI 兼容提供商走 liteLLM；Anthropic 兼容提供商从内部 IR 直接投影到 Anthropic Messages 请求。 |
 | 共享 IR 流程 | 路由、预处理、reasoning 缓存、工具修复、断路器都运行在统一内部消息上，避免端点各自维护转换逻辑。 |
+| 结构化路由 | 策略层返回 `RoutingDecision`，记录 requested/resolved/target model、目标 provider、命中的规则和原因。 |
 | 视觉模型注入 | 图片可先由配置的视觉模型生成描述，再替换为文本，让纯文本模型也能处理图片上下文。 |
 | 工具调用可靠性 | 保留工具调用 ID，修复 malformed JSON 工具参数，并提供工具调用循环断路器。 |
 | Reasoning 连续性 | 对 DeepSeek 等 thinking 模型自动缓存和回传 `reasoning_content`，保证多轮工具调用不中断。 |
@@ -154,6 +155,8 @@ curl http://localhost:8000/v1/responses \
 
 路由规则可按用户名、API Key 子串、请求模型通配符透明重定向请求。第一条匹配规则生效。
 
+路由发生在共享策略层，结果以 `RoutingDecision` 表达。日志会记录原始请求模型、解析后的模型、目标模型、目标提供商、命中规则和原因，便于排查“为什么请求去了这个上游”。
+
 规则结构：
 
 ```json
@@ -192,7 +195,7 @@ curl http://localhost:8000/v1/responses \
 客户端端点
   -> 协议入口
   -> 内部 IR
-  -> 共享策略层
+  -> 共享策略层（RoutingDecision、预处理、reasoning、工具修复）
   -> OpenAI/liteLLM 适配器或 direct Anthropic 适配器
   -> 内部输出
   -> 协议出口
@@ -200,13 +203,27 @@ curl http://localhost:8000/v1/responses \
 
 端点特有的协议细节只保留在 ingress/egress。路由、预处理、reasoning 缓存、工具修复和适配器选择都基于统一内部格式运行。
 
+主要代码边界：
+
+| 模块 | 职责 |
+|---|---|
+| `app/router/proxy.py` | FastAPI 端点、鉴权、provider 解析、adapter 调度、非流式请求统计。 |
+| `app/protocols/ingress.py` | `/chat/completions`、`/completions`、`/messages`、`/responses` 请求体转换为内部 IR。 |
+| `app/core/policy.py` | 路由决策、消息规范化、预处理挂钩、reasoning 注入、工具参数修复、tool-only 限制。 |
+| `app/core/state.py` | TTL cache、reasoning cache、tool-only counter、response chain cache。 |
+| `app/core/streaming.py` | 流式事件计量、reasoning 存储、tool-only 计数、流式错误渲染和统计回调。 |
+| `app/core/images.py` | data URI 图片提取、图片内容检测和 OpenAI 图像内容归一化。 |
+| `app/adapters/` | 将内部请求投递给 OpenAI/liteLLM 或 direct Anthropic Messages，并转回内部输出事件。 |
+| `app/protocols/egress.py` | 将内部输出渲染回 Chat、Completions、Messages、Responses 协议。 |
+| `app/services/lite_llm.py` | 仅作为 OpenAI 兼容上游的 liteLLM wrapper 和最小 reasoning 兼容补丁。 |
+
 ## 测试
 
 ```bash
 pytest tests/ -q
 ```
 
-当前预期结果：`290 passed`。
+当前预期结果：`298 passed`。
 
 真实烟测建议：
 

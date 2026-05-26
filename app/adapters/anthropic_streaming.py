@@ -14,6 +14,14 @@ _app_log = get_logger("app")
 _tool_log = get_logger("tool_calls")
 
 
+def _usage_value(usage: dict, current: int, *keys: str) -> int:
+    for key in keys:
+        value = usage.get(key)
+        if value is not None:
+            return value or 0
+    return current
+
+
 async def iter_anthropic_output_events(
     *,
     provider_info: dict,
@@ -92,8 +100,8 @@ async def iter_anthropic_output_events(
                         err_msg = err.get("message") or json.dumps(data, ensure_ascii=False)
                         raise HTTPException(status_code=502, detail=f"Upstream: {err_msg}")
                     if event_type == "message_start":
-                        usage = data.get("message", {}).get("usage", {}) or {}
-                        input_tokens = usage.get("input_tokens", input_tokens) or 0
+                        usage = data.get("message", {}).get("usage", {}) or data.get("usage", {}) or {}
+                        input_tokens = _usage_value(usage, input_tokens, "input_tokens", "prompt_tokens")
                         _app_log.debug("[anthropic_stream_adapter] message_start input_tokens=%d", input_tokens)
                         yield InternalOutputEvent(kind="message_start", role="assistant", raw=data)
                     elif event_type == "content_block_start":
@@ -194,11 +202,13 @@ async def iter_anthropic_output_events(
                         elif stop_reason:
                             finish_reason = "stop"
                         usage = data.get("usage", {}) or {}
-                        output_tokens = usage.get("output_tokens", output_tokens) or output_tokens
+                        input_tokens = _usage_value(usage, input_tokens, "input_tokens", "prompt_tokens")
+                        output_tokens = _usage_value(usage, output_tokens, "output_tokens", "completion_tokens")
                         _app_log.debug(
-                            "[anthropic_stream_adapter] message_delta stop_reason=%s finish_reason=%s output_tokens=%d",
+                            "[anthropic_stream_adapter] message_delta stop_reason=%s finish_reason=%s input_tokens=%d output_tokens=%d",
                             stop_reason,
                             finish_reason,
+                            input_tokens,
                             output_tokens,
                         )
                         yield InternalOutputEvent(
