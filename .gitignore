@@ -17,6 +17,7 @@ data.db-wal
 config.json
 tools/live-eval.config.json
 tools/live-eval.config.local.json
+tools/run-live-eval.bat
 *.log
 data/
 
