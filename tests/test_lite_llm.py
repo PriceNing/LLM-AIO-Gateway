@@ -1,5 +1,5 @@
 """
-Unit tests for app.services.lite_llm - model name routing, image handling, content normalization.
+Unit tests for app.services.lite_llm - OpenAI-compatible model routing and image normalization.
 """
 import pytest
 from app.services.lite_llm import (
@@ -30,14 +30,14 @@ def test_get_litellm_model_name_openai_custom_endpoint():
 
 def test_get_litellm_model_name_anthropic():
     provider = {"id": "minimax", "provider_type": "anthropic", "api_base": "https://api.minimaxi.com/v1"}
-    assert get_litellm_model_name("MiniMax-M2.7-highspeed", provider) == "anthropic/MiniMax-M2.7-highspeed"
+    with pytest.raises(ValueError, match="OpenAI-compatible"):
+        get_litellm_model_name("MiniMax-M2.7-highspeed", provider)
 
 
 def test_get_litellm_model_name_already_prefixed():
-    """Test behavior."""
+    """Composite model IDs are reduced to the provider-local model name."""
     provider = {"id": "any", "provider_type": "openai", "api_base": "https://api.test.com/v1"}
     assert get_litellm_model_name("openai/my-model", provider) == "openai/my-model"
-    # Test section
     assert get_litellm_model_name("deepseek/v4", provider) == "openai/v4"
 
 
@@ -129,10 +129,7 @@ def test_normalize_image_content_handles_list_content():
     assert any(p.get("type") == "image_url" for p in parts)
 
 
-# Test section
-
 def test_normalize_image_content_preserves_image_url_parts():
-    """Test behavior."""
     messages = [{"role": "user", "content": [
         {"type": "text", "text": "Describe:"},
         {"type": "image_url", "image_url": {"url": "https://example.com/photo.jpg"}}
@@ -146,7 +143,6 @@ def test_normalize_image_content_preserves_image_url_parts():
 
 
 def test_normalize_image_content_multiple_images_in_list():
-    """Test behavior."""
     messages = [{"role": "user", "content": [
         {"type": "image_url", "image_url": {"url": "https://example.com/a.jpg"}},
         {"type": "image_url", "image_url": {"url": "https://example.com/b.jpg"}},
@@ -158,11 +154,12 @@ def test_normalize_image_content_multiple_images_in_list():
 
 
 def test_normalize_image_content_mixed_data_uri_and_image_url():
-    """Test behavior."""
-    """Test behavior."""
-    """Test behavior."""
-    """Test behavior."""
-    """Test behavior."""
-    """Test behavior."""
-    """Test behavior."""
-    """Test behavior."""
+    messages = [{"role": "user", "content": [
+        {"type": "text", "text": f"Embedded: data:image/png;base64,{_IMG1}"},
+        {"type": "image_url", "image_url": {"url": "https://example.com/existing.jpg"}},
+    ]}]
+    normalized = _normalize_image_content(messages)
+    parts = normalized[0]["content"]
+    image_urls = [p.get("image_url", {}).get("url") for p in parts if p.get("type") == "image_url"]
+    assert f"data:image/png;base64,{_IMG1}" in image_urls
+    assert "https://example.com/existing.jpg" in image_urls

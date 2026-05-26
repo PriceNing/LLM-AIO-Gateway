@@ -126,6 +126,7 @@ class LogManager:
                 self._ensure_handlers()
                 self._cleanup_old_logs()
                 self._capture_litellm_logs()
+                self._emit_startup_diagnostics()
 
     @property
     def enabled(self) -> bool:
@@ -228,6 +229,22 @@ class LogManager:
         except Exception:
             pass
         self._litellm_captured = True
+
+    def _emit_startup_diagnostics(self) -> None:
+        try:
+            app_logger = logging.getLogger("llmgw.app")
+            app_logger.debug(
+                "[logging] configured enabled=%s level=%s log_dir=%s console=%s channels=%s",
+                self._enabled,
+                logging.getLevelName(self._level),
+                self._log_dir,
+                self._console,
+                {k: logging.getLevelName(v) for k, v in self._channel_levels.items()},
+            )
+            for channel, handler in self._handlers.items():
+                app_logger.debug("[logging] handler channel=%s file=%s", channel, getattr(handler, "baseFilename", ""))
+        except Exception:
+            pass
 
 
 def init_logging(config: Optional[dict] = None) -> LogManager:

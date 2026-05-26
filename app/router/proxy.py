@@ -1,22 +1,49 @@
 import hashlib
 import json
-import time
-import re
-import queue
 import threading
+import time
 import uuid
+from collections import deque
+from typing import Optional
+
+import anyio
 from fastapi import APIRouter, HTTPException, Header, Request
 from fastapi.responses import StreamingResponse
-from typing import Optional
-import anyio
-from collections import deque
 from app.database import (
-    get_providers, find_user_by_api_key, get_routing_rules,
+    get_providers, find_user_by_api_key,
     increment_global_stats, increment_user_usage, get_db,
     parse_model_id, add_request_record,
 )
-from app.services.lite_llm import create_chat_completion, create_completion, create_chat_completion_stream, create_completion_stream
-from app.services.preprocessing import preprocess_messages
+from app.core.text import friendly_error_msg, mask_key, message_text
+from app.protocols.ingress import (
+    anthropic_messages_to_internal,
+    chat_completions_to_internal,
+    completions_to_internal,
+    responses_to_internal,
+)
+from app.core.types import InternalMessage
+from app.core.policy import apply_routing_rules, prepare_request_policy
+from app.adapters.anthropic import (
+    anthropic_body_from_internal,
+    anthropic_messages_completion_for_internal,
+)
+from app.adapters.openai import chat_kwargs_from_internal, chat_messages_from_internal
+from app.adapters.output import response_to_internal_output
+from app.adapters.anthropic_streaming import iter_anthropic_output_events
+from app.adapters.openai_streaming import iter_openai_chat_output_events
+from app.protocols.egress import (
+    render_anthropic_messages_sse,
+    render_anthropic_message,
+    render_chat_completion,
+    render_chat_completions_sse,
+    render_completion,
+    render_completions_sse,
+    render_response,
+    render_responses_error_sse,
+    render_responses_sse,
+)
+from app.services.lite_llm import create_chat_completion
+from app.services.preprocessing import has_image_content, preprocess_messages
 from app.services.logger import get_logger
 from app.config import get_default
 
@@ -28,100 +55,9 @@ _app_log = get_logger("app")
 
 router = APIRouter()
 
-_STREAM_SENTINEL = object()  # Sentinel value to signal end of streaming queue
-_BILLING_HEADER_RE = re.compile(r'^\s*x-anthropic-billing-header:.*(?:\r?\n)?', re.IGNORECASE | re.MULTILINE)
-
 # Rolling log of recent requests for the admin stats dashboard
 _request_log = deque(maxlen=get_default("request_log_max", 200))
 _request_log_lock = threading.Lock()
-_max_log_len = get_default("request_log_max", 200)
-
-
-# Error helpers
-
-# Upstream error message mapping.
-_UPSTREAM_ERROR_MAP = [
-    ("output new_sensitive (1027)", "Content blocked by upstream safety policy on output"),
-    ("input new_sensitive", "Content blocked by upstream safety policy on input"),
-    ("content_filter", "Content blocked by upstream safety policy"),
-    ("content_policy_violation", "Content violates upstream usage policy"),
-    ("safety_rating", "Content failed upstream safety rating"),
-    ("No endpoints found that support image input", "This model does not support image input. Enable image preprocessing in the admin panel."),
-]
-
-def _strip_billing_header(text):
-    """Remove Anthropic billing header (x-anthropic-billing-header) injected by Claude Code.
-
-    Claude Code 2.1.37+ injects a random `cch=xxxxx` value into the system prompt as an
-    x-anthropic-billing-header text block.  Since `cch` changes on every request, this
-    breaks DeepSeek's prefix cache (request body becomes non-deterministic).
-    Strip lines matching the pattern so the system prompt stays stable across requests.
-
-    Handles both string and Anthropic array format (list of content blocks).
-    """
-    if not text:
-        if isinstance(text, list):
-            return []
-        return ""
-    if isinstance(text, list):
-        cleaned = []
-        for block in text:
-            if isinstance(block, dict) and block.get("type") == "text":
-                t = block.get("text", "")
-                stripped = _BILLING_HEADER_RE.sub('', t).strip()
-                if stripped:
-                    cleaned_block = dict(block)
-                    cleaned_block["text"] = stripped
-                    cleaned.append(cleaned_block)
-            else:
-                cleaned.append(block)
-        return cleaned
-    return _BILLING_HEADER_RE.sub('', text).strip()
-
-
-def _friendly_error_msg(e: Exception) -> str:
-    """Map known upstream errors to clearer client-facing messages."""
-    msg = str(e)
-    for pattern, friendly in _UPSTREAM_ERROR_MAP:
-        if pattern in msg:
-            return f"{friendly} (original: {msg[:120]})"
-    return msg
-
-def _mask_key(key: str) -> str:
-    if len(key) <= 8:
-        return key
-    return key[:4] + "..." + key[-4:]
-
-
-def _fix_tool_args(tc_dict: dict) -> None:
-    """Fix malformed tool-call arguments like MiniMax sending url:undefined."""
-    func = tc_dict.get("function")
-    if not func or not isinstance(func, dict):
-        return
-    args = func.get("arguments", "")
-    if args and "undefined" in args:
-        func["arguments"] = _sanitize_args(args)
-
-
-def _sanitize_args(args: str) -> str:
-    """Replace bare `undefined` values (MiniMax emits url:undefined in JSON)."""
-    out = []
-    in_str = False
-    i = 0
-    n = len(args)
-    while i < n:
-        c = args[i]
-        if c == '"' and (i == 0 or args[i-1] != '\\'):
-            in_str = not in_str
-        if not in_str and args[i:i+9] == 'undefined':
-            end = i + 9
-            if end >= n or args[end] in ',}]\n\r\t ':
-                out.append('""')
-                i = end
-                continue
-        out.append(c)
-        i += 1
-    return ''.join(out)
 
 
 def _log_request(username: str, api_key: str, model: str, provider_id: str,
@@ -131,7 +67,7 @@ def _log_request(username: str, api_key: str, model: str, provider_id: str,
         "time": time.strftime("%H:%M:%S"),
         "full_time": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "username": username,
-        "api_key": _mask_key(api_key),
+        "api_key": mask_key(api_key),
         "model": model,
         "requested_model": requested_model or model,
         "provider": provider_id or "",
@@ -167,20 +103,12 @@ def _log_request_body(username: str, model: str, endpoint: str, body: dict) -> N
     )
 
 
-async def _maybe_preprocess(messages: list, model: str, provider_id: str = "", requested_model: str = ""):
-    """Replace images with text descriptions if a vision preprocessor is configured.
-
-    Vision preprocessing is decided from requested_model, falling back to model when omitted,
-    so routing remains transparent and the target model does not affect whether descriptions are generated.
-
-    Returns (messages, modified: bool).
-    """
-    from app.services.lite_llm import _has_image_content
-    has_img = _has_image_content(messages)
+async def _policy_preprocess_request(internal, model: str, provider_id: str, requested_model: str):
     check_model = requested_model or model
+    has_img = has_image_content(internal.messages)
     _app_log.debug("[preprocess] CHECK req_model=%s target_model=%s has_image=%s msg_count=%d",
-                   check_model, model, has_img, len(messages))
-    # Look up the preprocessor by requested model, not routed target model
+                   check_model, model, has_img, len(internal.messages))
+
     mid = parse_model_id(check_model)
     with get_db() as db:
         if mid.provider_id:
@@ -197,8 +125,8 @@ async def _maybe_preprocess(messages: list, model: str, provider_id: str = "", r
     if not row or not row["preprocessor"]:
         if has_img:
             _app_log.warning("[preprocess] images detected for model=%s but preprocessor not enabled", check_model)
-        return messages, False
-    # Auto-detect first enabled preprocessor from config.json
+        return False
+
     from app.config import get_config
     cfg = get_config().config.get("preprocessors", {})
     preprocessor_config = None
@@ -210,11 +138,10 @@ async def _maybe_preprocess(messages: list, model: str, provider_id: str = "", r
             break
     if not preprocessor_config:
         _app_log.warning("[preprocess] no enabled preprocessor in config.json")
-        return messages, False
+        return False
     preprocessor_config["id"] = preprocessor_id
-    had_images = _has_image_content(messages)
-    result = await preprocess_messages(messages, preprocessor_config)
-    return result, had_images
+    await preprocess_messages(internal.messages, preprocessor_config)
+    return has_img
 
 
 def get_request_log() -> list:
@@ -457,50 +384,20 @@ _reasoning_tool_cache = TTLDict(
     ttl_seconds=get_default("reasoning_cache_ttl", 1800),
     max_size=get_default("reasoning_cache_max_size", 1000)
 )
+_reasoning_tool_global_cache = TTLDict(
+    ttl_seconds=get_default("reasoning_cache_ttl", 1800),
+    max_size=get_default("reasoning_cache_max_size", 1000)
+)
 _response_chain_cache = TTLDict(
     ttl_seconds=get_default("reasoning_cache_ttl", 1800),
     max_size=get_default("reasoning_cache_max_size", 1000)
 )
+def _ir_tool_message_count(messages: list[InternalMessage]) -> int:
+    return sum(1 for msg in messages if any(part.kind == "tool_call" for part in msg.parts))
 
 
-
-
-def _debug_msg_types(messages: list) -> None:
-    """Log the content types present in each message to diagnose image format issues."""
-    for i, msg in enumerate(messages[-4:]):  # Last 4 messages only
-        content = msg.get("content")
-        role = msg.get("role", "?")
-        if isinstance(content, list):
-            types = []
-            for part in content:
-                if isinstance(part, dict):
-                    t = part.get("type", "?")
-                    if t == "text" and isinstance(part.get("text"), str) and len(part["text"]) > 100:
-                        types.append(f"text(len={len(part['text'])})")
-                    elif t == "text":
-                        types.append(f"text={part.get('text','')[:50]}")
-                    elif t in ("image_url", "input_image"):
-                        url = part.get("image_url", "")
-                        if isinstance(url, dict):
-                            url = url.get("url", "")
-                        types.append(f"{t}(url_prefix={str(url)[:60]})")
-                    else:
-                        types.append(f"{t}")
-                elif isinstance(part, str):
-                    types.append(f"str(len={len(part)})")
-            _app_log.debug("[debug] msg[%d] role=%s content_types=%s", i, role, types)
-        elif isinstance(content, str):
-            _app_log.debug("[debug] msg[%d] role=%s content=str(len=%d) prefix=%s",
-                         i, role, len(content), content[:80])
-        else:
-            _app_log.debug("[debug] msg[%d] role=%s content_type=%s", i, role, type(content).__name__)
-
-
-def _attr(obj, key: str, default=None):
-    """Read a value from either an object via getattr or a dict via get."""
-    if isinstance(obj, dict):
-        return obj.get(key, default)
-    return getattr(obj, key, default)
+def _ir_reasoning_message_count(messages: list[InternalMessage]) -> int:
+    return sum(1 for msg in messages if any(part.kind == "reasoning" for part in msg.parts))
 
 
 def _remember_response_chain_key(response_id: str, conv_key: str) -> None:
@@ -516,10 +413,19 @@ def _conversation_cache_key(api_key: str, messages: list, response_chain_id: str
             return chained_key
     user_fingerprints = []
     for msg in messages:
+        if isinstance(msg, InternalMessage):
+            if msg.role != "user":
+                continue
+            text = _ir_text_for_cache(msg)
+            if not text and msg.parts:
+                text = json.dumps([part.raw if part.raw is not None else part.kind for part in msg.parts], sort_keys=True, default=str)
+            if text:
+                user_fingerprints.append(text[:200])
+            continue
         if not isinstance(msg, dict) or msg.get("role") != "user":
             continue
         content = msg.get("content")
-        text = _message_text(content)
+        text = message_text(content)
         if not text and isinstance(content, list):
             text = json.dumps(content, sort_keys=True, default=str)
         if text:
@@ -529,45 +435,12 @@ def _conversation_cache_key(api_key: str, messages: list, response_chain_id: str
     return f"{api_key}:{conv_hash}"
 
 
-def _message_text(content) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = []
-        for part in content:
-            if isinstance(part, str):
-                parts.append(part)
-            elif isinstance(part, dict) and part.get("type") == "text":
-                parts.append(part.get("text", ""))
-        return "\n".join(p for p in parts if p)
-    return ""
-
-
-def _tool_call_ids_from_message(msg: dict) -> list[str]:
-    ids = []
-    for tc in msg.get("tool_calls") or []:
-        if isinstance(tc, dict):
-            tc_id = tc.get("id")
-        else:
-            tc_id = getattr(tc, "id", None)
-        if tc_id:
-            ids.append(str(tc_id))
-    return ids
-
-
-def _anthropic_tool_block_index(text_block_started: bool, tool_uses: dict) -> int:
-    """Return the next Anthropic content block index after text and tool blocks."""
-    used = set()
-    if text_block_started:
-        used.add(0)
-        used.add(1)
-    for tool_use in tool_uses.values():
-        if isinstance(tool_use, dict) and "block_index" in tool_use:
-            used.add(int(tool_use["block_index"]))
-    idx = 0
-    while idx in used:
-        idx += 1
-    return idx
+def _ir_text_for_cache(message: InternalMessage) -> str:
+    parts = []
+    for part in message.parts:
+        if part.kind == "text" and part.text:
+            parts.append(part.text)
+    return "\n".join(parts)
 
 
 def _remember_reasoning_content(conv_key: str, reasoning_content: str, tool_call_ids=None) -> None:
@@ -580,53 +453,167 @@ def _remember_reasoning_content(conv_key: str, reasoning_content: str, tool_call
     tool_map = dict(_reasoning_tool_cache.get(conv_key, {}) or {})
     for tid in ids:
         tool_map[tid] = reasoning_content
+        _reasoning_tool_global_cache[tid] = reasoning_content
     while len(tool_map) > 200:
         oldest = next(iter(tool_map))
         tool_map.pop(oldest, None)
     _reasoning_tool_cache[conv_key] = tool_map
 
 
-def _inject_reasoning_content(messages: list, conv_key: str, label: str, allow_empty: bool = False) -> int:
-    """Restore DeepSeek reasoning only where tool-call continuity requires it."""
-    cached_rc = _reasoning_cache.get(conv_key)
+def _reasoning_context(conv_key: str, messages: list[InternalMessage] | None = None) -> tuple[str | None, dict]:
     tool_map = _reasoning_tool_cache.get(conv_key, {}) or {}
-    candidate_indexes = []
-    for idx in range(len(messages) - 1, -1, -1):
-        msg = messages[idx]
-        if msg.get("role") == "assistant" and not msg.get("tool_calls") and _message_text(msg.get("content")).strip():
-            break
-        if msg.get("role") == "assistant" and msg.get("tool_calls") and not msg.get("reasoning_content"):
-            candidate_indexes.append(idx)
+    if messages:
+        tool_map = _merge_global_reasoning_context(messages, tool_map)
+    return _reasoning_cache.get(conv_key), tool_map
 
-    injected = 0
-    exact = 0
-    fallback = 0
-    empty = 0
-    for idx in reversed(candidate_indexes):
-        msg = messages[idx]
-        rc = None
-        for tid in _tool_call_ids_from_message(msg):
-            if tid in tool_map:
-                rc = tool_map[tid]
-                exact += 1
-                break
-        if rc is None and cached_rc is not None:
-            rc = cached_rc
-            fallback += 1
-        elif rc is None and allow_empty:
-            rc = ""
-            empty += 1
-        if rc is not None:
-            msg["reasoning_content"] = rc
-            injected += 1
 
-    if injected or cached_rc is not None:
-        rc_len = len(cached_rc) if cached_rc is not None else 0
-        _app_log.debug(
-            "[%s] INJECTED rc total=%d exact=%d fallback=%d empty=%d candidates=%d len=%d conv_key=%s",
-            label, injected, exact, fallback, empty, len(candidate_indexes), rc_len, conv_key[:60]
-        )
-    return injected
+def _merge_global_reasoning_context(messages: list[InternalMessage], tool_map: dict) -> dict:
+    merged = dict(tool_map or {})
+    for msg in messages or []:
+        if not isinstance(msg, InternalMessage):
+            continue
+        for part in msg.parts:
+            if part.kind != "tool_result" or not part.tool_call_id or part.tool_call_id in merged:
+                continue
+            rc = _reasoning_tool_global_cache.get(part.tool_call_id)
+            if rc:
+                merged[part.tool_call_id] = rc
+    return merged
+
+
+async def _record_streaming_events(
+    events,
+    *,
+    conv_key: str,
+    tool_only_turns=None,
+    tool_only_limit: int = TOOL_ONLY_LIMIT,
+    remember_reasoning_content=None,
+):
+    accumulated_reasoning = ""
+    has_text = False
+    has_tools = False
+    tool_ids = []
+    usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 0}
+
+    def finalize() -> None:
+        nonlocal accumulated_reasoning
+        if accumulated_reasoning and remember_reasoning_content is not None:
+            remember_reasoning_content(conv_key, accumulated_reasoning, tool_ids)
+            _app_log.debug("[stream_policy] STORED rc key=%s len=%d tool_ids=%d", conv_key[:60], len(accumulated_reasoning), len(tool_ids))
+            accumulated_reasoning = ""
+        if tool_only_turns is not None:
+            if has_tools and not has_text:
+                count = tool_only_turns.increment(conv_key)
+                _app_log.debug("[stream_policy] tool_only_increment key=%s count=%d", conv_key[:60], count)
+            else:
+                tool_only_turns.reset(conv_key)
+                _app_log.debug("[stream_policy] tool_only_reset key=%s has_tools=%s has_text=%s", conv_key[:60], has_tools, has_text)
+
+    finalized = False
+    async for event in events:
+        if event.kind == "text_delta" and event.text:
+            has_text = True
+        elif event.kind == "reasoning_delta" and event.reasoning:
+            accumulated_reasoning += event.reasoning
+        elif event.kind == "tool_call_start":
+            has_tools = True
+            if event.tool_call_id:
+                tool_ids.append(event.tool_call_id)
+        elif event.kind == "usage":
+            usage.update(event.usage)
+        elif event.kind == "message_done":
+            finalize()
+            finalized = True
+        yield event
+
+    if not finalized:
+        finalize()
+
+
+async def _stream_internal_output(
+    *,
+    events,
+    endpoint: str,
+    model: str,
+    username: str,
+    api_key_value: str,
+    provider_id: str,
+    requested_model: str,
+    previous_response_id: str | None = None,
+    conv_key: str = "",
+    remember_response_chain_key=None,
+    remember_reasoning_content=None,
+    tool_only_turns=None,
+    tool_only_limit: int = TOOL_ONLY_LIMIT,
+):
+    total_tokens = 0
+    _app_log.debug(
+        "[stream_orchestrator] START endpoint=%s provider=%s model=%s requested=%s conv_key=%s previous_response_id=%s",
+        endpoint,
+        provider_id or "",
+        model,
+        requested_model,
+        conv_key[:60],
+        previous_response_id or "",
+    )
+
+    async def metered_events():
+        nonlocal total_tokens
+        async for event in _record_streaming_events(
+            events,
+            conv_key=conv_key,
+            remember_reasoning_content=remember_reasoning_content,
+            tool_only_turns=tool_only_turns,
+            tool_only_limit=tool_only_limit,
+        ):
+            if event.kind == "usage":
+                total_tokens = event.usage.get("total_tokens", total_tokens) or total_tokens
+            yield event
+
+    response_id = f"resp_{uuid.uuid4().hex}" if endpoint == "responses" else None
+    if endpoint == "responses" and remember_response_chain_key is not None and conv_key:
+        remember_response_chain_key(response_id, conv_key)
+
+    try:
+        if endpoint == "chat_completions":
+            async for line in render_chat_completions_sse(metered_events(), model=model):
+                yield line
+        elif endpoint == "completions":
+            async for line in render_completions_sse(metered_events(), model=model):
+                yield line
+        elif endpoint == "messages":
+            async for line in render_anthropic_messages_sse(metered_events(), model=model):
+                yield line
+        elif endpoint == "responses":
+            async for line in render_responses_sse(
+                metered_events(),
+                model=model,
+                previous_response_id=previous_response_id,
+                response_id=response_id,
+            ):
+                yield line
+        _log_request(username, api_key_value, model, provider_id or "", endpoint, True, total_tokens, requested_model)
+        increment_global_stats(success=True)
+        if username != "legacy":
+            increment_user_usage(username, api_key_value, True, total_tokens)
+        _app_log.debug("[stream_orchestrator] DONE endpoint=%s provider=%s model=%s total_tokens=%d", endpoint, provider_id or "", model, total_tokens)
+    except Exception as e:
+        error_msg = friendly_error_msg(e)
+        _error_log.error("[%s_stream] %s", endpoint, str(e))
+        _log_request(username, api_key_value, "-", provider_id or "", endpoint, False, 0, requested_model)
+        increment_global_stats(success=False)
+        if username != "legacy":
+            increment_user_usage(username, api_key_value, False, 0)
+        if tool_only_turns is not None and conv_key:
+            tool_only_turns.reset(conv_key)
+        if endpoint == "responses":
+            async for line in render_responses_error_sse(model=model, message=error_msg, previous_response_id=previous_response_id):
+                yield line
+        elif endpoint == "messages":
+            yield f"event: error\ndata: {json.dumps({'type': 'error', 'error': {'type': 'server_error', 'message': error_msg}})}\n\n"
+        else:
+            yield f"data: {json.dumps({'error': {'message': error_msg, 'type': 'server_error'}})}\n\n"
+            yield "data: [DONE]\n\n"
 
 def verify_api_key(authorization: Optional[str] = Header(None)) -> tuple[dict, dict]:
     if not authorization:
@@ -663,19 +650,6 @@ def ensure_model_allowed(user: dict, api_key: dict, model: str) -> None:
         return
     raise HTTPException(status_code=403, detail=f"Model '{model}' is not allowed for this API key")
 
-def usage_dict(response) -> dict:
-    usage = getattr(response, "usage", None)
-    if not usage:
-        return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
-                "prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 0}
-    return {
-        "prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
-        "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
-        "total_tokens": getattr(usage, "total_tokens", 0) or 0,
-        "prompt_cache_hit_tokens": getattr(usage, "prompt_cache_hit_tokens", 0) or 0,
-        "prompt_cache_miss_tokens": getattr(usage, "prompt_cache_miss_tokens", 0) or 0,
-    }
-
 @router.get("/models")
 def list_models(authorization: Optional[str] = Header(None)):
     user, api_key = verify_api_key(authorization)
@@ -708,356 +682,17 @@ def list_models(authorization: Optional[str] = Header(None)):
 
     return {"object": "list", "data": models}
 
-async def _iter_stream_async(stream_func):
-    """Iterate a sync generator in a background thread to avoid blocking the event loop.
-
-    Routes stream chunks through a thread-safe queue so the event loop thread
-    never blocks on network I/O, allowing concurrent streaming requests.
-
-    When the client disconnects, we close the stream generator to release the
-    underlying HTTP connection, then use PyThreadState_SetAsyncExc to forcibly
-    interrupt the background thread in case it's stuck in a blocking read (e.g.
-    llamacpp prefill taking minutes).
-    """
-    import ctypes
-
-    chunk_queue = queue.Queue()
-    error = None
-    done = threading.Event()
-    cancel = threading.Event()
-    stream_gen = None
-    bg_thread = None
-
-    def _run():
-        nonlocal error, stream_gen
-        try:
-            stream_gen = stream_func()
-            _chunk_idx = 0
-            for chunk in stream_gen:
-                if cancel.is_set():
-                    break
-                _chunk_idx += 1
-                chunk_queue.put(chunk)
-            _app_log.debug("[_iter_stream_async] generator finished, total_chunks=%d", _chunk_idx)
-        except GeneratorExit:
-            pass
-        except Exception as e:
-            import traceback as _tb
-            try:
-                _error_log.error("[_iter_stream_async] type=%s msg=%s", type(e).__name__, str(e)[:200])
-                _error_log.error("[_iter_stream_async] %s", _tb.format_exc())
-            except Exception:
-                pass
-            error = e
-        finally:
-            if stream_gen is not None:
-                try:
-                    stream_gen.close()
-                except Exception:
-                    pass
-            chunk_queue.put(_STREAM_SENTINEL)
-            done.set()
-
-    bg_thread = threading.Thread(target=_run, daemon=True)
-    bg_thread.start()
-
-    try:
-        while True:
-            try:
-                chunk = chunk_queue.get(timeout=0.01)
-                if chunk is _STREAM_SENTINEL:
-                    break
-                yield chunk
-            except queue.Empty:
-                if done.is_set():
-                    break
-                await anyio.sleep(0)
-
-        if error:
-            raise error
-    finally:
-        cancel.set()
-        # Force-interrupt the background thread if it's stuck in a blocking
-        # read (e.g. llamacpp processing a large prompt). This causes httpx's
-        # read() to abort via GeneratorExit and the HTTP connection to close.
-        if bg_thread is not None and bg_thread.is_alive():
-            try:
-                ctypes.pythonapi.PyThreadState_SetAsyncExc(
-                    ctypes.c_long(bg_thread.ident),
-                    ctypes.py_object(GeneratorExit)
-                )
-            except Exception:
-                pass
-
-
-async def _stream_chat(model, messages, provider_id, temperature, max_tokens, username, api_key_value, requested_model="", conv_key="", **extra):
-    chat_id = f"chatcmpl-{int(time.time())}"
-    if not conv_key:
-        conv_key = _conversation_cache_key(api_key_value, messages)
-
-    total_tokens = 0
-    input_tokens = 0
-    output_tokens = 0
-    error_msg = None
-    has_text_content = False
-    has_tool_calls = False
-    accumulated_reasoning = ""
-    response_tool_call_ids = []
-    think_stripped = False  # Set to True once </think> is seen
-    think_buf = ""          # Buffer content while inside <think> block
-    cache_hit = 0
-    cache_miss = 0
-
-    # Tool-call circuit breaker: strip tools if too many consecutive tool-only turns
-    if _tool_only_turns.get(conv_key, 0) >= TOOL_ONLY_LIMIT:
-        extra.pop("tools", None)
-        extra.pop("tool_choice", None)
-
-    try:
-        stream_func = lambda: create_chat_completion_stream(
-            model=model,
-            messages=messages,
-            provider_id=provider_id,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            **extra
-        )
-
-        async for chunk in _iter_stream_async(stream_func):
-            choice = chunk.choices[0] if chunk.choices else None
-            delta = {}
-            finish_reason = None
-
-            if choice:
-                finish_reason = getattr(choice, "finish_reason", None) or None
-                message = getattr(choice, "delta", None)
-                if message:
-                    content = getattr(message, "content", None)
-                    if content:
-                        if not think_stripped:
-                            think_buf += content
-                            if '</think>' in think_buf:
-                                # <think> block(s) completed - extract thinking, flush rest
-                                think_buf, think_content = _extract_and_strip_think(think_buf)
-                                if think_content:
-                                    accumulated_reasoning = think_content
-                                think_stripped = True
-                                if think_buf:
-                                    delta["content"] = think_buf
-                                    has_text_content = True
-                            elif '<think>' in think_buf or think_buf.lstrip().startswith('<think'):
-                                # If <think> never closes after buffering much content,
-                                # treat it as plain text so users aren't stuck waiting.
-                                if len(think_buf) >= 200:
-                                    think_buf = think_buf.replace('<think>', '', 1)
-                                    think_stripped = True
-                                    delta["content"] = think_buf
-                                    has_text_content = True
-                                    think_buf = ""
-                                # else: Still inside a <think> block - suppress for now
-                            else:
-                                # No <think> tag - not a thinking-mode response.
-                                # Flush buffer as regular text immediately.
-                                think_stripped = True
-                                delta["content"] = think_buf
-                                has_text_content = True
-                                think_buf = ""
-                        else:
-                            delta["content"] = content
-                            has_text_content = True
-                    reasoning = getattr(message, "reasoning_content", None)
-                    if reasoning:
-                        delta["reasoning_content"] = reasoning
-                        accumulated_reasoning += reasoning
-                    role = getattr(message, "role", None)
-                    if role:
-                        delta["role"] = role
-                    tool_calls = getattr(message, "tool_calls", None)
-                    if tool_calls:
-                        _tool_log.debug("[_stream_chat] raw tool_calls count=%d model=%s", len(tool_calls), model)
-                        serialized = []
-                        for tc in tool_calls:
-                            _tool_log.debug("[_stream_chat] raw tc type=%s repr=%s", type(tc).__name__, repr(tc))
-                            if hasattr(tc, "model_dump"):
-                                tc_dict = tc.model_dump(exclude_none=True)
-                            elif isinstance(tc, dict):
-                                tc_dict = dict(tc)
-                            else:
-                                tc_dict = {
-                                    "index": getattr(tc, "index", 0),
-                                    "id": getattr(tc, "id", None),
-                                    "type": getattr(tc, "type", "function"),
-                                    "function": {
-                                        "name": getattr(tc.function, "name", None) if hasattr(tc, "function") and tc.function else None,
-                                        "arguments": getattr(tc.function, "arguments", "") if hasattr(tc, "function") and tc.function else ""
-                                    }
-                                }
-                            _tool_log.debug("[_stream_chat] after dict convert: %s", json.dumps(tc_dict, ensure_ascii=False, default=str))
-                            # Coerce id to str (MiniMax returns bare integers)
-                            if tc_dict.get("id") is not None and not isinstance(tc_dict["id"], str):
-                                tc_dict["id"] = str(tc_dict["id"])
-                            tc_idx = int(tc_dict.get("index", 0))
-                            # Filter out spurious tool-calls from non-standard content
-                            # blocks (e.g. MiniMax "thinking") misread as empty tool uses.
-                            # Only filter when index<0.  id=None with non-empty arguments
-                            # is a valid arguments delta chunk - must NOT be filtered.
-                            if tc_idx < 0:
-                                _tool_log.debug("[_stream_chat] FILTERED spurious: id=%s idx=%s", tc_dict.get("id"), tc_idx)
-                                continue
-                            # Fix malformed tool-call arguments - MiniMax may emit
-                            # invalid JSON with bare `undefined` values (e.g. url:undefined)
-                            _fix_tool_args(tc_dict)
-                            _tool_log.debug("[_stream_chat] after _fix_tool_args: %s", json.dumps(tc_dict, ensure_ascii=False, default=str))
-                            serialized.append(tc_dict)
-                        if serialized:
-                            has_tool_calls = True
-                            delta["tool_calls"] = serialized
-                            response_tool_call_ids.extend([str(tc["id"]) for tc in serialized if tc.get("id")])
-                            _tool_log.debug("[_stream_chat] SSE delta payload: %s", json.dumps(serialized, ensure_ascii=False, default=str))
-                        else:
-                            _tool_log.debug("[_stream_chat] all tool_calls filtered out, no tool_calls in delta")
-
-            sse_data = {
-                "id": chat_id,
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": model,
-                "choices": [{
-                    "index": 0,
-                    "delta": delta,
-                    "finish_reason": finish_reason
-                }]
-            }
-            yield f"data: {json.dumps(sse_data, ensure_ascii=False)}\n\n"
-
-            if hasattr(chunk, "usage") and chunk.usage:
-                total_tokens = getattr(chunk.usage, "total_tokens", 0) or 0
-                input_tokens = getattr(chunk.usage, "prompt_tokens", 0) or 0
-                output_tokens = getattr(chunk.usage, "completion_tokens", 0) or 0
-                cache_hit = getattr(chunk.usage, "prompt_cache_hit_tokens", 0) or 0
-                cache_miss = getattr(chunk.usage, "prompt_cache_miss_tokens", 0) or 0
-        if accumulated_reasoning:
-            _remember_reasoning_content(conv_key, accumulated_reasoning, response_tool_call_ids)
-            _app_log.debug("[chat_stream] STORED rc key=%s len=%d cache_hit=%d cache_miss=%d", conv_key[:40], len(accumulated_reasoning), cache_hit, cache_miss)
-        else:
-            _app_log.debug("[chat_stream] no reasoning accumulated (think_stripped=%s)", think_stripped)
-
-        # Update tool-only counter for circuit breaker
-        if has_tool_calls and not has_text_content:
-            _tool_only_turns.increment(conv_key)
-        else:
-            _tool_only_turns.reset(conv_key)
-
-        _log_request(username, api_key_value, model, provider_id or "", "chat_completions", True, total_tokens, requested_model)
-        if username != "legacy":
-            increment_user_usage(username, api_key_value, True, total_tokens)
-        increment_global_stats(success=True)
-
-    except Exception as e:
-        error_msg = _friendly_error_msg(e)
-        _error_log.error("[chat_stream] %s", str(e))
-        _log_request(username, api_key_value, requested_model, provider_id or "", "chat_completions", False, 0, requested_model)
-        _tool_only_turns.reset(conv_key)
-        increment_global_stats(success=False)
-        if username != "legacy":
-            increment_user_usage(username, api_key_value, False, 0)
-
-    finally:
-        if error_msg:
-            yield f"data: {json.dumps({'error': {'message': error_msg, 'type': 'server_error'}})}\n\n"
-        else:
-            # When thinking mode consumed all tokens before generating visible content,
-            # fall back to reasoning_content as the response so the client shows something.
-            if not has_text_content and accumulated_reasoning:
-                yield f"data: {json.dumps({'id': chat_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': model, 'choices': [{'index': 0, 'delta': {'content': accumulated_reasoning}, 'finish_reason': 'stop'}]})}\n\n"
-            # If think_buf has buffered content but </think> was never seen (model
-            # doesn't use <think> tags - e.g. DeepSeek via Anthropic endpoint), flush
-            # the buffer as regular text so the client receives the response.
-            elif not has_text_content and think_buf:
-                yield f"data: {json.dumps({'id': chat_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': model, 'choices': [{'index': 0, 'delta': {'content': think_buf}, 'finish_reason': 'stop'}]})}\n\n"
-            yield "data: [DONE]\n\n"
-
-
-async def _stream_completions(model, prompt, provider_id, temperature, max_tokens, username, api_key_value, requested_model="", **extra):
-    """Stream a text completion response as SSE."""
-    cmpl_id = f"cmpl-{int(time.time())}"
-
-    total_tokens = 0
-    error_msg = None
-
-    try:
-        stream_func = lambda: create_completion_stream(
-            model=model,
-            prompt=prompt,
-            provider_id=provider_id,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            **extra
-        )
-
-        async for chunk in _iter_stream_async(stream_func):
-            choice = chunk.choices[0] if chunk.choices else None
-            text = ""
-            finish_reason = None
-
-            if choice:
-                finish_reason = getattr(choice, "finish_reason", None) or None
-                text = _strip_think_tags(getattr(choice, "text", "") or "")
-
-            sse_data = {
-                "id": cmpl_id,
-                "object": "text_completion.chunk",
-                "created": int(time.time()),
-                "model": model,
-                "choices": [{
-                    "index": 0,
-                    "text": text,
-                    "finish_reason": finish_reason
-                }]
-            }
-            yield f"data: {json.dumps(sse_data, ensure_ascii=False)}\n\n"
-
-            if hasattr(chunk, "usage") and chunk.usage:
-                total_tokens = getattr(chunk.usage, "total_tokens", 0) or 0
-                cache_hit = getattr(chunk.usage, "prompt_cache_hit_tokens", 0) or 0
-                cache_miss = getattr(chunk.usage, "prompt_cache_miss_tokens", 0) or 0
-
-        _log_request(username, api_key_value, model, provider_id or "", "completions", True, total_tokens, requested_model)
-        if username != "legacy":
-            increment_user_usage(username, api_key_value, True, total_tokens)
-        increment_global_stats(success=True)
-
-    except Exception as e:
-        error_msg = _friendly_error_msg(e)
-        _error_log.error("[completions_stream] %s", str(e))
-        _log_request(username, api_key_value, requested_model, provider_id or "", "completions", False, 0, requested_model)
-        increment_global_stats(success=False)
-        if username != "legacy":
-            increment_user_usage(username, api_key_value, False, 0)
-
-    finally:
-        if error_msg:
-            yield f"data: {json.dumps({'error': {'message': error_msg, 'type': 'server_error'}})}\n\n"
-        else:
-            yield "data: [DONE]\n\n"
-
-
 @router.post("/chat/completions")
 async def chat_completions(request: Request, authorization: Optional[str] = Header(None)):
     user, api_key = verify_api_key(authorization)
 
     body = await request.json()
-    model = body.get("model")
-    messages = body.get("messages", [])
-    temperature = body.get("temperature", 0.7)
-    max_tokens = body.get("max_tokens")
-    if max_tokens is None:
-        max_tokens = body.get("max_completion_tokens")
-    if max_tokens is None:
-        max_tokens = get_default("max_tokens", 16384)
-    provider_id = body.get("provider_id")
-    stream = body.get("stream", False)
-    previous_response_id = body.get("previous_response_id") or ""
+    internal = chat_completions_to_internal(body)
+    model = internal.target_model
+    temperature = internal.temperature
+    max_tokens = internal.max_tokens
+    provider_id = internal.provider_id
+    stream = internal.stream
 
     username = user.get("username", "legacy")
     api_key_value = api_key.get("key", "")
@@ -1065,185 +700,125 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
 
     if not model:
         raise HTTPException(status_code=400, detail="model is required")
-    if not messages:
+    if not internal.messages:
         raise HTTPException(status_code=400, detail="messages is required")
 
     ensure_model_allowed(user, api_key, model)
 
-    # Debug: log content types in messages to diagnose image format issues
-    _debug_msg_types(messages)
-
     requested_model = model
-    route_model, route_provider = _apply_routing_rules(username, api_key_value, model, model)
-    if route_model != model:
-        _app_log.debug("[chat] ROUTED model=%s -> %s", model, route_model)
-        model = route_model
-    if route_provider:
-        provider_id = route_provider
-
-    # Merge consecutive same-role messages for providers that require alternation
-    messages = _normalize_messages(messages)
-
-    # Compute conversation cache key BEFORE preprocessing, since preprocessing
-    # modifies the first user message (images -> text) which changes the key.
-    # All cache operations (reasoning, tool counter) must use this stable key.
-    conv_key = _conversation_cache_key(api_key_value, messages, previous_response_id)
-
-    # Preprocessor: replace images with text
-    msg, modified = await _maybe_preprocess(messages, model, provider_id, requested_model=requested_model)
-    messages = msg
+    policy = await prepare_request_policy(
+        internal,
+        username=username,
+        api_key_value=api_key_value,
+        preprocess_request=_policy_preprocess_request,
+        conversation_cache_key=_conversation_cache_key,
+        reasoning_context=_reasoning_context,
+        tool_only_turns=_tool_only_turns,
+        tool_only_limit=TOOL_ONLY_LIMIT,
+        log_label="chat",
+    )
+    model = internal.target_model
+    provider_id = internal.provider_id
+    conv_key = policy.conv_key
 
     try:
-        allowed_params = {
-            "top_p", "presence_penalty", "frequency_penalty", "stop",
-            "tools", "tool_choice", "response_format", "user"
-        }
-        extra = {key: body[key] for key in allowed_params if key in body}
-
-        _inject_reasoning_content(messages, conv_key, "chat")
-
-        # Tool-call circuit breaker: strip tools if too many consecutive tool-only turns
-        if _tool_only_turns.get(conv_key, 0) >= TOOL_ONLY_LIMIT:
-            extra.pop("tools", None)
-            extra.pop("tool_choice", None)
+        extra = chat_kwargs_from_internal(internal)
+        from app.database import get_provider as _get_prov, find_provider_by_model as _find
+        if provider_id:
+            provider_info = _get_prov(provider_id)
+        else:
+            provider_info = _find(model)
+        is_anthropic = provider_info and provider_info.get("provider_type") == "anthropic"
+        adapter_provider_id = provider_info.get("id", provider_id or "") if provider_info else provider_id
 
         if stream:
-            return StreamingResponse(
-                _stream_chat(
+            if is_anthropic:
+                anthropic_msgs, anthropic_body = anthropic_body_from_internal(internal)
+                adapter_provider_id = provider_info.get("id", provider_id or "")
+                events = iter_anthropic_output_events(
+                    provider_info=provider_info,
+                    messages=anthropic_msgs,
+                    body=anthropic_body,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
                     model=model,
-                    messages=messages,
+                )
+            else:
+                events = iter_openai_chat_output_events(
+                    model=model,
+                    messages=chat_messages_from_internal(internal),
                     provider_id=provider_id,
                     temperature=temperature,
                     max_tokens=max_tokens,
+                    extra=extra,
+                )
+            return StreamingResponse(
+                _stream_internal_output(
+                    events=events,
+                    endpoint="chat_completions",
+                    model=model,
                     username=username,
                     api_key_value=api_key_value,
+                    provider_id=adapter_provider_id,
                     requested_model=requested_model,
                     conv_key=conv_key,
-                    **extra
+                    remember_reasoning_content=_remember_reasoning_content,
+                    tool_only_turns=_tool_only_turns,
+                    tool_only_limit=TOOL_ONLY_LIMIT,
                 ),
                 media_type="text/event-stream"
             )
 
-        response = await anyio.to_thread.run_sync(
-            lambda: create_chat_completion(
-                model=model,
-                messages=messages,
-                provider_id=provider_id,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                **extra
+        if is_anthropic:
+            output = await anthropic_messages_completion_for_internal(provider_info, internal)
+            adapter_provider_id = provider_info.get("id", provider_id or "")
+        else:
+            response = await anyio.to_thread.run_sync(
+                lambda: create_chat_completion(
+                    model=model,
+                    messages=chat_messages_from_internal(internal),
+                    provider_id=provider_id,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    **extra
+                )
             )
-        )
-        choice = response.choices[0]
-        message = getattr(choice, "message", {})
-        content = _strip_think_tags(getattr(message, "content", None) or "")
-        tool_calls = getattr(message, "tool_calls", None)
-        reasoning_content = getattr(message, "reasoning_content", None)
-
-        # Store reasoning_content for next turn
-        if reasoning_content:
-            _remember_reasoning_content(conv_key, reasoning_content, _tool_call_ids_from_message({"tool_calls": tool_calls}))
-            usage = usage_dict(response)
+            output = response_to_internal_output(response)
+        if output.reasoning:
+            _remember_reasoning_content(conv_key, output.reasoning, [tool.id for tool in output.tool_calls])
             _app_log.debug("[chat_nonstream] STORED rc key=%s len=%d cache_hit=%d cache_miss=%d",
-                          conv_key[:40], len(reasoning_content),
-                          usage.get("prompt_cache_hit_tokens", 0), usage.get("prompt_cache_miss_tokens", 0))
+                          conv_key[:40], len(output.reasoning),
+                          output.usage.get("prompt_cache_hit_tokens", 0), output.usage.get("prompt_cache_miss_tokens", 0))
 
-        # Update tool-only counter for circuit breaker
-        valid_tool_calls = []
-        if tool_calls:
-            _tool_log.debug("[chat_completions] raw tool_calls count=%d model=%s", len(tool_calls), model)
-            for tc in tool_calls:
-                _tool_log.debug("[chat_completions] raw tc type=%s repr=%s", type(tc).__name__, repr(tc))
-                tc_id = getattr(tc, "id", None) if hasattr(tc, "id") else tc.get("id")
-                tc_idx = getattr(tc, "index", 0) if hasattr(tc, "index") else tc.get("index", 0)
-                if int(tc_idx) >= 0:
-                    valid_tool_calls.append(tc)
-                else:
-                    _tool_log.debug("[chat_completions] FILTERED spurious in valid check: id=%s idx=%s", tc_id, tc_idx)
-            tool_calls = valid_tool_calls if valid_tool_calls else None
-        if tool_calls and not content:
+        if output.tool_calls and not output.text:
             _tool_only_turns.increment(conv_key)
         else:
             _tool_only_turns.reset(conv_key)
 
-        usage = usage_dict(response)
-        _log_request(username, api_key_value, model, provider_id or "", "chat_completions", True, usage.get("total_tokens", 0), requested_model)
+        _log_request(username, api_key_value, model, adapter_provider_id or "", "chat_completions", True, output.usage.get("total_tokens", 0), requested_model)
         increment_global_stats(success=True)
         if username != "legacy":
-            increment_user_usage(username, api_key_value, True, usage.get("total_tokens", 0))
-        # When thinking/reasoning mode consumes all tokens before generating content,
-        # fall back to reasoning_content as the visible response.
-        if not content and reasoning_content:
-            content = reasoning_content
-        resp_msg = {"role": "assistant", "content": content}
-        if reasoning_content:
-            resp_msg["reasoning_content"] = reasoning_content
-        if tool_calls:
-            serialized = []
-            for tc in tool_calls:
-                if hasattr(tc, "model_dump"):
-                    tc_dict = tc.model_dump(exclude_none=True)
-                elif isinstance(tc, dict):
-                    tc_dict = dict(tc)
-                else:
-                    tc_dict = {
-                        "index": getattr(tc, "index", 0),
-                        "id": getattr(tc, "id", None),
-                        "type": getattr(tc, "type", "function"),
-                        "function": {
-                            "name": getattr(tc.function, "name", None) if hasattr(tc, "function") and tc.function else None,
-                            "arguments": getattr(tc.function, "arguments", "") if hasattr(tc, "function") and tc.function else ""
-                        }
-                    }
-                _tool_log.debug("[chat_completions] after dict convert: %s", json.dumps(tc_dict, ensure_ascii=False, default=str))
-                if tc_dict.get("id") is not None and not isinstance(tc_dict["id"], str):
-                    tc_dict["id"] = str(tc_dict["id"])
-                if int(tc_dict.get("index", 0)) < 0:
-                    _tool_log.debug("[chat_completions] FILTERED spurious: id=%s idx=%s", tc_dict.get("id"), tc_dict.get("index", 0))
-                    continue
-                _fix_tool_args(tc_dict)
-                _tool_log.debug("[chat_completions] after _fix_tool_args: %s", json.dumps(tc_dict, ensure_ascii=False, default=str))
-                serialized.append(tc_dict)
-            if serialized:
-                resp_msg["tool_calls"] = serialized
-                _tool_log.debug("[chat_completions] FINAL tool_calls: %s", json.dumps(serialized, ensure_ascii=False, default=str))
-            else:
-                _tool_log.debug("[chat_completions] all tool_calls filtered out")
-        return {
-            "id": f"chatcmpl-{int(time.time())}",
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": model,
-            "choices": [{
-                "index": 0,
-                "message": resp_msg,
-                "finish_reason": getattr(choice, "finish_reason", "stop") or "stop"
-            }],
-            "usage": usage
-        }
+            increment_user_usage(username, api_key_value, True, output.usage.get("total_tokens", 0))
+        return render_chat_completion(output, model=model)
     except Exception as e:
         _error_log.error("[chat] %s", str(e))
         _log_request(username, api_key_value, requested_model, provider_id or "", "chat_completions", False, 0, requested_model)
         increment_global_stats(success=False)
         if username != "legacy":
             increment_user_usage(username, api_key_value, False, 0)
-        raise HTTPException(status_code=500, detail=_friendly_error_msg(e))
+        raise HTTPException(status_code=500, detail=friendly_error_msg(e))
 
 @router.post("/completions")
 async def completions(request: Request, authorization: Optional[str] = Header(None)):
     user, api_key = verify_api_key(authorization)
 
     body = await request.json()
-    model = body.get("model")
-    prompt = body.get("prompt", "")
-    provider_id = body.get("provider_id")
-    stream = body.get("stream", False)
-    temperature = body.get("temperature", 0.7)
-    max_tokens = body.get("max_tokens")
-    if max_tokens is None:
-        max_tokens = body.get("max_completion_tokens")
-    if max_tokens is None:
-        max_tokens = get_default("max_tokens", 16384)
+    internal = completions_to_internal(body)
+    model = internal.target_model
+    provider_id = internal.provider_id
+    stream = internal.stream
+    temperature = internal.temperature
+    max_tokens = internal.max_tokens
 
     if not model:
         raise HTTPException(status_code=400, detail="model is required")
@@ -1254,64 +829,86 @@ async def completions(request: Request, authorization: Optional[str] = Header(No
     _log_request_body(username, model, "completions", body)
     api_key_value = api_key.get("key", "")
     requested_model = model
-    route_model, route_provider = _apply_routing_rules(username, api_key_value, model, model)
-    if route_model != model:
-        _app_log.debug("[completions] ROUTED model=%s -> %s", model, route_model)
-        model = route_model
-    if route_provider:
-        provider_id = route_provider
 
-    # Preprocessor: wrap prompt for image processing
-    msgs = [{"role": "user", "content": prompt}]
-    msgs, _ = await _maybe_preprocess(msgs, model, provider_id, requested_model=requested_model)
-    prompt = msgs[0].get("content", "") if msgs else prompt
+    policy = await prepare_request_policy(
+        internal,
+        username=username,
+        api_key_value=api_key_value,
+        preprocess_request=_policy_preprocess_request,
+        conversation_cache_key=_conversation_cache_key,
+        reasoning_context=None,
+        normalize=True,
+        log_label="completions",
+    )
+    model = internal.target_model
+    provider_id = internal.provider_id
+    conv_key = policy.conv_key
 
     try:
+        from app.database import get_provider as _get_prov, find_provider_by_model as _find
+        if provider_id:
+            provider_info = _get_prov(provider_id)
+        else:
+            provider_info = _find(model)
+        is_anthropic = provider_info and provider_info.get("provider_type") == "anthropic"
+        adapter_provider_id = provider_info.get("id", provider_id or "") if provider_info else provider_id
+
         if stream:
-            return StreamingResponse(
-                _stream_completions(
+            if is_anthropic:
+                anthropic_msgs, anthropic_body = anthropic_body_from_internal(internal)
+                adapter_provider_id = provider_info.get("id", provider_id or "")
+                events = iter_anthropic_output_events(
+                    provider_info=provider_info,
+                    messages=anthropic_msgs,
+                    body=anthropic_body,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
                     model=model,
-                    prompt=prompt,
-                    provider_id=provider_id,
+                )
+            else:
+                events = iter_openai_chat_output_events(
+                    model=model,
+                    messages=chat_messages_from_internal(internal),
+                    provider_id=adapter_provider_id,
                     temperature=temperature,
                     max_tokens=max_tokens,
+                    extra=chat_kwargs_from_internal(internal),
+                )
+            return StreamingResponse(
+                _stream_internal_output(
+                    events=events,
+                    endpoint="completions",
+                    model=model,
                     username=username,
                     api_key_value=api_key_value,
-                    requested_model=requested_model
+                    provider_id=adapter_provider_id,
+                    requested_model=requested_model,
+                    conv_key=conv_key,
                 ),
                 media_type="text/event-stream"
             )
 
-        response = await anyio.to_thread.run_sync(
-            lambda: create_completion(
-                model=model,
-                prompt=prompt,
-                provider_id=provider_id,
-                temperature=temperature,
-                max_tokens=max_tokens
+        if is_anthropic:
+            output = await anthropic_messages_completion_for_internal(provider_info, internal)
+            adapter_provider_id = provider_info.get("id", provider_id or "")
+        else:
+            response = await anyio.to_thread.run_sync(
+                lambda: create_chat_completion(
+                    model=model,
+                    messages=chat_messages_from_internal(internal),
+                    provider_id=adapter_provider_id,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    **chat_kwargs_from_internal(internal),
+                )
             )
-        )
-        choice = response.choices[0]
-        message = getattr(choice, "message", {})
-
-        usage = usage_dict(response)
-        _log_request(username, api_key_value, model, provider_id or "", "completions", True, usage.get("total_tokens", 0), requested_model)
+            output = response_to_internal_output(response)
+        _log_request(username, api_key_value, model, adapter_provider_id or "", "completions", True, output.usage.get("total_tokens", 0), requested_model)
     
         increment_global_stats(success=True)
         if username != "legacy":
-            increment_user_usage(username, api_key_value, True, usage.get("total_tokens", 0))
-        return {
-            "id": f"cmpl-{int(time.time())}",
-            "object": "text_completion",
-            "created": int(time.time()),
-            "model": model,
-            "choices": [{
-                "text": getattr(message, "content", ""),
-                "index": 0,
-                "finish_reason": getattr(choice, "finish_reason", "stop") or "stop"
-            }],
-            "usage": usage
-        }
+            increment_user_usage(username, api_key_value, True, output.usage.get("total_tokens", 0))
+        return render_completion(output, model=model)
     except Exception as e:
         _log_request(username, api_key_value, "-", provider_id or "", "completions", False, 0, requested_model)
 
@@ -1319,918 +916,7 @@ async def completions(request: Request, authorization: Optional[str] = Header(No
         if username != "legacy":
             increment_user_usage(username, api_key_value, False, 0)
         _error_log.error("FAILED: %s", str(e))
-        raise HTTPException(status_code=500, detail=_friendly_error_msg(e))
-
-# -- Anthropic Messages API conversion --
-
-def _anthropic_content_to_openai(content) -> list:
-    """Convert Anthropic content blocks to OpenAI chat content format."""
-    if isinstance(content, str):
-        return [content]  # plain string, return as-is for backward compat
-    if not isinstance(content, list):
-        return [str(content)]
-    parts = []
-    for block in content:
-        if not isinstance(block, dict):
-            parts.append(str(block))
-        elif block.get("type") == "text":
-            text = block.get("text", "")
-            if text:  # Filter empty text blocks to avoid downstream rejection
-                parts.append(text)
-        elif block.get("type") == "image":
-            source = block.get("source", {})
-            if source.get("type") == "base64":
-                media = source.get("media_type", "image/png")
-                data = source.get("data", "")
-                parts.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:{media};base64,{data}"}
-                })
-        elif block.get("type") == "tool_use":
-            # Tool_use in conversation history means it was an assistant tool call
-            # Already handled by _anthropic_to_openai_messages, skip here
-            pass
-        elif block.get("type") == "tool_result":
-            # Tool_result in conversation - handled by message role conversion
-            pass
-    # Return string if only text, list if has images
-    if all(isinstance(p, str) for p in parts):
-        return parts  # will be joined if needed
-    return parts
-
-
-def _anthropic_to_openai_messages(anthropic_msgs: list, system_prompt: str = "") -> tuple:
-    """Convert Anthropic Messages API input to OpenAI Chat Completions messages.
-    Also extracts tool definitions from the request for later use.
-    Returns (openai_messages, has_tools)."""
-    openai_msgs = []
-    has_tools = False
-    if system_prompt:
-        # Anthropic system can be a string or content block array, including cache_control.
-        if isinstance(system_prompt, list):
-            text_parts = []
-            for block in system_prompt:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    text = block.get("text", "")
-                    if text:
-                        text_parts.append(text)
-            system_prompt = "\n".join(text_parts)
-        if system_prompt:
-            openai_msgs.append({"role": "system", "content": system_prompt})
-    for m in anthropic_msgs:
-        role = m.get("role", "user")
-        content = m.get("content", "")
-        if role == "assistant":
-            openai_content = None
-            tool_calls = []
-            thinking_parts = []
-            if isinstance(content, list):
-                text_parts = []
-                for block in content:
-                    if block.get("type") == "text":
-                        text = block.get("text", "")
-                        if text:
-                            text_parts.append(text)
-                    elif block.get("type") == "tool_use":
-                        has_tools = True
-                        tool_calls.append({
-                            "id": block.get("id", ""),
-                            "type": "function",
-                            "function": {
-                                "name": block.get("name", ""),
-                                "arguments": json.dumps(block.get("input", {}))
-                            }
-                        })
-                    elif block.get("type") == "thinking":
-                        th_text = block.get("thinking", "")
-                        if th_text:
-                            thinking_parts.append(th_text)
-                openai_content = "\n".join(text_parts) or None
-            else:
-                openai_content = str(content) if content else None
-            msg = {"role": "assistant", "content": openai_content}
-            if tool_calls:
-                msg["tool_calls"] = tool_calls
-            # Preserve reasoning_content for DeepSeek thinking mode multi-turn continuity.
-            # Anthropic format stores thinking in content blocks; OpenAI format uses
-            # the reasoning_content field. Without this, DeepSeek re-thinks from scratch
-            # and may enter empty-output loops (content_chars=0, finish_reason=stop).
-            rc = m.get("reasoning_content")
-            if rc:
-                msg["reasoning_content"] = rc
-            elif thinking_parts:
-                msg["reasoning_content"] = "\n".join(thinking_parts)
-            openai_msgs.append(msg)
-        elif role == "user":
-            parts = _anthropic_content_to_openai(content)
-            # Check for tool_result blocks embedded in user messages (Anthropic format)
-            tool_results = []
-            other_parts = []
-            for block in (content if isinstance(content, list) else []):
-                if isinstance(block, dict) and block.get("type") == "tool_result":
-                    tool_results.append(block)
-                else:
-                    other_parts.append(block)
-            # Tool results MUST come first (before user text) - DeepSeek and other
-            # strict providers require tool messages immediately after assistant tool_calls.
-            # See: "An assistant message with 'tool_calls' must be followed by tool messages"
-            for tr in tool_results:
-                tool_use_id = tr.get("tool_use_id", "")
-                result_content = tr.get("content", "")
-                if isinstance(result_content, list):
-                    text_parts = []
-                    image_parts = []
-                    for block in result_content:
-                        if isinstance(block, dict):
-                            if block.get("type") == "text":
-                                text = block.get("text", "")
-                                if text:
-                                    text_parts.append(text)
-                            elif block.get("type") == "image":
-                                source = block.get("source", {})
-                                if source.get("type") == "base64":
-                                    media = source.get("media_type", "image/png")
-                                    data = source.get("data", "")
-                                    image_parts.append({"type": "image_url", "image_url": {"url": f"data:{media};base64,{data}"}})
-                    if image_parts:
-                        result_content = [{"type": "text", "text": "\n".join(text_parts) or "(tool output)"}] + image_parts
-                    else:
-                        result_content = "\n".join(text_parts)
-                elif isinstance(result_content, str):
-                    result_content = result_content
-                else:
-                    result_content = str(result_content)
-                openai_msgs.append({"role": "tool", "tool_call_id": tool_use_id, "content": result_content})
-            # Add non-tool parts as user message AFTER tool messages
-            if other_parts:
-                non_tool = _anthropic_content_to_openai(other_parts)
-                if len(non_tool) == 1 and isinstance(non_tool[0], str):
-                    openai_msgs.append({"role": "user", "content": non_tool[0]})
-                else:
-                    formatted = []
-                    for p in non_tool:
-                        if isinstance(p, str) and p:
-                            formatted.append({"type": "text", "text": p})
-                        elif isinstance(p, dict):
-                            formatted.append(p)
-                    openai_msgs.append({"role": "user", "content": formatted})
-            elif not tool_results:
-                # No tool_results, handle normally
-                if len(parts) == 1 and isinstance(parts[0], str):
-                    openai_msgs.append({"role": "user", "content": parts[0]})
-                else:
-                    formatted = []
-                    for p in parts:
-                        if isinstance(p, str) and p:
-                            formatted.append({"type": "text", "text": p})
-                        elif isinstance(p, dict):
-                            formatted.append(p)
-                    openai_msgs.append({"role": "user", "content": formatted})
-        elif role == "tool_result":
-            # Claude Code sends tool results (like file_read output) - convert to tool role
-            tool_use_id = m.get("tool_use_id", "")
-            result_content = m.get("content", "")
-            # Handle Anthropic tool_result content format (string or array of blocks)
-            if isinstance(result_content, list):
-                text_parts = []
-                image_parts = []
-                for block in result_content:
-                    if isinstance(block, dict):
-                        if block.get("type") == "text":
-                            text = block.get("text", "")
-                            if text:
-                                text_parts.append(text)
-                        elif block.get("type") == "image":
-                            source = block.get("source", {})
-                            if source.get("type") == "base64":
-                                media = source.get("media_type", "image/png")
-                                data = source.get("data", "")
-                                image_parts.append({
-                                    "type": "image_url",
-                                    "image_url": {"url": f"data:{media};base64,{data}"}
-                                })
-                if image_parts:
-                    result_content = [{"type": "text", "text": "\n".join(text_parts) or "(tool output)"}] + image_parts
-                else:
-                    result_content = "\n".join(text_parts) or "(tool output)"
-            elif isinstance(result_content, str):
-                result_content = result_content
-            else:
-                result_content = str(result_content)
-            openai_msgs.append({"role": "tool", "tool_call_id": tool_use_id, "content": result_content})
-    _app_log.debug("[messages] converted %d msgs has_tools=%s",
-                 len(openai_msgs),
-                 has_tools)
-    return openai_msgs, has_tools
-
-
-def _openai_to_anthropic_content(message: dict) -> list:
-    """Convert OpenAI assistant message to Anthropic content blocks."""
-    content_blocks = []
-    content = message.get("content", "")
-    if content:
-        content_blocks.append({"type": "text", "text": content})
-    tool_calls = message.get("tool_calls", [])
-    if tool_calls:
-        for tc in tool_calls:
-            tc_id = tc.get("id", "")
-            func = tc.get("function", {})
-            args_str = func.get("arguments", "{}")
-            try:
-                args = json.loads(args_str) if isinstance(args_str, str) else args_str
-            except json.JSONDecodeError:
-                args = {}
-            content_blocks.append({
-                "type": "tool_use",
-                "id": tc_id,
-                "name": func.get("name", ""),
-                "input": args
-            })
-    if not content_blocks:
-        content_blocks.append({"type": "text", "text": ""})
-    return content_blocks
-
-
-def _openai_messages_to_anthropic(messages: list, system_prompt: str = "") -> tuple:
-    """Convert OpenAI Chat Completions messages to Anthropic Messages format.
-    Return the (anthropic_messages, system_prompt, tools) tuple.
-    """
-    anthropic_msgs = []
-    system_texts = []
-    tools_from_messages = []
-
-    for msg in messages:
-        role = msg.get("role", "")
-        content = msg.get("content", "")
-
-        if role == "system":
-            system_texts.append(_strip_billing_header(content if isinstance(content, str) else str(content)))
-            continue
-
-        if role == "user":
-            parts = []
-            if isinstance(content, str):
-                parts = [{"type": "text", "text": content}]
-            elif isinstance(content, list):
-                for part in content:
-                    if isinstance(part, str):
-                        parts.append({"type": "text", "text": part})
-                    elif isinstance(part, dict):
-                        if part.get("type") == "image_url":
-                            img = part.get("image_url", {})
-                            url = img.get("url", "") if isinstance(img, dict) else img
-                            if url.startswith("data:"):
-                                parts.append({"type": "image", "source": {
-                                    "type": "base64",
-                                    "media_type": url.split(";")[0].replace("data:", ""),
-                                    "data": url.split(",", 1)[1] if "," in url else ""
-                                }})
-                        elif part.get("type") == "input_image":
-                            parts.append(part)
-                        else:
-                            parts.append(part)
-            anthropic_msgs.append({"role": "user", "content": parts})
-
-        elif role == "assistant":
-            content_blocks = _openai_to_anthropic_content(msg)
-            anthropic_msgs.append({"role": "assistant", "content": content_blocks})
-            # Extract tool_calls information, already handled by _openai_to_anthropic_content
-
-        elif role == "tool":
-            tool_call_id = msg.get("tool_call_id", "")
-            tool_content = content if isinstance(content, str) else str(content)
-            anthropic_msgs.append({
-                "role": "user",
-                "content": [{"type": "tool_result", "tool_use_id": tool_call_id, "content": tool_content}]
-            })
-
-    # Merge system text
-    if system_prompt:
-        system_texts.insert(0, system_prompt)
-    final_system = "\n\n".join(system_texts) if system_texts else ""
-
-    return anthropic_msgs, final_system
-
-
-def _map_stop_reason(finish_reason: str) -> str:
-    return {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"}.get(
-        finish_reason, "end_turn")
-
-
-async def _stream_anthropic_messages(model, messages, provider_id, temperature,
-                                      max_tokens, username, api_key_value,
-                                      requested_model="", system_prompt="", conv_key="", **extra):
-    """Stream OpenAI chat chunks as Anthropic-formatted SSE events."""
-    if not conv_key:
-        conv_key = _conversation_cache_key(api_key_value, messages)
-    msg_id = f"msg_{int(time.time())}"
-    total_tokens = 0
-    cache_hit = 0
-    cache_miss = 0
-    output_tokens = 0
-    error_msg = None
-    finish_reason = None
-    _flushed = False  # guard: finish_reason flush runs only once
-    accumulated_text = ""
-    text_buffer = ""
-    text_content_started = False
-    block_index = 0
-    tool_uses = {}
-    accumulated_reasoning = ""  # index -> {id, name, arguments_buffer, started}
-
-    try:
-        # Diagnostic: log message structure summary
-        msg_roles = [m.get("role", "?") if isinstance(m, dict) else "?" for m in messages]
-        _app_log.debug("[messages_stream] START model=%s msg_count=%d roles=%s max_tokens=%s tools=%s",
-                      model, len(messages), str(msg_roles), str(max_tokens),
-                      str(extra.get("tools", [])[:10]) if extra.get("tools") else "none")
-        stream_func = lambda: create_chat_completion_stream(
-            model=model, messages=messages, provider_id=provider_id,
-            temperature=temperature, max_tokens=max_tokens, **extra
-        )
-        yield f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': msg_id, 'type': 'message', 'role': 'assistant', 'content': [], 'model': model, 'stop_reason': None, 'stop_sequence': None, 'usage': {'input_tokens': 0, 'output_tokens': 0}}})}\n\n"
-
-        chunk_count = 0
-        content_total = 0
-        async for chunk in _iter_stream_async(stream_func):
-            chunk_count += 1
-            choice = chunk.choices[0] if chunk.choices else None
-            if not choice:
-                continue
-            delta = getattr(choice, "delta", None)
-            chunk_finish = getattr(choice, "finish_reason", None)
-            if chunk_finish:
-                finish_reason = chunk_finish  # save first finish_reason, don't overwrite
-                _app_log.debug(
-                    "[messages_stream] GOT finish_reason=%s at chunk=%d content_chars=%d",
-                    finish_reason, chunk_count, content_total
-                )
-
-            if delta:
-                content_delta = getattr(delta, "content", None)
-                if content_delta:
-                    content_total += len(content_delta)
-                    accumulated_text += content_delta
-                    text_buffer += content_delta
-                    if not text_content_started:
-                        text_content_started = True
-                        yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
-                    if len(text_buffer) >= 16:
-                        yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'text_delta', 'text': text_buffer}})}\n\n"
-                        text_buffer = ""
-                # Capture reasoning_content for DeepSeek multi-turn replay
-                reasoning_delta = getattr(delta, "reasoning_content", None)
-                if reasoning_delta:
-                    accumulated_reasoning += reasoning_delta
-
-                # Handle tool call deltas (OpenAI streaming format -> Anthropic tool_use events)
-                tool_calls_delta = getattr(delta, "tool_calls", None)
-                if tool_calls_delta:
-                    for tc in tool_calls_delta:
-                        idx = getattr(tc, "index", 0) if hasattr(tc, "index") else tc.get("index", 0)
-                        tc_id = getattr(tc, "id", "") if hasattr(tc, "id") else tc.get("id", "")
-                        tc_func = getattr(tc, "function", None) if hasattr(tc, "function") else tc.get("function", {})
-                        tc_name = getattr(tc_func, "name", "") if hasattr(tc_func, "name") else tc_func.get("name", "")
-                        tc_args = getattr(tc_func, "arguments", "") if hasattr(tc_func, "arguments") else tc_func.get("arguments", "")
-
-                        if idx not in tool_uses:
-                            tu_block_idx = _anthropic_tool_block_index(text_content_started, tool_uses)
-                            tu_id = tc_id if tc_id else f"toolu_{idx}"
-                            tool_uses[idx] = {"id": tu_id, "name": tc_name, "arguments": tc_args, "started": False, "block_index": tu_block_idx}
-                        else:
-                            tool_uses[idx]["arguments"] += tc_args
-                            if tc_name:
-                                tool_uses[idx]["name"] = tc_name
-                            if tc_id:
-                                tool_uses[idx]["id"] = tc_id
-                            # Send delta for accumulating arguments
-                            if tc_args and tool_uses[idx]["started"]:
-                                try:
-                                    json.loads(tool_uses[idx]["arguments"])
-                                except Exception:
-                                    pass  # still building, don't output incomplete JSON
-
-            if finish_reason and not _flushed:
-                _flushed = True
-                # Flush text
-                if text_buffer:
-                    yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'text_delta', 'text': text_buffer}})}\n\n"
-                    text_buffer = ""
-                if text_content_started:
-                    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
-
-                # Emit tool_use blocks
-                for idx, tu in sorted(tool_uses.items()):
-                    tu_block_idx = tu["block_index"]
-                    tu_id = tu["id"] or f"toolu_{idx}"
-                    try:
-                        tu_input = json.loads(tu["arguments"]) if tu["arguments"] else {}
-                    except json.JSONDecodeError:
-                        tu_input = {}
-                    sse_data = {
-                        "type": "content_block_start",
-                        "index": tu_block_idx,
-                        "content_block": {
-                            "type": "tool_use",
-                            "id": tu_id,
-                            "name": tu["name"],
-                            "input": {}
-                        }
-                    }
-                    yield f"event: content_block_start\ndata: {json.dumps(sse_data)}\n\n"
-                    yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': tu_block_idx, 'delta': {'type': 'input_json_delta', 'partial_json': json.dumps(tu_input, ensure_ascii=False)}})}\n\n"
-                    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': tu_block_idx})}\n\n"
-
-            if hasattr(chunk, "usage") and chunk.usage:
-                total_tokens = getattr(chunk.usage, "total_tokens", 0) or 0
-                output_tokens = getattr(chunk.usage, "completion_tokens", 0) or 0
-                cache_hit = getattr(chunk.usage, "prompt_cache_hit_tokens", 0) or 0
-                cache_miss = getattr(chunk.usage, "prompt_cache_miss_tokens", 0) or 0
-
-        # Fallback: if thinking consumed all tokens with no text/tool output,
-        # render reasoning_content as the visible response (same as _stream_chat fallback).
-        if content_total == 0 and not tool_uses and accumulated_reasoning:
-            _app_log.debug("[messages_stream] fallback: reasoning_content (%s chars) as response", len(accumulated_reasoning))
-            if not text_content_started:
-                block_index += 1
-                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
-            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'text_delta', 'text': accumulated_reasoning}})}\n\n"
-            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
-
-        stop_reason = _map_stop_reason(finish_reason) if finish_reason else "end_turn"
-        _app_log.debug(
-            "[messages_stream] DONE finish_reason=%s stop_reason=%s total_chunks=%d content_chars=%d accumulated_text_len=%d text_buffer_len=%d tool_uses_count=%d reasoning_chars=%d max_tokens_param=%s",
-            finish_reason or "None", stop_reason, chunk_count, content_total,
-            len(accumulated_text), len(text_buffer), len(tool_uses),
-            len(accumulated_reasoning), str(max_tokens)
-        )
-        _app_log.info(
-            "[messages_stream] END finish_reason=%s stop_reason=%s text=%s tools=%d reasoning=%d conv_key=%s",
-            finish_reason or "None",
-            stop_reason,
-            content_total > 0,
-            len(tool_uses),
-            len(accumulated_reasoning),
-            conv_key[:60],
-        )
-        yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': stop_reason, 'stop_sequence': None}, 'usage': {'output_tokens': output_tokens}})}\n\n"
-        yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
-
-        _log_request(username, api_key_value, model, provider_id or "", "messages", True, total_tokens, requested_model)
-        if accumulated_reasoning:
-            _remember_reasoning_content(
-                conv_key,
-                accumulated_reasoning,
-                [tu.get("id") for tu in tool_uses.values()]
-            )
-            _app_log.debug("[messages_stream] STORED rc key=%s len=%d cache_hit=%d cache_miss=%d", conv_key[:60], len(accumulated_reasoning), cache_hit, cache_miss)
-        if username != "legacy":
-            increment_user_usage(username, api_key_value, True, total_tokens)
-        increment_global_stats(success=True)
-
-    except Exception as e:
-        error_msg = _friendly_error_msg(e)
-        _error_log.error("[messages_stream] %s", str(e))
-        _log_request(username, api_key_value, "-", provider_id or "", "messages", False, 0, requested_model)
-        increment_global_stats(success=False)
-        if username != "legacy":
-            increment_user_usage(username, api_key_value, False, 0)
-
-    finally:
-        if error_msg:
-            yield f"event: error\ndata: {json.dumps({'type': 'error', 'error': {'type': 'server_error', 'message': error_msg}})}\n\n"
-
-
-async def _anthropic_passthrough(provider_info: dict, messages: list,
-                                  body: dict, max_tokens: int,
-                                  temperature, model: str) -> dict:
-    """Direct HTTP call to an Anthropic-compatible endpoint, bypassing liteLLM conversion."""
-    import httpx
-    api_base = (provider_info.get("api_base") or "").rstrip("/")
-    api_key = provider_info.get("api_key") or "sk-no-auth"
-    # Extract the actual model name from composite IDs because upstream does not know provider/model format
-    mid = parse_model_id(model)
-    upstream_model = mid.model_name
-    # Build Anthropic-format request - use routed model, not body.get("model")
-    req_body = {"model": upstream_model, "messages": messages, "max_tokens": max_tokens}
-    if temperature is not None:
-        req_body["temperature"] = temperature
-    system = _strip_billing_header(body.get("system"))
-    if system:
-        req_body["system"] = system
-    tools = body.get("tools")
-    if tools:
-        req_body["tools"] = [{"name": t["name"], "description": t.get("description", ""),
-                             "input_schema": t.get("input_schema", {"type": "object", "properties": {}})}
-                            for t in tools if isinstance(t, dict) and t.get("name")]
-    # Per-provider thinking mode: configured via provider_info.extra_headers.
-    extra_headers = provider_info.get("extra_headers", {}) or {}
-    thinking = extra_headers.get("thinking")
-    if thinking in ("enabled", "disabled"):
-        req_body["thinking"] = {"type": thinking}
-    async with httpx.AsyncClient(timeout=120) as client:
-        resp = await client.post(
-            f"{api_base}/v1/messages",
-            headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
-                     "Content-Type": "application/json"},
-            json=req_body,
-        )
-        if resp.status_code != 200:
-            try:
-                err_body = resp.json()
-                err_msg = err_body.get("error", {}).get("message", resp.text[:300])
-            except Exception:
-                err_msg = resp.text[:300] or f"HTTP {resp.status_code}"
-            raise HTTPException(status_code=502, detail=f"Upstream: {err_msg}")
-        data = resp.json()
-        # Wrap in OpenAI-compatible format for downstream processing
-        content_blocks = data.get("content", [])
-        text_parts = [b.get("text", "") for b in content_blocks if b.get("type") == "text"]
-        tool_uses = [b for b in content_blocks if b.get("type") == "tool_use"]
-        # Build minimal OpenAI-compatible response
-        openai_message = {"role": "assistant", "content": "\n".join(text_parts) or None}
-        if tool_uses:
-            openai_message["tool_calls"] = [{
-                "id": tu["id"], "type": "function",
-                "function": {"name": tu.get("name", ""), "arguments": json.dumps(tu.get("input", {}))}
-            } for tu in tool_uses]
-        usage = data.get("usage", {})
-        return type("Response", (), {
-            "choices": [type("Choice", (), {
-                "message": openai_message,
-                "finish_reason": data.get("stop_reason", "end_turn")
-            })],
-            "usage": type("Usage", (), {
-                "prompt_tokens": usage.get("input_tokens", 0),
-                "completion_tokens": usage.get("output_tokens", 0),
-                "total_tokens": usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
-            })
-        })()
-
-
-async def _stream_responses_anthropic_passthrough(provider_info: dict, messages: list,
-                                                   body: dict, max_tokens: int,
-                                                   temperature, username: str,
-                                                   api_key_value: str, model: str,
-                                                   requested_model: str, conv_key: str = ""):
-    """Stream Responses API SSE by calling an Anthropic-compatible upstream directly."""
-    import httpx
-
-    api_base = (provider_info.get("api_base") or "").rstrip("/")
-    api_key = provider_info.get("api_key") or "sk-no-auth"
-    mid = parse_model_id(model)
-    upstream_model = mid.model_name
-    provider_id = provider_info.get("id", "")
-
-    if not conv_key:
-        conv_key = _conversation_cache_key(api_key_value, messages)
-
-    resp_id = f"resp_{uuid.uuid4().hex}"
-    msg_id = f"msg_{uuid.uuid4().hex}"
-    created_at = int(time.time())
-
-    total_tokens = 0
-    input_tokens = 0
-    output_tokens = 0
-    cache_hit = 0
-    cache_miss = 0
-    error_msg = None
-    accumulated_text = ""
-    accumulated_reasoning = ""
-    text_buffer = ""
-    text_item_added = False
-    text_content_added = False
-    text_output_index = 0
-    output_index_counter = 0
-    tool_calls_state = {}
-    block_states = {}
-
-    response_base = {
-        "id": resp_id,
-        "object": "response",
-        "created_at": created_at,
-        "status": "in_progress",
-        "model": model,
-        "output": [],
-        "previous_response_id": body.get("previous_response_id") or None,
-        "metadata": {},
-        "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
-    }
-
-    yield f"data: {json.dumps({'type': 'response.created', 'response': response_base})}\n\n"
-    yield f"data: {json.dumps({'type': 'response.in_progress', 'response': response_base})}\n\n"
-
-    req_body = {"model": upstream_model, "messages": messages, "max_tokens": max_tokens, "stream": True}
-    if temperature is not None:
-        req_body["temperature"] = temperature
-    system = _strip_billing_header(body.get("system"))
-    if system:
-        req_body["system"] = system
-    tools = body.get("tools")
-    if tools:
-        req_body["tools"] = [
-            {"name": t["name"], "description": t.get("description", ""),
-             "input_schema": t.get("input_schema", {"type": "object", "properties": {}})}
-            for t in tools if isinstance(t, dict) and t.get("name")
-        ]
-    extra_headers = provider_info.get("extra_headers", {}) or {}
-    thinking = extra_headers.get("thinking")
-    if thinking in ("enabled", "disabled"):
-        req_body["thinking"] = {"type": thinking}
-
-    try:
-        async with httpx.AsyncClient(timeout=300) as client:
-            async with client.stream(
-                "POST",
-                f"{api_base}/v1/messages",
-                headers={
-                    "x-api-key": api_key,
-                    "anthropic-version": "2023-06-01",
-                    "Content-Type": "application/json",
-                },
-                json=req_body,
-            ) as resp:
-                if resp.status_code != 200:
-                    try:
-                        err_body = await resp.aread()
-                        err_data = json.loads(err_body)
-                        err_msg = err_data.get("error", {}).get("message", str(err_body)[:300])
-                    except Exception:
-                        err_msg = f"HTTP {resp.status_code}"
-                    error_msg = f"Upstream {resp.status_code}: {err_msg}"
-                else:
-                    current_event = None
-                    async for line in resp.aiter_lines():
-                        if not line:
-                            continue
-                        if line.startswith("event: "):
-                            current_event = line[7:].strip()
-                            continue
-                        if not line.startswith("data: "):
-                            continue
-                        raw = line[6:]
-                        if raw == "[DONE]":
-                            break
-                        try:
-                            data = json.loads(raw)
-                        except Exception:
-                            continue
-
-                        event_type = current_event or data.get("type")
-                        current_event = None
-
-                        if event_type == "message_start":
-                            usage = data.get("message", {}).get("usage", {}) or {}
-                            input_tokens = usage.get("input_tokens", input_tokens) or 0
-                            total_tokens = input_tokens + output_tokens
-                        elif event_type == "content_block_start":
-                            block_index = data.get("index", 0)
-                            block = data.get("content_block", {}) or {}
-                            block_type = block.get("type", "")
-                            block_states[block_index] = {
-                                "type": block_type,
-                                "id": block.get("id", ""),
-                                "name": block.get("name", ""),
-                                "arguments_buffer": "",
-                                "item_added": False,
-                                "output_index": None,
-                            }
-
-                            if block_type == "text":
-                                if not text_item_added:
-                                    yield f"data: {json.dumps({'type': 'response.output_item.added', 'output_index': output_index_counter, 'item': {'type': 'message', 'id': msg_id, 'status': 'in_progress', 'role': 'assistant', 'content': []}})}\n\n"
-                                    text_item_added = True
-                                    text_output_index = output_index_counter
-                                    output_index_counter += 1
-                                if not text_content_added:
-                                    yield f"data: {json.dumps({'type': 'response.content_part.added', 'output_index': text_output_index, 'content_index': 0, 'part': {'type': 'output_text', 'text': '', 'annotations': []}})}\n\n"
-                                    text_content_added = True
-                            elif block_type == "tool_use":
-                                tu_id = block.get("id", "") or f"toolu_{block_index}"
-                                call_id = tu_id if isinstance(tu_id, str) and tu_id.startswith("call_") else f"call_{tu_id}"
-                                block_states[block_index].update({
-                                    "id": tu_id,
-                                    "call_id": call_id,
-                                    "name": block.get("name", ""),
-                                    "output_index": output_index_counter,
-                                    "item_added": True,
-                                })
-                                tool_calls_state[block_index] = block_states[block_index]
-                                yield f"data: {json.dumps({'type': 'response.output_item.added', 'output_index': output_index_counter, 'item': {'type': 'function_call', 'id': tu_id, 'call_id': call_id, 'name': block.get('name', ''), 'arguments': '', 'status': 'in_progress'}})}\n\n"
-                                output_index_counter += 1
-                            elif block_type in ("thinking", "redacted_thinking"):
-                                pass
-
-                        elif event_type == "content_block_delta":
-                            block_index = data.get("index", 0)
-                            delta = data.get("delta", {}) or {}
-                            delta_type = delta.get("type", "")
-                            state = block_states.get(block_index)
-
-                            if delta_type == "text_delta":
-                                text = delta.get("text", "")
-                                if text:
-                                    accumulated_text += text
-                                    text_buffer += text
-                                    if len(text_buffer) >= 16 and text_content_added:
-                                        yield f"data: {json.dumps({'type': 'response.output_text.delta', 'output_index': text_output_index, 'content_index': 0, 'delta': text_buffer})}\n\n"
-                                        text_buffer = ""
-                            elif delta_type == "input_json_delta":
-                                partial_json = delta.get("partial_json", "")
-                                if state and state.get("item_added"):
-                                    state["arguments_buffer"] += partial_json
-                                    yield f"data: {json.dumps({'type': 'response.function_call_arguments.delta', 'output_index': state['output_index'], 'call_id': state['call_id'], 'delta': partial_json})}\n\n"
-                            elif delta_type in ("thinking_delta", "redacted_thinking_delta"):
-                                thinking_text = delta.get("thinking", "") or delta.get("text", "")
-                                if thinking_text:
-                                    accumulated_reasoning += thinking_text
-
-                        elif event_type == "message_delta":
-                            usage = data.get("usage", {}) or {}
-                            output_tokens = usage.get("output_tokens", output_tokens) or output_tokens
-                            total_tokens = input_tokens + output_tokens
-
-                    # finished stream normally
-    except Exception as e:
-        import traceback
-        error_msg = _friendly_error_msg(e)
-        _error_log.error("[responses_stream_anthropic] %s", traceback.format_exc())
-        _error_log.error("[responses_stream_anthropic] %s", error_msg)
-
-    if text_buffer:
-        yield f"data: {json.dumps({'type': 'response.output_text.delta', 'output_index': text_output_index, 'content_index': 0, 'delta': text_buffer})}\n\n"
-        text_buffer = ""
-
-    completion_output = []
-    if text_item_added:
-        if text_content_added:
-            yield f"data: {json.dumps({'type': 'response.output_text.done', 'output_index': text_output_index, 'content_index': 0, 'text': accumulated_text})}\n\n"
-            yield f"data: {json.dumps({'type': 'response.content_part.done', 'output_index': text_output_index, 'content_index': 0, 'part': {'type': 'output_text', 'text': accumulated_text, 'annotations': []}})}\n\n"
-        msg_out = {
-            "type": "message",
-            "id": msg_id,
-            "status": "completed",
-            "role": "assistant",
-            "content": [{"type": "output_text", "text": accumulated_text, "annotations": []}],
-        }
-        if accumulated_reasoning:
-            msg_out["reasoning_content"] = accumulated_reasoning
-        yield f"data: {json.dumps({'type': 'response.output_item.done', 'output_index': text_output_index, 'item': msg_out})}\n\n"
-        completion_output.append(msg_out)
-    elif accumulated_reasoning:
-        completion_output.append({
-            "type": "message",
-            "id": msg_id,
-            "status": "completed",
-            "role": "assistant",
-            "content": [{"type": "output_text", "text": accumulated_reasoning, "annotations": []}],
-        })
-    elif accumulated_text:
-        flushed = accumulated_text.replace("<think>", "", 1) if "<think>" in accumulated_text else accumulated_text
-        if flushed.strip():
-            completion_output.append({
-                "type": "message",
-                "id": msg_id,
-                "status": "completed",
-                "role": "assistant",
-                "content": [{"type": "output_text", "text": flushed, "annotations": []}],
-            })
-
-    for idx in sorted(tool_calls_state.keys()):
-        state = tool_calls_state[idx]
-        if state["item_added"]:
-            yield f"data: {json.dumps({'type': 'response.function_call_arguments.done', 'output_index': state['output_index'], 'call_id': state['call_id'], 'arguments': state['arguments_buffer']})}\n\n"
-            yield f"data: {json.dumps({'type': 'response.output_item.done', 'output_index': state['output_index'], 'item': {'type': 'function_call', 'id': state['id'], 'call_id': state['call_id'], 'name': state['name'], 'arguments': state['arguments_buffer'], 'status': 'completed'}})}\n\n"
-            completion_output.append({
-                "type": "function_call",
-                "id": state["id"],
-                "call_id": state["call_id"],
-                "name": state["name"],
-                "arguments": state["arguments_buffer"],
-                "status": "completed",
-            })
-
-    if accumulated_reasoning:
-        _remember_reasoning_content(
-            conv_key,
-            accumulated_reasoning,
-            [state.get("id") for state in tool_calls_state.values()],
-        )
-
-    has_text = len(accumulated_text.strip()) > 0
-    has_tools = len(tool_calls_state) > 0
-    if has_tools and not has_text:
-        _tool_only_turns.increment(conv_key)
-    else:
-        _tool_only_turns.reset(conv_key)
-
-    if error_msg:
-        _log_request(username, api_key_value, "-", provider_id, "responses", False, 0, requested_model)
-        increment_global_stats(success=False)
-        if username != "legacy":
-            increment_user_usage(username, api_key_value, False, 0)
-        yield f"data: {json.dumps({'type': 'error', 'error': {'message': error_msg, 'type': 'server_error'}})}\n\n"
-        response_completed = {
-            "type": "response.completed",
-            "response": {
-                "id": resp_id,
-                "object": "response",
-                "created_at": created_at,
-                "status": "failed",
-                "model": model,
-                "output": completion_output,
-                "previous_response_id": body.get("previous_response_id") or None,
-                "metadata": {},
-                "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens, "total_tokens": total_tokens},
-                "status_details": {"error": {"type": "server_error", "message": error_msg}},
-            },
-        }
-        yield f"data: {json.dumps(response_completed)}\n\n"
-        yield "data: [DONE]\n\n"
-        return
-
-    _log_request(username, api_key_value, model, provider_id, "responses", True, total_tokens, requested_model)
-    if username != "legacy":
-        increment_user_usage(username, api_key_value, True, total_tokens)
-    increment_global_stats(success=True)
-
-    yield f"data: {json.dumps({'type': 'response.completed', 'response': {'id': resp_id, 'object': 'response', 'created_at': created_at, 'status': 'completed', 'model': model, 'output': completion_output, 'previous_response_id': body.get('previous_response_id') or None, 'metadata': {}, 'usage': {'input_tokens': input_tokens, 'output_tokens': output_tokens, 'total_tokens': total_tokens}}})}\n\n"
-    yield "data: [DONE]\n\n"
-
-
-async def _stream_anthropic_passthrough(provider_info, messages, body, max_tokens, temperature,
-                                         username, api_key_value, model, requested_model):
-    """Stream SSE events directly from an Anthropic-compatible upstream."""
-    import httpx
-    api_base = (provider_info.get("api_base") or "").rstrip("/")
-    api_key = provider_info.get("api_key") or "sk-no-auth"
-    # Extract the actual model name from composite IDs because upstream does not know provider/model format
-    mid = parse_model_id(model)
-    upstream_model = mid.model_name
-    req_body = {"model": upstream_model, "messages": messages, "max_tokens": max_tokens, "stream": True}
-    if temperature is not None:
-        req_body["temperature"] = temperature
-    system = _strip_billing_header(body.get("system"))
-    if system:
-        req_body["system"] = system
-    tools = body.get("tools")
-    if tools:
-        # Strip type field - Anthropic-compatible endpoints (DeepSeek) reject type:"custom"
-        req_body["tools"] = [{k: v for k, v in t.items() if k != "type"} for t in tools if isinstance(t, dict)]
-    # Per-provider thinking mode: configured via provider_info.extra_headers.
-    extra_headers = provider_info.get("extra_headers", {}) or {}
-    thinking = extra_headers.get("thinking")
-    if thinking in ("enabled", "disabled"):
-        req_body["thinking"] = {"type": thinking}
-    total_tokens = 0
-    provider_id = provider_info.get("id", "")
-    try:
-        async with httpx.AsyncClient(timeout=300) as client:
-            async with client.stream(
-                "POST", f"{api_base}/v1/messages",
-                headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "Content-Type": "application/json"},
-                json=req_body,
-            ) as resp:
-                if resp.status_code != 200:
-                    try:
-                        err_body = await resp.aread()
-                        err_data = json.loads(err_body)
-                        err_msg = err_data.get("error", {}).get("message", str(err_body)[:300])
-                    except Exception:
-                        err_msg = f"HTTP {resp.status_code}"
-                    _log_request(username, api_key_value, "-", provider_id, "messages", False, 0, requested_model)
-                    increment_global_stats(success=False)
-                    if username != "legacy":
-                        increment_user_usage(username, api_key_value, False, 0)
-                    yield f"event: error\ndata: {json.dumps({'type': 'error', 'error': {'message': f'Upstream {resp.status_code}: {err_msg}'}})}\n\n"
-                    return
-                async for line in resp.aiter_lines():
-                    if line:
-                        # Track usage from Anthropic SSE events for gateway stats
-                        if line.startswith("data: "):
-                            try:
-                                data = json.loads(line[6:])
-                                if data.get("type") == "message_start":
-                                    usage = data.get("message", {}).get("usage", {})
-                                    total_tokens += usage.get("input_tokens", 0)
-                                elif data.get("type") == "message_delta":
-                                    usage = data.get("usage", {})
-                                    total_tokens += usage.get("output_tokens", 0)
-                            except Exception:
-                                pass
-                        yield line + "\n"
-        _log_request(username, api_key_value, model, provider_id, "messages", True, total_tokens, requested_model)
-        increment_global_stats(success=True)
-        if username != "legacy":
-            increment_user_usage(username, api_key_value, True, total_tokens)
-    except Exception as e:
-        _log_request(username, api_key_value, "-", provider_id, "messages", False, 0, requested_model)
-        increment_global_stats(success=False)
-        if username != "legacy":
-            increment_user_usage(username, api_key_value, False, 0)
-        _error_log.error("[anthropic_passthrough_stream] %s", e)
-        yield f"event: error\ndata: {json.dumps({'type': 'error', 'error': {'message': str(e)}})}\n\n"
-
+        raise HTTPException(status_code=500, detail=friendly_error_msg(e))
 
 @router.post("/messages")
 async def anthropic_messages(request: Request, authorization: Optional[str] = Header(None)):
@@ -2239,15 +925,11 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
     body = await request.json()
     model = body.get("model")
     anthropic_msgs = body.get("messages", [])
-    max_tokens = body.get("max_tokens")
-    if max_tokens is None:
-        max_tokens = body.get("max_completion_tokens")
-    if max_tokens is None:
-        max_tokens = get_default("max_tokens", 16384)
     provider_id = body.get("provider_id")
     stream = body.get("stream", False)
     previous_response_id = body.get("previous_response_id") or ""
-    system_prompt = _strip_billing_header(body.get("system", ""))
+    internal = anthropic_messages_to_internal({**body, "provider_id": provider_id})
+    system_prompt = internal.system
     _app_log.debug("[ANTHRO_ENTRY] model=%s msgs=%d system=%s tools=%s",
                   model, len(anthropic_msgs),
                   "yes" if system_prompt else "no",
@@ -2261,823 +943,131 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
     username = user.get("username", "legacy")
     api_key_value = api_key.get("key", "")
     requested_model = model
-    route_model, route_provider = _apply_routing_rules(username, api_key_value, model, model)
-    if route_model != model:
-        _app_log.debug("[messages] ROUTED model=%s -> %s", model, route_model)
-        model = route_model
-    if route_provider:
-        provider_id = route_provider
 
-    # Check if target provider is Anthropic-native - pass through directly
-    # to avoid double-formatting which loses tool_use IDs
+    route_model, route_provider = apply_routing_rules(username, api_key_value, model, model)
+    routed_model = route_model
+    routed_provider_id = route_provider or provider_id
+
+    # Resolve the upstream adapter after ingress has normalized the client protocol.
     from app.database import get_provider as _get_prov, find_provider_by_model as _find
-    if provider_id:
-        provider_info = _get_prov(provider_id)
+    if routed_provider_id:
+        provider_info = _get_prov(routed_provider_id)
     else:
-        provider_info = _find(model)
-    if provider_info and provider_info.get("provider_type") == "anthropic":
-        is_anthropic_provider = True
-        messages = anthropic_msgs
-    else:
-        is_anthropic_provider = False
-        messages, _ = _anthropic_to_openai_messages(anthropic_msgs, system_prompt)
-        # Diagnostic: log converted message summary to find truncation root cause
-        _app_log.debug(
-            "[messages] CONVERTED anthropic(%d msgs) -> openai(%d msgs) system_prompt_len=%d tools=%s stream=%s max_tokens=%s model=%s",
-            len(anthropic_msgs), len(messages), len(system_prompt) if system_prompt else 0,
-            str(body.get("tools", [])[:10]) if body.get("tools") else "none",
-            str(body.get("stream")), str(max_tokens), model
-        )
-        system_prompt = ""  # already embedded in messages
+        provider_info = _find(routed_model)
+    internal.target_model = routed_model
+    if routed_provider_id:
+        internal.provider_id = routed_provider_id
+    policy = await prepare_request_policy(
+        internal,
+        username=username,
+        api_key_value=api_key_value,
+        preprocess_request=_policy_preprocess_request,
+        conversation_cache_key=_conversation_cache_key,
+        reasoning_context=_reasoning_context,
+        normalize=False,
+        log_label="messages",
+    )
+    model = internal.target_model
+    provider_id = internal.provider_id
+    previous_response_id = internal.previous_response_id
+    max_tokens = internal.max_tokens
+    temperature = internal.temperature
+    system_prompt = internal.system
+    _app_log.debug(
+        "[messages] NORMALIZED anthropic(%d msgs) -> internal(%d msgs) system_prompt_len=%d tools=%s stream=%s max_tokens=%s model=%s provider_type=%s",
+        len(anthropic_msgs), len(internal.messages), len(system_prompt) if system_prompt else 0,
+        str(body.get("tools", [])[:10]) if body.get("tools") else "none",
+        str(body.get("stream")), str(max_tokens), model,
+        provider_info.get("provider_type") if provider_info else "unknown",
+    )
 
-    # Compute conversation cache key BEFORE preprocessing (see chat_completions for rationale)
-    conv_key = _conversation_cache_key(api_key_value, messages, previous_response_id)
-
-    # Preprocessor: replace images with text descriptions
-    msg_list, modified = await _maybe_preprocess(messages, model, provider_id, requested_model=requested_model)
-    messages = msg_list
+    conv_key = policy.conv_key
 
     try:
-        # Collect Anthropic tool definitions: top-level tools + tools from body
-        tools = body.get("tools")
-        if tools and isinstance(tools, list):
-            converted = []
-            for t in tools:
-                if isinstance(t, dict) and t.get("name"):
-                    converted.append({
-                        "type": "function",
-                        "function": {
-                            "name": t["name"],
-                            "description": t.get("description", ""),
-                            "parameters": t.get("input_schema", {"type": "object", "properties": {}})
-                        }
-                    })
-            tools = converted if converted else None
-        else:
-            tools = body.get("tools")  # pass through if not our format
-
-        # Non-Anthropic providers: strip tool_choice that will cause rejection.
-        # MiniMax rejects "auto" (error 2013), and Anthropic dict-format
-        # tool_choice ({type: "auto"}) has no OpenAI equivalent.
-        tool_choice = body.get("tool_choice")
-        if not is_anthropic_provider:
-            if isinstance(tool_choice, dict) and not tool_choice.get("name"):
-                tool_choice = None  # Anthropic "auto"/"any" -> let provider default
-            elif tool_choice == "auto":
-                tool_choice = None  # MiniMax rejects "auto"
-
-        if not is_anthropic_provider:
-            _inject_reasoning_content(messages, conv_key, "messages")
-
         if stream:
             if provider_info and provider_info.get("provider_type") == "anthropic":
+                anthropic_adapter_messages, anthropic_adapter_body = anthropic_body_from_internal(internal)
+                events = iter_anthropic_output_events(
+                    provider_info=provider_info,
+                    messages=anthropic_adapter_messages,
+                    body=anthropic_adapter_body,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    model=model,
+                )
                 return StreamingResponse(
-                    _stream_anthropic_passthrough(
-                        provider_info, messages, body, max_tokens, temperature,
-                        username, api_key_value, model, requested_model
+                    _stream_internal_output(
+                        events=events,
+                        endpoint="messages",
+                        model=model,
+                        username=username,
+                        api_key_value=api_key_value,
+                        provider_id=provider_id,
+                        requested_model=requested_model,
+                        conv_key=conv_key,
+                        remember_reasoning_content=_remember_reasoning_content,
                     ),
                     media_type="text/event-stream"
                 )
+            adapter_messages = chat_messages_from_internal(internal)
+            adapter_extra = chat_kwargs_from_internal(internal)
+            events = iter_openai_chat_output_events(
+                model=model,
+                messages=adapter_messages,
+                provider_id=provider_id,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                extra=adapter_extra,
+                strip_thinking=False,
+            )
             return StreamingResponse(
-                _stream_anthropic_messages(
-                    model=model, messages=messages, provider_id=provider_id,
-                    temperature=temperature, max_tokens=max_tokens,
-                    username=username, api_key_value=api_key_value,
-                    requested_model=requested_model, system_prompt=system_prompt,
-                    tools=tools, tool_choice=tool_choice,
+                _stream_internal_output(
+                    events=events,
+                    endpoint="messages",
+                    model=model,
+                    username=username,
+                    api_key_value=api_key_value,
+                    provider_id=provider_id,
+                    requested_model=requested_model,
                     conv_key=conv_key,
+                    remember_reasoning_content=_remember_reasoning_content,
                 ),
                 media_type="text/event-stream"
             )
 
-        # Non-streaming: use Anthropic passthrough for native providers
         if provider_info and provider_info.get("provider_type") == "anthropic":
-            response = await _anthropic_passthrough(
-                provider_info, messages, body, max_tokens, temperature, model)
+            output = await anthropic_messages_completion_for_internal(provider_info, internal)
         else:
+            adapter_messages = chat_messages_from_internal(internal)
+            adapter_extra = chat_kwargs_from_internal(internal)
             _app_log.debug("[OPENAI_EXIT] model=%s msgs=%d tools=%s tool_choice=%s conv_key=%s",
-                          model, len(messages), "yes" if tools else "no", str(tool_choice), conv_key)
+                          model, len(adapter_messages), "yes" if adapter_extra.get("tools") else "no",
+                          str(adapter_extra.get("tool_choice")), conv_key)
             response = await anyio.to_thread.run_sync(
                 lambda: create_chat_completion(
-                    model=model, messages=messages, provider_id=provider_id,
+                    model=model, messages=adapter_messages, provider_id=provider_id,
                     max_tokens=max_tokens, temperature=temperature,
-                    tools=tools, tool_choice=tool_choice,
+                    **adapter_extra,
                 )
             )
-        choice = response.choices[0]
-        message = getattr(choice, "message", {})
-        finish_reason = getattr(choice, "finish_reason", "stop") or "stop"
-
-        # Fallback: if thinking consumed all tokens with no text/tool output,
-        # render reasoning_content as the visible response.
-        reasoning_content = getattr(message, "reasoning_content", None)
-        if not message.get("content") and not message.get("tool_calls") and reasoning_content:
-            message["content"] = reasoning_content
-
-        # Capture cache stats before converting message
-        usage = usage_dict(response)
-        cache_hit = usage.get("prompt_cache_hit_tokens", 0)
-        cache_miss = usage.get("prompt_cache_miss_tokens", 0)
-
-        if reasoning_content:
-            _remember_reasoning_content(conv_key, reasoning_content, _tool_call_ids_from_message(message))
-            _app_log.debug("[messages_nonstream] STORED rc key=%s len=%d cache_hit=%d cache_miss=%d", conv_key[:60], len(reasoning_content), cache_hit, cache_miss)
-        # Convert OpenAI response to Anthropic format
-        content_blocks = _openai_to_anthropic_content(message)
-        _log_request(username, api_key_value, model, provider_id or "", "messages", True, usage.get("total_tokens", 0), requested_model)
+            output = response_to_internal_output(response)
+        if output.reasoning:
+            _remember_reasoning_content(conv_key, output.reasoning, [tool.id for tool in output.tool_calls])
+            _app_log.debug("[messages_nonstream] STORED rc key=%s len=%d cache_hit=%d cache_miss=%d",
+                          conv_key[:60], len(output.reasoning),
+                          output.usage.get("prompt_cache_hit_tokens", 0), output.usage.get("prompt_cache_miss_tokens", 0))
+        _log_request(username, api_key_value, model, provider_id or "", "messages", True, output.usage.get("total_tokens", 0), requested_model)
         increment_global_stats(success=True)
         if username != "legacy":
-            increment_user_usage(username, api_key_value, True, usage.get("total_tokens", 0))
-
-        return {
-            "id": f"msg_{int(time.time())}",
-            "type": "message",
-            "role": "assistant",
-            "content": content_blocks,
-            "model": model,
-            "stop_reason": _map_stop_reason(finish_reason),
-            "stop_sequence": None,
-            "usage": {
-                "input_tokens": usage.get("prompt_tokens", 0),
-                "output_tokens": usage.get("completion_tokens", 0)
-            }
-        }
+            increment_user_usage(username, api_key_value, True, output.usage.get("total_tokens", 0))
+        return render_anthropic_message(output, model=model)
     except Exception as e:
         _log_request(username, api_key_value, "-", provider_id or "", "messages", False, 0, requested_model)
         increment_global_stats(success=False)
         if username != "legacy":
             increment_user_usage(username, api_key_value, False, 0)
         _error_log.error("FAILED: %s", str(e))
-        raise HTTPException(status_code=500, detail=_friendly_error_msg(e))
-
-
-async def _stream_responses(model, messages, provider_id, temperature, max_tokens, username, api_key_value, instructions, requested_model="", conv_key="", **extra):
-    resp_id = f"resp_{uuid.uuid4().hex}"
-    msg_id = f"msg_{uuid.uuid4().hex}"
-    created_at = int(time.time())
-
-    if not conv_key:
-        conv_key = _conversation_cache_key(api_key_value, messages)
-    _remember_response_chain_key(resp_id, conv_key)
-
-    total_tokens = 0
-    input_tokens = 0
-    output_tokens = 0
-    error_msg = None
-    cache_hit = 0
-    cache_miss = 0
-    finish_reason = None
-    _flushed = False  # guard: finish_reason flush runs only once
-    text_item_added = False
-    text_content_added = False
-    accumulated_text = ""
-    accumulated_reasoning = ""
-    text_buffer = ""
-    think_stripped = False  # True once </think> has been passed
-    tool_calls_state = {}  # index -> {id, name, arguments_buffer, item_added, output_index}
-    output_index_counter = 0
-
-    # Tool-call circuit breaker: strip tools if too many consecutive tool-only turns
-    if _tool_only_turns.get(conv_key, 0) >= TOOL_ONLY_LIMIT:
-        extra.pop("tools", None)
-        extra.pop("tool_choice", None)
-
-    # Strip OpenAI-specific fields from tool function definitions that
-    # non-OpenAI providers (MiniMax) reject as "invalid chat setting (2013)".
-    for tool in extra.get("tools", []):
-        fn = tool.get("function")
-        if isinstance(fn, dict):
-            fn.pop("strict", None)
-            fn.pop("additionalProperties", None)
-            params = fn.get("parameters")
-            if isinstance(params, dict):
-                params.pop("additionalProperties", None)
-                for prop in params.get("properties", {}).values():
-                    if isinstance(prop, dict):
-                        prop.pop("additionalProperties", None)
-
-    try:
-        stream_func = lambda: create_chat_completion_stream(
-            model=model,
-            messages=messages,
-            provider_id=provider_id,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            **extra
-        )
-
-        response_base = {
-            "id": resp_id,
-            "object": "response",
-            "created_at": created_at,
-            "status": "in_progress",
-            "model": model,
-            "output": [],
-            "previous_response_id": extra.get("previous_response_id") or None,
-            "metadata": {},
-            "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
-        }
-
-        yield f"data: {json.dumps({'type': 'response.created', 'response': response_base})}\n\n"
-        yield f"data: {json.dumps({'type': 'response.in_progress', 'response': response_base})}\n\n"
-
-        chunk_count = 0
-        async for chunk in _iter_stream_async(stream_func):
-            chunk_count += 1
-            choice = chunk.choices[0] if chunk.choices else None
-            if not choice:
-                continue
-
-            delta = getattr(choice, "delta", None)
-            chunk_finish = getattr(choice, "finish_reason", None)
-            if chunk_finish:
-                finish_reason = chunk_finish  # save first finish_reason, don't overwrite
-
-            if delta:
-                # --- Handle text content ---
-                content_delta = getattr(delta, "content", None)
-                if content_delta:
-                    accumulated_text += content_delta
-                    if not think_stripped:
-                        # MiniMax/DeepSeek emit <think>...</think> inline.
-                        # Buffer until </think> is seen, then extract & strip.
-                        if '</think>' in accumulated_text:
-                            accumulated_text, think_content = _extract_and_strip_think(accumulated_text)
-                            if think_content:
-                                accumulated_reasoning = think_content
-                            think_stripped = True
-                            text_buffer = accumulated_text  # seed with cleaned text
-                        elif '<think>' in accumulated_text or accumulated_text.lstrip().startswith('<think'):
-                            # If <think> never closes after buffering much content,
-                            # treat it as plain text so users aren't stuck waiting.
-                            if len(accumulated_text) >= 200:
-                                accumulated_text = accumulated_text.replace('<think>', '', 1)
-                                think_stripped = True
-                                text_buffer = accumulated_text
-                            # else: still inside <think> block - don't yield yet
-                        elif len(accumulated_text) >= 5:
-                            # No think tag detected - model doesn't use thinking mode
-                            think_stripped = True
-                            text_buffer = accumulated_text
-                    else:
-                        text_buffer += content_delta
-
-                    if not text_item_added:
-                        yield f"data: {json.dumps({'type': 'response.output_item.added', 'output_index': output_index_counter, 'item': {'type': 'message', 'id': msg_id, 'status': 'in_progress', 'role': 'assistant', 'content': []}})}\n\n"
-                        text_item_added = True
-                        text_output_index = output_index_counter
-                        output_index_counter += 1
-                    if think_stripped:
-                        if not text_content_added:
-                            yield f"data: {json.dumps({'type': 'response.content_part.added', 'output_index': text_output_index, 'content_index': 0, 'part': {'type': 'output_text', 'text': '', 'annotations': []}})}\n\n"
-                            text_content_added = True
-                        if len(text_buffer) >= 16:
-                            yield f"data: {json.dumps({'type': 'response.output_text.delta', 'output_index': text_output_index, 'content_index': 0, 'delta': text_buffer})}\n\n"
-                            text_buffer = ""
-
-                # --- Capture reasoning content for DeepSeek multi-turn replay ---
-                reasoning_delta = getattr(delta, "reasoning_content", None)
-                if reasoning_delta:
-                    accumulated_reasoning += reasoning_delta
-
-                # --- Handle tool calls ---
-                tool_calls_delta = getattr(delta, "tool_calls", None)
-                if tool_calls_delta:
-                    for tc in tool_calls_delta:
-                        _tool_log.debug("[_stream_responses] raw tc type=%s repr=%s", type(tc).__name__, repr(tc))
-                        idx = getattr(tc, "index", 0) if hasattr(tc, "index") else tc.get("index", 0)
-                        tc_id = getattr(tc, "id", "") if hasattr(tc, "id") else tc.get("id", "")
-                        # Coerce id to str (MiniMax returns bare integers)
-                        if tc_id is not None and not isinstance(tc_id, str):
-                            tc_id = str(tc_id)
-                        # Skip spurious tool-calls from non-standard content blocks (e.g. MiniMax "thinking")
-                        # Only filter when index<0.  id=None is normal for arguments-only delta chunks.
-                        if int(idx) < 0:
-                            _tool_log.debug("[_stream_responses] FILTERED spurious: id=%s idx=%s", tc_id, idx)
-                            continue
-                        tc_func = getattr(tc, "function", None) if hasattr(tc, "function") else tc.get("function", {})
-
-                        if idx not in tool_calls_state:
-                            # New tool call
-                            fn_name = getattr(tc_func, "name", "") if hasattr(tc_func, "name") else tc_func.get("name", "")
-                            tc_output_index = output_index_counter
-                            output_index_counter += 1
-                            call_id = tc_id if tc_id and tc_id.startswith("call_") else (f"call_{tc_id}" if tc_id else f"call_{int(time.time())}_{idx}")
-                            tool_calls_state[idx] = {
-                                "id": tc_id or f"fc_{int(time.time())}_{idx}",
-                                "call_id": call_id,
-                                "name": fn_name,
-                                "arguments_buffer": "",
-                                "item_added": False,
-                                "output_index": tc_output_index
-                            }
-                            _tool_log.debug("[_stream_responses] NEW tool_call idx=%d name=%s id=%s", idx, fn_name, tc_id)
-
-                        state = tool_calls_state[idx]
-                        args_chunk = getattr(tc_func, "arguments", "") if hasattr(tc_func, "arguments") else tc_func.get("arguments", "")
-                        if args_chunk:
-                            _tool_log.debug("[_stream_responses] args_chunk RAW: %s", args_chunk)
-                            state["arguments_buffer"] += args_chunk
-                            # Fix malformed JSON (e.g. MiniMax sends url:undefined) - both in buffer and in the chunk being sent
-                            if "undefined" in args_chunk:
-                                args_chunk = _sanitize_args(args_chunk)
-                                _tool_log.debug("[_stream_responses] args_chunk SANITIZED -> %s", args_chunk)
-                            if "undefined" in state["arguments_buffer"]:
-                                state["arguments_buffer"] = _sanitize_args(state["arguments_buffer"])
-                                _tool_log.debug("[_stream_responses] buffer SANITIZED -> %s", state["arguments_buffer"])
-                            if not state["item_added"]:
-                                yield f"data: {json.dumps({'type': 'response.output_item.added', 'output_index': state['output_index'], 'item': {'type': 'function_call', 'id': state['id'], 'call_id': state['call_id'], 'name': state['name'], 'arguments': '', 'status': 'in_progress'}})}\n\n"
-                                state["item_added"] = True
-                            yield f"data: {json.dumps({'type': 'response.function_call_arguments.delta', 'output_index': state['output_index'], 'call_id': state['call_id'], 'delta': args_chunk})}\n\n"
-
-            # --- Handle finish ---
-            if finish_reason and not _flushed:
-                _flushed = True
-                # Flush text buffer
-                if text_buffer:
-                    yield f"data: {json.dumps({'type': 'response.output_text.delta', 'output_index': text_output_index, 'content_index': 0, 'delta': text_buffer})}\n\n"
-                    text_buffer = ""
-                if text_content_added:
-                    yield f"data: {json.dumps({'type': 'response.output_text.done', 'output_index': text_output_index, 'content_index': 0, 'text': accumulated_text})}\n\n"
-                    yield f"data: {json.dumps({'type': 'response.content_part.done', 'output_index': text_output_index, 'content_index': 0, 'part': {'type': 'output_text', 'text': accumulated_text, 'annotations': []}})}\n\n"
-                if text_item_added:
-                    output_content = [{'type': 'output_text', 'text': accumulated_text, 'annotations': []}]
-                    msg_item = {'type': 'message', 'id': msg_id, 'status': 'completed', 'role': 'assistant', 'content': output_content}
-                    if accumulated_reasoning:
-                        msg_item['reasoning_content'] = accumulated_reasoning
-                    yield f"data: {json.dumps({'type': 'response.output_item.done', 'output_index': text_output_index, 'item': msg_item})}\n\n"
-
-                # Finalize tool calls
-                for idx, state in sorted(tool_calls_state.items()):
-                    if state["item_added"]:
-                        yield f"data: {json.dumps({'type': 'response.function_call_arguments.done', 'output_index': state['output_index'], 'call_id': state['call_id'], 'arguments': state['arguments_buffer']})}\n\n"
-                        yield f"data: {json.dumps({'type': 'response.output_item.done', 'output_index': state['output_index'], 'item': {'type': 'function_call', 'id': state['id'], 'call_id': state['call_id'], 'name': state['name'], 'arguments': state['arguments_buffer'], 'status': 'completed'}})}\n\n"
-
-                # Reset handled
-
-            if hasattr(chunk, "usage") and chunk.usage:
-                total_tokens = getattr(chunk.usage, "total_tokens", 0) or 0
-                input_tokens = getattr(chunk.usage, "prompt_tokens", 0) or 0
-                output_tokens = getattr(chunk.usage, "completion_tokens", 0) or 0
-                cache_hit = getattr(chunk.usage, "prompt_cache_hit_tokens", 0) or 0
-                cache_miss = getattr(chunk.usage, "prompt_cache_miss_tokens", 0) or 0
-
-        # Store reasoning_content for next turn replay (DeepSeek thinking mode requires echo-back)
-        if accumulated_reasoning:
-            _remember_reasoning_content(
-                conv_key,
-                accumulated_reasoning,
-                [state.get("id") for state in tool_calls_state.values()]
-            )
-            _app_log.debug("[responses_stream] STORED rc key=%s len=%d cache_hit=%d cache_miss=%d", conv_key, len(accumulated_reasoning), cache_hit, cache_miss)
-
-        # Update tool-only counter for circuit breaker
-        has_text = len(accumulated_text.strip()) > 0
-        has_tools = len(tool_calls_state) > 0
-        if has_tools and not has_text:
-            _tool_only_turns.increment(conv_key)
-        else:
-            _tool_only_turns.reset(conv_key)
-
-        _log_request(username, api_key_value, model, provider_id or "", "responses", True, total_tokens, requested_model)
-        if username != "legacy":
-            increment_user_usage(username, api_key_value, True, total_tokens)
-        increment_global_stats(success=True)
-
-    except Exception as e:
-        import traceback
-        error_msg = _friendly_error_msg(e)
-        _app_log.error("[responses_stream] type=%s msg=%s", type(e).__name__, str(e))
-        _app_log.error("[responses_stream] %s", traceback.format_exc())
-        _error_log.error("[responses_stream] type=%s msg=%s", type(e).__name__, str(e))
-        _error_log.error("[responses_stream] %s", traceback.format_exc())
-        _log_request(username, api_key_value, "-", provider_id or "", "responses", False, 0, requested_model)
-        _error_log.error("[responses_stream] %s", error_msg)
-        _tool_only_turns.reset(conv_key)  # Reset on error
-        increment_global_stats(success=False)
-        if username != "legacy":
-            increment_user_usage(username, api_key_value, False, 0)
-
-    finally:
-        if error_msg:
-            yield f"data: {json.dumps({'type': 'error', 'error': {'message': error_msg, 'type': 'server_error'}})}\n\n"
-        completion_output = []
-        if not error_msg:
-            if text_item_added:
-                msg_out = {'type': 'message', 'id': msg_id, 'status': 'completed', 'role': 'assistant', 'content': [{'type': 'output_text', 'text': accumulated_text, 'annotations': []}]}
-                if accumulated_reasoning:
-                    msg_out['reasoning_content'] = accumulated_reasoning
-                completion_output.append(msg_out)
-            elif accumulated_reasoning:
-                # Thinking mode consumed all tokens before generating visible content.
-                # Fall back to reasoning_content as the response.
-                completion_output.append({'type': 'message', 'id': msg_id, 'status': 'completed', 'role': 'assistant', 'content': [{'type': 'output_text', 'text': accumulated_reasoning, 'annotations': []}]})
-            elif accumulated_text:
-                # <think> opened but never closed before stream ended, or no
-                # thinking tags at all. Flush whatever was buffered as the response.
-                flushed = accumulated_text.replace('<think>', '', 1) if '<think>' in accumulated_text else accumulated_text
-                if flushed.strip():
-                    completion_output.append({'type': 'message', 'id': msg_id, 'status': 'completed', 'role': 'assistant', 'content': [{'type': 'output_text', 'text': flushed, 'annotations': []}]})
-            for idx in sorted(tool_calls_state.keys()):
-                state = tool_calls_state[idx]
-                if state["item_added"]:
-                    completion_output.append({'type': 'function_call', 'id': state['id'], 'call_id': state['call_id'], 'name': state['name'], 'arguments': state['arguments_buffer'], 'status': 'completed'})
-        response_completed = {
-            'type': 'response.completed',
-            'response': {
-                'id': resp_id, 'object': 'response', 'created_at': created_at,
-                'status': 'failed' if error_msg else 'completed',
-                'model': model, 'output': completion_output,
-                'previous_response_id': extra.get("previous_response_id") or None, 'metadata': {},
-                'usage': {'input_tokens': input_tokens, 'output_tokens': output_tokens, 'total_tokens': total_tokens}
-            }
-        }
-        if error_msg:
-            response_completed['response']['status_details'] = {
-                'error': {'type': 'server_error', 'message': error_msg}
-            }
-        yield f"data: {json.dumps(response_completed)}\n\n"
-        yield "data: [DONE]\n\n"
-
-
-def _normalize_messages(messages: list) -> list:
-    """Merge consecutive same-role messages into one.
-
-    Many OpenAI-compatible providers (MiniMax, DeepSeek, etc.) require strict
-    user/assistant/tool alternation and only one system message at the start.
-    Consecutive same-role messages cause "invalid chat setting" errors.
-
-    Also strips Anthropic billing headers (x-anthropic-billing-header; cch=xxx)
-    from system message content - injected by Claude Code since v2.1.37, these
-    contain a random `cch` value that breaks DeepSeek's prefix cache.
-    """
-    if not messages:
-        return messages
-
-    merged = []
-    for msg in messages:
-        role = msg.get("role", "user")
-        content = msg.get("content", "")
-
-        # Strip billing header from system message text
-        if role == "system" and isinstance(content, (str, list)):
-            msg["content"] = _strip_billing_header(content)
-            content = msg["content"]
-
-        if merged and merged[-1].get("role") == role and role in ("system", "user"):
-            # Merge content into previous same-role message
-            prev = merged[-1]
-            prev_content = prev.get("content", "")
-            if isinstance(prev_content, str) and isinstance(content, str):
-                prev["content"] = prev_content + "\n\n" + content
-            elif isinstance(prev_content, list) and isinstance(content, str):
-                prev_content.append({"type": "text", "text": content})
-            elif isinstance(prev_content, str) and isinstance(content, list):
-                prev["content"] = [{"type": "text", "text": prev_content}] + content
-            elif isinstance(prev_content, list) and isinstance(content, list):
-                prev["content"] = prev_content + content
-            # Preserve other fields from the later message (reasoning_content, etc.)
-            for k, v in msg.items():
-                if k not in ("role", "content") and v:
-                    if k not in prev or not prev.get(k):
-                        prev[k] = v
-        else:
-            merged.append(dict(msg))
-
-    return merged
-
-
-def _extract_and_strip_think(text: str) -> tuple[str, str]:
-    """Extract and remove <think>...</think> blocks with correct nesting support.
-
-    Uses a depth counter rather than a non-greedy regex so that nested
-    <think> blocks (e.g. <think>A<think>B</think>C</think>) are handled
-    correctly - the outermost block is extracted whole.
-    """
-    if not text:
-        return text, ""
-    think_parts = []
-    result = []
-    i = 0
-    while i < len(text):
-        start = text.find("<think>", i)
-        if start == -1:
-            result.append(text[i:])
-            break
-        result.append(text[i:start])
-        # Find matching </think> using depth counter
-        depth = 1
-        pos = start + 7  # len("<think>") == 7
-        while depth > 0 and pos < len(text):
-            next_open = text.find("<think>", pos)
-            next_close = text.find("</think>", pos)
-            if next_close == -1:
-                # Unclosed <think> - treat rest as think content
-                pos = -1
-                break
-            if next_open != -1 and next_open < next_close:
-                depth += 1
-                pos = next_open + 7
-            else:
-                depth -= 1
-                if depth == 0:
-                    # Extract content between <think> and </think>
-                    think_parts.append(text[start + 7:next_close])
-                pos = next_close + 8  # len("</think>") == 8
-        if pos == -1:
-            result.append(text[start:])
-            break
-        # Skip whitespace after </think> to match old regex \s* behavior
-        while pos < len(text) and text[pos] in " \t\n\r\f":
-            pos += 1
-        i = pos
-    return "".join(result).strip(), "\n".join(think_parts)
-
-
-def _strip_think_tags(text: str) -> str:
-    """Remove <think>...</think> blocks, discarding the content."""
-    cleaned, _ = _extract_and_strip_think(text)
-    return cleaned
-
-
-def _convert_responses_input(input_list: list) -> list:
-    """Convert OpenAI Responses API input format to Chat Completions messages format.
-
-    Handles: message, function_call, function_call_output, reasoning.
-    """
-    messages = []
-    last_tool_assistant_idx = None
-    tool_call_assistant_idx = {}
-
-    def _convert_content(content_parts):
-        """Convert Responses API content parts to Chat Completions content format.
-
-        Returns a plain string when text-only (backward compatible), or a list of
-        content part dicts when images are present (OpenAI Chat Completions format).
-        """
-        if isinstance(content_parts, str):
-            return content_parts
-        if isinstance(content_parts, list):
-            has_visual = False
-            parts = []
-            for part in content_parts:
-                if isinstance(part, dict):
-                    if part.get("type") in ("input_text", "output_text", "text"):
-                        parts.append({"type": "text", "text": part.get("text", "")})
-                    elif part.get("type") == "input_image":
-                        has_visual = True
-                        image_url = part.get("image_url", "")
-                        if isinstance(image_url, dict):
-                            image_url = image_url.get("url", "")
-                        detail = part.get("detail", "auto")
-                        parts.append({
-                            "type": "image_url",
-                            "image_url": {"url": image_url, "detail": detail}
-                        })
-                elif isinstance(part, str):
-                    parts.append({"type": "text", "text": part})
-            if has_visual:
-                return parts
-            text = "\n".join(p.get("text", "") for p in parts if p.get("type") == "text")
-            return text
-        return ""
-
-    i = 0
-    while i < len(input_list):
-        item = input_list[i]
-        if not isinstance(item, dict):
-            i += 1
-            continue
-
-        item_type = item.get("type", "")
-
-        if item_type == "message":
-            role = item.get("role", "user")
-            if role == "developer":
-                role = "system"
-            content = _convert_content(item.get("content", []))
-            msg = {"role": role, "content": content}
-            # Preserve reasoning_content for DeepSeek multi-turn continuity
-            rc = item.get("reasoning_content")
-            if role == "assistant" and rc:
-                msg["reasoning_content"] = rc
-            messages.append(msg)
-            i += 1
-
-        elif item_type == "function_call":
-            # Collect consecutive function_call items into one assistant message
-            tool_calls = []
-            while i < len(input_list) and isinstance(input_list[i], dict) and input_list[i].get("type") == "function_call":
-                fc = input_list[i]
-                tc_id = fc.get("call_id", "")
-                tc_name = fc.get("name", "")
-                tc_args = fc.get("arguments", "")
-                tool_calls.append({
-                    "id": tc_id,
-                    "type": "function",
-                    "function": {"name": tc_name, "arguments": tc_args}
-                })
-                i += 1
-            msg = {"role": "assistant", "content": None, "tool_calls": tool_calls}
-            # Check any function_call for reasoning_content (Codex may preserve it)
-            for fc_item in input_list[i - len(tool_calls):i]:
-                if isinstance(fc_item, dict) and fc_item.get("reasoning_content"):
-                    msg["reasoning_content"] = fc_item["reasoning_content"]
-                    break
-            if messages and messages[-1].get("role") == "assistant" and not messages[-1].get("tool_calls"):
-                prev = messages[-1]
-                prev_text = _message_text(prev.get("content")).strip()
-                if prev_text:
-                    if prev.get("reasoning_content"):
-                        prev["reasoning_content"] = f"{prev['reasoning_content']}\n{prev_text}"
-                    else:
-                        prev["reasoning_content"] = prev_text
-                prev["content"] = None
-                prev["tool_calls"] = tool_calls
-                if msg.get("reasoning_content") and not prev.get("reasoning_content"):
-                    prev["reasoning_content"] = msg["reasoning_content"]
-                last_tool_assistant_idx = len(messages) - 1
-                for tc in tool_calls:
-                    tc_id = tc.get("id")
-                    if tc_id:
-                        tool_call_assistant_idx[str(tc_id)] = last_tool_assistant_idx
-            else:
-                messages.append(msg)
-                last_tool_assistant_idx = len(messages) - 1
-                for tc in tool_calls:
-                    tc_id = tc.get("id")
-                    if tc_id:
-                        tool_call_assistant_idx[str(tc_id)] = last_tool_assistant_idx
-
-        elif item_type == "function_call_output":
-            fc_output = item
-            output = fc_output.get("output", "")
-            # Diagnostic: show output format for debugging image preprocessing
-            if isinstance(output, str):
-                has_data_uri = "data:image" in output
-                _app_log.info("[responses FCO] call_id=%s output=str(len=%d, data_uri=%s, preview=%s)",
-                             fc_output.get('call_id','?')[:30], len(output), has_data_uri, repr(output[:200]))
-            elif isinstance(output, list):
-                types = [(p.get("type","?"), len(str(p)[:80])) for p in output if isinstance(p, dict)]
-                _app_log.info("[responses FCO] call_id=%s output=list(len=%d, types=%s)",
-                             fc_output.get('call_id','?')[:30], len(output), types)
-            else:
-                _app_log.info("[responses FCO] call_id=%s output=%s",
-                             fc_output.get('call_id','?')[:30], type(output).__name__)
-            # Convert content parts (input_image -> image_url) so preprocessing can
-            # detect and describe images embedded in tool call outputs.
-            converted_output = _convert_content(output)
-            fc_reasoning = fc_output.get("reasoning_content")
-            assistant_idx = tool_call_assistant_idx.get(str(fc_output.get("call_id", "")), last_tool_assistant_idx)
-            if fc_reasoning and assistant_idx is not None:
-                assistant_msg = messages[assistant_idx]
-                if assistant_msg.get("role") == "assistant" and assistant_msg.get("tool_calls") and not assistant_msg.get("reasoning_content"):
-                    assistant_msg["reasoning_content"] = fc_reasoning
-            messages.append({
-                "role": "tool",
-                "tool_call_id": fc_output.get("call_id", ""),
-                "content": converted_output
-            })
-            i += 1
-
-        elif item_type == "reasoning":
-            # Preserve reasoning summaries when they can be associated with the
-            # current assistant turn. Some Responses clients emit a standalone
-            # reasoning item between tool call items, and dropping it can break
-            # multi-turn thinking continuity.
-            rc = item.get("reasoning_content") or item.get("summary") or item.get("text") or item.get("content")
-            if isinstance(rc, list):
-                parts = []
-                for part in rc:
-                    if isinstance(part, dict):
-                        parts.append(part.get("text", "") or part.get("reasoning", ""))
-                    elif isinstance(part, str):
-                        parts.append(part)
-                rc = "\n".join(p for p in parts if p)
-            elif isinstance(rc, dict):
-                rc = rc.get("text") or rc.get("reasoning") or rc.get("summary") or ""
-            if rc and last_tool_assistant_idx is not None:
-                assistant_msg = messages[last_tool_assistant_idx]
-                if assistant_msg.get("role") == "assistant" and not assistant_msg.get("reasoning_content"):
-                    assistant_msg["reasoning_content"] = rc
-            i += 1
-
-        elif item_type == "input_image":
-            # Top-level input_image (Responses API): attach to the nearest preceding
-            # user message, or create a new user message if none exists yet.
-            image_url = item.get("image_url", "")
-            if isinstance(image_url, dict):
-                image_url = image_url.get("url", "")
-            detail = item.get("detail", "auto")
-            image_part = {"type": "image_url", "image_url": {"url": image_url, "detail": detail}}
-            # Walk backwards to find last user message
-            attached = False
-            for m in reversed(messages):
-                if m.get("role") == "user":
-                    if isinstance(m["content"], str):
-                        m["content"] = [{"type": "text", "text": m["content"]}]
-                    m["content"].append(image_part)
-                    attached = True
-                    break
-            if not attached:
-                messages.append({"role": "user", "content": [image_part]})
-            i += 1
-
-        elif "role" in item:
-            # Fallback for simple message format
-            messages.append({"role": item["role"], "content": item.get("content", "")})
-            i += 1
-        else:
-            i += 1
-
-    return messages
-
-
-def _convert_responses_tools(tools: list) -> list:
-    """Convert tools from Responses API format to Chat Completions format.
-
-    Responses API: {"type": "function", "name": "...", "description": "...", "parameters": {...}}
-    Chat Completions: {"type": "function", "function": {"name": "...", "description": "...", "parameters": {...}}}
-
-    Only keeps type='function' tools; filters out web_search, custom, and other built-in types
-    that are Codex-specific and not supported by Chat Completions API.
-    """
-    converted = []
-    for tool in tools:
-        if not isinstance(tool, dict):
-            continue
-        # Already in Chat Completions format (has nested 'function' key)
-        if "function" in tool:
-            converted.append(tool)
-            continue
-        tool_type = tool.get("type", "")
-        # Only pass through function-type tools; skip built-in types like web_search, custom
-        if tool_type != "function":
-            continue
-        # Responses API flat format - wrap non-type fields under 'function'
-        # Strip OpenAI-specific fields (strict, additionalProperties) that
-        # non-OpenAI providers (MiniMax) reject as "invalid chat setting (2013)".
-        # Always copy nested structures before modifying to avoid mutating the
-        # original request body.
-        function_fields = {k: v for k, v in tool.items() if k not in ("type", "strict", "additionalProperties")}
-        params = function_fields.get("parameters")
-        if isinstance(params, dict):
-            params = dict(params)  # shallow copy to avoid mutating original
-            params.pop("additionalProperties", None)
-            props = params.get("properties", {})
-            if isinstance(props, dict):
-                cleaned = {}
-                for key, prop in props.items():
-                    if isinstance(prop, dict):
-                        prop = dict(prop)  # copy before modifying
-                        prop.pop("additionalProperties", None)
-                    cleaned[key] = prop
-                params["properties"] = cleaned
-            function_fields["parameters"] = params
-        converted.append({"type": tool_type, "function": function_fields})
-    return converted
-
-
-
-def _apply_routing_rules(username: str, api_key_value: str, requested_model: str, resolved_model: str) -> tuple[str, str]:
-    """Apply user-defined routing rules. Returns (final_model, provider_id)."""
-
-    rules = get_routing_rules()
-    for rule in rules:
-        if not rule.get("enabled", True):
-            continue
-        # Match username: empty = all, or exact match
-        rule_user = rule.get("username", "")
-        if rule_user and rule_user != username:
-            continue
-        # Match API key: empty = all, or substring match
-        key_pat = rule.get("api_key_pattern", "")
-        if key_pat and key_pat not in api_key_value:
-            continue
-        # Match model: the requested_model (before resolution), supports * wildcard
-        # Try both composite ID and simple model_id matches for compatibility
-        match_model = rule.get("match_model", "")
-        if not match_model:
-            continue
-        mid = parse_model_id(requested_model)
-        if not (_wildcard_match(match_model, requested_model) or
-                (mid.is_composite and _wildcard_match(match_model, mid.model_name))):
-            continue
-        # Rule matched - return target
-        target = rule.get("target_model", resolved_model)
-        provider = rule.get("target_provider", "")
-        if target and target != resolved_model:
-            _app_log.info("[routing] rule='%s' matched: %s@%s requested '%s', routing to '%s'",
-                          rule.get("name", ""), username, _mask_key(api_key_value),
-                          requested_model, target)
-        return target or resolved_model, provider or ""
-    return resolved_model, ""
-
-
-def _wildcard_match(pattern: str, value: str) -> bool:
-    """Simple glob-style wildcard matching: * matches any sequence."""
-    regex = re.escape(pattern).replace(r"\*", ".*")
-    return bool(re.fullmatch(regex, value, re.IGNORECASE))
+        raise HTTPException(status_code=500, detail=friendly_error_msg(e))
 
 
 @router.post("/responses")
@@ -3085,18 +1075,15 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
     user, api_key = verify_api_key(authorization)
 
     body = await request.json()
-    model = body.get("model")
+    internal = responses_to_internal(body)
+    model = internal.target_model
     input_data = body.get("input", "")
-    instructions = body.get("instructions", "")
-    temperature = body.get("temperature", 0.7)
-    max_tokens = body.get("max_tokens")
-    if max_tokens is None:
-        max_tokens = body.get("max_completion_tokens")
-    if max_tokens is None:
-        max_tokens = get_default("max_tokens", 16384)
-    provider_id = body.get("provider_id")
-    stream = body.get("stream", False)
-    previous_response_id = body.get("previous_response_id") or ""
+    instructions = internal.metadata.get("instructions", "")
+    temperature = internal.temperature
+    max_tokens = internal.max_tokens
+    provider_id = internal.provider_id
+    stream = internal.stream
+    previous_response_id = internal.previous_response_id
 
     if not model:
         raise HTTPException(status_code=400, detail="model is required")
@@ -3120,81 +1107,50 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
     # Check permission on requested model BEFORE routing
     requested_model = model
     ensure_model_allowed(user, api_key, requested_model)
-    # Apply user-defined routing rules
     username = user.get("username", "legacy")
     api_key_value = api_key.get("key", "")
-    route_model, route_provider = _apply_routing_rules(username, api_key_value, requested_model, model)
-    if route_model != model:
-        _app_log.debug("[responses] ROUTED model=%s -> %s", model, route_model)
-        model = route_model
-    if route_provider:
-        provider_id = route_provider
 
     if isinstance(input_data, str):
-        if instructions:
-            messages = [
-                {"role": "system", "content": instructions},
-                {"role": "user", "content": input_data}
-            ]
-        else:
-            messages = [{"role": "user", "content": input_data}]
+        pass
     elif isinstance(input_data, list):
-        messages = _convert_responses_input(input_data)
         _app_log.debug(
-            "[responses CONVERT] input_items=%d messages=%d roles=%s tool_msgs=%d rc_msgs=%d",
+            "[responses CONVERT] input_items=%d ir_messages=%d roles=%s tool_msgs=%d rc_msgs=%d",
             len(input_data),
-            len(messages),
-            [m.get("role", "?") for m in messages],
-            sum(1 for m in messages if m.get("tool_calls")),
-            sum(1 for m in messages if m.get("reasoning_content")),
+            len(internal.messages),
+            [m.role for m in internal.messages],
+            _ir_tool_message_count(internal.messages),
+            _ir_reasoning_message_count(internal.messages),
         )
-        if instructions:
-            messages.insert(0, {"role": "system", "content": instructions})
     else:
         raise HTTPException(status_code=400, detail="input must be a string or list of messages")
 
-    # Merge consecutive same-role messages so the array alternates role correctly.
-    # Non-OpenAI providers (MiniMax) require strict user/assistant alternation and
-    # reject consecutive same-role messages as "invalid chat setting (2013)".
-    _pre_norm = len(messages)
-    messages = _normalize_messages(messages)
-    _app_log.debug("[responses NORM] messages %d -> %d roles=%s", _pre_norm, len(messages), [m['role'] for m in messages])
-
-    # Compute conversation cache key BEFORE preprocessing (see chat_completions for rationale)
-    conv_key = _conversation_cache_key(api_key_value, messages, previous_response_id)
-
-    # Preprocessor: replace images with text
-    msg, modified = await _maybe_preprocess(messages, model, provider_id, requested_model=requested_model)
-    messages = msg
+    policy = await prepare_request_policy(
+        internal,
+        username=username,
+        api_key_value=api_key_value,
+        preprocess_request=_policy_preprocess_request,
+        conversation_cache_key=_conversation_cache_key,
+        reasoning_context=_reasoning_context if isinstance(input_data, list) else None,
+        log_label="responses",
+    )
+    model = internal.target_model
+    provider_id = internal.provider_id
+    conv_key = policy.conv_key
 
     if isinstance(input_data, list):
-        injected = _inject_reasoning_content(messages, conv_key, "responses")
         _app_log.debug(
-            "[responses REASONING] injected=%d messages=%d tool_msgs=%d rc_msgs=%d conv_key=%s",
-            injected,
-            len(messages),
-            sum(1 for m in messages if m.get("tool_calls")),
-            sum(1 for m in messages if m.get("reasoning_content")),
+            "[responses REASONING] injected=%d ir_messages=%d tool_msgs=%d rc_msgs=%d conv_key=%s",
+            policy.reasoning_injected,
+            len(internal.messages),
+            _ir_tool_message_count(internal.messages),
+            _ir_reasoning_message_count(internal.messages),
             conv_key[:60],
         )
 
     try:
-        allowed_params = {
-            "top_p", "presence_penalty", "frequency_penalty", "stop",
-            "tools", "tool_choice", "response_format", "user"
-        }
-        extra = {key: body[key] for key in allowed_params if key in body}
-        if previous_response_id:
-            extra["previous_response_id"] = previous_response_id
-        # Convert tools from Responses API format to Chat Completions format
-        if "tools" in extra and isinstance(extra["tools"], list):
-            extra["tools"] = _convert_responses_tools(extra["tools"])
-        # MiniMax rejects tool_choice="auto" (error 2013). Strip it for
-        # providers that don't support this parameter.
-        if extra.get("tool_choice") == "auto":
-            extra.pop("tool_choice")
+        extra = dict(internal.extra)
 
-        # Detect Anthropic target providers and use passthrough to avoid liteLLM double conversion
+        # Choose an upstream adapter after policy has finalized the internal request.
         from app.database import get_provider as _get_prov, find_provider_by_model as _find
         if provider_id:
             provider_info = _get_prov(provider_id)
@@ -3203,57 +1159,64 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
         is_anthropic = provider_info and provider_info.get("provider_type") == "anthropic"
 
         if is_anthropic:
-            # Convert Chat Completions messages to native Anthropic format
-            anthropic_msgs, system_text = _openai_messages_to_anthropic(messages)
-            # Build Anthropic request body
-            anthropic_body = {"system": system_text} if system_text else {}
-            anthropic_tools = extra.get("tools")
-            if anthropic_tools and isinstance(anthropic_tools, list):
-                anthropic_body["tools"] = [
-                    {"name": t["function"]["name"],
-                     "description": t["function"].get("description", ""),
-                     "input_schema": t["function"].get("parameters", {"type": "object", "properties": {}})}
-                    for t in anthropic_tools
-                    if isinstance(t, dict) and t.get("function", {}).get("name")
-                ]
+            anthropic_msgs, anthropic_body = anthropic_body_from_internal(internal)
 
             if stream:
+                events = iter_anthropic_output_events(
+                    provider_info=provider_info,
+                    messages=anthropic_msgs,
+                    body=anthropic_body,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    model=model,
+                )
                 return StreamingResponse(
-                    _stream_responses_anthropic_passthrough(
-                        provider_info,
-                        anthropic_msgs,
-                        anthropic_body,
-                        max_tokens,
-                        temperature,
-                        username,
-                        api_key_value,
-                        model,
-                        requested_model,
+                    _stream_internal_output(
+                        events=events,
+                        endpoint="responses",
+                        model=model,
+                        username=username,
+                        api_key_value=api_key_value,
+                        provider_id=provider_id,
+                        requested_model=requested_model,
+                        previous_response_id=previous_response_id,
                         conv_key=conv_key,
+                        remember_response_chain_key=_remember_response_chain_key,
+                        remember_reasoning_content=_remember_reasoning_content,
+                        tool_only_turns=_tool_only_turns,
+                        tool_only_limit=TOOL_ONLY_LIMIT,
                     ),
                     media_type="text/event-stream"
                 )
 
-            # Non-streaming: call the Anthropic endpoint directly to avoid liteLLM double conversion
-            response = await _anthropic_passthrough(
-                provider_info, anthropic_msgs, anthropic_body,
-                max_tokens, temperature, model
-            )
+            output = await anthropic_messages_completion_for_internal(provider_info, internal)
         else:
+            adapter_messages = chat_messages_from_internal(internal)
+            adapter_extra = chat_kwargs_from_internal(internal)
             if stream:
+                events = iter_openai_chat_output_events(
+                    model=model,
+                    messages=adapter_messages,
+                    provider_id=provider_id,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    extra=adapter_extra,
+                )
                 return StreamingResponse(
-                    _stream_responses(
+                    _stream_internal_output(
+                        events=events,
+                        endpoint="responses",
                         model=model,
-                        messages=messages,
-                        provider_id=provider_id,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
                         username=username,
                         api_key_value=api_key_value,
-                        instructions=instructions,
+                        provider_id=provider_id,
                         requested_model=requested_model,
+                        previous_response_id=previous_response_id,
                         conv_key=conv_key,
-                        **extra
+                        remember_response_chain_key=_remember_response_chain_key,
+                        remember_reasoning_content=_remember_reasoning_content,
+                        tool_only_turns=_tool_only_turns,
+                        tool_only_limit=TOOL_ONLY_LIMIT,
                     ),
                     media_type="text/event-stream"
                 )
@@ -3261,98 +1224,31 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
             response = await anyio.to_thread.run_sync(
                 lambda: create_chat_completion(
                     model=model,
-                    messages=messages,
+                    messages=adapter_messages,
                     provider_id=provider_id,
                     temperature=temperature,
                     max_tokens=max_tokens,
-                    **extra
+                    **adapter_extra
                 )
             )
-        choice = response.choices[0]
-        message = getattr(choice, "message", {})
-        # _anthropic_passthrough returns dict messages, while liteLLM returns objects,
-        # so use _attr to support both access styles
-        content = _strip_think_tags(_attr(message, "content", "") or "")
-        reasoning_content = _attr(message, "reasoning_content", None)
-        tool_calls = _attr(message, "tool_calls", None)
-        usage = usage_dict(response)
-        _log_request(username, api_key_value, model, provider_id or "", "responses", True, usage.get("total_tokens", 0), requested_model)
-        increment_global_stats(success=True)
-        if username != "legacy":
-            increment_user_usage(username, api_key_value, True, usage.get("total_tokens", 0))
-
-        # Cache reasoning_content for multi-turn replay (DeepSeek thinking mode requires echo-back)
-        if reasoning_content:
-            _remember_reasoning_content(conv_key, reasoning_content, _tool_call_ids_from_message({
-                "tool_calls": tool_calls
-            }))
+            output = response_to_internal_output(response)
+        if output.reasoning:
+            _remember_reasoning_content(conv_key, output.reasoning, [tool.id for tool in output.tool_calls])
             _app_log.debug("[responses_nonstream] STORED rc key=%s len=%d cache_hit=%d cache_miss=%d",
-                          conv_key, len(reasoning_content),
-                          usage.get("prompt_cache_hit_tokens", 0), usage.get("prompt_cache_miss_tokens", 0))
+                          conv_key, len(output.reasoning),
+                          output.usage.get("prompt_cache_hit_tokens", 0), output.usage.get("prompt_cache_miss_tokens", 0))
 
         resp_id = f"resp_{uuid.uuid4().hex}"
-        msg_id = f"msg_{uuid.uuid4().hex}"
         _remember_response_chain_key(resp_id, conv_key)
-        output = []
-        # When thinking mode consumed all tokens before generating visible content,
-        # fall back to reasoning_content as the response.
-        if not content and reasoning_content:
-            content = reasoning_content
-        if content:
-            msg_out = {
-                "type": "message",
-                "id": msg_id,
-                "status": "completed",
-                "role": "assistant",
-                "content": [{"type": "output_text", "text": content, "annotations": []}]
-            }
-            if reasoning_content:
-                msg_out["reasoning_content"] = reasoning_content
-            output.append(msg_out)
-        if tool_calls:
-            _tool_log.debug("[responses_endpoint] raw tool_calls count=%d model=%s", len(tool_calls), model)
-            for tc in tool_calls:
-                _tool_log.debug("[responses_endpoint] raw tc type=%s repr=%s", type(tc).__name__, repr(tc))
-                tc_id = getattr(tc, "id", "") if hasattr(tc, "id") else tc.get("id", "")
-                if tc_id is not None and not isinstance(tc_id, str):
-                    tc_id = str(tc_id)
-                tc_idx = getattr(tc, "index", 0) if hasattr(tc, "index") else tc.get("index", 0)
-                if int(tc_idx) < 0:
-                    _tool_log.debug("[responses_endpoint] FILTERED spurious: id=%s idx=%s", tc_id, tc_idx)
-                    continue
-                tc_func = getattr(tc, "function", None) if hasattr(tc, "function") else tc.get("function", {})
-                fn_name = getattr(tc_func, "name", "") if hasattr(tc_func, "name") else tc_func.get("name", "")
-                fn_args = getattr(tc_func, "arguments", "") if hasattr(tc_func, "arguments") else tc_func.get("arguments", "")
-                _tool_log.debug("[responses_endpoint] fn_name=%s args_raw=%s", fn_name, fn_args)
-                if fn_args and "undefined" in fn_args:
-                    fn_args = _sanitize_args(fn_args)
-                    _tool_log.debug("[responses_endpoint] args SANITIZED -> %s", fn_args)
-                output.append({
-                    "type": "function_call",
-                    "id": tc_id or f"fc_{int(time.time())}",
-                    "call_id": tc_id or f"call_{int(time.time())}",
-                    "name": fn_name,
-                    "arguments": fn_args,
-                    "status": "completed"
-                })
-        return {
-            "id": resp_id,
-            "object": "response",
-            "created_at": int(time.time()),
-            "status": "completed",
-            "model": model,
-            "previous_response_id": previous_response_id or None,
-            "output": output,
-            "usage": {
-                "input_tokens": usage.get("prompt_tokens", 0),
-                "output_tokens": usage.get("completion_tokens", 0),
-                "total_tokens": usage.get("total_tokens", 0)
-            }
-        }
+        _log_request(username, api_key_value, model, provider_id or "", "responses", True, output.usage.get("total_tokens", 0), requested_model)
+        increment_global_stats(success=True)
+        if username != "legacy":
+            increment_user_usage(username, api_key_value, True, output.usage.get("total_tokens", 0))
+        return render_response(output, model=model, previous_response_id=previous_response_id, response_id=resp_id)
     except Exception as e:
         _log_request(username, api_key_value, "-", provider_id or "", "responses", False, 0, requested_model)
         increment_global_stats(success=False)
         if username != "legacy":
             increment_user_usage(username, api_key_value, False, 0)
         _error_log.error("FAILED: %s", str(e))
-        raise HTTPException(status_code=500, detail=_friendly_error_msg(e))
+        raise HTTPException(status_code=500, detail=friendly_error_msg(e))

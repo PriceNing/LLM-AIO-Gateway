@@ -16,15 +16,15 @@ Configuration (in config.json):
 Database: config.json preprocessors section. The first enabled entry is auto-applied to all requests.
 """
 import hashlib
-import json
 import logging
 import threading
 from typing import Optional
 
 import httpx
 
-from app.config import get_config, get_default
-from app.services.lite_llm import _extract_image_data_uris, _has_image_content
+from app.config import get_default
+from app.core.types import InternalMessage, InternalPart, text_part, tool_result_part
+from app.services.lite_llm import _extract_image_data_uris
 
 _log = logging.getLogger("llmgw.app")
 
@@ -52,13 +52,6 @@ def _set_cached_description(url_or_data: str, description: str) -> None:
             # Evict oldest (simple FIFO via dict pop)
             _cache.pop(next(iter(_cache)), None)
         _cache[_cache_key(url_or_data)] = description
-
-
-def _get_preprocessor_config(preprocessor_id: str) -> Optional[dict]:
-    """Load preprocessor configuration from config.json."""
-    cfg = get_config()
-    preprocessors = cfg.config.get("preprocessors", {})
-    return preprocessors.get(preprocessor_id)
 
 
 async def describe_image(
@@ -142,214 +135,147 @@ async def describe_image(
 
 
 async def preprocess_messages(
-    messages: list,
+    messages: list[InternalMessage],
     preprocessor_config: Optional[dict] = None,
-) -> list:
-    """Intercept images in messages, describe them via vision model, replace with text."""
+) -> list[InternalMessage]:
+    """Preprocess images in internal messages."""
     if not preprocessor_config:
-        _log.info("[preprocess] SKIP no config dict")
+        _log.info("[preprocess:v2] SKIP no config dict")
+        return messages
+    if not messages:
         return messages
 
     if preprocessor_config.get("enabled") is False:
-        _log.info("[preprocess] SKIP preprocessor disabled - stripping images anyway")
+        _log.info("[preprocess:v2] SKIP preprocessor disabled - stripping images anyway")
         _strip_all_images(messages)
+        return messages
+
+    if not has_image_content(messages):
+        _log.info("[preprocess:v2] no images detected, skipping")
         return messages
 
     preprocessor_id = preprocessor_config.get("id", "unknown")
+    new_turn_start = _new_turn_start(messages)
+    _log.info("[preprocess:v2] new_turn_start=%d total_msgs=%d", new_turn_start, len(messages))
 
-    if not _has_image_content(messages):
-        _log.info("[preprocess] no images detected, skipping")
-        return messages
-
-    # Find the current turn start by scanning backward for the last assistant message with text and no tool_calls
-    # which marks the previous turn final answer; messages after it belong to the current turn.
-    # Only describe new images in the current turn; old images in history are only stripped,
-    # to avoid appending stale image descriptions to the latest user message.
-    new_turn_start = 0
-    for i in range(len(messages) - 1, -1, -1):
-        msg = messages[i]
-        if msg.get("role") == "assistant":
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                has_text = bool(content.strip())
-            elif isinstance(content, list):
-                has_text = any(
-                    p.get("type") == "text" and p.get("text", "").strip()
-                    for p in content if isinstance(p, dict)
-                )
-            else:
-                has_text = False
-            has_tool_calls = bool(msg.get("tool_calls"))
-            # Text without tool_calls marks the previous final answer and is the turn boundary
-            if has_text and not has_tool_calls:
-                new_turn_start = i + 1
-                break
-        elif msg.get("role") == "user":
-            # If the message already contains <image_description>, a marker from earlier preprocessing,
-            # it marks a previously processed user message and is used as the boundary.
-            c = msg.get("content", "")
-            if isinstance(c, str) and "<image_description" in c:
-                new_turn_start = i + 1
-                break
-            elif isinstance(c, list):
-                has_desc = any(
-                    isinstance(p, dict) and p.get("type") == "text"
-                    and "<image_description" in p.get("text", "")
-                    for p in c
-                )
-                if has_desc:
-                    new_turn_start = i + 1
-                    break
-
-    _log.info("[preprocess] new_turn_start=%d total_msgs=%d", new_turn_start, len(messages))
-
-    # Only scan current-turn messages for images
-    has_new_images = False
-    for i in range(new_turn_start, len(messages)):
-        msg = messages[i]
-        role = msg.get("role")
-        if role not in ("user", "tool"):
-            continue
-        content = msg.get("content")
-        if isinstance(content, list):
-            for part in content:
-                if not isinstance(part, dict):
-                    continue
-                if part.get("type") in ("image_url", "input_image", "image"):
-                    has_new_images = True
-                    break
-                if part.get("type") == "tool_result":
-                    inner = part.get("content")
-                    if isinstance(inner, list):
-                        for ip in inner:
-                            if isinstance(ip, dict) and ip.get("type") == "image":
-                                has_new_images = True
-                                break
-                if part.get("type") == "text":
-                    if _extract_image_data_uris(part.get("text", "")):
-                        has_new_images = True
-                        break
-            if has_new_images:
-                break
-        elif isinstance(content, str):
-            if _extract_image_data_uris(content):
-                has_new_images = True
-                break
-
-    if not has_new_images:
-        # No new images in the current turn; only clean residual images from history
-        if _has_image_content(messages):
-            _log.info("[preprocess] images only in history (before turn %d), strip only", new_turn_start)
-        else:
-            _log.info("[preprocess] no images detected, skipping")
-        _strip_all_images(messages)
-        return messages
-
-    # Extract images from current-turn messages
-    images_to_describe: list[dict] = []
-    last_user_msg_idx = None
-
-    for i in range(new_turn_start, len(messages)):
-        msg = messages[i]
-        role = msg.get("role")
-        if role not in ("user", "tool"):
-            continue
-        if role == "user":
-            last_user_msg_idx = i
-        content = msg.get("content")
-        if isinstance(content, list):
-            for part in content:
-                if not isinstance(part, dict):
-                    continue
-                if part.get("type") in ("image_url", "input_image"):
-                    url = part.get("image_url", {})
-                    if isinstance(url, dict):
-                        url = url.get("url", "")
-                    elif isinstance(url, str):
-                        pass
-                    else:
-                        url = ""
-                    images_to_describe.append({"url": url, "data": ""})
-                elif part.get("type") == "image":
-                    source = part.get("source", {})
-                    if source.get("type") == "base64":
-                        media = source.get("media_type", "image/png")
-                        data = source.get("data", "")
-                        images_to_describe.append({"url": "", "data": f"data:{media};base64,{data}"})
-                elif part.get("type") == "tool_result":
-                    inner = part.get("content")
-                    if isinstance(inner, list):
-                        for ip in inner:
-                            if isinstance(ip, dict) and ip.get("type") == "image":
-                                source = ip.get("source", {})
-                                if source.get("type") == "base64":
-                                    media = source.get("media_type", "image/png")
-                                    data = source.get("data", "")
-                                    images_to_describe.append({"url": "", "data": f"data:{media};base64,{data}"})
-                elif part.get("type") == "text":
-                    uris = _extract_image_data_uris(part.get("text", ""))
-                    for mime, data_uri in uris:
-                        images_to_describe.append({"url": "", "data": data_uri})
-        elif isinstance(content, str):
-            uris = _extract_image_data_uris(content)
-            for mime, data_uri in uris:
-                images_to_describe.append({"url": "", "data": data_uri})
-
+    images_to_describe = _collect_images(messages, new_turn_start)
     if not images_to_describe:
+        _log.info("[preprocess:v2] images only in history (before turn %d), strip only", new_turn_start)
         _strip_all_images(messages)
         return messages
 
-    # Deduplicate within the same turn; one image may appear in both user messages and tool_result
     seen_keys = set()
-    unique_images: list[dict] = []
+    unique_images = []
     for img in images_to_describe:
         key = _cache_key(img.get("url", ""), img.get("data", ""))
         if key not in seen_keys:
             seen_keys.add(key)
             unique_images.append(img)
-    images_to_describe = unique_images
 
-    _log.info("[preprocess] processing %d new image(s) via preprocessor=%s (turn_start=%d)",
-             len(images_to_describe), preprocessor_id, new_turn_start)
+    _log.info("[preprocess:v2] processing %d new image(s) via preprocessor=%s (turn_start=%d)",
+              len(unique_images), preprocessor_id, new_turn_start)
 
     descriptions = []
-    for img in images_to_describe[:preprocessor_config.get("max_images", 5)]:
+    for img in unique_images[:preprocessor_config.get("max_images", 5)]:
         desc = await describe_image(
             image_url=img.get("url", ""),
             image_data=img.get("data", ""),
             preprocessor_config=preprocessor_config,
         )
-        if desc:
-            descriptions.append(desc)
-        else:
-            descriptions.append("[image: could not be described]")
+        descriptions.append(desc or "[image: could not be described]")
 
-    _log.info("[preprocess] described %d images", len(descriptions))
-
-    # Insert descriptions inline after each image position to preserve filename/context association
     _strip_images_with_descriptions(messages, descriptions, new_turn_start)
-
     return messages
 
 
-def _join_text_parts(parts: list) -> str | list:
-    """If all items are text blocks (type=text dicts or plain strings), join into a single string.
-    Otherwise return the list unchanged."""
-    if not parts:
-        return ""
-    all_text = True
-    text_values = []
-    for p in parts:
-        if isinstance(p, str):
-            text_values.append(p)
-        elif isinstance(p, dict) and p.get("type") == "text":
-            text_values.append(p.get("text", ""))
+def has_image_content(messages: list[InternalMessage]) -> bool:
+    for msg in messages:
+        for part in msg.parts:
+            if part.kind == "image":
+                return True
+            if part.kind == "tool_result" and has_image_content([InternalMessage(role="tool", parts=part.parts)]):
+                return True
+            if part.kind == "text" and _extract_image_data_uris(part.text):
+                return True
+    return False
+
+
+def _new_turn_start(messages: list[InternalMessage]) -> int:
+    for i in range(len(messages) - 1, -1, -1):
+        msg = messages[i]
+        if msg.role == "assistant":
+            has_text = any(part.kind == "text" and part.text.strip() for part in msg.parts)
+            has_tool_calls = any(part.kind == "tool_call" for part in msg.parts)
+            if has_text and not has_tool_calls:
+                return i + 1
+        elif msg.role == "user":
+            if any(part.kind == "text" and "<image_description" in part.text for part in msg.parts):
+                return i + 1
+    return 0
+
+
+def _collect_images(messages: list[InternalMessage], turn_start: int) -> list[dict]:
+    images = []
+    for msg in messages[turn_start:]:
+        if msg.role not in ("user", "tool"):
+            continue
+        _collect_images_from_parts(msg.parts, images)
+    return images
+
+
+def _collect_images_from_parts(parts: list[InternalPart], out: list[dict]) -> None:
+    for part in parts:
+        if part.kind == "image":
+            out.append(_image_payload(part))
+        elif part.kind == "tool_result":
+            _collect_images_from_parts(part.parts, out)
+        elif part.kind == "text":
+            for _mime, data_uri in _extract_image_data_uris(part.text):
+                out.append({"url": "", "data": data_uri})
+
+
+def _image_payload(part: InternalPart) -> dict:
+    source = part.source or {}
+    if source.get("kind") == "url":
+        return {"url": source.get("url", ""), "data": ""}
+    if source.get("kind") == "base64":
+        media = source.get("media_type") or "image/png"
+        return {"url": "", "data": f"data:{media};base64,{source.get('data', '')}"}
+    return {"url": source.get("url", ""), "data": source.get("data", "")}
+
+
+def _strip_all_images(messages: list[InternalMessage]) -> None:
+    for msg in messages:
+        msg.parts = _replace_images_in_parts(msg.parts, [], False, 0)[0]
+
+
+def _strip_images_with_descriptions(messages: list[InternalMessage], descriptions: list, turn_start: int) -> None:
+    desc_idx = 0
+    for idx, msg in enumerate(messages):
+        msg.parts, desc_idx = _replace_images_in_parts(msg.parts, descriptions, idx >= turn_start, desc_idx)
+
+
+def _replace_images_in_parts(parts: list[InternalPart], descriptions: list, is_current: bool, desc_idx: int):
+    replaced = []
+    for part in parts:
+        if part.kind == "image":
+            payload = _image_payload(part)
+            replaced.append(text_part(_build_inline_replacement(desc_idx, descriptions, is_current, payload.get("url", ""), payload.get("data", ""))))
+            if is_current:
+                desc_idx += 1
+        elif part.kind == "tool_result":
+            inner, desc_idx = _replace_images_in_parts(part.parts, descriptions, is_current, desc_idx)
+            replaced.append(tool_result_part(part.tool_call_id, inner, raw=part.raw, extensions=part.extensions))
+        elif part.kind == "text":
+            text = part.text
+            for _mime, data_uri in _extract_image_data_uris(text):
+                text = text.replace(data_uri, _build_inline_replacement(desc_idx, descriptions, is_current, image_data=data_uri))
+                if is_current:
+                    desc_idx += 1
+            replaced.append(text_part(text, raw=part.raw, extensions=part.extensions))
         else:
-            all_text = False
-            break
-    if all_text:
-        return "\n".join(text_values)
-    return parts
+            replaced.append(part)
+    return replaced, desc_idx
 
 
 def _cached_image_replacement(image_url: str = "", image_data: str = "") -> str:
@@ -360,24 +286,6 @@ def _cached_image_replacement(image_url: str = "", image_data: str = "") -> str:
     return "[image: removed]"
 
 
-def _image_part_payload(part: dict) -> tuple[str, str]:
-    """Extract (url, data_uri) from an OpenAI or Anthropic image block."""
-    if part.get("type") in ("image_url", "input_image"):
-        url = part.get("image_url", {})
-        if isinstance(url, dict):
-            url = url.get("url", "")
-        elif not isinstance(url, str):
-            url = ""
-        return url, ""
-    if part.get("type") == "image":
-        source = part.get("source", {})
-        if isinstance(source, dict) and source.get("type") == "base64":
-            media = source.get("media_type", "image/png")
-            data = source.get("data", "")
-            return "", f"data:{media};base64,{data}"
-    return "", ""
-
-
 def _build_inline_replacement(desc_idx: int, descriptions: list, is_current: bool,
                               image_url: str = "", image_data: str = "") -> str:
     """Build replacement text for an image. Current-turn images get description
@@ -386,111 +294,3 @@ def _build_inline_replacement(desc_idx: int, descriptions: list, is_current: boo
         desc = descriptions[desc_idx]
         return f"[Image #{desc_idx + 1}]: {desc}"
     return _cached_image_replacement(image_url, image_data)
-
-
-def _strip_images_with_descriptions(messages: list, descriptions: list, turn_start: int) -> None:
-    """Strip all images from messages. In the current turn (>= turn_start), each image
-    is replaced with a placeholder followed immediately by its description, preserving
-    positional context with nearby filename references.
-
-    History messages (< turn_start) only get stripped without descriptions."""
-    desc_idx = 0
-    for mi, msg in enumerate(messages):
-        is_current = mi >= turn_start
-        content = msg.get("content")
-        if isinstance(content, list):
-            stripped = []
-            for part in content:
-                if not isinstance(part, dict):
-                    stripped.append(part)
-                    continue
-
-                if part.get("type") in ("image_url", "input_image", "image"):
-                    image_url, image_data = _image_part_payload(part)
-                    replacement = _build_inline_replacement(
-                        desc_idx, descriptions, is_current, image_url, image_data
-                    )
-                    stripped.append({"type": "text", "text": replacement})
-                    if is_current:
-                        desc_idx += 1
-                    _log.debug("[preprocess] stripped image %s", "with desc" if is_current else "history")
-
-                elif part.get("type") == "tool_result":
-                    inner = part.get("content")
-                    if isinstance(inner, list):
-                        clean_inner = []
-                        for ip in inner:
-                            if isinstance(ip, dict) and ip.get("type") == "image":
-                                image_url, image_data = _image_part_payload(ip)
-                                replacement = _build_inline_replacement(
-                                    desc_idx, descriptions, is_current, image_url, image_data
-                                )
-                                clean_inner.append({"type": "text", "text": replacement})
-                                if is_current:
-                                    desc_idx += 1
-                            else:
-                                clean_inner.append(ip)
-                        part = dict(part)
-                        part["content"] = _join_text_parts(clean_inner)
-                    stripped.append(part)
-                else:
-                    stripped.append(part)
-            msg["content"] = _join_text_parts(stripped)
-
-        elif isinstance(content, str):
-            uris = _extract_image_data_uris(content)
-            cleaned = content
-            for _mime, data_uri in uris:
-                replacement = _build_inline_replacement(
-                    desc_idx, descriptions, is_current, image_data=data_uri
-                )
-                cleaned = cleaned.replace(data_uri, replacement)
-                if is_current:
-                    desc_idx += 1
-            if cleaned != content:
-                msg["content"] = cleaned
-                _log.debug("[preprocess] stripped data URI from text")
-
-
-def _strip_all_images(messages: list) -> None:
-    """Remove all image_url, input_image, and Anthropic image content parts.
-    Replaces them with '[image: removed]' text placeholders to preserve
-    conversation flow for non-multimodal models."""
-    for msg in messages:
-        content = msg.get("content")
-        if isinstance(content, list):
-            stripped = []
-            for part in content:
-                if isinstance(part, dict):
-                    if part.get("type") in ("image_url", "input_image", "image"):
-                        image_url, image_data = _image_part_payload(part)
-                        stripped.append({"type": "text", "text": _cached_image_replacement(image_url, image_data)})
-                        _log.debug("[preprocess] stripped image from message")
-                    elif part.get("type") == "tool_result":
-                        # Strip nested images from tool_result content
-                        inner = part.get("content")
-                        if isinstance(inner, list):
-                            clean_inner = []
-                            for ip in inner:
-                                if isinstance(ip, dict) and ip.get("type") == "image":
-                                    image_url, image_data = _image_part_payload(ip)
-                                    clean_inner.append({"type": "text", "text": _cached_image_replacement(image_url, image_data)})
-                                else:
-                                    clean_inner.append(ip)
-                            part = dict(part)
-                            part["content"] = _join_text_parts(clean_inner)
-                        stripped.append(part)
-                    else:
-                        stripped.append(part)
-                else:
-                    stripped.append(part)
-            msg["content"] = _join_text_parts(stripped)
-        elif isinstance(content, str):
-            # Use _extract_image_data_uris to find all embedded data URIs
-            uris = _extract_image_data_uris(content)
-            cleaned = content
-            for _mime, data_uri in uris:
-                cleaned = cleaned.replace(data_uri, _cached_image_replacement(image_data=data_uri))
-            if cleaned != content:
-                msg["content"] = cleaned
-                _log.debug("[preprocess] stripped data URI from text")

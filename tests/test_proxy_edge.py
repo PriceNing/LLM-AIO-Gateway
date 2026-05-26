@@ -7,12 +7,17 @@ from fastapi.testclient import TestClient
 from main import app
 from app.config import load_config
 from app.database import init_db, add_provider, add_user, add_user_api_key
+from app.core.policy import apply_routing_rules as _apply_routing_rules
+from app.core.policy import wildcard_match as _wildcard_match
+from app.core.text import mask_key as _mask_key
+from app.core.tool_args import fix_tool_args as _fix_tool_args
+from app.core.tool_args import sanitize_args as _sanitize_args
+from app.protocols.ingress import responses_tools_to_chat_tools
+from app.protocols.ir import ir_to_anthropic_messages, ir_to_openai_messages, openai_messages_to_ir, responses_input_to_ir
 from app.router.proxy import (
-    _conversation_cache_key, _sanitize_args, _wildcard_match,
-    _fix_tool_args, _convert_responses_input, _convert_responses_tools,
-    _mask_key, _apply_routing_rules,
+    _conversation_cache_key,
     TTLDict, ensure_model_allowed, allowed_models_for,
-    _openai_messages_to_anthropic, _remember_response_chain_key, _response_chain_cache,
+    _remember_response_chain_key, _response_chain_cache,
 )
 
 client = TestClient(app)
@@ -141,43 +146,43 @@ def test_mask_key():
 
 # -- Responses input conversion --
 
-def test_convert_responses_input_simple():
+def test_responses_input_ir_projects_simple_message_to_openai_shape():
     input_data = [
         {"type": "message", "role": "user", "content": "Hello"}
     ]
-    messages = _convert_responses_input(input_data)
+    messages = ir_to_openai_messages(responses_input_to_ir(input_data))
     assert messages == [{"role": "user", "content": "Hello"}]
 
 
-def test_convert_responses_input_with_system():
+def test_responses_input_ir_projects_developer_message_to_system_shape():
     input_data = [
         {"type": "message", "role": "developer", "content": "You are helpful."},
         {"type": "message", "role": "user", "content": "Hi"}
     ]
-    messages = _convert_responses_input(input_data)
+    messages = ir_to_openai_messages(responses_input_to_ir(input_data))
     assert messages[0]["role"] == "system"
     assert messages[1]["role"] == "user"
 
 
-def test_convert_responses_input_with_function_calls():
+def test_responses_input_ir_projects_function_calls_to_openai_tool_shape():
     input_data = [
         {"type": "message", "role": "user", "content": "Search for cats"},
         {"type": "function_call", "call_id": "call_1", "name": "search", "arguments": '{"q": "cats"}'},
         {"type": "function_call_output", "call_id": "call_1", "output": "Found 5 cats"}
     ]
-    messages = _convert_responses_input(input_data)
+    messages = ir_to_openai_messages(responses_input_to_ir(input_data))
     assert messages[0]["role"] == "user"
     assert messages[1]["role"] == "assistant"
     assert messages[1]["tool_calls"][0]["function"]["name"] == "search"
     assert messages[2]["role"] == "tool"
 
 
-def test_convert_responses_tools():
+def test_responses_tools_project_to_openai_chat_tools():
     tools = [
         {"type": "function", "name": "search", "description": "Search", "parameters": {"type": "object"}},
         {"type": "web_search", "name": "web"},
     ]
-    converted = _convert_responses_tools(tools)
+    converted = responses_tools_to_chat_tools(tools)
     assert len(converted) == 1  # web_search filtered out
     assert converted[0]["function"]["name"] == "search"
 
@@ -267,13 +272,13 @@ def test_ensure_model_allowed_blocked():
     assert exc.value.status_code == 403
 
 
-# -- Anthropic passthrough model extraction --
+# -- Anthropic adapter model extraction --
 
 @pytest.mark.asyncio
-async def test_anthropic_passthrough_model_extraction():
+async def test_anthropic_adapter_model_extraction():
     """Test behavior."""
-    from app.router.proxy import _anthropic_passthrough
-    from unittest.mock import AsyncMock, patch, MagicMock
+    from app.adapters.anthropic import anthropic_messages_completion
+    from unittest.mock import patch, MagicMock
 
     provider = {"api_base": "https://api.deepseek.com/anthropic", "api_key": "sk-test"}
     body = {"system": "", "tools": []}
@@ -292,7 +297,7 @@ async def test_anthropic_passthrough_model_extraction():
         return mock_resp
 
     with patch("httpx.AsyncClient.post", side_effect=mock_post) as mock_fn:
-        await _anthropic_passthrough(
+        await anthropic_messages_completion(
             provider, [], body, 100, 0.7, "deepseek/deepseek-v4-pro"
         )
         sent_body = mock_fn.call_args[1]["json"]
@@ -300,10 +305,9 @@ async def test_anthropic_passthrough_model_extraction():
 
 
 @pytest.mark.asyncio
-async def test_responses_anthropic_stream_uses_passthrough(monkeypatch):
-    from app.router import proxy
+async def test_responses_anthropic_stream_uses_internal_events(monkeypatch):
+    from app.adapters import anthropic_streaming
     import types
-    import sys
 
     provider = {
         "id": "pixel-api",
@@ -348,22 +352,21 @@ async def test_responses_anthropic_stream_uses_passthrough(monkeypatch):
             self.called = {"args": args, "kwargs": kwargs}
             return FakeStream()
 
-    fake_httpx = types.SimpleNamespace(AsyncClient=FakeClient)
-    monkeypatch.setitem(sys.modules, "httpx", fake_httpx)
+    monkeypatch.setattr(anthropic_streaming, "httpx", types.SimpleNamespace(AsyncClient=FakeClient))
+
+    from app.adapters.anthropic_streaming import iter_anthropic_output_events
+    from app.protocols.egress import render_responses_sse
 
     chunks = []
-    async for line in proxy._stream_responses_anthropic_passthrough(
-        provider,
-        [{"role": "user", "content": "Hi"}],
-        {"system": "", "tools": []},
-        16,
-        0.7,
-        "alice",
-        "user-key",
-        "gpt-5.5",
-        "gpt-5.5",
-        conv_key="conv-1",
-    ):
+    events = iter_anthropic_output_events(
+        provider_info=provider,
+        messages=[{"role": "user", "content": "Hi"}],
+        body={"system": "", "tools": []},
+        max_tokens=16,
+        temperature=0.7,
+        model="gpt-5.5",
+    )
+    async for line in render_responses_sse(events, model="gpt-5.5"):
         chunks.append(line)
 
     joined = "".join(chunks)
@@ -372,15 +375,158 @@ async def test_responses_anthropic_stream_uses_passthrough(monkeypatch):
     assert "hello" in joined
 
 
-def test_openai_messages_to_anthropic_does_not_duplicate_system_prompt():
+def test_ir_projects_openai_system_to_anthropic_system_without_duplication():
     messages = [
         {"role": "system", "content": "You are helpful."},
         {"role": "user", "content": "Hi"},
     ]
-    anthropic_msgs, system_text = _openai_messages_to_anthropic(messages)
+    anthropic_msgs, system_text = ir_to_anthropic_messages(openai_messages_to_ir(messages))
     assert len(anthropic_msgs) == 1
     assert anthropic_msgs[0]["role"] == "user"
     assert system_text == "You are helpful."
+
+
+def test_chat_completions_anthropic_provider_uses_direct_adapter(monkeypatch, temp_db):
+    add_provider({
+        "id": "anth-chat",
+        "name": "Anth Chat",
+        "provider_type": "anthropic",
+        "api_base": "https://anth.example/v1",
+        "api_key": "upstream-key",
+        "enabled": True,
+        "models": [{"id": "anth-model", "name": "Anth Model", "enabled": True}],
+    })
+
+    called = {}
+
+    async def fake_anthropic_completion(provider_info, internal):
+        called["provider_type"] = provider_info["provider_type"]
+        called["model"] = internal.target_model
+        from app.core.output import InternalOutputMessage
+        return InternalOutputMessage(
+            role="assistant",
+            text="ok",
+            finish_reason="stop",
+            usage={"total_tokens": 3},
+        )
+
+    def fail_litellm(*args, **kwargs):
+        raise AssertionError("chat/completions should not route Anthropic providers through liteLLM")
+
+    monkeypatch.setattr("app.router.proxy.anthropic_messages_completion_for_internal", fake_anthropic_completion)
+    monkeypatch.setattr("app.router.proxy.create_chat_completion", fail_litellm)
+
+    response = client.post("/v1/chat/completions", headers=temp_db["headers"], json={
+        "model": "anth-chat/anth-model",
+        "messages": [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "Hi"},
+        ],
+    })
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "ok"
+    assert called == {"provider_type": "anthropic", "model": "anth-chat/anth-model"}
+
+
+def test_completions_anthropic_provider_uses_direct_adapter(monkeypatch, temp_db):
+    add_provider({
+        "id": "anth-text",
+        "name": "Anth Text",
+        "provider_type": "anthropic",
+        "api_base": "https://anth.example/v1",
+        "api_key": "upstream-key",
+        "enabled": True,
+        "models": [{"id": "text-model", "name": "Text Model", "enabled": True}],
+    })
+
+    called = {}
+
+    async def fake_anthropic_completion(provider_info, internal):
+        called["provider_type"] = provider_info["provider_type"]
+        called["endpoint"] = internal.endpoint
+        called["prompt"] = internal.messages[0].parts[0].text
+        from app.core.output import InternalOutputMessage
+        return InternalOutputMessage(
+            role="assistant",
+            text="completion ok",
+            finish_reason="stop",
+            usage={"total_tokens": 4},
+        )
+
+    def fail_litellm(*args, **kwargs):
+        raise AssertionError("/completions should not route Anthropic providers through liteLLM")
+
+    monkeypatch.setattr("app.router.proxy.anthropic_messages_completion_for_internal", fake_anthropic_completion)
+    monkeypatch.setattr("app.router.proxy.create_chat_completion", fail_litellm)
+
+    response = client.post("/v1/completions", headers=temp_db["headers"], json={
+        "model": "anth-text/text-model",
+        "prompt": "Complete me",
+    })
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["text"] == "completion ok"
+    assert called == {"provider_type": "anthropic", "endpoint": "completions", "prompt": "Complete me"}
+
+
+def test_completions_openai_provider_uses_ir_chat_adapter(monkeypatch, temp_db):
+    add_provider({
+        "id": "openai-text",
+        "name": "OpenAI Text",
+        "provider_type": "openai",
+        "api_base": "https://openai.example/v1",
+        "api_key": "upstream-key",
+        "enabled": True,
+        "models": [{"id": "text-model", "name": "Text Model", "enabled": True}],
+    })
+
+    called = {}
+
+    def fake_chat_completion(**kwargs):
+        called["messages"] = kwargs["messages"]
+        called["provider_id"] = kwargs["provider_id"]
+
+        class Message:
+            content = "openai completion"
+            reasoning_content = None
+            tool_calls = []
+
+        class Choice:
+            message = Message()
+            finish_reason = "stop"
+
+        class Response:
+            choices = [Choice()]
+            usage = {"total_tokens": 5}
+
+        return Response()
+
+    monkeypatch.setattr("app.router.proxy.create_chat_completion", fake_chat_completion)
+
+    response = client.post("/v1/completions", headers=temp_db["headers"], json={
+        "model": "openai-text/text-model",
+        "prompt": "Complete me",
+    })
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["text"] == "openai completion"
+    assert called["messages"] == [{"role": "user", "content": "Complete me"}]
+    assert called["provider_id"] == "openai-text"
+
+
+def test_anthropic_output_uses_reasoning_as_text_when_visible_text_empty():
+    from app.adapters.anthropic import _anthropic_response_to_internal
+
+    output = _anthropic_response_to_internal({
+        "content": [{"type": "thinking", "thinking": "hidden but useful"}],
+        "stop_reason": "max_tokens",
+        "usage": {"input_tokens": 3, "output_tokens": 5},
+    })
+
+    assert output.reasoning == "hidden but useful"
+    assert output.text == "hidden but useful"
+    assert output.finish_reason == "length"
 
 
 def test_remember_response_chain_key_uses_final_conv_key():

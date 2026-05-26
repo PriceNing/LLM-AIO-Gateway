@@ -1,28 +1,41 @@
 """Tests for proxy message conversion and response helpers."""
 import json
 import pytest
+from app.core.policy import wildcard_match as _wildcard_match
+from app.core.policy import normalize_messages
+from app.core.policy import inject_reasoning_content
+from app.core.text import friendly_error_msg as _friendly_error_msg
+from app.core.text import mask_key as _mask_key
+from app.core.text import strip_billing_header as _strip_billing_header
+from app.core.think import extract_and_strip_think as _extract_and_strip_think
+from app.core.think import strip_think_tags as _strip_think_tags
+from app.core.tool_args import fix_tool_args as _fix_tool_args
+from app.core.tool_args import sanitize_args as _sanitize_args
+from app.core.types import InternalRequest
+from app.protocols.ingress import responses_tools_to_chat_tools
+from app.protocols.ir import anthropic_messages_to_ir, ir_to_anthropic_messages, ir_to_openai_messages, openai_messages_to_ir, responses_input_to_ir
+from app.adapters.openai import chat_messages_from_internal
 from app.router.proxy import (
-    _anthropic_to_openai_messages,
-    _anthropic_content_to_openai,
-    _openai_to_anthropic_content,
-    _map_stop_reason,
-    _normalize_messages,
-    _extract_and_strip_think,
-    _strip_think_tags,
-    _sanitize_args,
-    _fix_tool_args,
-    _convert_responses_input,
-    _convert_responses_tools,
-    _wildcard_match,
-    _mask_key,
-    _friendly_error_msg,
-    _strip_billing_header,
     _conversation_cache_key,
-    _inject_reasoning_content,
     _remember_reasoning_content,
     _reasoning_cache,
     _reasoning_tool_cache,
+    _reasoning_context,
+    _reasoning_tool_global_cache,
 )
+
+
+def _normalize_internal_messages_for_test(messages):
+    if not messages:
+        return []
+    request = InternalRequest(
+        endpoint="chat_completions",
+        requested_model="test",
+        target_model="test",
+        messages=openai_messages_to_ir(messages),
+    )
+    normalize_messages(request)
+    return chat_messages_from_internal(request)
 
 # Test section
 _IMG1 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==" * 3
@@ -31,75 +44,74 @@ _IMG2 = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRo
 
 # Test section
 
-def test_anthropic_content_to_openai_string():
-    result = _anthropic_content_to_openai("Hello world")
-    assert result == ["Hello world"]
+def test_anthropic_content_to_ir_string():
+    result = anthropic_messages_to_ir([{"role": "user", "content": "Hello world"}])
+    assert result[0].parts[0].kind == "text"
+    assert result[0].parts[0].text == "Hello world"
 
 
-def test_anthropic_content_to_openai_text_blocks():
-    result = _anthropic_content_to_openai([
+def test_anthropic_content_to_ir_text_blocks():
+    result = anthropic_messages_to_ir([{"role": "user", "content": [
         {"type": "text", "text": "Part A"},
         {"type": "text", "text": "Part B"},
-    ])
-    assert result == ["Part A", "Part B"]
+    ]}])
+    assert [part.text for part in result[0].parts] == ["Part A", "Part B"]
 
 
-def test_anthropic_content_to_openai_image_block():
-    result = _anthropic_content_to_openai([
+def test_anthropic_content_to_ir_image_block():
+    result = anthropic_messages_to_ir([{"role": "user", "content": [
         {"type": "text", "text": "Look:"},
         {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": _IMG1}},
-    ])
-    assert len(result) == 2
-    assert result[0] == "Look:"
-    assert isinstance(result[1], dict)
-    assert result[1]["type"] == "image_url"
-    assert "data:image/png;base64," in result[1]["image_url"]["url"]
+    ]}])
+    assert len(result[0].parts) == 2
+    assert result[0].parts[0].text == "Look:"
+    assert result[0].parts[1].kind == "image"
+    projected = ir_to_openai_messages(result)
+    assert "data:image/png;base64," in projected[0]["content"][1]["image_url"]["url"]
 
 
-def test_anthropic_content_to_openai_tool_use_skipped():
-    """Test behavior."""
-    result = _anthropic_content_to_openai([
+def test_anthropic_content_to_ir_tool_use_preserved():
+    result = anthropic_messages_to_ir([{"role": "assistant", "content": [
         {"type": "tool_use", "id": "t1", "name": "search", "input": {}},
-    ])
-    assert result == []
+    ]}])
+    assert result[0].parts[0].kind == "tool_call"
+    assert result[0].parts[0].tool_call_id == "t1"
 
 
-def test_anthropic_content_to_openai_non_dict_items():
-    result = _anthropic_content_to_openai(["plain", 123, None])
-    assert result == ["plain", "123", "None"]
+def test_anthropic_content_to_ir_non_dict_items():
+    result = anthropic_messages_to_ir([{"role": "user", "content": ["plain", 123, None]}])
+    assert [part.kind for part in result[0].parts] == ["unknown", "unknown", "unknown"]
 
 
 # Test section
 
-def test_anthropic_to_openai_simple():
-    msgs, has_tools = _anthropic_to_openai_messages([
+def test_ir_projects_anthropic_simple_message_to_openai_shape():
+    ir = anthropic_messages_to_ir([
         {"role": "user", "content": "Hello"}
     ])
+    msgs = ir_to_openai_messages(ir)
     assert len(msgs) == 1
     assert msgs[0]["role"] == "user"
     assert msgs[0]["content"] == "Hello"
-    assert has_tools is False
 
 
-def test_anthropic_to_openai_with_system():
-    msgs, _ = _anthropic_to_openai_messages(
-        [{"role": "user", "content": "Hi"}],
-        system_prompt="You are helpful."
-    )
+def test_ir_projects_anthropic_system_to_openai_system_shape():
+    msgs = ir_to_openai_messages(anthropic_messages_to_ir([{"role": "user", "content": "Hi"}], "You are helpful."))
     assert len(msgs) == 2
     assert msgs[0]["role"] == "system"
     assert msgs[0]["content"] == "You are helpful."
 
 
-def test_anthropic_to_openai_assistant_with_tool_use():
-    msgs, has_tools = _anthropic_to_openai_messages([
+def test_ir_projects_anthropic_tool_use_to_openai_tool_call_shape():
+    ir = anthropic_messages_to_ir([
         {"role": "user", "content": "Search cats"},
         {"role": "assistant", "content": [
             {"type": "text", "text": "Let me search"},
             {"type": "tool_use", "id": "call_1", "name": "search", "input": {"q": "cats"}}
         ]},
     ])
-    assert has_tools is True
+    msgs = ir_to_openai_messages(ir)
+    assert any(part.kind == "tool_call" for message in ir for part in message.parts)
     assert len(msgs) == 2
     assert msgs[1]["role"] == "assistant"
     assert msgs[1]["content"] == "Let me search"
@@ -108,15 +120,13 @@ def test_anthropic_to_openai_assistant_with_tool_use():
     assert json.loads(msgs[1]["tool_calls"][0]["function"]["arguments"]) == {"q": "cats"}
 
 
-def test_anthropic_to_openai_tool_result_in_user_message():
-    """Test behavior."""
-    msgs, has_tools = _anthropic_to_openai_messages([
+def test_ir_projects_anthropic_tool_result_to_openai_tool_message_shape():
+    msgs = ir_to_openai_messages(anthropic_messages_to_ir([
         {"role": "user", "content": [
             {"type": "tool_result", "tool_use_id": "call_1", "content": "Found 3 cats"},
             {"type": "text", "text": "What next?"},
         ]},
-    ])
-    # Test section
+    ]))
     assert len(msgs) == 2
     assert msgs[0]["role"] == "tool"
     assert msgs[0]["tool_call_id"] == "call_1"
@@ -125,16 +135,15 @@ def test_anthropic_to_openai_tool_result_in_user_message():
     assert msgs[1]["content"] == "What next?"
 
 
-def test_anthropic_to_openai_tool_result_with_image():
-    """Test behavior."""
-    msgs, _ = _anthropic_to_openai_messages([
+def test_ir_projects_anthropic_tool_result_image_to_openai_tool_message_shape():
+    msgs = ir_to_openai_messages(anthropic_messages_to_ir([
         {"role": "user", "content": [
             {"type": "tool_result", "tool_use_id": "call_1", "content": [
                 {"type": "text", "text": "Screenshot:"},
                 {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": _IMG1}},
             ]},
         ]},
-    ])
+    ]))
     assert len(msgs) == 1
     assert msgs[0]["role"] == "tool"
     content = msgs[0]["content"]
@@ -143,24 +152,23 @@ def test_anthropic_to_openai_tool_result_with_image():
     assert content[1]["type"] == "image_url"
 
 
-def test_anthropic_to_openai_tool_result_role():
-    """Test behavior."""
-    msgs, _ = _anthropic_to_openai_messages([
-        {"role": "tool_result", "tool_use_id": "call_1", "content": "Result text"},
-    ])
+def test_ir_projects_anthropic_tool_result_role_to_openai_tool_role():
+    msgs = ir_to_openai_messages(anthropic_messages_to_ir([{"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "call_1", "content": "Result text"},
+    ]}]))
     assert len(msgs) == 1
     assert msgs[0]["role"] == "tool"
     assert msgs[0]["tool_call_id"] == "call_1"
     assert msgs[0]["content"] == "Result text"
 
 
-def test_anthropic_to_openai_tool_result_role_with_image():
-    msgs, _ = _anthropic_to_openai_messages([
-        {"role": "tool_result", "tool_use_id": "call_1", "content": [
+def test_ir_projects_anthropic_tool_result_role_with_image_to_openai_shape():
+    msgs = ir_to_openai_messages(anthropic_messages_to_ir([{"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "call_1", "content": [
             {"type": "text", "text": "File:"},
             {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": _IMG1}},
         ]},
-    ])
+    ]}]))
     assert msgs[0]["role"] == "tool"
     content = msgs[0]["content"]
     assert isinstance(content, list)
@@ -168,13 +176,13 @@ def test_anthropic_to_openai_tool_result_role_with_image():
     assert content[1]["type"] == "image_url"
 
 
-def test_anthropic_to_openai_user_with_image():
-    msgs, _ = _anthropic_to_openai_messages([
+def test_ir_projects_anthropic_user_image_to_openai_image_shape():
+    msgs = ir_to_openai_messages(anthropic_messages_to_ir([
         {"role": "user", "content": [
             {"type": "text", "text": "Describe:"},
             {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": _IMG2}},
         ]},
-    ])
+    ]))
     assert msgs[0]["role"] == "user"
     content = msgs[0]["content"]
     assert isinstance(content, list)
@@ -186,19 +194,22 @@ def test_anthropic_to_openai_user_with_image():
 # Test section
 
 def test_openai_to_anthropic_text_only():
-    result = _openai_to_anthropic_content({"role": "assistant", "content": "Hello"})
-    assert len(result) == 1
-    assert result[0] == {"type": "text", "text": "Hello"}
+    messages, system = ir_to_anthropic_messages(openai_messages_to_ir([{"role": "assistant", "content": "Hello"}]))
+    result = messages[0]["content"]
+    assert system == ""
+    assert result == [{"type": "text", "text": "Hello"}]
 
 
 def test_openai_to_anthropic_with_tool_calls():
-    result = _openai_to_anthropic_content({
+    messages, system = ir_to_anthropic_messages(openai_messages_to_ir([{
         "role": "assistant",
         "content": "Let me search",
         "tool_calls": [
             {"id": "call_1", "type": "function", "function": {"name": "search", "arguments": '{"q":"cats"}'}}
         ]
-    })
+    }]))
+    result = messages[0]["content"]
+    assert system == ""
     assert len(result) == 2
     assert result[0] == {"type": "text", "text": "Let me search"}
     assert result[1]["type"] == "tool_use"
@@ -208,19 +219,23 @@ def test_openai_to_anthropic_with_tool_calls():
 
 
 def test_openai_to_anthropic_empty_content():
-    result = _openai_to_anthropic_content({"role": "assistant", "content": ""})
+    messages, system = ir_to_anthropic_messages(openai_messages_to_ir([{"role": "assistant", "content": ""}]))
+    result = messages[0]["content"]
+    assert system == ""
     assert result == [{"type": "text", "text": ""}]
 
 
 def test_openai_to_anthropic_invalid_json_args():
     """Test behavior."""
-    result = _openai_to_anthropic_content({
+    messages, system = ir_to_anthropic_messages(openai_messages_to_ir([{
         "role": "assistant",
         "content": None,
         "tool_calls": [
             {"id": "c1", "type": "function", "function": {"name": "f", "arguments": "not json"}}
         ]
-    })
+    }]))
+    result = messages[0]["content"]
+    assert system == ""
     assert result[0]["type"] == "tool_use"
     assert result[0]["input"] == {}
 
@@ -228,11 +243,13 @@ def test_openai_to_anthropic_invalid_json_args():
 # Test section
 
 def test_map_stop_reason_all():
-    assert _map_stop_reason("stop") == "end_turn"
-    assert _map_stop_reason("length") == "max_tokens"
-    assert _map_stop_reason("tool_calls") == "tool_use"
-    assert _map_stop_reason("unknown") == "end_turn"
-    assert _map_stop_reason("") == "end_turn"
+    from app.protocols.egress import _anthropic_stop_reason
+
+    assert _anthropic_stop_reason("stop") == "end_turn"
+    assert _anthropic_stop_reason("length") == "max_tokens"
+    assert _anthropic_stop_reason("tool_calls") == "tool_use"
+    assert _anthropic_stop_reason("unknown") == "end_turn"
+    assert _anthropic_stop_reason("") == "end_turn"
 
 
 # Test section
@@ -242,7 +259,7 @@ def test_normalize_consecutive_system():
         {"role": "system", "content": "Rule 1"},
         {"role": "system", "content": "Rule 2"},
     ]
-    result = _normalize_messages(msgs)
+    result = _normalize_internal_messages_for_test(msgs)
     assert len(result) == 1
     assert result[0]["content"] == "Rule 1\n\nRule 2"
 
@@ -252,7 +269,7 @@ def test_normalize_consecutive_user():
         {"role": "user", "content": "Question 1"},
         {"role": "user", "content": "Question 2"},
     ]
-    result = _normalize_messages(msgs)
+    result = _normalize_internal_messages_for_test(msgs)
     assert len(result) == 1
     assert result[0]["content"] == "Question 1\n\nQuestion 2"
 
@@ -263,7 +280,7 @@ def test_normalize_no_merge_assistant():
         {"role": "assistant", "content": "Reply 1"},
         {"role": "assistant", "content": "Reply 2"},
     ]
-    result = _normalize_messages(msgs)
+    result = _normalize_internal_messages_for_test(msgs)
     assert len(result) == 2
 
 
@@ -272,7 +289,7 @@ def test_normalize_no_merge_tool():
         {"role": "tool", "content": "Result 1", "tool_call_id": "c1"},
         {"role": "tool", "content": "Result 2", "tool_call_id": "c2"},
     ]
-    result = _normalize_messages(msgs)
+    result = _normalize_internal_messages_for_test(msgs)
     assert len(result) == 2
 
 
@@ -282,11 +299,9 @@ def test_normalize_mixed_content_types():
         {"role": "user", "content": "Text first"},
         {"role": "user", "content": [{"type": "text", "text": "Then list"}]},
     ]
-    result = _normalize_messages(msgs)
+    result = _normalize_internal_messages_for_test(msgs)
     assert len(result) == 1
-    content = result[0]["content"]
-    assert isinstance(content, list)
-    assert len(content) == 2
+    assert result[0]["content"] == "Text first\n\nThen list"
 
 
 def test_normalize_list_then_string():
@@ -294,11 +309,9 @@ def test_normalize_list_then_string():
         {"role": "user", "content": [{"type": "text", "text": "List first"}]},
         {"role": "user", "content": "Then string"},
     ]
-    result = _normalize_messages(msgs)
+    result = _normalize_internal_messages_for_test(msgs)
     assert len(result) == 1
-    content = result[0]["content"]
-    assert isinstance(content, list)
-    assert len(content) == 2
+    assert result[0]["content"] == "List first\n\nThen string"
 
 
 def test_normalize_list_then_list():
@@ -306,10 +319,9 @@ def test_normalize_list_then_list():
         {"role": "user", "content": [{"type": "text", "text": "A"}]},
         {"role": "user", "content": [{"type": "text", "text": "B"}]},
     ]
-    result = _normalize_messages(msgs)
+    result = _normalize_internal_messages_for_test(msgs)
     assert len(result) == 1
-    content = result[0]["content"]
-    assert len(content) == 2
+    assert result[0]["content"] == "A\n\nB"
 
 
 def test_normalize_preserves_extra_fields():
@@ -318,17 +330,17 @@ def test_normalize_preserves_extra_fields():
         {"role": "user", "content": "Q1"},
         {"role": "user", "content": "Q2", "reasoning_content": "think"},
     ]
-    result = _normalize_messages(msgs)
+    result = _normalize_internal_messages_for_test(msgs)
     assert result[0].get("reasoning_content") == "think"
 
 
 def test_normalize_empty():
-    assert _normalize_messages([]) == []
+    assert _normalize_internal_messages_for_test([]) == []
 
 
 def test_normalize_single():
     msgs = [{"role": "user", "content": "Hi"}]
-    result = _normalize_messages(msgs)
+    result = _normalize_internal_messages_for_test(msgs)
     assert result == msgs
 
 
@@ -340,7 +352,7 @@ def test_normalize_interleaved():
         {"role": "system", "content": "S2"},
         {"role": "user", "content": "U2"},
     ]
-    result = _normalize_messages(msgs)
+    result = _normalize_internal_messages_for_test(msgs)
     assert len(result) == 4
 
 
@@ -479,95 +491,95 @@ def test_mask_key_exact_eight():
 
 # Test section
 
-def test_convert_responses_input_developer_role():
+def test_responses_input_ir_projects_developer_role_to_openai_system():
     """Test behavior."""
-    result = _convert_responses_input([
+    result = ir_to_openai_messages(responses_input_to_ir([
         {"type": "message", "role": "developer", "content": "You are helpful."},
         {"type": "message", "role": "user", "content": "Hi"},
-    ])
+    ]))
     assert result[0]["role"] == "system"
 
 
-def test_convert_responses_input_input_image_attaches_to_user():
+def test_responses_input_ir_attaches_input_image_to_user_message():
     """Test behavior."""
-    result = _convert_responses_input([
+    result = ir_to_openai_messages(responses_input_to_ir([
         {"type": "message", "role": "user", "content": "Look at this:"},
         {"type": "input_image", "image_url": "https://example.com/img.jpg"},
-    ])
+    ]))
     assert len(result) == 1
     content = result[0]["content"]
     assert isinstance(content, list)
     assert content[1]["type"] == "image_url"
 
 
-def test_convert_responses_input_input_image_no_user():
+def test_responses_input_ir_creates_user_message_for_orphan_input_image():
     """Test behavior."""
-    result = _convert_responses_input([
+    result = ir_to_openai_messages(responses_input_to_ir([
         {"type": "message", "role": "system", "content": "System"},
         {"type": "input_image", "image_url": "https://example.com/img.jpg"},
-    ])
+    ]))
     assert result[-1]["role"] == "user"
     assert isinstance(result[-1]["content"], list)
 
 
-def test_convert_responses_input_reasoning_skipped():
+def test_responses_input_ir_keeps_standalone_reasoning_out_of_openai_projection():
     """Test behavior."""
-    result = _convert_responses_input([
+    result = ir_to_openai_messages(responses_input_to_ir([
         {"type": "message", "role": "user", "content": "Hi"},
         {"type": "reasoning", "content": "Thinking..."},
-    ])
+    ]))
     assert len(result) == 1
 
 
-def test_convert_responses_input_reasoning_item_backfills_assistant():
+def test_responses_input_ir_backfills_reasoning_item_onto_assistant_tool_call():
     """Test behavior."""
-    result = _convert_responses_input([
+    result = ir_to_openai_messages(responses_input_to_ir([
         {"type": "message", "role": "user", "content": "Search"},
         {"type": "function_call", "call_id": "call_1", "name": "search", "arguments": '{"q":"x"}'},
         {"type": "reasoning", "content": "Need to search"},
         {"type": "function_call_output", "call_id": "call_1", "output": "Found"},
-    ])
+    ]))
     assert result[1].get("reasoning_content") == "Need to search"
 
 
-def test_convert_responses_input_string_content():
+def test_responses_input_ir_projects_string_content_to_openai_shape():
     """Test behavior."""
-    result = _convert_responses_input([
+    result = ir_to_openai_messages(responses_input_to_ir([
         {"type": "message", "role": "user", "content": "Plain string"},
-    ])
+    ]))
     assert result[0]["content"] == "Plain string"
 
 
-def test_convert_responses_input_content_with_images():
+def test_responses_input_ir_projects_image_content_to_openai_shape():
     """Test behavior."""
-    result = _convert_responses_input([
+    result = ir_to_openai_messages(responses_input_to_ir([
         {"type": "message", "role": "user", "content": [
             {"type": "input_text", "text": "Describe:"},
             {"type": "input_image", "image_url": "https://example.com/img.jpg"},
         ]},
-    ])
+    ]))
     content = result[0]["content"]
     assert isinstance(content, list)
     assert len(content) == 2
 
 
-def test_convert_responses_input_function_call_with_reasoning():
+def test_responses_input_ir_preserves_function_call_reasoning():
     """Test behavior."""
-    result = _convert_responses_input([
+    result = ir_to_openai_messages(responses_input_to_ir([
         {"type": "message", "role": "user", "content": "Search"},
         {"type": "function_call", "call_id": "c1", "name": "search",
          "arguments": '{"q":"x"}', "reasoning_content": "Need to search"},
-    ])
+    ]))
     assert result[1].get("reasoning_content") == "Need to search"
 
 
-def test_convert_responses_input_merges_assistant_text_before_function_call():
+def test_responses_input_ir_treats_assistant_text_before_function_call_as_reasoning():
     """Test behavior."""
-    result = _convert_responses_input([
+    result = ir_to_openai_messages(responses_input_to_ir([
         {"type": "message", "role": "user", "content": "Search"},
         {"type": "message", "role": "assistant", "content": "Let me check."},
         {"type": "function_call", "call_id": "c1", "name": "search", "arguments": '{"q":"x"}'},
-    ])
+    ]))
     assert len(result) == 2
     assert result[1]["role"] == "assistant"
     assert result[1]["tool_calls"][0]["id"] == "c1"
@@ -575,41 +587,41 @@ def test_convert_responses_input_merges_assistant_text_before_function_call():
     assert result[1]["reasoning_content"] == "Let me check."
 
 
-def test_convert_responses_input_function_call_output_with_reasoning_backfills_assistant():
+def test_responses_input_ir_backfills_function_call_output_reasoning_to_assistant():
     """Test behavior."""
-    result = _convert_responses_input([
+    result = ir_to_openai_messages(responses_input_to_ir([
         {"type": "message", "role": "user", "content": "Search"},
         {"type": "function_call", "call_id": "c1", "name": "search", "arguments": '{"q":"x"}'},
         {"type": "function_call_output", "call_id": "c1", "output": "Found", "reasoning_content": "Need to search"},
-    ])
+    ]))
     assert result[1].get("reasoning_content") == "Need to search"
     assert result[2]["role"] == "tool"
 
 
-def test_convert_responses_input_non_dict_skipped():
-    result = _convert_responses_input(["not a dict", 123])
+def test_responses_input_ir_skips_non_dict_items():
+    result = ir_to_openai_messages(responses_input_to_ir(["not a dict", 123]))
     assert result == []
 
 
-def test_convert_responses_input_fallback_role():
+def test_responses_input_ir_accepts_fallback_message_shape():
     """Test behavior."""
-    result = _convert_responses_input([
+    result = ir_to_openai_messages(responses_input_to_ir([
         {"role": "user", "content": "Simple fallback"},
-    ])
+    ]))
     assert len(result) == 1
     assert result[0]["role"] == "user"
 
 
 # Test section
 
-def test_convert_responses_tools_already_formatted():
+def test_responses_tools_preserve_already_openai_formatted_tools():
     """Test behavior."""
     tools = [{"type": "function", "function": {"name": "f", "parameters": {}}}]
-    result = _convert_responses_tools(tools)
+    result = responses_tools_to_chat_tools(tools)
     assert result == tools
 
 
-def test_convert_responses_tools_strips_openai_fields():
+def test_responses_tools_strip_openai_specific_schema_fields():
     """Test behavior."""
     tools = [{
         "type": "function",
@@ -625,7 +637,7 @@ def test_convert_responses_tools_strips_openai_fields():
             }
         }
     }]
-    result = _convert_responses_tools(tools)
+    result = responses_tools_to_chat_tools(tools)
     func = result[0]["function"]
     assert "strict" not in func
     assert "additionalProperties" not in func
@@ -633,8 +645,8 @@ def test_convert_responses_tools_strips_openai_fields():
     assert "additionalProperties" not in func["parameters"]["properties"]["q"]
 
 
-def test_convert_responses_tools_filters_non_function():
-    result = _convert_responses_tools([
+def test_responses_tools_filter_non_function_tools():
+    result = responses_tools_to_chat_tools([
         {"type": "web_search", "name": "web"},
         {"type": "custom", "name": "custom"},
         {"type": "function", "name": "my_func", "parameters": {}},
@@ -643,23 +655,13 @@ def test_convert_responses_tools_filters_non_function():
     assert result[0]["function"]["name"] == "my_func"
 
 
-def test_convert_responses_tools_non_dict_skipped():
-    result = _convert_responses_tools(["not dict", 123, None])
+def test_responses_tools_skip_non_dict_items():
+    result = responses_tools_to_chat_tools(["not dict", 123, None])
     assert result == []
 
 
-def test_convert_responses_tools_empty():
-    assert _convert_responses_tools([]) == []
-
-
-def test_anthropic_tool_block_indexes_unique():
-    from app.router.proxy import _anthropic_tool_block_index
-
-    tool_uses = {}
-    assert _anthropic_tool_block_index(False, tool_uses) == 0
-    tool_uses[0] = {"block_index": 0}
-    assert _anthropic_tool_block_index(False, tool_uses) == 1
-    assert _anthropic_tool_block_index(True, tool_uses) == 2
+def test_responses_tools_empty_list():
+    assert responses_tools_to_chat_tools([]) == []
 
 
 # -- _friendly_error_msg --
@@ -677,7 +679,7 @@ def test_friendly_error_msg_no_image_support():
     assert "" in result
 
 
-def test_friendly_error_msg_unmapped_passthrough():
+def test_friendly_error_msg_unmapped_is_preserved():
     e = Exception("Some unknown error message")
     result = _friendly_error_msg(e)
     assert result == "Some unknown error message"
@@ -685,43 +687,43 @@ def test_friendly_error_msg_unmapped_passthrough():
 
 # Test section
 
-def test_anthropic_to_openai_system_as_array():
+def test_ir_projects_anthropic_system_array_to_openai_system_text():
     """Test behavior."""
-    msgs, has_tools = _anthropic_to_openai_messages(
+    msgs = ir_to_openai_messages(anthropic_messages_to_ir(
         [{"role": "user", "content": "Hello"}],
-        system_prompt=[
+        [
             {"type": "text", "text": "You are helpful.", "cache_control": {"type": "ephemeral"}},
             {"type": "text", "text": "Be concise.", "cache_control": {"type": "ephemeral"}},
         ]
-    )
+    ))
     assert msgs[0]["role"] == "system"
     assert msgs[0]["content"] == "You are helpful.\nBe concise."
     assert isinstance(msgs[0]["content"], str)
 
 
-def test_anthropic_to_openai_system_array_with_empty_blocks():
+def test_ir_projects_anthropic_system_array_filters_empty_blocks():
     """Test behavior."""
-    msgs, _ = _anthropic_to_openai_messages(
+    msgs = ir_to_openai_messages(anthropic_messages_to_ir(
         [{"role": "user", "content": "Hi"}],
-        system_prompt=[
+        [
             {"type": "text", "text": "", "cache_control": {"type": "ephemeral"}},
             {"type": "text", "text": "Valid text.", "cache_control": {"type": "ephemeral"}},
         ]
-    )
+    ))
     assert msgs[0]["content"] == "Valid text."
 
 
-def test_anthropic_to_openai_system_array_strips_billing_header():
-    msgs, _ = _anthropic_to_openai_messages(
+def test_ir_projects_anthropic_system_array_after_billing_header_strip():
+    msgs = ir_to_openai_messages(anthropic_messages_to_ir(
         [{"role": "user", "content": "Hi"}],
-        system_prompt=_strip_billing_header([
+        _strip_billing_header([
             {
                 "type": "text",
                 "text": "Prompt\nx-anthropic-billing-header: cc_version=2.1.37; cc_entrypoint=cli; cch=random;",
                 "cache_control": {"type": "ephemeral"},
             },
         ])
-    )
+    ))
     assert msgs[0]["content"] == "Prompt"
 
 
@@ -753,7 +755,30 @@ def test_strip_billing_header_removes_any_header_line_shape():
 
 
 def test_normalize_system_list_strips_billing_header_preserves_cache_control():
-    result = _normalize_messages([
+    request = InternalRequest(
+        endpoint="messages",
+        requested_model="test",
+        target_model="test",
+        messages=anthropic_messages_to_ir(
+            [{"role": "user", "content": "Hi"}],
+            [
+                {
+                    "type": "text",
+                    "text": "Prompt\nx-anthropic-billing-header: cc_version=2.1.37; cc_entrypoint=cli; cch=random;",
+                    "cache_control": {"type": "ephemeral"},
+                },
+            ],
+        ),
+    )
+    normalize_messages(request)
+    system_part = request.messages[0].parts[0]
+    assert system_part.text == "Prompt"
+    assert system_part.extensions["cache_control"] == {"type": "ephemeral"}
+    assert chat_messages_from_internal(request)[0]["content"] == "Prompt"
+
+
+def test_normalize_openai_system_list_strips_billing_header():
+    result = _normalize_internal_messages_for_test([
         {
             "role": "system",
             "content": [
@@ -766,13 +791,7 @@ def test_normalize_system_list_strips_billing_header_preserves_cache_control():
         },
         {"role": "user", "content": "Hi"},
     ])
-    assert result[0]["content"] == [
-        {
-            "type": "text",
-            "text": "Prompt",
-            "cache_control": {"type": "ephemeral"},
-        },
-    ]
+    assert result[0]["content"] == "Prompt"
 
 
 # Test section
@@ -794,9 +813,11 @@ def test_reasoning_injection_uses_tool_id_and_active_segment_only():
     _remember_reasoning_content(conv_key, "old reasoning", ["old_call"])
     _remember_reasoning_content(conv_key, "new reasoning", ["new_call"])
 
-    assert _inject_reasoning_content(messages, conv_key, "test") == 1
-    assert "reasoning_content" not in messages[1]
-    assert messages[5]["reasoning_content"] == "new reasoning"
+    messages = openai_messages_to_ir(messages)
+    assert inject_reasoning_content(messages, _reasoning_cache.get(conv_key), _reasoning_tool_cache.get(conv_key, {})) == 1
+    projected = ir_to_openai_messages(messages)
+    assert "reasoning_content" not in projected[1]
+    assert projected[5]["reasoning_content"] == "new reasoning"
 
 
 def test_reasoning_injection_fallback_limited_to_active_tool_segment():
@@ -816,10 +837,12 @@ def test_reasoning_injection_fallback_limited_to_active_tool_segment():
     _reasoning_tool_cache.drop(conv_key)
     _reasoning_cache[conv_key] = "latest reasoning"
 
-    assert _inject_reasoning_content(messages, conv_key, "test") == 2
-    assert "reasoning_content" not in messages[1]
-    assert messages[5]["reasoning_content"] == "latest reasoning"
-    assert messages[7]["reasoning_content"] == "latest reasoning"
+    messages = openai_messages_to_ir(messages)
+    assert inject_reasoning_content(messages, _reasoning_cache.get(conv_key), _reasoning_tool_cache.get(conv_key, {})) == 2
+    projected = ir_to_openai_messages(messages)
+    assert "reasoning_content" not in projected[1]
+    assert projected[5]["reasoning_content"] == "latest reasoning"
+    assert projected[7]["reasoning_content"] == "latest reasoning"
 
 
 def test_reasoning_injection_does_not_add_empty_fields_by_default():
@@ -832,8 +855,25 @@ def test_reasoning_injection_does_not_add_empty_fields_by_default():
     _reasoning_cache.drop(conv_key)
     _reasoning_tool_cache.drop(conv_key)
 
-    assert _inject_reasoning_content(messages, conv_key, "test") == 0
-    assert "reasoning_content" not in messages[1]
+    messages = openai_messages_to_ir(messages)
+    assert inject_reasoning_content(messages, _reasoning_cache.get(conv_key), _reasoning_tool_cache.get(conv_key, {})) == 0
+    projected = ir_to_openai_messages(messages)
+    assert "reasoning_content" not in projected[1]
+
+
+def test_reasoning_injection_stops_when_client_already_provides_reasoning():
+    messages = openai_messages_to_ir([
+        {"role": "user", "content": "start"},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "tool", "arguments": "{}"}}], "reasoning_content": "client reasoning"},
+        {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "call_2", "type": "function", "function": {"name": "tool", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "call_2", "content": "result"},
+    ])
+
+    assert inject_reasoning_content(messages, "cached reasoning", {"call_2": "cached reasoning"}) == 1
+    projected = ir_to_openai_messages(messages)
+    assert projected[1]["reasoning_content"] == "client reasoning"
+    assert projected[3]["reasoning_content"] == "cached reasoning"
 
 
 def test_reasoning_cache_survives_image_preprocess_flow():
@@ -853,8 +893,10 @@ def test_reasoning_cache_survives_image_preprocess_flow():
     _reasoning_tool_cache.drop(conv_key)
     _remember_reasoning_content(conv_key, "cached reasoning", ["call_2"])
 
-    assert _inject_reasoning_content(messages, conv_key, "test") == 1
-    assert messages[5]["reasoning_content"] == "cached reasoning"
+    messages = openai_messages_to_ir(messages)
+    assert inject_reasoning_content(messages, _reasoning_cache.get(conv_key), _reasoning_tool_cache.get(conv_key, {})) == 1
+    projected = ir_to_openai_messages(messages)
+    assert projected[5]["reasoning_content"] == "cached reasoning"
 
 
 def test_conversation_cache_key_prefers_response_chain_id():
@@ -890,59 +932,79 @@ def test_conversation_cache_key_uses_followup_user_messages():
     assert _conversation_cache_key("api", followup_a) != _conversation_cache_key("api", followup_b)
 
 
-def test_anthropic_tool_block_index_assigns_unique_indexes():
-    from app.router.proxy import _anthropic_tool_block_index
+def test_conversation_cache_key_ignores_internal_tool_results_for_reasoning_replay():
+    before_tool_result = openai_messages_to_ir([
+        {"role": "user", "content": "Diagnose my computer"},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "run", "arguments": "{}"}}]},
+    ])
+    after_tool_result = openai_messages_to_ir([
+        {"role": "user", "content": "Diagnose my computer"},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "run", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "CPU and memory results"},
+    ])
 
-    tool_uses = {}
-    first = _anthropic_tool_block_index(False, tool_uses)
-    tool_uses[0] = {"block_index": first}
-    second = _anthropic_tool_block_index(False, tool_uses)
-    tool_uses[1] = {"block_index": second}
-
-    assert first == 0
-    assert second == 1
-    assert _anthropic_tool_block_index(True, tool_uses) == 2
+    assert _conversation_cache_key("api", before_tool_result) == _conversation_cache_key("api", after_tool_result)
 
 
-def test_anthropic_content_to_openai_filters_empty_text():
-    """Test behavior."""
-    result = _anthropic_content_to_openai([
+def test_reasoning_context_falls_back_to_tool_id_when_conversation_key_drifts():
+    producing_messages = openai_messages_to_ir([
+        {"role": "user", "content": "Diagnose my computer"},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "run", "arguments": "{}"}}]},
+    ])
+    replay_messages = openai_messages_to_ir([
+        {"role": "user", "content": "Diagnose my computer"},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "run", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "partial result"},
+        {"role": "user", "content": "continue"},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "call_2", "type": "function", "function": {"name": "run", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "call_2", "content": "more result"},
+    ])
+    old_key = _conversation_cache_key("api-drift", producing_messages)
+    new_key = _conversation_cache_key("api-drift", replay_messages)
+    _reasoning_cache.drop(old_key)
+    _reasoning_cache.drop(new_key)
+    _reasoning_tool_cache.drop(old_key)
+    _reasoning_tool_cache.drop(new_key)
+    _reasoning_tool_global_cache.drop("call_1")
+    _reasoning_tool_global_cache.drop("call_2")
+
+    _remember_reasoning_content(old_key, "reasoning for call 1", ["call_1"])
+    cached_rc, tool_map = _reasoning_context(new_key, replay_messages)
+
+    assert cached_rc is None
+    assert tool_map == {"call_1": "reasoning for call 1"}
+    assert inject_reasoning_content(replay_messages, cached_rc, tool_map) == 1
+    projected = ir_to_openai_messages(replay_messages)
+    assert projected[1]["reasoning_content"] == "reasoning for call 1"
+    assert "reasoning_content" not in projected[5]
+
+
+def test_anthropic_content_to_ir_filters_empty_text():
+    result = anthropic_messages_to_ir([{"role": "user", "content": [
         {"type": "text", "text": ""},
         {"type": "text", "text": "Hello"},
         {"type": "text", "text": ""},
-    ])
-    assert result == ["Hello"]
+    ]}])
+    assert [part.text for part in result[0].parts] == ["Hello"]
 
 
-def test_anthropic_to_openai_assistant_empty_text_filtered():
-    """Test behavior."""
-    msgs, _ = _anthropic_to_openai_messages(
-        [{"role": "assistant", "content": [
+def test_ir_projects_anthropic_assistant_filters_empty_text():
+    msgs = ir_to_openai_messages(anthropic_messages_to_ir([{"role": "assistant", "content": [
             {"type": "text", "text": ""},
             {"type": "text", "text": "I can help."},
-        ]}],
-        system_prompt=""
-    )
+        ]}]))
     assert msgs[0]["content"] == "I can help."
 
 
-def test_anthropic_to_openai_assistant_all_text_empty():
-    """Test behavior."""
-    msgs, _ = _anthropic_to_openai_messages(
-        [{"role": "assistant", "content": [{"type": "text", "text": ""}]}],
-        system_prompt=""
-    )
+def test_ir_projects_anthropic_assistant_all_empty_text_as_none():
+    msgs = ir_to_openai_messages(anthropic_messages_to_ir([{"role": "assistant", "content": [{"type": "text", "text": ""}]}]))
     assert msgs[0]["content"] is None
 
 
-def test_anthropic_to_openai_image_only_user_no_empty_text():
-    """Test behavior."""
-    msgs, _ = _anthropic_to_openai_messages(
-        [{"role": "user", "content": [
+def test_ir_projects_anthropic_image_only_user_without_empty_text():
+    msgs = ir_to_openai_messages(anthropic_messages_to_ir([{"role": "user", "content": [
             {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": _IMG1}}
-        ]}],
-        system_prompt=""
-    )
+        ]}]))
     content = msgs[0]["content"]
     assert isinstance(content, list)
     assert len(content) == 1

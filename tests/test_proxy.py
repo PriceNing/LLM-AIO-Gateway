@@ -112,7 +112,7 @@ def test_chat_completion_accepts_request_without_previous_response_id(monkeypatc
 
 
 def test_anthropic_messages_accepts_request_without_previous_response_id(monkeypatch):
-    from app.router import proxy
+    from app.adapters import openai_streaming
 
     def fake_stream(**kwargs):
         class Delta:
@@ -130,7 +130,7 @@ def test_anthropic_messages_accepts_request_without_previous_response_id(monkeyp
 
         yield Chunk()
 
-    monkeypatch.setattr(proxy, "create_chat_completion_stream", fake_stream)
+    monkeypatch.setattr(openai_streaming, "create_chat_completion_stream", fake_stream)
 
     with client.stream("POST", "/v1/messages", headers=headers, json={
         "model": "allowed-model",
@@ -143,6 +143,67 @@ def test_anthropic_messages_accepts_request_without_previous_response_id(monkeyp
     assert response.status_code == 200
     assert "message_start" in body
     assert "message_stop" in body
+
+
+@pytest.mark.asyncio
+async def test_openai_stream_tolerates_litellm_tail_chunk_builder_error_after_output(monkeypatch):
+    from app.adapters import openai_streaming
+
+    class Delta:
+        content = "ok"
+        reasoning_content = None
+        tool_calls = None
+
+    class Choice:
+        delta = Delta()
+        finish_reason = None
+
+    class Chunk:
+        choices = [Choice()]
+        usage = None
+
+    def fake_stream(**kwargs):
+        yield Chunk()
+        raise Exception("litellm.APIError: Error building chunks for logging/streaming usage calculation")
+
+    monkeypatch.setattr(openai_streaming, "create_chat_completion_stream", fake_stream)
+
+    events = []
+    async for event in openai_streaming.iter_openai_chat_output_events(
+        model="allowed-model",
+        messages=[{"role": "user", "content": "Hello"}],
+        provider_id="test-provider",
+        temperature=0.7,
+        max_tokens=32,
+    ):
+        events.append(event)
+
+    assert [event.kind for event in events] == ["message_start", "text_delta", "message_done"]
+    assert events[1].text == "ok"
+    assert events[-1].finish_reason == "stop"
+
+
+@pytest.mark.asyncio
+async def test_openai_stream_propagates_litellm_tail_chunk_builder_error_before_output(monkeypatch):
+    from app.adapters import openai_streaming
+
+    def fake_stream(**kwargs):
+        raise Exception("litellm.APIError: Error building chunks for logging/streaming usage calculation")
+        yield
+
+    monkeypatch.setattr(openai_streaming, "create_chat_completion_stream", fake_stream)
+
+    events = openai_streaming.iter_openai_chat_output_events(
+        model="allowed-model",
+        messages=[{"role": "user", "content": "Hello"}],
+        provider_id="test-provider",
+        temperature=0.7,
+        max_tokens=32,
+    )
+
+    with pytest.raises(Exception, match="Error building chunks"):
+        async for _event in events:
+            pass
 
 
 def test_static_admin_page_loads():
@@ -202,9 +263,11 @@ def preprocess_db(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_maybe_preprocess_native_model_images_preserved(preprocess_db):
+async def test_policy_preprocess_native_model_images_preserved(preprocess_db):
     """Test behavior."""
-    from app.router.proxy import _maybe_preprocess
+    from app.adapters.openai import chat_messages_from_internal
+    from app.protocols.ingress import chat_completions_to_internal
+    from app.router.proxy import _policy_preprocess_request
 
     msgs = [{"role": "user", "content": [
         {"type": "text", "text": "Describe:"},
@@ -215,7 +278,9 @@ async def test_maybe_preprocess_native_model_images_preserved(preprocess_db):
         {"type": "image_url", "image_url": {"url": "https://example.com/photo.jpg"}}
     ]}]
 
-    result, modified = await _maybe_preprocess(msgs, "native-model")
+    internal = chat_completions_to_internal({"model": "native-model", "messages": msgs})
+    modified = await _policy_preprocess_request(internal, "native-model", "", "native-model")
+    result = chat_messages_from_internal(internal)
 
     assert modified is False
     assert result == original
@@ -226,9 +291,11 @@ async def test_maybe_preprocess_native_model_images_preserved(preprocess_db):
 
 
 @pytest.mark.asyncio
-async def test_maybe_preprocess_inject_model_images_stripped(preprocess_db):
+async def test_policy_preprocess_inject_model_images_stripped(preprocess_db):
     """Test behavior."""
-    from app.router.proxy import _maybe_preprocess
+    from app.adapters.openai import chat_messages_from_internal
+    from app.protocols.ingress import chat_completions_to_internal
+    from app.router.proxy import _policy_preprocess_request
     from unittest.mock import AsyncMock, MagicMock, patch
 
     msgs = [{"role": "user", "content": [
@@ -244,7 +311,9 @@ async def test_maybe_preprocess_inject_model_images_stripped(preprocess_db):
 
     with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
         mock_post.return_value = mock_response
-        result, modified = await _maybe_preprocess(msgs, "inject-model")
+        internal = chat_completions_to_internal({"model": "inject-model", "messages": msgs})
+        modified = await _policy_preprocess_request(internal, "inject-model", "", "inject-model")
+        result = chat_messages_from_internal(internal)
 
     assert modified is True
     content = result[0]["content"]
@@ -255,23 +324,29 @@ async def test_maybe_preprocess_inject_model_images_stripped(preprocess_db):
 
 
 @pytest.mark.asyncio
-async def test_maybe_preprocess_inject_model_no_images_skips(preprocess_db):
+async def test_policy_preprocess_inject_model_no_images_skips(preprocess_db):
     """Test behavior."""
-    from app.router.proxy import _maybe_preprocess
+    from app.adapters.openai import chat_messages_from_internal
+    from app.protocols.ingress import chat_completions_to_internal
+    from app.router.proxy import _policy_preprocess_request
 
     msgs = [{"role": "user", "content": "Just a text question"}]
     original = [{"role": "user", "content": "Just a text question"}]
 
-    result, modified = await _maybe_preprocess(msgs, "noimage-model")
+    internal = chat_completions_to_internal({"model": "noimage-model", "messages": msgs})
+    modified = await _policy_preprocess_request(internal, "noimage-model", "", "noimage-model")
+    result = chat_messages_from_internal(internal)
 
     assert modified is False
     assert result == original
 
 
 @pytest.mark.asyncio
-async def test_maybe_preprocess_model_not_in_db(preprocess_db):
+async def test_policy_preprocess_model_not_in_db(preprocess_db):
     """Test behavior."""
-    from app.router.proxy import _maybe_preprocess
+    from app.adapters.openai import chat_messages_from_internal
+    from app.protocols.ingress import chat_completions_to_internal
+    from app.router.proxy import _policy_preprocess_request
 
     msgs = [{"role": "user", "content": [
         {"type": "image_url", "image_url": {"url": "https://example.com/unknown.jpg"}}
@@ -280,13 +355,15 @@ async def test_maybe_preprocess_model_not_in_db(preprocess_db):
         {"type": "image_url", "image_url": {"url": "https://example.com/unknown.jpg"}}
     ]}]
 
-    result, modified = await _maybe_preprocess(msgs, "unknown-model")
+    internal = chat_completions_to_internal({"model": "unknown-model", "messages": msgs})
+    modified = await _policy_preprocess_request(internal, "unknown-model", "", "unknown-model")
+    result = chat_messages_from_internal(internal)
 
     assert modified is False
     assert result == original
 
 
 @pytest.mark.asyncio
-async def test_maybe_preprocess_respects_requested_model(preprocess_db):
+async def test_policy_preprocess_respects_requested_model(preprocess_db):
     """Test behavior."""
     """Test behavior."""

@@ -4,44 +4,27 @@ import re
 import litellm
 from litellm import completion
 from typing import Optional, Any
+from pydantic import Field
+from litellm.types.utils import ModelResponse, Message, Delta
 from app.database import get_providers, get_provider, find_provider_by_model
 from app.services.logger import get_logger
 from app.config import get_default
 
-# -- Monkey-patch: MiniMax Anthropic responses may have non-string `id` fields --
-# liteLLM's AnthropicResponse and related models require `id: str`, but MiniMax's
-# Anthropic-compatible endpoint returns `id` as a bare integer.  Coerce to str.
+# -- liteLLM compatibility: expose reasoning_content on response models --
+# Several OpenAI-compatible providers return reasoning_content, but some liteLLM
+# versions do not include it on Message/Delta. The policy layer needs the field
+# for multi-turn reasoning continuity.
 try:
-    from typing import Annotated
-    from pydantic import BeforeValidator
-    from litellm.llms.anthropic.chat import (
-        AnthropicResponse,
-        AnthropicResponseContentBlockToolUse,
-    )
-    from litellm.types.utils import ModelResponse, Message, Delta
-    from litellm.types.llms.openai import ChatCompletionChunk
-
-    _coerce_id = Annotated[str, BeforeValidator(lambda x: str(x) if x is not None else x)]
-    for _model in (
-        AnthropicResponse,
-        AnthropicResponseContentBlockToolUse,
-        ModelResponse,
-        ChatCompletionChunk,
-    ):
-        _model.model_fields["id"].annotation = _coerce_id
-        _model.model_rebuild(force=True)
-
-    # Add reasoning_content to Message and Delta models so liteLLM preserves it
-    # when providers (llama.cpp, DeepSeek, etc.) include it in the response.
-    from pydantic import Field
     for _model in (Message, Delta):
         if "reasoning_content" not in _model.model_fields:
             _model.model_fields["reasoning_content"] = Field(default=None)
             _model.model_rebuild(force=True)
 except Exception:
-    logging.getLogger("llmgw.app").warning("liteLLM monkey-patch for MiniMax id coercion failed - MiniMax Anthropic responses may have type errors")
+    logging.getLogger("llmgw.app").warning(
+        "liteLLM compatibility patch for reasoning_content fields failed"
+    )
 
-# -- Monkey-patch: preserve reasoning_content in liteLLM responses --
+# -- liteLLM compatibility: preserve reasoning_content in responses --
 # liteLLM's convert_to_model_response_object (utils.py:5755) constructs Message
 # objects from the OpenAI response dict but only extracts known fields (content,
 # role, function_call, tool_calls).  reasoning_content is dropped even though the
@@ -81,41 +64,7 @@ try:
     _litellm_utils.convert_to_model_response_object = _patched_convert
 except Exception:
     logging.getLogger("llmgw.app").warning(
-        "liteLLM monkey-patch for reasoning_content failed"
-    )
-
-# -- Monkey-patch removed: thinking mode is now configured via
-# provider.extra_headers in build_completion_args and passthrough paths.
-# The AnthropicChatCompletion path (used by MiniMax etc.) no longer needs
-# a monkey-patch - each provider's extra_headers controls thinking.
-
-# -- Monkey-patch: convert reasoning_content -> thinking_blocks for Anthropic messages --
-# liteLLM's anthropic_messages_pt (factory.py:2558) only looks for "thinking_blocks"
-# in assistant messages, ignoring "reasoning_content".  When the gateway injects
-# cached reasoning_content for multi-turn continuity, liteLLM drops it during
-# OpenAI->Anthropic message conversion.  Intercept the function to synthesize
-# thinking_blocks from reasoning_content before liteLLM processes the messages.
-try:
-    # liteLLM moved anthropic_messages_pt between versions; try both paths
-    try:
-        from litellm.llms.prompt_templates import factory as _pt_factory
-    except (ImportError, ModuleNotFoundError):
-        from litellm.litellm_core_utils.prompt_templates import factory as _pt_factory
-    _original_anthropic_messages_pt = _pt_factory.anthropic_messages_pt
-
-    def _patched_anthropic_messages_pt(messages, model, llm_provider):
-        for msg in messages:
-            if isinstance(msg, dict) and msg.get("role") == "assistant":
-                if not msg.get("thinking_blocks") and msg.get("reasoning_content"):
-                    msg["thinking_blocks"] = [
-                        {"type": "thinking", "thinking": msg["reasoning_content"]}
-                    ]
-        return _original_anthropic_messages_pt(messages, model, llm_provider)
-
-    _pt_factory.anthropic_messages_pt = _patched_anthropic_messages_pt
-except Exception:
-    logging.getLogger("llmgw.app").warning(
-        "liteLLM monkey-patch for anthropic_messages_pt (reasoning_content->thinking) failed"
+        "liteLLM compatibility patch for preserving reasoning_content failed"
     )
 
 litellm.drop_params = False  # Allow provider-specific params like DeepSeek's 'thinking'
@@ -230,23 +179,19 @@ def _has_image_content(messages: list) -> bool:
 
 
 def get_litellm_model_name(model: str, provider: dict) -> str:
-    """Build the correct model name for liteLLM based on provider type."""
+    """Build the liteLLM model name for OpenAI-compatible providers."""
     provider_type = provider.get("provider_type", "openai")
-    provider_id = provider.get("id", "")
     api_base = provider.get("api_base", "")
+    if provider_type != "openai":
+        raise ValueError("liteLLM adapter only supports OpenAI-compatible providers")
 
     # Extract the plain model name; parse_model_id handles simple and composite formats
     from app.database import parse_model_id
     model = parse_model_id(model).model_name
 
-    if provider_type == "openai":
-        if api_base and not any(host in api_base for host in OPENAI_HOSTS):
-            return f"openai/{model}"
-        return model
-    elif provider_type == "anthropic":
-        return f"anthropic/{model}"
-    else:
-        return model
+    if api_base and not any(host in api_base for host in OPENAI_HOSTS):
+        return f"openai/{model}"
+    return model
 
 
 def build_completion_args(model: str, provider_id: Optional[str] = None) -> tuple[str, dict[str, Any]]:
@@ -259,12 +204,7 @@ def build_completion_args(model: str, provider_id: Optional[str] = None) -> tupl
     params: dict[str, Any] = {"api_key": provider.get("api_key") or "sk-no-auth"}
     api_base = provider.get("api_base", "").rstrip("/")
     if api_base:
-        # Anthropic-compatible providers expect the official API path /v1/messages
-        # appended to the configured base URL (consistent with passthrough behavior).
-        if provider.get("provider_type") == "anthropic" and not api_base.endswith(("/v1/messages", "/messages")):
-            params["api_base"] = api_base + "/v1/messages"
-        else:
-            params["api_base"] = api_base
+        params["api_base"] = api_base
 
     litellm_model = get_litellm_model_name(model, provider)
     # Per-provider thinking mode: configured via provider.extra_headers.
@@ -319,40 +259,6 @@ def create_chat_completion_stream(
     kwargs["stream"] = True
     if "stream_options" not in kwargs:
         kwargs["stream_options"] = {"include_usage": True}
-    _normalize_image_content(messages)
-    if _has_image_content(messages):
-        kwargs["max_tokens"] = max(kwargs.get("max_tokens", 0), MIN_IMAGE_MAX_TOKENS)
-    return completion(model=litellm_model, messages=messages, **clean_params(kwargs))
-
-
-def create_completion(
-    model: str,
-    prompt: str,
-    provider_id: Optional[str] = None,
-    **kwargs
-) -> dict:
-    litellm_model, extra_params = build_completion_args(model, provider_id)
-    kwargs.update(extra_params)
-    messages = [{"role": "user", "content": prompt}]
-    _normalize_image_content(messages)
-    if _has_image_content(messages):
-        kwargs["max_tokens"] = max(kwargs.get("max_tokens", 0), MIN_IMAGE_MAX_TOKENS)
-    response = completion(model=litellm_model, messages=messages, **clean_params(kwargs))
-    return response
-
-
-def create_completion_stream(
-    model: str,
-    prompt: str,
-    provider_id: Optional[str] = None,
-    **kwargs
-):
-    litellm_model, extra_params = build_completion_args(model, provider_id)
-    kwargs.update(extra_params)
-    kwargs["stream"] = True
-    if "stream_options" not in kwargs:
-        kwargs["stream_options"] = {"include_usage": True}
-    messages = [{"role": "user", "content": prompt}]
     _normalize_image_content(messages)
     if _has_image_content(messages):
         kwargs["max_tokens"] = max(kwargs.get("max_tokens", 0), MIN_IMAGE_MAX_TOKENS)

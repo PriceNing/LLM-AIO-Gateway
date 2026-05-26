@@ -12,11 +12,15 @@ venv/
 
 # Runtime data (contains secrets & generated files)
 data.db
+data.db-shm
+data.db-wal
 config.json
 *.log
 data/
 
 # Project-local notes (not for distribution)
+AGENTS.md
+使用说明书.md
 CLAUDE.md
 opencode-fix.md
 history/
