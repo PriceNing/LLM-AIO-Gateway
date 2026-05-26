@@ -3,7 +3,7 @@ Unit tests for liteLLM OpenAI-compatible routing and image normalization helpers
 """
 import pytest
 from app.core.images import extract_image_data_uris, has_image_content, normalize_image_content
-from app.services.lite_llm import get_litellm_model_name
+from app.services.lite_llm import _disable_thinking_when_tools_forced, get_litellm_model_name
 
 # -- Model name routing --
 
@@ -35,6 +35,16 @@ def test_get_litellm_model_name_already_prefixed():
     provider = {"id": "any", "provider_type": "openai", "api_base": "https://api.test.com/v1"}
     assert get_litellm_model_name("openai/my-model", provider) == "openai/my-model"
     assert get_litellm_model_name("deepseek/v4", provider) == "openai/v4"
+
+
+def test_disable_thinking_when_tools_forced_only_with_tools():
+    kwargs = {"extra_body": {"thinking": {"type": "enabled"}}}
+    _disable_thinking_when_tools_forced(kwargs)
+    assert kwargs["extra_body"]["thinking"] == {"type": "enabled"}
+
+    kwargs["tools"] = [{"type": "function", "function": {"name": "run"}}]
+    _disable_thinking_when_tools_forced(kwargs)
+    assert kwargs["extra_body"]["thinking"] == {"type": "disabled"}
 
 
 # -- Image data URI extraction --

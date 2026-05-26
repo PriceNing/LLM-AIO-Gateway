@@ -11,7 +11,7 @@ from app.core.policy import RouteTarget, RoutingDecision
 from app.core.policy import fix_tool_args, inject_reasoning_content, request_has_tools, strip_tools
 from app.protocols.ir import ir_to_anthropic_messages, ir_to_openai_messages, openai_messages_to_ir
 from app.adapters.anthropic import anthropic_body_from_internal
-from app.adapters.openai import chat_messages_from_internal
+from app.adapters.openai import chat_kwargs_from_internal, chat_messages_from_internal
 from app.services.preprocessing import preprocess_messages
 
 
@@ -97,6 +97,18 @@ def test_anthropic_messages_to_internal_preserves_any_tool_choice():
     assert body["tool_choice"] == {"type": "any"}
 
 
+def test_anthropic_messages_tool_choice_projects_to_openai_chat_shape():
+    req = anthropic_messages_to_internal({
+        "model": "openai-test",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"name": "run", "input_schema": {"type": "object"}}],
+        "tool_choice": {"type": "tool", "name": "run"},
+    })
+
+    kwargs = chat_kwargs_from_internal(req)
+    assert kwargs["tool_choice"] == {"type": "function", "function": {"name": "run"}}
+
+
 def test_ir_preserves_anthropic_cache_control_tool_use_tool_result_and_images():
     req = anthropic_messages_to_internal({
         "model": "claude-test",
@@ -179,6 +191,18 @@ def test_responses_to_internal_converts_function_items_and_tools():
     assert req.tools[0].name == "run"
     assert "strict" not in req.extra["tools"][0]["function"]
     assert req.tool_choice is None
+
+
+def test_responses_tool_choice_projects_to_openai_chat_shape():
+    req = responses_to_internal({
+        "model": "gpt-test",
+        "input": "hi",
+        "tools": [{"type": "function", "name": "run", "parameters": {"type": "object"}}],
+        "tool_choice": {"type": "function", "name": "run"},
+    })
+
+    kwargs = chat_kwargs_from_internal(req)
+    assert kwargs["tool_choice"] == {"type": "function", "function": {"name": "run"}}
 
 
 def test_ir_preserves_responses_images_and_reasoning_content():

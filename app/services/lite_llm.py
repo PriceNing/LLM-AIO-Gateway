@@ -132,6 +132,18 @@ def clean_params(params: dict[str, Any]) -> dict[str, Any]:
     return cleaned
 
 
+def _disable_thinking_when_tools_forced(kwargs: dict[str, Any]) -> None:
+    """DeepSeek rejects forced tool_choice while thinking mode is enabled."""
+    if not kwargs.get("tools"):
+        return
+    extra_body = kwargs.get("extra_body")
+    if not isinstance(extra_body, dict):
+        return
+    thinking = extra_body.get("thinking")
+    if isinstance(thinking, dict) and thinking.get("type") == "enabled":
+        extra_body["thinking"] = {"type": "disabled"}
+
+
 def create_chat_completion(
     model: str,
     messages: list,
@@ -140,6 +152,7 @@ def create_chat_completion(
 ) -> dict:
     litellm_model, extra_params = build_completion_args(model, provider_id)
     kwargs.update(extra_params)
+    _disable_thinking_when_tools_forced(kwargs)
     normalize_image_content(messages)
     if has_image_content(messages):
         kwargs["max_tokens"] = max(kwargs.get("max_tokens", 0), MIN_IMAGE_MAX_TOKENS)
@@ -155,6 +168,7 @@ def create_chat_completion_stream(
 ):
     litellm_model, extra_params = build_completion_args(model, provider_id)
     kwargs.update(extra_params)
+    _disable_thinking_when_tools_forced(kwargs)
     kwargs["stream"] = True
     if "stream_options" not in kwargs:
         kwargs["stream_options"] = {"include_usage": True}
