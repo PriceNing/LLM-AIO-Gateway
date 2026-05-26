@@ -15,6 +15,7 @@ data.db
 data.db-shm
 data.db-wal
 config.json
+tools/live-eval.config.json
 *.log
 data/
 
@@ -27,6 +28,7 @@ history/
 
 # Logs
 logs/
+reports/
 
 # IDE
 .idea/

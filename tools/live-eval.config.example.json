@@ -1,0 +1,13 @@
+{
+  "base_url": "http://192.168.75.100:8000",
+  "api_key": "sk-aio-replace-me",
+  "admin_username": "",
+  "admin_password": "",
+  "judge_model": "",
+  "models": [],
+  "limit": 0,
+  "timeout": 120,
+  "output_dir": "reports/live-eval",
+  "skip_multimodal": false,
+  "skip_stream": false
+}
