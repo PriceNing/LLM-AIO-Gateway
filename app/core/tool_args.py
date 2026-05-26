@@ -25,15 +25,3 @@ def fix_tool_args(tc_dict: dict) -> None:
     args = func.get("arguments", "")
     if args and "undefined" in args:
         func["arguments"] = sanitize_args(args)
-
-
-def tool_call_ids_from_message(msg: dict) -> list[str]:
-    ids = []
-    for tc in msg.get("tool_calls") or []:
-        if isinstance(tc, dict):
-            tc_id = tc.get("id")
-        else:
-            tc_id = getattr(tc, "id", None)
-        if tc_id:
-            ids.append(str(tc_id))
-    return ids

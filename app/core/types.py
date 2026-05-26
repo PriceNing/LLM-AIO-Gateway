@@ -19,23 +19,6 @@ class InternalTool:
 
 
 @dataclass(slots=True)
-class ModelRef:
-    requested: str = ""
-    target: str = ""
-    provider_id: str = ""
-
-
-@dataclass(slots=True)
-class GenerationOptions:
-    stream: bool = False
-    temperature: Any = None
-    max_tokens: int = 0
-    tool_choice: Any = None
-    previous_response_id: str = ""
-    extra: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass(slots=True)
 class InternalPart:
     kind: PartKind
     text: str = ""
@@ -129,21 +112,6 @@ class InternalRequest:
     extra: dict[str, Any] = field(default_factory=dict)
     raw_body: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
-
-    @property
-    def model_ref(self) -> ModelRef:
-        return ModelRef(self.requested_model or "", self.target_model or "", self.provider_id or "")
-
-    @property
-    def options(self) -> GenerationOptions:
-        return GenerationOptions(
-            stream=self.stream,
-            temperature=self.temperature,
-            max_tokens=self.max_tokens,
-            tool_choice=self.tool_choice,
-            previous_response_id=self.previous_response_id,
-            extra=dict(self.extra),
-        )
 
     def chat_tools(self) -> list[dict[str, Any]] | None:
         if not self.tools:

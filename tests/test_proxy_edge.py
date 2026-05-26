@@ -240,32 +240,26 @@ def test_auth_status():
 # -- ensure_model_allowed with composite IDs --
 
 def test_ensure_model_allowed_wildcard_passes():
-    """Test behavior."""
     ensure_model_allowed({}, {"allowed_models": ["*"]}, "any-model")
 
 
 def test_ensure_model_allowed_exact_simple():
-    """Test behavior."""
     ensure_model_allowed({}, {"allowed_models": ["gpt-4"]}, "gpt-4")
 
 
 def test_ensure_model_allowed_exact_composite():
-    """Test behavior."""
     ensure_model_allowed({}, {"allowed_models": ["opencode-go/deepseek-v4-flash"]}, "opencode-go/deepseek-v4-flash")
 
 
 def test_ensure_model_allowed_composite_extracts_simple():
-    """Test behavior."""
     ensure_model_allowed({}, {"allowed_models": ["deepseek-v4-flash"]}, "opencode-go/deepseek-v4-flash")
 
 
 def test_ensure_model_allowed_simple_in_composite_allowed():
-    """Test behavior."""
     ensure_model_allowed({}, {"allowed_models": ["opencode-go/deepseek-v4-flash"]}, "deepseek-v4-flash")
 
 
 def test_ensure_model_allowed_blocked():
-    """Test behavior."""
     from fastapi import HTTPException
     with pytest.raises(HTTPException) as exc:
         ensure_model_allowed({}, {"allowed_models": ["gpt-4"]}, "claude-3")
@@ -276,14 +270,12 @@ def test_ensure_model_allowed_blocked():
 
 @pytest.mark.asyncio
 async def test_anthropic_adapter_model_extraction():
-    """Test behavior."""
     from app.adapters.anthropic import anthropic_messages_completion
     from unittest.mock import patch, MagicMock
 
     provider = {"api_base": "https://api.deepseek.com/anthropic", "api_key": "sk-test"}
     body = {"system": "", "tools": []}
 
-    # Test section
     mock_resp = MagicMock()
     mock_resp.status_code = 200
     mock_resp.json.return_value = {
