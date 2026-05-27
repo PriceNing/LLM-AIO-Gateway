@@ -70,6 +70,9 @@
                 <button class="nav-btn" onclick="showSection('routing', event)" data-section="routing">
                     <span class="nav-icon">&#128257;</span><span data-i18n="nav.routing">路由规则</span>
                 </button>
+                <button class="nav-btn" onclick="showSection('fallbacks', event)" data-section="fallbacks">
+                    <span class="nav-icon">&#128737;</span><span data-i18n="nav.fallbacks">Fallback Policies</span>
+                </button>
                 <button class="nav-btn" onclick="showSection('preprocessors', event)" data-section="preprocessors">
                     <span class="nav-icon">&#127918;</span><span data-i18n="nav.preprocessors">视觉模型注入</span>
                 </button>
@@ -120,6 +123,15 @@
                         </div>
                     </div>
                     <div id="routingRulesList" class="routing-list"></div>
+                </div>
+
+                <!-- Fallback Policies -->
+                <div id="fallbacks-section" class="section" style="display:none;">
+                    <div class="section-header">
+                        <h2 data-i18n="fallbacks.title">Fallback Policies</h2>
+                        <button class="btn btn-primary" onclick="showAddFallbackPolicyModal()" data-i18n="fallbacks.add">Add Policy</button>
+                    </div>
+                    <div id="fallbackPoliciesList" class="routing-list"></div>
                 </div>
 
                 <!-- Stats -->

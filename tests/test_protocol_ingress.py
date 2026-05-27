@@ -381,7 +381,7 @@ async def test_prepare_request_policy_routes_normalizes_preprocesses_and_injects
     assert req.provider_id == "target-provider"
     projected = chat_messages_from_internal(req)
     assert projected[0] == {"role": "user", "content": "a\n\nb"}
-    assert projected[-1]["content"] == "request-target=target-model;requested=source-model"
+    assert projected[-1]["content"] == "request-target=source-model;requested=source-model"
     assert result.routing.matched is True
     assert result.routing.rule_id == 7
     assert result.routing.rule_name == "route-test"
@@ -416,7 +416,7 @@ async def test_prepare_request_policy_can_preprocess_request_and_update_internal
     )
 
     assert result.modified_by_preprocessor is True
-    assert req.messages[-1].parts[0].text == "request-target=target-model;requested=source-model"
+    assert req.messages[-1].parts[0].text == "request-target=source-model;requested=source-model"
 
 
 @pytest.mark.asyncio

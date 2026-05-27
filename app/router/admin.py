@@ -6,11 +6,12 @@ from app.database import (
     get_users, get_user, add_user, update_user, delete_user,
     add_user_api_key, update_user_api_key, delete_user_api_key,
     get_routing_rules, get_routing_rule, add_routing_rule, update_routing_rule, delete_routing_rule,
+    get_fallback_policies, get_fallback_policy, add_fallback_policy, update_fallback_policy, delete_fallback_policy,
     get_global_stats, reset_global_stats, reset_user_stats,
     get_history_stats,
     find_provider_by_model, parse_model_id,
 )
-from app.core.policy import apply_routing_rules
+from app.core.policy import apply_fallback_policy, apply_routing_rules
 from app.core.text import mask_key
 from app.router.auth import require_admin_session
 from app.services.discovery import refresh_provider_models, refresh_all_providers, check_provider_health, check_all_provider_health
@@ -244,6 +245,11 @@ async def dry_run_routing_rule(body: dict, authorization: Optional[str] = Header
     provider_source = "target_provider" if decision.target_provider else "model_lookup"
     provider = get_provider(decision.target_provider) if decision.target_provider else find_provider_by_model(decision.target_model)
     mid = parse_model_id(requested_model)
+    fallback_preview = apply_fallback_policy(
+        provider.get("id", "") if provider else decision.target_provider,
+        decision.target_model,
+        str(body.get("fallback_trigger") or "http_5xx"),
+    )
 
     return {
         "input": {
@@ -263,9 +269,16 @@ async def dry_run_routing_rule(body: dict, authorization: Optional[str] = Header
             "reason": decision.reason,
             "target_model": decision.target_model,
             "target_provider": decision.target_provider,
-            "fallbacks": [
+        },
+        "fallback_preview": {
+            "matched": fallback_preview.matched,
+            "policy_id": fallback_preview.policy_id,
+            "policy_name": fallback_preview.policy_name,
+            "trigger": fallback_preview.trigger,
+            "reason": fallback_preview.reason,
+            "chain": [
                 {"model": target.model, "provider_id": target.provider_id}
-                for target in decision.fallbacks
+                for target in fallback_preview.chain
             ],
         },
         "provider": {
@@ -280,6 +293,73 @@ async def dry_run_routing_rule(body: dict, authorization: Optional[str] = Header
             "model": decision.target_model,
             "provider_id": provider.get("id", "") if provider else decision.target_provider,
             "provider_type": provider.get("provider_type", "") if provider else "",
+        },
+    }
+
+
+# -- Fallback policies --
+
+@router.get("/fallback-policies")
+async def list_fallback_policies(authorization: Optional[str] = Header(None)):
+    await require_admin_session(authorization)
+    return {"policies": get_fallback_policies()}
+
+
+@router.post("/fallback-policies")
+async def create_fallback_policy(policy: dict, authorization: Optional[str] = Header(None)):
+    await require_admin_session(authorization)
+    try:
+        return add_fallback_policy(policy)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/fallback-policies/{policy_id}")
+async def get_fallback_policy_endpoint(policy_id: str, authorization: Optional[str] = Header(None)):
+    await require_admin_session(authorization)
+    policy = get_fallback_policy(policy_id)
+    if not policy:
+        raise HTTPException(status_code=404, detail="Fallback policy not found")
+    return policy
+
+
+@router.put("/fallback-policies/{policy_id}")
+async def update_fallback_policy_endpoint(policy_id: str, updates: dict, authorization: Optional[str] = Header(None)):
+    await require_admin_session(authorization)
+    policy = update_fallback_policy(policy_id, updates)
+    if not policy:
+        raise HTTPException(status_code=404, detail="Fallback policy not found")
+    return policy
+
+
+@router.delete("/fallback-policies/{policy_id}")
+async def delete_fallback_policy_endpoint(policy_id: str, authorization: Optional[str] = Header(None)):
+    await require_admin_session(authorization)
+    if not delete_fallback_policy(policy_id):
+        raise HTTPException(status_code=404, detail="Fallback policy not found")
+    return {"status": "deleted", "policy_id": policy_id}
+
+
+@router.post("/fallback-policies/dry-run")
+async def dry_run_fallback_policy(body: dict, authorization: Optional[str] = Header(None)):
+    await require_admin_session(authorization)
+    model = str(body.get("model") or "").strip()
+    if not model:
+        raise HTTPException(status_code=400, detail="model is required")
+    provider_id = str(body.get("provider_id") or body.get("provider") or "").strip()
+    trigger = str(body.get("trigger") or body.get("error_type") or "http_5xx").strip()
+    decision = apply_fallback_policy(provider_id, model, trigger)
+    return {
+        "input": {"provider_id": provider_id, "model": model, "trigger": trigger},
+        "fallback": {
+            "matched": decision.matched,
+            "policy_id": decision.policy_id,
+            "policy_name": decision.policy_name,
+            "reason": decision.reason,
+            "chain": [
+                {"model": target.model, "provider_id": target.provider_id}
+                for target in decision.chain
+            ],
         },
     }
 

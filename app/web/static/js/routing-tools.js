@@ -66,6 +66,7 @@ function routingDryRunResultHtml(result) {
     var routing = result.routing || {};
     var provider = result.provider || {};
     var effective = result.effective || {};
+    var fallback = result.fallback_preview || {};
     var matchedLabel = routing.matched ? t('routing.dryRunMatched') : t('routing.dryRunNoMatch');
     var providerLabel = provider.found
         ? escHtml(provider.id || '-') + (provider.provider_type ? ' (' + escHtml(provider.provider_type) + ')' : '')
@@ -80,5 +81,15 @@ function routingDryRunResultHtml(result) {
             '<div><span class="label">' + t('routing.dryRunProvider') + '</span><code>' + providerLabel + '</code></div>' +
             '<div><span class="label">' + t('routing.dryRunEffective') + '</span><code>' + escHtml((effective.provider_id ? effective.provider_id + '/' : '') + (effective.model || '-')) + '</code></div>' +
         '</div>' +
-        '<div class="dry-run-reason"><span class="label">' + t('routing.dryRunReason') + '</span> ' + escHtml(routing.reason || '-') + '</div>';
+        '<div class="dry-run-reason"><span class="label">' + t('routing.dryRunReason') + '</span> ' + escHtml(routing.reason || '-') + '</div>' +
+        '<div class="dry-run-reason"><span class="label">' + t('routing.dryRunFallback') + '</span> ' + routingDryRunFallbackHtml(fallback) + '</div>';
+}
+
+function routingDryRunFallbackHtml(fallback) {
+    if (!fallback || !fallback.matched) return '<code>-</code>';
+    var chain = fallback.chain || [];
+    var text = chain.map(function(target) {
+        return (target.provider_id ? target.provider_id + '/' : '') + (target.model || '');
+    }).join(' -> ');
+    return '<code>' + escHtml(fallback.policy_name || fallback.policy_id || '-') + '</code> <span>' + escHtml(text || '-') + '</span>';
 }

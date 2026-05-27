@@ -33,6 +33,7 @@ zh: {
     'nav.providers': '提供商',
     'nav.models': '模型管理',
     'nav.routing': '路由规则',
+    'nav.fallbacks': 'Fallback 策略',
     'nav.stats': '统计',
     'nav.preprocessors': '视觉模型注入',
     'nav.logout': '退出',
@@ -136,7 +137,6 @@ zh: {
     'routing.matchModelHint': '支持 * 通配符，如 deepseek-*',
     'routing.targetModel': '目标模型',
     'routing.targetProvider': '目标提供商（空=自动）',
-    'routing.fallbackModels': 'Fallback 模型链（JSON，可选）',
     'routing.save': '保存',
     'routing.cancel': '取消',
     'routing.loadFail': '加载路由规则失败',
@@ -161,6 +161,36 @@ zh: {
     'routing.dryRunProvider': '目标提供商',
     'routing.dryRunEffective': '最终路由',
     'routing.dryRunReason': '原因',
+    'routing.dryRunFallback': 'Fallback 预览',
+
+    'fallbacks.title': 'Fallback 策略',
+    'fallbacks.add': '新增策略',
+    'fallbacks.empty': '暂无 Fallback 策略',
+    'fallbacks.addTitle': '新增 Fallback 策略',
+    'fallbacks.editTitle': '编辑 Fallback 策略',
+    'fallbacks.name': '策略名称',
+    'fallbacks.matchProvider': '匹配提供商',
+    'fallbacks.matchModel': '匹配模型',
+    'fallbacks.triggers': '触发条件',
+    'fallbacks.chain': 'Fallback 链',
+    'fallbacks.addTarget': '添加目标',
+    'fallbacks.timeout': '超时',
+    'fallbacks.connectionError': '连接错误',
+    'fallbacks.http429': 'HTTP 429',
+    'fallbacks.http5xx': 'HTTP 5xx',
+    'fallbacks.http4xx': 'HTTP 4xx',
+    'fallbacks.loadFail': '加载 Fallback 策略失败',
+    'fallbacks.addFail': '新增 Fallback 策略失败',
+    'fallbacks.updateFail': '更新 Fallback 策略失败',
+    'fallbacks.deleteFail': '删除 Fallback 策略失败',
+    'fallbacks.deleteConfirm': '确定要删除这条 Fallback 策略吗？',
+    'fallbacks.save': '保存',
+    'fallbacks.cancel': '取消',
+    'fallbacks.enabled': '启用',
+    'fallbacks.disabled': '禁用',
+    'fallbacks.noMatchModel': '请填写匹配模型',
+    'fallbacks.delete': '删除',
+    'fallbacks.edit': '编辑',
 
     'stats.title': '调用统计',
     'stats.loadFail': '加载统计失败',
@@ -282,6 +312,7 @@ en: {
     'nav.providers': 'Providers',
     'nav.models': 'Models',
     'nav.routing': 'Routing',
+    'nav.fallbacks': 'Fallback Policies',
     'nav.stats': 'Stats',
     'nav.preprocessors': 'Vision Model Injection',
     'nav.logout': 'Logout',
@@ -385,7 +416,6 @@ en: {
     'routing.matchModelHint': 'Supports * wildcard, e.g. deepseek-*',
     'routing.targetModel': 'Target Model',
     'routing.targetProvider': 'Target Provider (empty=auto)',
-    'routing.fallbackModels': 'Fallback Model Chain (JSON, optional)',
     'routing.save': 'Save',
     'routing.cancel': 'Cancel',
     'routing.loadFail': 'Failed to load routing rules',
@@ -410,6 +440,36 @@ en: {
     'routing.dryRunProvider': 'Target Provider',
     'routing.dryRunEffective': 'Effective Route',
     'routing.dryRunReason': 'Reason',
+    'routing.dryRunFallback': 'Fallback Preview',
+
+    'fallbacks.title': 'Fallback Policies',
+    'fallbacks.add': 'Add Policy',
+    'fallbacks.empty': 'No fallback policies configured',
+    'fallbacks.addTitle': 'Add Fallback Policy',
+    'fallbacks.editTitle': 'Edit Fallback Policy',
+    'fallbacks.name': 'Policy Name',
+    'fallbacks.matchProvider': 'Match Provider',
+    'fallbacks.matchModel': 'Match Model',
+    'fallbacks.triggers': 'Triggers',
+    'fallbacks.chain': 'Fallback Chain',
+    'fallbacks.addTarget': 'Add Target',
+    'fallbacks.timeout': 'Timeout',
+    'fallbacks.connectionError': 'Connection Error',
+    'fallbacks.http429': 'HTTP 429',
+    'fallbacks.http5xx': 'HTTP 5xx',
+    'fallbacks.http4xx': 'HTTP 4xx',
+    'fallbacks.loadFail': 'Failed to load fallback policies',
+    'fallbacks.addFail': 'Failed to add fallback policy',
+    'fallbacks.updateFail': 'Failed to update fallback policy',
+    'fallbacks.deleteFail': 'Failed to delete fallback policy',
+    'fallbacks.deleteConfirm': 'Delete this fallback policy?',
+    'fallbacks.save': 'Save',
+    'fallbacks.cancel': 'Cancel',
+    'fallbacks.enabled': 'Enabled',
+    'fallbacks.disabled': 'Disabled',
+    'fallbacks.noMatchModel': 'Match model is required',
+    'fallbacks.delete': 'Delete',
+    'fallbacks.edit': 'Edit',
 
     'stats.title': 'Statistics',
     'stats.loadFail': 'Failed to load stats',
@@ -746,6 +806,7 @@ function showSection(section, evt) {
     if (section === 'providers') loadProviders();
     if (section === 'models') loadModels();
     if (section === 'routing') { loadRoutingRules(); loadUsers(); loadModels(); loadProviders(); }
+    if (section === 'fallbacks') { loadFallbackPolicies(); loadModels(); loadProviders(); }
     if (section === 'stats') loadStats();
     if (section === 'preprocessors') loadPreprocessors();
 }
@@ -1055,23 +1116,12 @@ function routingFormHtml(title, rule) {
             modelSelectHtml('ruleTargetModel', rule.target_model || '', false) + '</div>' +
         '<div class="form-group"><label>' + t('routing.targetProvider') + '</label>' +
             providerSelectHtml('ruleTargetProvider', rule.target_provider || '') + '</div>' +
-        '<div class="form-group"><label>' + t('routing.fallbackModels') + '</label>' +
-            '<textarea id="ruleFallbackModels" rows="4" style="font-family:monospace;font-size:12px" placeholder=\'[{"model":"backup-model","provider_id":"backup-provider"}]\'>' + escHtml(JSON.stringify(rule.fallback_models || [], null, 2)) + '</textarea></div>' +
         '<div class="form-actions">' +
             '<button class="btn btn-secondary" onclick="closeModal()">' + t('routing.cancel') + '</button>' +
             '<button class="btn btn-primary" id="ruleSaveBtn">' + t('routing.save') + '</button></div>';
 }
 
 function readRoutingForm() {
-    var fallbackModels = [];
-    var fallbackText = document.getElementById('ruleFallbackModels').value.trim();
-    if (fallbackText) {
-        try {
-            fallbackModels = JSON.parse(fallbackText);
-        } catch (e) {
-            toast('fallback_models JSON invalid: ' + e.message, 'error');
-        }
-    }
     return {
         name: document.getElementById('ruleName').value.trim(),
         enabled: document.getElementById('ruleEnabled').checked,
@@ -1079,8 +1129,7 @@ function readRoutingForm() {
         api_key_pattern: document.getElementById('ruleKeyPattern').value.trim(),
         match_model: document.getElementById('ruleMatchModel').value.trim(),
         target_model: document.getElementById('ruleTargetModel').value.trim(),
-        target_provider: document.getElementById('ruleTargetProvider').value.trim(),
-        fallback_models: fallbackModels
+        target_provider: document.getElementById('ruleTargetProvider').value.trim()
     };
 }
 
@@ -1139,6 +1188,197 @@ async function deleteRoutingRule(ruleId) {
         await api('/admin/routing-rules/' + encodeURIComponent(ruleId), { method: 'DELETE' });
         loadRoutingRules();
     } catch (e) { toast(t('routing.deleteFail') + ': ' + e.message, 'error'); }
+}
+
+var fallbackPolicies = [];
+
+async function loadFallbackPolicies() {
+    try {
+        var data = await api('/admin/fallback-policies');
+        fallbackPolicies = data.policies || [];
+        renderFallbackPolicies();
+    } catch (e) {
+        toast(t('fallbacks.loadFail') + ': ' + e.message, 'error');
+    }
+}
+
+function renderFallbackPolicies() {
+    var container = document.getElementById('fallbackPoliciesList');
+    if (!container) return;
+    if (!fallbackPolicies.length) {
+        container.innerHTML = '<div class="empty-state"><div class="empty-icon">&#128737;</div><p>' + t('fallbacks.empty') + '</p></div>';
+        return;
+    }
+    container.innerHTML = fallbackPolicies.map(function(policy) {
+        var triggers = policy.triggers || {};
+        var enabledTriggers = Object.keys(triggers).filter(function(key) { return triggers[key]; });
+        var chain = policy.chain || [];
+        return '<div class="routing-card glass">' +
+            '<div class="card-top">' +
+                '<div>' +
+                    '<div class="card-title">' + escHtml(policy.name || policy.id || '') + '</div>' +
+                    '<div class="card-meta" style="margin-top:4px;">' +
+                        '<span class="status-dot ' + (policy.enabled ? 'on' : 'off') + '"></span>' +
+                        '<span>' + (policy.enabled ? t('fallbacks.enabled') : t('fallbacks.disabled')) + '</span>' +
+                        '<span>' + escHtml(enabledTriggers.join(', ') || '-') + '</span>' +
+                    '</div>' +
+                '</div>' +
+                '<div class="card-actions">' +
+                    '<button class="btn btn-secondary btn-sm" onclick="showEditFallbackPolicyModal(\'' + jsEsc(policy.id) + '\')">' + t('fallbacks.edit') + '</button>' +
+                    '<button class="btn btn-danger btn-sm" onclick="deleteFallbackPolicy(\'' + jsEsc(policy.id) + '\')">' + t('fallbacks.delete') + '</button>' +
+                '</div>' +
+            '</div>' +
+            '<div class="routing-rule-detail">' +
+                '<div class="routing-arrow">' +
+                    '<div class="routing-from"><span class="label">' + t('fallbacks.matchModel') + ':</span><code>' + escHtml(policy.match_model || '*') + '</code>' +
+                    (policy.match_provider ? ' @ <code>' + escHtml(policy.match_provider) + '</code>' : '') + '</div>' +
+                    '<span class="arrow">&#8594;</span>' +
+                    '<div class="routing-to"><span class="label">' + t('fallbacks.chain') + ':</span> ' + fallbackChainText(chain) + '</div>' +
+                '</div>' +
+            '</div>' +
+        '</div>';
+    }).join('');
+}
+
+function fallbackChainText(chain) {
+    if (!chain || !chain.length) return '<code>-</code>';
+    return chain.map(function(target) {
+        if (typeof target === 'string') return '<code>' + escHtml(target) + '</code>';
+        return '<code>' + escHtml((target.provider_id ? target.provider_id + '/' : '') + (target.model || '')) + '</code>';
+    }).join(' <span class="arrow">&#8594;</span> ');
+}
+
+function fallbackPolicyFormHtml(title, policy) {
+    policy = policy || {};
+    var triggers = Object.assign({ timeout: true, connection_error: true, http_429: true, http_5xx: true, http_4xx: false }, policy.triggers || {});
+    var chain = policy.chain && policy.chain.length ? policy.chain : [{ model: '', provider_id: '' }];
+    return '<h2>' + title + '</h2>' +
+        '<div class="form-group"><label>' + t('fallbacks.name') + '</label>' +
+            '<input type="text" id="fallbackName" value="' + escHtml(policy.name || '') + '"></div>' +
+        '<div class="form-group"><label><input type="checkbox" id="fallbackEnabled"' + (policy.enabled === false ? '' : ' checked') + '> ' + t('fallbacks.enabled') + '</label></div>' +
+        '<div class="form-group"><label>' + t('fallbacks.matchProvider') + '</label>' +
+            providerSelectHtml('fallbackMatchProvider', policy.match_provider || '') + '</div>' +
+        '<div class="form-group"><label>' + t('fallbacks.matchModel') + '</label>' +
+            '<input type="text" id="fallbackMatchModel" list="fallbackModelList" value="' + escHtml(policy.match_model || '*') + '" placeholder="*">' +
+            '<datalist id="fallbackModelList"></datalist></div>' +
+        '<div class="form-group"><label>' + t('fallbacks.triggers') + '</label>' +
+            '<div class="checkbox-grid">' +
+                fallbackTriggerCheckbox('timeout', t('fallbacks.timeout'), triggers.timeout) +
+                fallbackTriggerCheckbox('connection_error', t('fallbacks.connectionError'), triggers.connection_error) +
+                fallbackTriggerCheckbox('http_429', t('fallbacks.http429'), triggers.http_429) +
+                fallbackTriggerCheckbox('http_5xx', t('fallbacks.http5xx'), triggers.http_5xx) +
+                fallbackTriggerCheckbox('http_4xx', t('fallbacks.http4xx'), triggers.http_4xx) +
+            '</div></div>' +
+        '<div class="form-group"><label>' + t('fallbacks.chain') + '</label>' +
+            '<div id="fallbackChainRows">' + chain.map(function(target, index) { return fallbackChainRowHtml(target, index); }).join('') + '</div>' +
+            '<button class="btn btn-secondary btn-sm" type="button" onclick="addFallbackTargetRow()">' + t('fallbacks.addTarget') + '</button></div>' +
+        '<div class="form-actions">' +
+            '<button class="btn btn-secondary" onclick="closeModal()">' + t('fallbacks.cancel') + '</button>' +
+            '<button class="btn btn-primary" id="fallbackSaveBtn">' + t('fallbacks.save') + '</button></div>';
+}
+
+function fallbackTriggerCheckbox(id, label, checked) {
+    return '<label><input type="checkbox" class="fallback-trigger" value="' + id + '"' + (checked ? ' checked' : '') + '> ' + label + '</label>';
+}
+
+function fallbackChainRowHtml(target, index) {
+    target = target || {};
+    if (typeof target === 'string') target = { model: target, provider_id: '' };
+    return '<div class="fallback-chain-row" data-index="' + index + '">' +
+        providerSelectHtml('fallbackProvider' + index, target.provider_id || target.target_provider || '') +
+        modelSelectHtml('fallbackModel' + index, target.model || target.target_model || '', false) +
+        '<button class="btn btn-secondary btn-sm" type="button" onclick="moveFallbackTargetRow(this, -1)">&#8593;</button>' +
+        '<button class="btn btn-secondary btn-sm" type="button" onclick="moveFallbackTargetRow(this, 1)">&#8595;</button>' +
+        '<button class="btn btn-danger btn-sm" type="button" onclick="removeFallbackTargetRow(this)">' + t('common.delete') + '</button>' +
+    '</div>';
+}
+
+function populateFallbackModelDatalist() {
+    var dl = document.getElementById('fallbackModelList');
+    if (!dl) return;
+    var models = (allModels || []).map(function(m) { return m.id; });
+    dl.innerHTML = '<option value="*">' + models.map(function(id) { return '<option value="' + escHtml(id) + '">'; }).join('');
+}
+
+function addFallbackTargetRow() {
+    var rows = document.getElementById('fallbackChainRows');
+    var index = rows.querySelectorAll('.fallback-chain-row').length;
+    rows.insertAdjacentHTML('beforeend', fallbackChainRowHtml({}, index));
+}
+
+function removeFallbackTargetRow(btn) {
+    var rows = document.getElementById('fallbackChainRows');
+    if (rows.querySelectorAll('.fallback-chain-row').length <= 1) return;
+    btn.closest('.fallback-chain-row').remove();
+}
+
+function moveFallbackTargetRow(btn, direction) {
+    var row = btn.closest('.fallback-chain-row');
+    if (direction < 0 && row.previousElementSibling) row.parentNode.insertBefore(row, row.previousElementSibling);
+    if (direction > 0 && row.nextElementSibling) row.parentNode.insertBefore(row.nextElementSibling, row);
+}
+
+function readFallbackPolicyForm() {
+    var triggers = {};
+    document.querySelectorAll('.fallback-trigger').forEach(function(input) { triggers[input.value] = input.checked; });
+    var chain = [];
+    document.querySelectorAll('.fallback-chain-row').forEach(function(row) {
+        var provider = row.querySelector('select[id^="fallbackProvider"]').value.trim();
+        var model = row.querySelector('select[id^="fallbackModel"]').value.trim();
+        if (model) chain.push({ provider_id: provider, model: model });
+    });
+    return {
+        name: document.getElementById('fallbackName').value.trim() || 'New Fallback Policy',
+        enabled: document.getElementById('fallbackEnabled').checked,
+        match_provider: document.getElementById('fallbackMatchProvider').value.trim(),
+        match_model: document.getElementById('fallbackMatchModel').value.trim() || '*',
+        triggers: triggers,
+        chain: chain
+    };
+}
+
+function showAddFallbackPolicyModal() {
+    document.getElementById('modalContent').innerHTML = fallbackPolicyFormHtml(t('fallbacks.addTitle'), {});
+    populateFallbackModelDatalist();
+    document.getElementById('fallbackSaveBtn').onclick = addFallbackPolicy;
+    document.getElementById('modal').style.display = 'flex';
+}
+
+function showEditFallbackPolicyModal(policyId) {
+    var policy = fallbackPolicies.find(function(p) { return p.id === policyId; });
+    if (!policy) return;
+    document.getElementById('modalContent').innerHTML = fallbackPolicyFormHtml(t('fallbacks.editTitle'), policy);
+    populateFallbackModelDatalist();
+    document.getElementById('fallbackSaveBtn').onclick = function() { updateFallbackPolicy(policyId); };
+    document.getElementById('modal').style.display = 'flex';
+}
+
+async function addFallbackPolicy() {
+    var form = readFallbackPolicyForm();
+    if (!form.match_model) { toast(t('fallbacks.noMatchModel'), 'error'); return; }
+    try {
+        await api('/admin/fallback-policies', { method: 'POST', body: JSON.stringify(form) });
+        closeModal();
+        loadFallbackPolicies();
+    } catch (e) { toast(t('fallbacks.addFail') + ': ' + e.message, 'error'); }
+}
+
+async function updateFallbackPolicy(policyId) {
+    var form = readFallbackPolicyForm();
+    if (!form.match_model) { toast(t('fallbacks.noMatchModel'), 'error'); return; }
+    try {
+        await api('/admin/fallback-policies/' + encodeURIComponent(policyId), { method: 'PUT', body: JSON.stringify(form) });
+        closeModal();
+        loadFallbackPolicies();
+    } catch (e) { toast(t('fallbacks.updateFail') + ': ' + e.message, 'error'); }
+}
+
+async function deleteFallbackPolicy(policyId) {
+    if (!confirm(t('fallbacks.deleteConfirm'))) return;
+    try {
+        await api('/admin/fallback-policies/' + encodeURIComponent(policyId), { method: 'DELETE' });
+        loadFallbackPolicies();
+    } catch (e) { toast(t('fallbacks.deleteFail') + ': ' + e.message, 'error'); }
 }
 
 /* ═══════════════════════════════ Providers ═══════════════════════════════ */

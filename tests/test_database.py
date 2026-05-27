@@ -9,6 +9,7 @@ from app.database import (
     find_provider_by_model, parse_model_id,
     add_provider, get_provider, get_providers, update_provider, delete_provider,
     add_routing_rule, get_routing_rules, update_routing_rule, delete_routing_rule,
+    add_fallback_policy, get_fallback_policies, update_fallback_policy, delete_fallback_policy,
 )
 
 
@@ -206,14 +207,12 @@ def test_add_and_list_routing_rules():
         "username": "", "api_key_pattern": "",
         "match_model": "test-*", "target_model": "target-model",
         "target_provider": "",
-        "fallback_models": [{"model": "fallback-model", "provider_id": "fallback-provider"}],
     })
     assert rule["name"] == "Test Rule"
-    assert rule["fallback_models"] == [{"model": "fallback-model", "provider_id": "fallback-provider"}]
+    assert "fallback_models" not in rule
     rules = get_routing_rules()
     assert len(rules) == 1
     assert rules[0]["match_model"] == "test-*"
-    assert rules[0]["fallback_models"][0]["model"] == "fallback-model"
 
 
 def test_update_routing_rule():
@@ -225,7 +224,34 @@ def test_update_routing_rule():
     updated = update_routing_rule(rule["id"], {"name": "New Rule", "enabled": False, "fallback_models": ["t2"]})
     assert updated["name"] == "New Rule"
     assert updated["enabled"] is False
-    assert updated["fallback_models"] == ["t2"]
+    assert "fallback_models" not in updated
+
+
+def test_add_update_delete_fallback_policy():
+    policy = add_fallback_policy({
+        "name": "Pixel fallback",
+        "match_provider": "PixelAPI",
+        "match_model": "gpt-5.5",
+        "triggers": {"http_5xx": True, "http_4xx": False},
+        "chain": [{"model": "gpt-5.5", "provider_id": "NewAPI"}],
+    })
+    assert policy["name"] == "Pixel fallback"
+    assert policy["enabled"] is True
+    assert policy["triggers"]["http_5xx"] is True
+    assert policy["triggers"]["http_4xx"] is False
+    assert policy["chain"][0]["provider_id"] == "NewAPI"
+
+    policies = get_fallback_policies()
+    assert len(policies) == 1
+
+    updated = update_fallback_policy(policy["id"], {
+        "enabled": False,
+        "chain": [{"model": "deepseek-v4-flash", "provider_id": "deepseek"}],
+    })
+    assert updated["enabled"] is False
+    assert updated["chain"][0]["model"] == "deepseek-v4-flash"
+    assert delete_fallback_policy(policy["id"]) is True
+    assert delete_fallback_policy(policy["id"]) is False
 
 
 def test_delete_routing_rule():

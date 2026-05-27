@@ -333,6 +333,44 @@ def test_routing_dry_run_requires_model(temp_db):
     assert response.status_code == 400
 
 
+def test_fallback_policy_crud_and_dry_run(temp_db):
+    created = client.post("/admin/fallback-policies", json={
+        "name": "Primary fallback",
+        "enabled": True,
+        "match_provider": "primary-provider",
+        "match_model": "primary-*",
+        "triggers": {"http_5xx": True, "http_4xx": False},
+        "chain": [{"provider_id": "backup-provider", "model": "backup-model"}],
+    }, headers=temp_db["headers"])
+    assert created.status_code == 200
+    policy_id = created.json()["id"]
+
+    dry = client.post("/admin/fallback-policies/dry-run", json={
+        "provider_id": "primary-provider",
+        "model": "primary-model",
+        "trigger": "http_5xx",
+    }, headers=temp_db["headers"])
+    assert dry.status_code == 200
+    assert dry.json()["fallback"]["matched"] is True
+    assert dry.json()["fallback"]["policy_id"] == policy_id
+    assert dry.json()["fallback"]["chain"][0] == {"model": "backup-model", "provider_id": "backup-provider"}
+
+    blocked = client.post("/admin/fallback-policies/dry-run", json={
+        "provider_id": "primary-provider",
+        "model": "primary-model",
+        "trigger": "http_4xx",
+    }, headers=temp_db["headers"])
+    assert blocked.status_code == 200
+    assert blocked.json()["fallback"]["matched"] is False
+
+    updated = client.put(f"/admin/fallback-policies/{policy_id}", json={"enabled": False}, headers=temp_db["headers"])
+    assert updated.status_code == 200
+    assert updated.json()["enabled"] is False
+
+    deleted = client.delete(f"/admin/fallback-policies/{policy_id}", headers=temp_db["headers"])
+    assert deleted.status_code == 200
+
+
 # -- Stats reset --
 
 def test_reset_stats(temp_db):

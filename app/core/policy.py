@@ -3,7 +3,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable
 
-from app.database import get_routing_rules, parse_model_id
+from app.database import get_fallback_policies, get_routing_rules, parse_model_id
 from app.core.types import InternalMessage, InternalRequest, reasoning_part
 from app.core.text import mask_key, strip_billing_header
 from app.core.tool_args import sanitize_args
@@ -190,7 +190,6 @@ class RoutingDecision:
     requested_model: str
     resolved_model: str
     target: RouteTarget
-    fallbacks: list[RouteTarget] = field(default_factory=list)
     matched: bool = False
     rule_id: int | None = None
     rule_name: str = ""
@@ -205,8 +204,16 @@ class RoutingDecision:
     def target_provider(self) -> str:
         return self.target.provider_id
 
-    def candidate_targets(self) -> list[RouteTarget]:
-        return [self.target, *self.fallbacks]
+
+@dataclass(slots=True)
+class FallbackDecision:
+    target: RouteTarget
+    trigger: str = ""
+    matched: bool = False
+    policy_id: str = ""
+    policy_name: str = ""
+    reason: str = "no fallback policy matched"
+    chain: list[RouteTarget] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -227,9 +234,9 @@ def wildcard_match(pattern: str, value: str) -> bool:
     return bool(re.fullmatch(regex, value, re.IGNORECASE))
 
 
-def _fallback_targets(raw_fallbacks) -> list[RouteTarget]:
+def _route_targets(raw_targets) -> list[RouteTarget]:
     targets = []
-    for item in raw_fallbacks or []:
+    for item in raw_targets or []:
         if isinstance(item, str):
             model = item.strip()
             provider_id = ""
@@ -241,6 +248,75 @@ def _fallback_targets(raw_fallbacks) -> list[RouteTarget]:
         if model:
             targets.append(RouteTarget(model=model, provider_id=provider_id))
     return targets
+
+
+def fallback_trigger_enabled(triggers: dict, trigger: str) -> bool:
+    return bool((triggers or {}).get(trigger))
+
+
+def _target_label(provider_id: str, model: str) -> str:
+    mid = parse_model_id(model)
+    if provider_id and mid.is_composite and mid.provider_id == provider_id:
+        return model
+    if provider_id:
+        return f"{provider_id}/{model}"
+    return model
+
+
+def apply_fallback_policy(provider_id: str, model: str, trigger: str = "") -> FallbackDecision:
+    target = RouteTarget(model=model, provider_id=provider_id)
+    for policy in get_fallback_policies():
+        if not policy.get("enabled", True):
+            continue
+        match_provider = policy.get("match_provider", "")
+        if match_provider and match_provider != provider_id:
+            continue
+        match_model = policy.get("match_model", "*") or "*"
+        mid = parse_model_id(model)
+        if not (
+            wildcard_match(match_model, model)
+            or (mid.is_composite and wildcard_match(match_model, mid.model_name))
+        ):
+            continue
+        if trigger and not fallback_trigger_enabled(policy.get("triggers", {}), trigger):
+            _app_log.info(
+                "[fallback] policy_skipped policy_id=%s policy='%s' target=%s provider=%s trigger=%s reason=trigger_disabled",
+                policy.get("id"),
+                policy.get("name", ""),
+                model,
+                provider_id or "-",
+                trigger,
+            )
+            continue
+        chain = _route_targets(policy.get("chain"))
+        decision = FallbackDecision(
+            target=target,
+            trigger=trigger,
+            matched=bool(chain),
+            policy_id=policy.get("id", ""),
+            policy_name=policy.get("name", ""),
+            reason=f"matched fallback policy '{policy.get('name', '') or policy.get('id', '')}' for target '{_target_label(provider_id, model)}'",
+            chain=chain,
+        )
+        _app_log.info(
+            "[fallback] matched=%s policy_id=%s policy='%s' target=%s provider=%s trigger=%s chain=%d reason=%s",
+            decision.matched,
+            decision.policy_id,
+            decision.policy_name,
+            model,
+            provider_id or "-",
+            trigger or "-",
+            len(chain),
+            decision.reason,
+        )
+        return decision
+    _app_log.debug(
+        "[fallback] matched=False target=%s provider=%s trigger=%s reason=no policy matched",
+        model,
+        provider_id or "-",
+        trigger or "-",
+    )
+    return FallbackDecision(target=target, trigger=trigger)
 
 
 def apply_routing_rules(username: str, api_key_value: str, requested_model: str, resolved_model: str) -> RoutingDecision:
@@ -270,7 +346,6 @@ def apply_routing_rules(username: str, api_key_value: str, requested_model: str,
             requested_model=requested_model,
             resolved_model=resolved_model,
             target=RouteTarget(model=target_model, provider_id=target_provider),
-            fallbacks=_fallback_targets(rule.get("fallback_models")),
             matched=True,
             rule_id=rule.get("id"),
             rule_name=rule.get("name", ""),
@@ -313,30 +388,6 @@ async def prepare_request_policy(
 ) -> RequestPolicyResult:
     """Apply request-side policy while keeping endpoint-specific output unchanged."""
     requested_model = request.requested_model
-    routing = apply_routing_rules(
-        username, api_key_value, requested_model, request.target_model
-    )
-    route_model = routing.target_model
-    route_provider = routing.target_provider
-    if route_model != request.target_model:
-        _app_log.debug("[%s] ROUTED model=%s -> %s", log_label, request.target_model, route_model)
-        request.target_model = route_model
-    if route_provider:
-        request.provider_id = route_provider
-    _app_log.debug(
-        "[%s ROUTE] matched=%s source=%s rule_id=%s rule='%s' requested=%s resolved=%s target=%s provider=%s reason=%s",
-        log_label,
-        routing.matched,
-        routing.source,
-        routing.rule_id,
-        routing.rule_name,
-        routing.requested_model,
-        routing.resolved_model,
-        routing.target_model,
-        routing.target_provider or "-",
-        routing.reason,
-    )
-
     if normalize:
         pre_norm = len(request.messages)
         normalize_messages(request)
@@ -352,9 +403,40 @@ async def prepare_request_policy(
 
     modified = await preprocess_request(
         request,
-        request.target_model,
-        request.provider_id,
         requested_model,
+        parse_model_id(requested_model).provider_id,
+        requested_model,
+    )
+    _app_log.info(
+        "[%s preprocess.result] requested=%s modified=%s messages=%d",
+        log_label,
+        requested_model,
+        modified,
+        len(request.messages),
+    )
+
+    routing = apply_routing_rules(
+        username, api_key_value, requested_model, request.target_model
+    )
+    route_model = routing.target_model
+    route_provider = routing.target_provider
+    if route_model != request.target_model:
+        _app_log.debug("[%s] ROUTED model=%s -> %s", log_label, request.target_model, route_model)
+        request.target_model = route_model
+    if route_provider:
+        request.provider_id = route_provider
+    _app_log.info(
+        "[%s ROUTE] matched=%s source=%s rule_id=%s rule='%s' requested=%s resolved=%s target=%s provider=%s reason=%s",
+        log_label,
+        routing.matched,
+        routing.source,
+        routing.rule_id,
+        routing.rule_name,
+        routing.requested_model,
+        routing.resolved_model,
+        routing.target_model,
+        routing.target_provider or "-",
+        routing.reason,
     )
     injected = 0
     if reasoning_context is not None:

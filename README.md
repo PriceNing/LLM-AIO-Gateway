@@ -167,14 +167,15 @@ curl http://localhost:8000/v1/responses \
   "api_key_pattern": "",
   "match_model": "MiniMax-M2*",
   "target_model": "target-model",
-  "target_provider": "target-provider",
-  "fallback_models": [
-    {"model": "backup-model", "provider_id": "backup-provider"}
-  ]
+  "target_provider": "target-provider"
 }
 ```
 
-管理接口提供 `POST /admin/routing-rules/dry-run` 用于检查某个用户、API Key 片段和请求模型会命中哪条规则。提供商页面也提供健康检查入口，对 `/models` 可用性、延迟和模型数量做快速探测。非流式请求在主目标发生上游错误时会按 `fallback_models` 顺序尝试备用目标。
+Routing rules only describe active routing. Passive fallback is configured separately in `fallback_policies`: match the routed provider/model plus a failure trigger such as `timeout`, `connection_error`, `http_429`, or `http_5xx`, then try the configured fallback chain. The admin UI provides a dedicated fallback policy editor, so users do not need to write JSON in a routing rule.
+
+The request pipeline is: ingress -> vision preprocessing based on the requested model -> active routing -> primary upstream call -> passive fallback on classified failure -> egress. Logs are emitted at each key stage (`preprocess.*`, `routing`, `upstream.primary.*`, `fallback.*`) so route and fallback decisions can be inspected after the fact.
+
+管理接口提供 `POST /admin/routing-rules/dry-run` 用于检查某个用户、API Key 片段和请求模型会命中哪条主动路由规则。Fallback 已拆成独立策略，可通过 `POST /admin/fallback-policies/dry-run` 按 provider、model 和失败类型检查会使用哪条 fallback 链。提供商页面也提供健康检查入口，对 `/models` 可用性、延迟和模型数量做快速探测。
 
 ## 配置
 

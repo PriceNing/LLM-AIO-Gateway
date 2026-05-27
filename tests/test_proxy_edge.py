@@ -248,25 +248,38 @@ def test_routing_rules_can_set_provider_only(temp_db):
     assert decision.target_provider == "target-provider"
 
 
-def test_routing_rules_include_fallback_chain(temp_db):
-    from app.database import add_routing_rule
-    add_routing_rule({
+def test_fallback_policy_matches_current_target(temp_db):
+    from app.core.policy import apply_fallback_policy
+    from app.database import add_fallback_policy
+    add_fallback_policy({
         "name": "fallback-chain", "enabled": True,
-        "username": "", "api_key_pattern": "",
-        "match_model": "old-model", "target_model": "primary-model", "target_provider": "primary-provider",
-        "fallback_models": [
+        "match_provider": "primary-provider", "match_model": "primary-model",
+        "chain": [
             {"model": "fallback-a", "provider_id": "provider-a"},
             "fallback-b",
         ],
+    })
+    decision = apply_fallback_policy("primary-provider", "primary-model", "http_5xx")
+
+    assert decision.matched is True
+    assert decision.policy_name == "fallback-chain"
+    assert decision.chain[0].model == "fallback-a"
+    assert decision.chain[0].provider_id == "provider-a"
+    assert decision.chain[1].model == "fallback-b"
+
+
+def test_routing_rules_do_not_carry_fallback_chain(temp_db):
+    from app.database import add_routing_rule
+    add_routing_rule({
+        "name": "route-only", "enabled": True,
+        "username": "", "api_key_pattern": "",
+        "match_model": "old-model", "target_model": "primary-model", "target_provider": "primary-provider",
     })
     decision = _apply_routing_rules("alice", "user-key", "old-model", "old-model")
 
     assert decision.matched is True
     assert decision.target_model == "primary-model"
-    assert decision.fallbacks[0].model == "fallback-a"
-    assert decision.fallbacks[0].provider_id == "provider-a"
-    assert decision.fallbacks[1].model == "fallback-b"
-    assert [target.model for target in decision.candidate_targets()] == ["primary-model", "fallback-a", "fallback-b"]
+    assert not hasattr(decision, "fallbacks")
 
 
 # -- TTLDict --
@@ -811,7 +824,7 @@ def test_completions_openai_provider_uses_ir_chat_adapter(monkeypatch, temp_db):
 
 
 def test_chat_completions_nonstream_uses_fallback_on_upstream_error(monkeypatch, temp_db):
-    from app.database import add_routing_rule
+    from app.database import add_fallback_policy, add_routing_rule
     add_provider({
         "id": "primary-fail",
         "name": "Primary Fail",
@@ -833,7 +846,11 @@ def test_chat_completions_nonstream_uses_fallback_on_upstream_error(monkeypatch,
     add_routing_rule({
         "name": "fallback-rule", "enabled": True,
         "match_model": "source-model", "target_model": "primary-model", "target_provider": "primary-fail",
-        "fallback_models": [{"model": "fallback-model", "provider_id": "fallback-ok"}],
+    })
+    add_fallback_policy({
+        "name": "primary fallback", "enabled": True,
+        "match_provider": "primary-fail", "match_model": "primary-model",
+        "chain": [{"model": "fallback-model", "provider_id": "fallback-ok"}],
     })
 
     calls = []

@@ -36,10 +36,7 @@ def row_to_dict(row: sqlite3.Row | None) -> dict | None:
 
 
 def migrate(conn: sqlite3.Connection) -> None:
-    try:
-        conn.execute("ALTER TABLE routing_rules ADD COLUMN fallback_models TEXT NOT NULL DEFAULT '[]'")
-    except sqlite3.OperationalError:
-        pass
+    return None
 
 
 def normalize_rule(row: sqlite3.Row | None) -> Optional[dict]:
@@ -47,7 +44,6 @@ def normalize_rule(row: sqlite3.Row | None) -> Optional[dict]:
     if not data:
         return None
     data["enabled"] = to_bool(data["enabled"])
-    data["fallback_models"] = json_loads(data.get("fallback_models", "[]")) or []
     return data
 
 
@@ -67,7 +63,7 @@ def add_routing_rule(get_db, get_rule, rule: dict) -> dict:
     entry_id = rule.get("id") or uuid.uuid4().hex[:8]
     with get_db() as db:
         db.execute(
-            "INSERT INTO routing_rules (id, name, enabled, username, api_key_pattern, match_model, target_model, target_provider, fallback_models) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO routing_rules (id, name, enabled, username, api_key_pattern, match_model, target_model, target_provider) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 entry_id,
                 rule.get("name", "New Rule"),
@@ -77,7 +73,6 @@ def add_routing_rule(get_db, get_rule, rule: dict) -> dict:
                 rule.get("match_model", ""),
                 rule.get("target_model", ""),
                 rule.get("target_provider", ""),
-                json_dumps_list(rule.get("fallback_models", [])),
             ),
         )
     return get_rule(entry_id)
@@ -88,13 +83,11 @@ def update_routing_rule(get_db, get_rule, rule_id: str, updates: dict) -> Option
         existing = db.execute("SELECT 1 FROM routing_rules WHERE id = ?", (rule_id,)).fetchone()
         if not existing:
             return None
-        for key in ("name", "enabled", "username", "api_key_pattern", "match_model", "target_model", "target_provider", "fallback_models"):
+        for key in ("name", "enabled", "username", "api_key_pattern", "match_model", "target_model", "target_provider"):
             if key in updates:
                 value = updates[key]
                 if key == "enabled":
                     value = 1 if value else 0
-                elif key == "fallback_models":
-                    value = json_dumps_list(value)
                 db.execute(f"UPDATE routing_rules SET {key} = ? WHERE id = ?", (value, rule_id))
     return get_rule(rule_id)
 

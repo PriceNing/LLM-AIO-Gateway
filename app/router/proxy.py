@@ -14,7 +14,7 @@ from app.database import (
     parse_model_id, add_request_record,
 )
 from app.core.text import friendly_error_msg, mask_key
-from app.core.policy import RouteTarget
+from app.core.policy import RouteTarget, apply_fallback_policy
 from app.core.state import (
     TOOL_ONLY_LIMIT,
     conversation_cache_key as _conversation_cache_key,
@@ -49,7 +49,7 @@ from app.protocols.egress import (
 )
 from app.services.lite_llm import create_chat_completion
 from app.services.preprocessing import has_image_content, preprocess_messages
-from app.services.routing_targets import candidate_targets, is_retryable_endpoint_error, provider_for_log, resolve_provider
+from app.services.routing_targets import candidate_targets, classify_upstream_error, provider_for_log, resolve_provider
 from app.services.logger import get_logger
 from app.config import get_default
 
@@ -66,9 +66,17 @@ _request_log = deque(maxlen=get_default("request_log_max", 200))
 _request_log_lock = threading.Lock()
 
 
-async def _call_nonstream_target(target: RouteTarget, internal, *, temperature, max_tokens):
+async def _call_nonstream_target(target: RouteTarget, internal, *, temperature, max_tokens, log_label: str, stage: str):
     provider_info = resolve_provider(target.model, target.provider_id)
     adapter_provider_id = provider_for_log(provider_info, target.provider_id)
+    _app_log.info(
+        "[%s upstream.%s.start] target=%s provider=%s provider_type=%s",
+        log_label,
+        stage,
+        target.model,
+        adapter_provider_id or "-",
+        provider_info.get("provider_type") if provider_info else "unknown",
+    )
     if provider_info and provider_info.get("provider_type") == "anthropic":
         output = await anthropic_messages_completion_for_internal(provider_info, internal)
     else:
@@ -83,6 +91,16 @@ async def _call_nonstream_target(target: RouteTarget, internal, *, temperature, 
             )
         )
         output = response_to_internal_output(response)
+    _app_log.info(
+        "[%s upstream.%s.success] target=%s provider=%s tokens=%s text_len=%d tool_calls=%d",
+        log_label,
+        stage,
+        target.model,
+        adapter_provider_id or "-",
+        output.usage.get("total_tokens", 0),
+        len(output.text or ""),
+        len(output.tool_calls or []),
+    )
     return output, provider_info, adapter_provider_id
 
 
@@ -90,24 +108,86 @@ async def _call_nonstream_with_fallbacks(policy, internal, *, temperature, max_t
     original_model = internal.target_model
     original_provider = internal.provider_id
     last_exc = None
-    targets = candidate_targets(policy, original_model, original_provider)
+    primary = RouteTarget(model=original_model, provider_id=original_provider)
+    targets = [primary]
+    _app_log.debug(
+        "[%s pipeline] primary_call target=%s provider=%s",
+        log_label,
+        primary.model,
+        primary.provider_id or "-",
+    )
     for index, target in enumerate(targets):
         internal.target_model = target.model
         internal.provider_id = target.provider_id
         try:
-            if index:
-                _app_log.warning(
-                    "[%s fallback] trying target=%s provider=%s after error=%s",
+            return await _call_nonstream_target(target, internal, temperature=temperature, max_tokens=max_tokens, log_label=log_label, stage="primary")
+        except Exception as exc:
+            last_exc = exc
+            trigger = classify_upstream_error(exc)
+            _app_log.warning(
+                "[%s upstream.primary.failed] target=%s provider=%s trigger=%s error=%s",
+                log_label,
+                target.model,
+                target.provider_id or "-",
+                trigger,
+                friendly_error_msg(exc),
+            )
+            decision = apply_fallback_policy(target.provider_id, target.model, trigger)
+            if not decision.matched:
+                _app_log.info(
+                    "[%s fallback.decision] matched=False source=%s provider=%s trigger=%s reason=%s",
                     log_label,
                     target.model,
                     target.provider_id or "-",
-                    friendly_error_msg(last_exc) if last_exc else "",
+                    trigger,
+                    decision.reason,
                 )
-            return await _call_nonstream_target(target, internal, temperature=temperature, max_tokens=max_tokens)
+                raise
+            _app_log.info(
+                "[%s fallback.decision] matched=True policy_id=%s policy='%s' source=%s provider=%s trigger=%s chain=%d",
+                log_label,
+                decision.policy_id,
+                decision.policy_name,
+                target.model,
+                target.provider_id or "-",
+                trigger,
+                len(decision.chain),
+            )
+            targets = candidate_targets(primary, decision.chain)
+            break
+
+    for index, target in enumerate(targets[1:], 1):
+        internal.target_model = target.model
+        internal.provider_id = target.provider_id
+        try:
+            _app_log.info(
+                "[%s fallback.attempt.start] index=%d target=%s provider=%s after_error=%s",
+                log_label,
+                index,
+                target.model,
+                target.provider_id or "-",
+                friendly_error_msg(last_exc) if last_exc else "",
+            )
+            return await _call_nonstream_target(target, internal, temperature=temperature, max_tokens=max_tokens, log_label=log_label, stage="fallback")
         except Exception as exc:
             last_exc = exc
-            if index >= len(targets) - 1 or not is_retryable_endpoint_error(exc):
-                raise
+            _app_log.warning(
+                "[%s fallback.attempt.failed] index=%d target=%s provider=%s trigger=%s error=%s",
+                log_label,
+                index,
+                target.model,
+                target.provider_id or "-",
+                classify_upstream_error(exc),
+                friendly_error_msg(exc),
+            )
+    _app_log.error(
+        "[%s fallback.exhausted] primary=%s provider=%s candidates=%d error=%s",
+        log_label,
+        primary.model,
+        primary.provider_id or "-",
+        max(len(targets) - 1, 0),
+        friendly_error_msg(last_exc) if last_exc else "no target available",
+    )
     raise last_exc or RuntimeError("No routing target available")
 
 
@@ -157,8 +237,14 @@ def _log_request_body(username: str, model: str, endpoint: str, body: dict) -> N
 async def _policy_preprocess_request(internal, model: str, provider_id: str, requested_model: str):
     check_model = requested_model or model
     has_img = has_image_content(internal.messages)
-    _app_log.debug("[preprocess] CHECK req_model=%s target_model=%s has_image=%s msg_count=%d",
-                   check_model, model, has_img, len(internal.messages))
+    _app_log.info(
+        "[preprocess.decision] requested=%s target=%s provider=%s has_image=%s messages=%d",
+        check_model,
+        model,
+        provider_id or "-",
+        has_img,
+        len(internal.messages),
+    )
 
     mid = parse_model_id(check_model)
     with get_db() as db:
@@ -172,10 +258,12 @@ async def _policy_preprocess_request(internal, model: str, provider_id: str, req
                 "SELECT preprocessor FROM provider_models WHERE model_id = ? AND enabled = 1 ORDER BY provider_id LIMIT 1",
                 (mid.model_name,)
             ).fetchone()
-    _app_log.debug("[preprocess] DB lookup model='%s' -> row=%s", check_model, dict(row) if row else None)
+    _app_log.debug("[preprocess.lookup] requested=%s row=%s", check_model, dict(row) if row else None)
     if not row or not row["preprocessor"]:
         if has_img:
-            _app_log.warning("[preprocess] images detected for model=%s but preprocessor not enabled", check_model)
+            _app_log.warning("[preprocess.decision] enabled=False requested=%s reason=model_preprocessor_disabled", check_model)
+        else:
+            _app_log.info("[preprocess.decision] enabled=False requested=%s reason=no_images", check_model)
         return False
 
     from app.config import get_config
@@ -188,10 +276,17 @@ async def _policy_preprocess_request(internal, model: str, provider_id: str, req
             preprocessor_id = pid
             break
     if not preprocessor_config:
-        _app_log.warning("[preprocess] no enabled preprocessor in config.json")
+        _app_log.warning("[preprocess.decision] enabled=False requested=%s reason=no_enabled_preprocessor_config", check_model)
         return False
     preprocessor_config["id"] = preprocessor_id
     await preprocess_messages(internal.messages, preprocessor_config)
+    _app_log.info(
+        "[preprocess.vision.completed] requested=%s preprocessor=%s modified=%s messages=%d",
+        check_model,
+        preprocessor_id,
+        has_img,
+        len(internal.messages),
+    )
     return has_img
 
 

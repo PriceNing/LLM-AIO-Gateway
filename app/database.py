@@ -6,6 +6,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
 from contextlib import contextmanager
+from app.db import fallback as fallback_db
 from app.db import routing as routing_db
 
 _lock = threading.Lock()
@@ -36,8 +37,9 @@ def init_db(path: Optional[str] = None) -> None:
             _migrate_provider_models_created_at(conn)
             # Migration: add extra_headers to providers if missing
             _migrate_providers_extra_headers(conn)
-            # Migration: add fallback route chains to routing rules if missing
+            # Routing and fallback policy migrations.
             routing_db.migrate(conn)
+            fallback_db.migrate(conn)
         _initialized = True
 
 
@@ -160,8 +162,18 @@ CREATE TABLE IF NOT EXISTS routing_rules (
     api_key_pattern TEXT NOT NULL DEFAULT '',
     match_model TEXT NOT NULL DEFAULT '',
     target_model TEXT NOT NULL DEFAULT '',
-    target_provider TEXT NOT NULL DEFAULT '',
-    fallback_models TEXT NOT NULL DEFAULT '[]'
+    target_provider TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS fallback_policies (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL DEFAULT 'New Fallback Policy',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    match_provider TEXT NOT NULL DEFAULT '',
+    match_model TEXT NOT NULL DEFAULT '*',
+    triggers TEXT NOT NULL DEFAULT '{}',
+    chain TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS global_stats (
@@ -818,3 +830,23 @@ def update_routing_rule(rule_id: str, updates: dict) -> Optional[dict]:
 
 def delete_routing_rule(rule_id: str) -> bool:
     return routing_db.delete_routing_rule(get_db, rule_id)
+
+
+def get_fallback_policies() -> list:
+    return fallback_db.get_fallback_policies(get_db)
+
+
+def get_fallback_policy(policy_id: str) -> Optional[dict]:
+    return fallback_db.get_fallback_policy(get_db, policy_id)
+
+
+def add_fallback_policy(policy: dict) -> dict:
+    return fallback_db.add_fallback_policy(get_db, get_fallback_policy, policy)
+
+
+def update_fallback_policy(policy_id: str, updates: dict) -> Optional[dict]:
+    return fallback_db.update_fallback_policy(get_db, get_fallback_policy, policy_id, updates)
+
+
+def delete_fallback_policy(policy_id: str) -> bool:
+    return fallback_db.delete_fallback_policy(get_db, policy_id)
