@@ -167,14 +167,13 @@ Rule structure:
   "api_key_pattern": "",
   "match_model": "MiniMax-M2*",
   "target_model": "target-model",
-  "target_provider": "target-provider",
-  "fallback_models": [
-    {"model": "backup-model", "provider_id": "backup-provider"}
-  ]
+  "target_provider": "target-provider"
 }
 ```
 
-The admin API includes `POST /admin/routing-rules/dry-run` to inspect which rule would match a username, API-key fragment, and requested model. Provider cards also expose a health check that probes `/models` availability, latency, and model count. Non-streaming requests try `fallback_models` in order when the primary target fails with an upstream error.
+Routing rules only describe active routing. Passive fallback is configured separately in `fallback_policies`: match the routed provider/model plus a failure trigger such as `timeout`, `connection_error`, `http_429`, or `http_5xx`, then try the configured fallback chain. The admin UI provides a dedicated fallback policy editor, so users do not need to write JSON in a routing rule.
+
+The admin API includes `POST /admin/routing-rules/dry-run` to inspect which active routing rule would match, and `POST /admin/fallback-policies/dry-run` to inspect which fallback chain would activate for a given provider, model, and failure type. Provider cards also expose a health check that probes `/models` availability, latency, and model count.
 
 ## Configuration
 
@@ -228,7 +227,7 @@ Main code boundaries:
 pytest tests/ -q
 ```
 
-Expected current result: `318 passed`.
+Expected current result: `334 passed`.
 
 Live smoke matrix:
 

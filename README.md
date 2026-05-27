@@ -229,7 +229,7 @@ The request pipeline is: ingress -> vision preprocessing based on the requested 
 pytest tests/ -q
 ```
 
-当前预期结果：`318 passed`。
+当前预期结果：`334 passed`。
 
 真实烟测建议：
 
