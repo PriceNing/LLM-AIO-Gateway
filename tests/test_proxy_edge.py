@@ -888,6 +888,297 @@ def test_chat_completions_nonstream_uses_fallback_on_upstream_error(monkeypatch,
     assert response.json()["model"] == "fallback-model"
 
 
+def test_chat_completions_nonstream_fallback_matches_resolved_provider(monkeypatch, temp_db):
+    from app.database import add_fallback_policy
+
+    add_provider({
+        "id": "resolved-primary",
+        "name": "Resolved Primary",
+        "provider_type": "openai",
+        "api_base": "https://resolved-primary.example/v1",
+        "api_key": "upstream-key",
+        "enabled": True,
+        "models": [{"id": "resolved-primary-model", "name": "Primary", "enabled": True}],
+    })
+    add_provider({
+        "id": "resolved-fallback",
+        "name": "Resolved Fallback",
+        "provider_type": "openai",
+        "api_base": "https://resolved-fallback.example/v1",
+        "api_key": "upstream-key",
+        "enabled": True,
+        "models": [{"id": "resolved-fallback-model", "name": "Fallback", "enabled": True}],
+    })
+    add_fallback_policy({
+        "name": "resolved provider fallback", "enabled": True,
+        "match_provider": "resolved-primary", "match_model": "resolved-primary/resolved-primary-model",
+        "chain": [{"model": "resolved-fallback-model", "provider_id": "resolved-fallback"}],
+    })
+
+    calls = []
+
+    def fake_chat_completion(**kwargs):
+        calls.append((kwargs["model"], kwargs["provider_id"]))
+        if kwargs["provider_id"] == "resolved-primary":
+            raise RuntimeError("resolved primary unavailable")
+
+        class Message:
+            content = "resolved fallback response"
+            reasoning_content = None
+            tool_calls = []
+
+        class Choice:
+            message = Message()
+            finish_reason = "stop"
+
+        class Response:
+            choices = [Choice()]
+            usage = {"total_tokens": 13}
+
+        return Response()
+
+    monkeypatch.setattr("app.router.proxy.create_chat_completion", fake_chat_completion)
+
+    response = client.post("/v1/chat/completions", headers=temp_db["headers"], json={
+        "model": "resolved-primary/resolved-primary-model",
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "resolved fallback response"
+    assert calls == [("resolved-primary/resolved-primary-model", "resolved-primary"), ("resolved-fallback-model", "resolved-fallback")]
+
+
+def test_chat_completions_stream_uses_fallback_before_output(monkeypatch, temp_db):
+    from app.database import add_fallback_policy, add_routing_rule
+    from app.core.output import InternalOutputEvent
+
+    add_provider({
+        "id": "primary-stream-fail",
+        "name": "Primary Stream Fail",
+        "provider_type": "openai",
+        "api_base": "https://primary-stream.example/v1",
+        "api_key": "upstream-key",
+        "enabled": True,
+        "models": [{"id": "primary-stream-model", "name": "Primary", "enabled": True}],
+    })
+    add_provider({
+        "id": "fallback-stream-ok",
+        "name": "Fallback Stream OK",
+        "provider_type": "openai",
+        "api_base": "https://fallback-stream.example/v1",
+        "api_key": "upstream-key",
+        "enabled": True,
+        "models": [{"id": "fallback-stream-model", "name": "Fallback", "enabled": True}],
+    })
+    add_routing_rule({
+        "name": "stream-fallback-rule", "enabled": True,
+        "match_model": "stream-source", "target_model": "primary-stream-model", "target_provider": "primary-stream-fail",
+    })
+    add_fallback_policy({
+        "name": "stream primary fallback", "enabled": True,
+        "match_provider": "primary-stream-fail", "match_model": "primary-stream-model",
+        "chain": [{"model": "fallback-stream-model", "provider_id": "fallback-stream-ok"}],
+    })
+
+    calls = []
+
+    async def fake_stream_events(**kwargs):
+        calls.append((kwargs["model"], kwargs["provider_id"]))
+        if kwargs["provider_id"] == "primary-stream-fail":
+            raise RuntimeError("primary stream unavailable")
+        yield InternalOutputEvent(kind="message_start", role="assistant")
+        yield InternalOutputEvent(kind="text_delta", text="fallback stream response")
+        yield InternalOutputEvent(kind="usage", usage={"total_tokens": 11})
+        yield InternalOutputEvent(kind="message_done", finish_reason="stop")
+
+    monkeypatch.setattr("app.router.proxy.iter_openai_chat_output_events", fake_stream_events)
+
+    with client.stream("POST", "/v1/chat/completions", headers=temp_db["headers"], json={
+        "model": "stream-source",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": True,
+    }) as response:
+        body = response.read().decode("utf-8")
+
+    assert response.status_code == 200
+    assert "fallback stream response" in body
+    assert "primary stream unavailable" not in body
+    assert calls == [("primary-stream-model", "primary-stream-fail"), ("fallback-stream-model", "fallback-stream-ok")]
+
+
+def test_chat_completions_stream_fallback_matches_resolved_provider(monkeypatch, temp_db):
+    from app.database import add_fallback_policy
+    from app.core.output import InternalOutputEvent
+
+    add_provider({
+        "id": "resolved-stream-primary",
+        "name": "Resolved Stream Primary",
+        "provider_type": "openai",
+        "api_base": "https://resolved-stream-primary.example/v1",
+        "api_key": "upstream-key",
+        "enabled": True,
+        "models": [{"id": "resolved-stream-primary-model", "name": "Primary", "enabled": True}],
+    })
+    add_provider({
+        "id": "resolved-stream-fallback",
+        "name": "Resolved Stream Fallback",
+        "provider_type": "openai",
+        "api_base": "https://resolved-stream-fallback.example/v1",
+        "api_key": "upstream-key",
+        "enabled": True,
+        "models": [{"id": "resolved-stream-fallback-model", "name": "Fallback", "enabled": True}],
+    })
+    add_fallback_policy({
+        "name": "resolved stream fallback", "enabled": True,
+        "match_provider": "resolved-stream-primary", "match_model": "resolved-stream-primary/resolved-stream-primary-model",
+        "chain": [{"model": "resolved-stream-fallback-model", "provider_id": "resolved-stream-fallback"}],
+    })
+
+    calls = []
+
+    async def fake_stream_events(**kwargs):
+        calls.append((kwargs["model"], kwargs["provider_id"]))
+        if kwargs["provider_id"] == "resolved-stream-primary":
+            raise RuntimeError("resolved stream primary unavailable")
+        yield InternalOutputEvent(kind="message_start", role="assistant")
+        yield InternalOutputEvent(kind="text_delta", text="resolved stream fallback response")
+        yield InternalOutputEvent(kind="usage", usage={"total_tokens": 17})
+        yield InternalOutputEvent(kind="message_done", finish_reason="stop")
+
+    monkeypatch.setattr("app.router.proxy.iter_openai_chat_output_events", fake_stream_events)
+
+    with client.stream("POST", "/v1/chat/completions", headers=temp_db["headers"], json={
+        "model": "resolved-stream-primary/resolved-stream-primary-model",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": True,
+    }) as response:
+        body = response.read().decode("utf-8")
+
+    assert response.status_code == 200
+    assert "resolved stream fallback response" in body
+    assert calls == [
+        ("resolved-stream-primary/resolved-stream-primary-model", "resolved-stream-primary"),
+        ("resolved-stream-fallback-model", "resolved-stream-fallback"),
+    ]
+
+
+def test_chat_completions_stream_logs_fallback_target_model(monkeypatch, temp_db):
+    from app.database import add_fallback_policy, add_routing_rule
+    from app.core.output import InternalOutputEvent
+    import app.router.proxy as proxy
+
+    add_provider({
+        "id": "primary-stream-log-fail",
+        "name": "Primary Stream Log Fail",
+        "provider_type": "openai",
+        "api_base": "https://primary-stream-log.example/v1",
+        "api_key": "upstream-key",
+        "enabled": True,
+        "models": [{"id": "primary-stream-log-model", "name": "Primary", "enabled": True}],
+    })
+    add_provider({
+        "id": "fallback-stream-log-ok",
+        "name": "Fallback Stream Log OK",
+        "provider_type": "openai",
+        "api_base": "https://fallback-stream-log.example/v1",
+        "api_key": "upstream-key",
+        "enabled": True,
+        "models": [{"id": "fallback-stream-log-model", "name": "Fallback", "enabled": True}],
+    })
+    add_routing_rule({
+        "name": "stream-log-rule", "enabled": True,
+        "match_model": "stream-log-source", "target_model": "primary-stream-log-model", "target_provider": "primary-stream-log-fail",
+    })
+    add_fallback_policy({
+        "name": "stream log fallback", "enabled": True,
+        "match_provider": "primary-stream-log-fail", "match_model": "primary-stream-log-model",
+        "chain": [{"model": "fallback-stream-log-model", "provider_id": "fallback-stream-log-ok"}],
+    })
+
+    logged = []
+
+    def fake_log_request(username, api_key, model, provider_id, endpoint, success, tokens, requested_model=""):
+        logged.append((model, provider_id, endpoint, success, requested_model))
+
+    async def fake_stream_events(**kwargs):
+        if kwargs["provider_id"] == "primary-stream-log-fail":
+            raise RuntimeError("primary stream unavailable")
+        yield InternalOutputEvent(kind="message_start", role="assistant")
+        yield InternalOutputEvent(kind="text_delta", text="fallback stream response")
+        yield InternalOutputEvent(kind="usage", usage={"total_tokens": 19})
+        yield InternalOutputEvent(kind="message_done", finish_reason="stop")
+
+    monkeypatch.setattr(proxy, "_log_request", fake_log_request)
+    monkeypatch.setattr("app.router.proxy.iter_openai_chat_output_events", fake_stream_events)
+
+    with client.stream("POST", "/v1/chat/completions", headers=temp_db["headers"], json={
+        "model": "stream-log-source",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": True,
+    }) as response:
+        body = response.read().decode("utf-8")
+
+    assert response.status_code == 200
+    assert "fallback stream response" in body
+    assert logged[-1] == ("fallback-stream-log-model", "fallback-stream-log-ok", "chat_completions", True, "stream-log-source")
+
+
+def test_chat_completions_stream_does_not_fallback_after_output(monkeypatch, temp_db):
+    from app.database import add_fallback_policy, add_routing_rule
+    from app.core.output import InternalOutputEvent
+
+    add_provider({
+        "id": "primary-stream-midfail",
+        "name": "Primary Stream Midfail",
+        "provider_type": "openai",
+        "api_base": "https://primary-midfail.example/v1",
+        "api_key": "upstream-key",
+        "enabled": True,
+        "models": [{"id": "primary-midfail-model", "name": "Primary", "enabled": True}],
+    })
+    add_provider({
+        "id": "fallback-stream-unused",
+        "name": "Fallback Stream Unused",
+        "provider_type": "openai",
+        "api_base": "https://fallback-unused.example/v1",
+        "api_key": "upstream-key",
+        "enabled": True,
+        "models": [{"id": "fallback-unused-model", "name": "Fallback", "enabled": True}],
+    })
+    add_routing_rule({
+        "name": "stream-midfail-rule", "enabled": True,
+        "match_model": "stream-midfail-source", "target_model": "primary-midfail-model", "target_provider": "primary-stream-midfail",
+    })
+    add_fallback_policy({
+        "name": "stream midfail fallback", "enabled": True,
+        "match_provider": "primary-stream-midfail", "match_model": "primary-midfail-model",
+        "chain": [{"model": "fallback-unused-model", "provider_id": "fallback-stream-unused"}],
+    })
+
+    calls = []
+
+    async def fake_stream_events(**kwargs):
+        calls.append((kwargs["model"], kwargs["provider_id"]))
+        yield InternalOutputEvent(kind="message_start", role="assistant")
+        yield InternalOutputEvent(kind="text_delta", text="partial primary")
+        raise RuntimeError("primary failed after output")
+
+    monkeypatch.setattr("app.router.proxy.iter_openai_chat_output_events", fake_stream_events)
+
+    with client.stream("POST", "/v1/chat/completions", headers=temp_db["headers"], json={
+        "model": "stream-midfail-source",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": True,
+    }) as response:
+        body = response.read().decode("utf-8")
+
+    assert response.status_code == 200
+    assert "partial primary" in body
+    assert "primary failed after output" in body
+    assert calls == [("primary-midfail-model", "primary-stream-midfail")]
+
+
 def test_anthropic_output_uses_reasoning_as_text_when_visible_text_empty():
     from app.adapters.anthropic import _anthropic_response_to_internal
 

@@ -12,6 +12,7 @@ OutputEventKind = Literal[
     "message_delta",
     "message_done",
     "usage",
+    "metadata",
 ]
 
 
@@ -34,6 +35,7 @@ class InternalOutputEvent:
     arguments_delta: str = ""
     arguments: str = ""
     usage: dict[str, int] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
     raw: Any = None
 
 

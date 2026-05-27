@@ -14,6 +14,7 @@ from app.database import (
     parse_model_id, add_request_record,
 )
 from app.core.text import friendly_error_msg, mask_key
+from app.core.output import InternalOutputEvent
 from app.core.policy import RouteTarget, apply_fallback_policy
 from app.core.state import (
     TOOL_ONLY_LIMIT,
@@ -104,11 +105,17 @@ async def _call_nonstream_target(target: RouteTarget, internal, *, temperature, 
     return output, provider_info, adapter_provider_id
 
 
+def _fallback_provider_id_for_target(target: RouteTarget) -> str:
+    provider_info = resolve_provider(target.model, target.provider_id)
+    return provider_for_log(provider_info, target.provider_id)
+
+
 async def _call_nonstream_with_fallbacks(policy, internal, *, temperature, max_tokens, log_label: str):
     original_model = internal.target_model
     original_provider = internal.provider_id
     last_exc = None
     primary = RouteTarget(model=original_model, provider_id=original_provider)
+    primary = RouteTarget(model=primary.model, provider_id=_fallback_provider_id_for_target(primary))
     targets = [primary]
     _app_log.debug(
         "[%s pipeline] primary_call target=%s provider=%s",
@@ -128,17 +135,18 @@ async def _call_nonstream_with_fallbacks(policy, internal, *, temperature, max_t
                 "[%s upstream.primary.failed] target=%s provider=%s trigger=%s error=%s",
                 log_label,
                 target.model,
-                target.provider_id or "-",
+                _fallback_provider_id_for_target(target) or "-",
                 trigger,
                 friendly_error_msg(exc),
             )
-            decision = apply_fallback_policy(target.provider_id, target.model, trigger)
+            fallback_provider_id = _fallback_provider_id_for_target(target)
+            decision = apply_fallback_policy(fallback_provider_id, target.model, trigger)
             if not decision.matched:
                 _app_log.info(
                     "[%s fallback.decision] matched=False source=%s provider=%s trigger=%s reason=%s",
                     log_label,
                     target.model,
-                    target.provider_id or "-",
+                    fallback_provider_id or "-",
                     trigger,
                     decision.reason,
                 )
@@ -149,7 +157,7 @@ async def _call_nonstream_with_fallbacks(policy, internal, *, temperature, max_t
                 decision.policy_id,
                 decision.policy_name,
                 target.model,
-                target.provider_id or "-",
+                fallback_provider_id or "-",
                 trigger,
                 len(decision.chain),
             )
@@ -182,6 +190,153 @@ async def _call_nonstream_with_fallbacks(policy, internal, *, temperature, max_t
             )
     _app_log.error(
         "[%s fallback.exhausted] primary=%s provider=%s candidates=%d error=%s",
+        log_label,
+        primary.model,
+        primary.provider_id or "-",
+        max(len(targets) - 1, 0),
+        friendly_error_msg(last_exc) if last_exc else "no target available",
+    )
+    raise last_exc or RuntimeError("No routing target available")
+
+
+def _stream_events_for_target(target: RouteTarget, internal, *, temperature, max_tokens, log_label: str, strip_thinking=True):
+    provider_info = resolve_provider(target.model, target.provider_id)
+    adapter_provider_id = provider_for_log(provider_info, target.provider_id)
+    _app_log.info(
+        "[%s upstream.stream.start] target=%s provider=%s provider_type=%s",
+        log_label,
+        target.model,
+        adapter_provider_id or "-",
+        provider_info.get("provider_type") if provider_info else "unknown",
+    )
+    if provider_info and provider_info.get("provider_type") == "anthropic":
+        anthropic_msgs, anthropic_body = anthropic_body_from_internal(internal)
+        events = iter_anthropic_output_events(
+            provider_info=provider_info,
+            messages=anthropic_msgs,
+            body=anthropic_body,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            model=target.model,
+        )
+    else:
+        events = iter_openai_chat_output_events(
+            model=target.model,
+            messages=chat_messages_from_internal(internal),
+            provider_id=adapter_provider_id,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            extra=chat_kwargs_from_internal(internal),
+            strip_thinking=strip_thinking,
+        )
+    return events, provider_info, adapter_provider_id
+
+
+def _is_client_visible_stream_event(event) -> bool:
+    if event.kind in ("text_delta", "reasoning_delta"):
+        return bool(event.text or event.reasoning)
+    if event.kind in ("tool_call_start", "tool_call_arguments_delta", "tool_call_done"):
+        return True
+    if event.kind == "message_done":
+        return True
+    return False
+
+
+async def _stream_events_with_fallbacks(internal, *, temperature, max_tokens, log_label: str, strip_thinking=True):
+    primary = RouteTarget(model=internal.target_model, provider_id=internal.provider_id)
+    primary = RouteTarget(model=primary.model, provider_id=_fallback_provider_id_for_target(primary))
+    targets = [primary]
+    last_exc = None
+    index = 0
+
+    while index < len(targets):
+        target = targets[index]
+        stage = "primary" if index == 0 else "fallback"
+        internal.target_model = target.model
+        internal.provider_id = target.provider_id
+        fallback_provider_id = _fallback_provider_id_for_target(target)
+        emitted = False
+        try:
+            events, provider_info, adapter_provider_id = _stream_events_for_target(
+                target,
+                internal,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                log_label=log_label,
+                strip_thinking=strip_thinking,
+            )
+            yield InternalOutputEvent(kind="metadata", metadata={"model": target.model, "provider_id": adapter_provider_id or ""})
+            async for event in events:
+                if _is_client_visible_stream_event(event):
+                    emitted = True
+                yield event
+            _app_log.info(
+                "[%s upstream.stream.success] stage=%s target=%s provider=%s",
+                log_label,
+                stage,
+                target.model,
+                adapter_provider_id or "-",
+            )
+            return
+        except Exception as exc:
+            last_exc = exc
+            trigger = classify_upstream_error(exc)
+            _app_log.warning(
+                "[%s upstream.stream.failed] stage=%s target=%s provider=%s trigger=%s emitted=%s error=%s",
+                log_label,
+                stage,
+                target.model,
+                fallback_provider_id or "-",
+                trigger,
+                emitted,
+                friendly_error_msg(exc),
+            )
+            if emitted:
+                _app_log.info(
+                    "[%s fallback.stream.skipped] target=%s provider=%s trigger=%s reason=client_output_started",
+                    log_label,
+                    target.model,
+                    fallback_provider_id or "-",
+                    trigger,
+                )
+                raise
+            if index == 0:
+                decision = apply_fallback_policy(fallback_provider_id, target.model, trigger)
+                if not decision.matched:
+                    _app_log.info(
+                        "[%s fallback.stream.decision] matched=False source=%s provider=%s trigger=%s reason=%s",
+                        log_label,
+                        target.model,
+                        fallback_provider_id or "-",
+                        trigger,
+                        decision.reason,
+                    )
+                    raise
+                targets = candidate_targets(primary, decision.chain)
+                _app_log.info(
+                    "[%s fallback.stream.decision] matched=True policy_id=%s policy='%s' source=%s provider=%s trigger=%s chain=%d",
+                    log_label,
+                    decision.policy_id,
+                    decision.policy_name,
+                    target.model,
+                    fallback_provider_id or "-",
+                    trigger,
+                    len(targets) - 1,
+                )
+            index += 1
+            if index < len(targets):
+                next_target = targets[index]
+                _app_log.info(
+                    "[%s fallback.stream.attempt.start] index=%d target=%s provider=%s after_error=%s",
+                    log_label,
+                    index,
+                    next_target.model,
+                    next_target.provider_id or "-",
+                    friendly_error_msg(last_exc),
+                )
+
+    _app_log.error(
+        "[%s fallback.stream.exhausted] primary=%s provider=%s candidates=%d error=%s",
         log_label,
         primary.model,
         primary.provider_id or "-",
@@ -554,32 +709,13 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
     adapter_provider_id = provider_id or ""
 
     try:
-        extra = chat_kwargs_from_internal(internal)
-        provider_info = resolve_provider(model, provider_id)
-        is_anthropic = provider_info and provider_info.get("provider_type") == "anthropic"
-        adapter_provider_id = provider_for_log(provider_info, provider_id)
-
         if stream:
-            if is_anthropic:
-                anthropic_msgs, anthropic_body = anthropic_body_from_internal(internal)
-                adapter_provider_id = provider_for_log(provider_info, provider_id)
-                events = iter_anthropic_output_events(
-                    provider_info=provider_info,
-                    messages=anthropic_msgs,
-                    body=anthropic_body,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    model=model,
-                )
-            else:
-                events = iter_openai_chat_output_events(
-                    model=model,
-                    messages=chat_messages_from_internal(internal),
-                    provider_id=adapter_provider_id,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    extra=extra,
-                )
+            events = _stream_events_with_fallbacks(
+                internal,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                log_label="chat",
+            )
             return StreamingResponse(
                 _stream_internal_output(
                     events=events,
@@ -670,31 +806,13 @@ async def completions(request: Request, authorization: Optional[str] = Header(No
     adapter_provider_id = provider_id or ""
 
     try:
-        provider_info = resolve_provider(model, provider_id)
-        is_anthropic = provider_info and provider_info.get("provider_type") == "anthropic"
-        adapter_provider_id = provider_for_log(provider_info, provider_id)
-
         if stream:
-            if is_anthropic:
-                anthropic_msgs, anthropic_body = anthropic_body_from_internal(internal)
-                adapter_provider_id = provider_for_log(provider_info, provider_id)
-                events = iter_anthropic_output_events(
-                    provider_info=provider_info,
-                    messages=anthropic_msgs,
-                    body=anthropic_body,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    model=model,
-                )
-            else:
-                events = iter_openai_chat_output_events(
-                    model=model,
-                    messages=chat_messages_from_internal(internal),
-                    provider_id=adapter_provider_id,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    extra=chat_kwargs_from_internal(internal),
-                )
+            events = _stream_events_with_fallbacks(
+                internal,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                log_label="completions",
+            )
             return StreamingResponse(
                 _stream_internal_output(
                     events=events,
@@ -791,40 +909,11 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
 
     try:
         if stream:
-            if provider_info and provider_info.get("provider_type") == "anthropic":
-                anthropic_adapter_messages, anthropic_adapter_body = anthropic_body_from_internal(internal)
-                events = iter_anthropic_output_events(
-                    provider_info=provider_info,
-                    messages=anthropic_adapter_messages,
-                    body=anthropic_adapter_body,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    model=model,
-                )
-                return StreamingResponse(
-                    _stream_internal_output(
-                        events=events,
-                        endpoint="messages",
-                        model=model,
-                        username=username,
-                        api_key_value=api_key_value,
-                        provider_id=adapter_provider_id,
-                        requested_model=requested_model,
-                        log_request=_log_request,
-                        conv_key=conv_key,
-                        remember_reasoning_content=_remember_reasoning_content,
-                    ),
-                    media_type="text/event-stream"
-                )
-            adapter_messages = chat_messages_from_internal(internal)
-            adapter_extra = chat_kwargs_from_internal(internal)
-            events = iter_openai_chat_output_events(
-                model=model,
-                messages=adapter_messages,
-                provider_id=adapter_provider_id,
+            events = _stream_events_with_fallbacks(
+                internal,
                 temperature=temperature,
                 max_tokens=max_tokens,
-                extra=adapter_extra,
+                log_label="messages",
                 strip_thinking=False,
             )
             return StreamingResponse(
@@ -952,89 +1041,39 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
         )
 
     try:
-        extra = dict(internal.extra)
-
-        # Choose an upstream adapter after policy has finalized the internal request.
-        provider_info = resolve_provider(model, provider_id)
-        adapter_provider_id = provider_for_log(provider_info, provider_id)
-        is_anthropic = provider_info and provider_info.get("provider_type") == "anthropic"
-
-        if is_anthropic:
-            anthropic_msgs, anthropic_body = anthropic_body_from_internal(internal)
-
-            if stream:
-                events = iter_anthropic_output_events(
-                    provider_info=provider_info,
-                    messages=anthropic_msgs,
-                    body=anthropic_body,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    model=model,
-                )
-                return StreamingResponse(
-                    _stream_internal_output(
-                        events=events,
-                        endpoint="responses",
-                        model=model,
-                        username=username,
-                        api_key_value=api_key_value,
-                        provider_id=adapter_provider_id,
-                        requested_model=requested_model,
-                        log_request=_log_request,
-                        previous_response_id=previous_response_id,
-                        conv_key=conv_key,
-                        remember_response_chain_key=_remember_response_chain_key,
-                        remember_reasoning_content=_remember_reasoning_content,
-                        tool_only_turns=_tool_only_turns,
-                    ),
-                    media_type="text/event-stream"
-                )
-
-            output, provider_info, adapter_provider_id = await _call_nonstream_with_fallbacks(
-                policy,
+        if stream:
+            events = _stream_events_with_fallbacks(
                 internal,
                 temperature=temperature,
                 max_tokens=max_tokens,
                 log_label="responses",
             )
-        else:
-            adapter_messages = chat_messages_from_internal(internal)
-            adapter_extra = chat_kwargs_from_internal(internal)
-            if stream:
-                events = iter_openai_chat_output_events(
+            return StreamingResponse(
+                _stream_internal_output(
+                    events=events,
+                    endpoint="responses",
                     model=model,
-                    messages=adapter_messages,
+                    username=username,
+                    api_key_value=api_key_value,
                     provider_id=adapter_provider_id,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    extra=adapter_extra,
-                )
-                return StreamingResponse(
-                    _stream_internal_output(
-                        events=events,
-                        endpoint="responses",
-                        model=model,
-                        username=username,
-                        api_key_value=api_key_value,
-                        provider_id=adapter_provider_id,
-                        requested_model=requested_model,
-                        log_request=_log_request,
-                        previous_response_id=previous_response_id,
-                        conv_key=conv_key,
-                        remember_response_chain_key=_remember_response_chain_key,
-                        remember_reasoning_content=_remember_reasoning_content,
-                        tool_only_turns=_tool_only_turns,
-                    ),
-                    media_type="text/event-stream"
-                )
-
-            output, provider_info, adapter_provider_id = await _call_nonstream_with_fallbacks(
-                policy,
-                internal,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                log_label="responses",
+                    requested_model=requested_model,
+                    log_request=_log_request,
+                    previous_response_id=previous_response_id,
+                    conv_key=conv_key,
+                    remember_response_chain_key=_remember_response_chain_key,
+                    remember_reasoning_content=_remember_reasoning_content,
+                    tool_only_turns=_tool_only_turns,
+                ),
+                media_type="text/event-stream"
             )
+
+        output, provider_info, adapter_provider_id = await _call_nonstream_with_fallbacks(
+            policy,
+            internal,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            log_label="responses",
+        )
         model = internal.target_model
         provider_id = internal.provider_id
         if output.reasoning:

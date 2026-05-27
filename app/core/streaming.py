@@ -3,6 +3,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from app.core.output import InternalOutputEvent
 from app.core.text import friendly_error_msg
 from app.database import increment_global_stats, increment_user_usage
 from app.protocols.egress import (
@@ -95,6 +96,8 @@ async def stream_internal_output(
     tool_only_turns=None,
 ):
     total_tokens = 0
+    final_model = model
+    final_provider_id = provider_id or ""
     _app_log.debug(
         "[stream_orchestrator] START endpoint=%s provider=%s model=%s requested=%s conv_key=%s previous_response_id=%s",
         endpoint,
@@ -106,13 +109,17 @@ async def stream_internal_output(
     )
 
     async def metered_events():
-        nonlocal total_tokens
+        nonlocal total_tokens, final_model, final_provider_id
         async for event in record_streaming_events(
             events,
             conv_key=conv_key,
             remember_reasoning_content=remember_reasoning_content,
             tool_only_turns=tool_only_turns,
         ):
+            if event.kind == "metadata":
+                final_model = str(event.metadata.get("model") or final_model)
+                final_provider_id = str(event.metadata.get("provider_id") or final_provider_id)
+                continue
             if event.kind == "usage":
                 total_tokens = event.usage.get("total_tokens", total_tokens) or total_tokens
             yield event
@@ -139,15 +146,15 @@ async def stream_internal_output(
                 response_id=response_id,
             ):
                 yield line
-        log_request(username, api_key_value, model, provider_id or "", endpoint, True, total_tokens, requested_model)
+        log_request(username, api_key_value, final_model, final_provider_id, endpoint, True, total_tokens, requested_model)
         increment_global_stats(success=True)
         if username != "legacy":
             increment_user_usage(username, api_key_value, True, total_tokens)
         _app_log.debug(
             "[stream_orchestrator] DONE endpoint=%s provider=%s model=%s total_tokens=%d",
             endpoint,
-            provider_id or "",
-            model,
+            final_provider_id,
+            final_model,
             total_tokens,
         )
     except Exception as exc:
