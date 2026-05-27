@@ -78,6 +78,20 @@ def test_chat_completion_forbidden_model():
     assert response.status_code == 403
 
 
+def test_chat_completion_requires_provider_prefix_when_only_composite_model_allowed():
+    from app.database import get_db
+    with get_db() as db:
+        db.execute("UPDATE user_api_keys SET allowed_models = ? WHERE key = 'user-key'", ('["test-provider/allowed-model"]',))
+
+    response = client.post("/v1/chat/completions", headers=headers, json={
+        "model": "allowed-model",
+        "messages": [{"role": "user", "content": "Hello"}]
+    })
+
+    assert response.status_code == 403
+    assert "provider-qualified" in response.json()["detail"]
+
+
 def test_chat_completion_accepts_request_without_previous_response_id(monkeypatch):
     from app.router import proxy
 

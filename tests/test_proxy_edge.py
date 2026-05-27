@@ -21,9 +21,9 @@ from app.core.state import (
     response_chain_cache as _response_chain_cache,
 )
 from app.router.proxy import (
-    _adapter_provider_id,
     ensure_model_allowed, allowed_models_for,
 )
+from app.services.routing_targets import adapter_provider_id
 
 client = TestClient(app)
 
@@ -248,6 +248,27 @@ def test_routing_rules_can_set_provider_only(temp_db):
     assert decision.target_provider == "target-provider"
 
 
+def test_routing_rules_include_fallback_chain(temp_db):
+    from app.database import add_routing_rule
+    add_routing_rule({
+        "name": "fallback-chain", "enabled": True,
+        "username": "", "api_key_pattern": "",
+        "match_model": "old-model", "target_model": "primary-model", "target_provider": "primary-provider",
+        "fallback_models": [
+            {"model": "fallback-a", "provider_id": "provider-a"},
+            "fallback-b",
+        ],
+    })
+    decision = _apply_routing_rules("alice", "user-key", "old-model", "old-model")
+
+    assert decision.matched is True
+    assert decision.target_model == "primary-model"
+    assert decision.fallbacks[0].model == "fallback-a"
+    assert decision.fallbacks[0].provider_id == "provider-a"
+    assert decision.fallbacks[1].model == "fallback-b"
+    assert [target.model for target in decision.candidate_targets()] == ["primary-model", "fallback-a", "fallback-b"]
+
+
 # -- TTLDict --
 
 def test_ttldict_operations():
@@ -298,8 +319,16 @@ def test_ensure_model_allowed_composite_extracts_simple():
     ensure_model_allowed({}, {"allowed_models": ["deepseek-v4-flash"]}, "opencode-go/deepseek-v4-flash")
 
 
-def test_ensure_model_allowed_simple_in_composite_allowed():
-    ensure_model_allowed({}, {"allowed_models": ["opencode-go/deepseek-v4-flash"]}, "deepseek-v4-flash")
+def test_ensure_model_allowed_simple_rejected_when_only_composite_allowed():
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as exc:
+        ensure_model_allowed({}, {"allowed_models": ["opencode-go/deepseek-v4-flash"]}, "deepseek-v4-flash")
+    assert exc.value.status_code == 403
+    assert "provider-qualified" in exc.value.detail
+
+
+def test_ensure_model_allowed_simple_passes_when_simple_allowed_with_composites():
+    ensure_model_allowed({}, {"allowed_models": ["deepseek-v4-flash", "opencode-go/deepseek-v4-flash"]}, "deepseek-v4-flash")
 
 
 def test_ensure_model_allowed_blocked():
@@ -471,8 +500,8 @@ def test_anthropic_message_url_avoids_duplicate_v1():
 
 
 def test_adapter_provider_id_prefers_resolved_provider():
-    assert _adapter_provider_id({"id": "NewAPI"}, "") == "NewAPI"
-    assert _adapter_provider_id(None, "pixel-api") == "pixel-api"
+    assert adapter_provider_id({"id": "NewAPI"}, "") == "NewAPI"
+    assert adapter_provider_id(None, "pixel-api") == "pixel-api"
 
 
 @pytest.mark.asyncio
@@ -779,6 +808,67 @@ def test_completions_openai_provider_uses_ir_chat_adapter(monkeypatch, temp_db):
     assert response.json()["choices"][0]["text"] == "openai completion"
     assert called["messages"] == [{"role": "user", "content": "Complete me"}]
     assert called["provider_id"] == "openai-text"
+
+
+def test_chat_completions_nonstream_uses_fallback_on_upstream_error(monkeypatch, temp_db):
+    from app.database import add_routing_rule
+    add_provider({
+        "id": "primary-fail",
+        "name": "Primary Fail",
+        "provider_type": "openai",
+        "api_base": "https://primary.example/v1",
+        "api_key": "upstream-key",
+        "enabled": True,
+        "models": [{"id": "primary-model", "name": "Primary", "enabled": True}],
+    })
+    add_provider({
+        "id": "fallback-ok",
+        "name": "Fallback OK",
+        "provider_type": "openai",
+        "api_base": "https://fallback.example/v1",
+        "api_key": "upstream-key",
+        "enabled": True,
+        "models": [{"id": "fallback-model", "name": "Fallback", "enabled": True}],
+    })
+    add_routing_rule({
+        "name": "fallback-rule", "enabled": True,
+        "match_model": "source-model", "target_model": "primary-model", "target_provider": "primary-fail",
+        "fallback_models": [{"model": "fallback-model", "provider_id": "fallback-ok"}],
+    })
+
+    calls = []
+
+    def fake_chat_completion(**kwargs):
+        calls.append((kwargs["model"], kwargs["provider_id"]))
+        if kwargs["provider_id"] == "primary-fail":
+            raise RuntimeError("primary unavailable")
+
+        class Message:
+            content = "fallback response"
+            reasoning_content = None
+            tool_calls = []
+
+        class Choice:
+            message = Message()
+            finish_reason = "stop"
+
+        class Response:
+            choices = [Choice()]
+            usage = {"total_tokens": 7}
+
+        return Response()
+
+    monkeypatch.setattr("app.router.proxy.create_chat_completion", fake_chat_completion)
+
+    response = client.post("/v1/chat/completions", headers=temp_db["headers"], json={
+        "model": "source-model",
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "fallback response"
+    assert calls == [("primary-model", "primary-fail"), ("fallback-model", "fallback-ok")]
+    assert response.json()["model"] == "fallback-model"
 
 
 def test_anthropic_output_uses_reasoning_as_text_when_visible_text_empty():

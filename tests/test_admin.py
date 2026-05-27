@@ -284,6 +284,55 @@ def test_delete_nonexistent_routing_rule(temp_db):
     assert response.status_code == 404
 
 
+def test_routing_dry_run_reports_matching_rule_and_provider(temp_db):
+    client.post("/admin/providers", json={
+        "id": "target-prov", "name": "Target Provider", "provider_type": "openai",
+        "api_base": "https://api.test/v1", "api_key": "upstream", "enabled": True,
+        "models": [{"id": "target-model", "name": "Target Model", "enabled": True}],
+    }, headers=temp_db["headers"])
+    rule_resp = client.post("/admin/routing-rules", json={
+        "name": "Dry Run Rule", "enabled": True, "username": "alice",
+        "api_key_pattern": "secret", "match_model": "source-*",
+        "target_model": "target-model", "target_provider": "target-prov",
+    }, headers=temp_db["headers"])
+
+    response = client.post("/admin/routing-rules/dry-run", json={
+        "username": "alice",
+        "api_key": "sk-secret-value",
+        "model": "source-model",
+    }, headers=temp_db["headers"])
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["routing"]["matched"] is True
+    assert data["routing"]["rule_id"] == rule_resp.json()["id"]
+    assert data["routing"]["target_model"] == "target-model"
+    assert data["routing"]["target_provider"] == "target-prov"
+    assert data["provider"]["found"] is True
+    assert data["provider"]["id"] == "target-prov"
+    assert data["effective"]["provider_type"] == "openai"
+    assert "secret" not in data["input"]["api_key"]
+
+
+def test_routing_dry_run_reports_no_match(temp_db):
+    response = client.post("/admin/routing-rules/dry-run", json={
+        "username": "alice",
+        "api_key": "sk-test",
+        "model": "plain-model",
+    }, headers=temp_db["headers"])
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["routing"]["matched"] is False
+    assert data["routing"]["target_model"] == "plain-model"
+    assert data["provider"]["found"] is False
+
+
+def test_routing_dry_run_requires_model(temp_db):
+    response = client.post("/admin/routing-rules/dry-run", json={"username": "alice"}, headers=temp_db["headers"])
+    assert response.status_code == 400
+
+
 # -- Stats reset --
 
 def test_reset_stats(temp_db):
@@ -304,6 +353,39 @@ def test_admin_list_models(temp_db):
     assert response.status_code == 200
     model_ids = [m["id"] for m in response.json()["models"]]
     assert "mp/m-a" in model_ids
+
+
+def test_provider_health_endpoint(temp_db, monkeypatch):
+    client.post("/admin/providers", json={
+        "id": "health-admin", "name": "Health Admin", "provider_type": "openai",
+        "api_base": "https://api.test/v1", "api_key": "test", "enabled": True,
+        "models": []
+    }, headers=temp_db["headers"])
+
+    async def fake_health(provider_id):
+        return {"provider_id": provider_id, "ok": True, "status": "ok", "model_count": 1}
+
+    monkeypatch.setattr("app.router.admin.check_provider_health", fake_health)
+
+    response = client.get("/admin/providers/health-admin/health", headers=temp_db["headers"])
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+
+
+def test_provider_health_all_endpoint(temp_db, monkeypatch):
+    async def fake_health_all():
+        return [{"provider_id": "p1", "ok": True, "status": "ok"}]
+
+    monkeypatch.setattr("app.router.admin.check_all_provider_health", fake_health_all)
+
+    response = client.get("/admin/providers/health-all", headers=temp_db["headers"])
+    assert response.status_code == 200
+    assert response.json()["results"][0]["provider_id"] == "p1"
+
+
+def test_provider_health_endpoint_missing_provider(temp_db):
+    response = client.get("/admin/providers/missing/health", headers=temp_db["headers"])
+    assert response.status_code == 404
 
 
 # -- Preprocessor endpoints --

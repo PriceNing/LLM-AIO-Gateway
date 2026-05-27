@@ -53,6 +53,73 @@ def _parts_to_openai_content(parts: list[InternalPart]) -> Any:
     return content
 
 
+def _coerce_image_source(item: dict[str, Any]) -> dict[str, Any] | None:
+    """Normalize common OpenAI-compatible image part variants into IR source."""
+    source_obj = item.get("source")
+    image_url = item.get("image_url")
+    image_obj = item.get("image")
+
+    if isinstance(image_url, dict):
+        source = {"kind": "url", "url": image_url.get("url", "")}
+        detail = image_url.get("detail") or item.get("detail")
+        if detail:
+            source["detail"] = detail
+        return source
+    if isinstance(image_url, str) and image_url:
+        source = {"kind": "url", "url": image_url}
+        if item.get("detail"):
+            source["detail"] = item.get("detail")
+        return source
+
+    for key in ("url", "uri"):
+        if isinstance(item.get(key), str) and item[key]:
+            source = {"kind": "url", "url": item[key]}
+            if item.get("detail"):
+                source["detail"] = item.get("detail")
+            return source
+
+    if isinstance(source_obj, str) and source_obj:
+        source = {"kind": "url", "url": source_obj}
+        if item.get("detail"):
+            source["detail"] = item.get("detail")
+        return source
+    if isinstance(source_obj, dict):
+        source_type = source_obj.get("type") or source_obj.get("kind")
+        data = source_obj.get("data") or source_obj.get("base64")
+        if source_type == "base64" or data:
+            source = {
+                "kind": "base64",
+                "media_type": source_obj.get("media_type") or source_obj.get("mime_type") or source_obj.get("mimeType") or "image/png",
+                "data": data or "",
+            }
+        else:
+            source = {"kind": "url", "url": source_obj.get("url") or source_obj.get("uri") or ""}
+        if item.get("detail"):
+            source["detail"] = item.get("detail")
+        return source
+
+    if isinstance(image_obj, dict):
+        nested = _coerce_image_source(image_obj)
+        if nested:
+            if item.get("detail") and not nested.get("detail"):
+                nested["detail"] = item.get("detail")
+            return nested
+    if isinstance(image_obj, str) and image_obj:
+        if image_obj.startswith("data:image"):
+            return {"kind": "url", "url": image_obj}
+        return {"kind": "base64", "media_type": item.get("media_type") or item.get("mime_type") or item.get("mimeType") or "image/png", "data": image_obj}
+
+    data = item.get("data") or item.get("base64") or item.get("file_data")
+    if isinstance(data, str) and data:
+        if data.startswith("data:image"):
+            return {"kind": "url", "url": data}
+        media_type = item.get("media_type") or item.get("mime_type") or item.get("mimeType") or "image/png"
+        if str(media_type).startswith("image/"):
+            return {"kind": "base64", "media_type": media_type, "data": data}
+
+    return None
+
+
 def _parts_from_openai_content(content: Any) -> list[InternalPart]:
     if content is None:
         return []
@@ -75,36 +142,10 @@ def _parts_from_openai_content(content: Any) -> list[InternalPart]:
             txt = item.get("text", "")
             if txt:
                 parts.append(text_part(txt, raw=dict(item)))
-        elif item_type in ("image_url", "input_image"):
-            image_url = item.get("image_url", "")
-            source = {
-                "kind": "url",
-                "url": image_url.get("url", "") if isinstance(image_url, dict) else image_url,
-            }
-            detail = image_url.get("detail") if isinstance(image_url, dict) else item.get("detail")
-            if detail:
-                source["detail"] = detail
-            parts.append(image_part(source, raw=dict(item)))
-        elif item_type == "image":
-            source_obj = item.get("source")
-            if isinstance(source_obj, dict):
-                source_type = source_obj.get("type") or source_obj.get("kind")
-                if source_type == "base64" or source_obj.get("data"):
-                    source = {
-                        "kind": "base64",
-                        "media_type": source_obj.get("media_type") or source_obj.get("mime_type") or "image/png",
-                        "data": source_obj.get("data", ""),
-                    }
-                else:
-                    source = {
-                        "kind": "url",
-                        "url": source_obj.get("url") or source_obj.get("uri") or "",
-                    }
-                if item.get("detail"):
-                    source["detail"] = item.get("detail")
+        elif item_type in ("image_url", "input_image", "image", "file"):
+            source = _coerce_image_source(item)
+            if source:
                 parts.append(image_part(source, raw=dict(item)))
-            elif isinstance(source_obj, str):
-                parts.append(image_part({"kind": "url", "url": source_obj}, raw=dict(item)))
             else:
                 parts.append(unknown_part(dict(item)))
         else:

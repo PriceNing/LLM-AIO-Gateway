@@ -117,10 +117,19 @@ async def describe_image(
             if resp.status_code == 200:
                 data = resp.json()
                 message = data.get("choices", [{}])[0].get("message", {})
-                description = message.get("content", "") or message.get("reasoning_content", "")
+                content = message.get("content", "")
+                reasoning_content = message.get("reasoning_content", "")
+                description = content if content else reasoning_content
                 if description:
                     _set_cached_description(image_url or image_data, description)
-                    _log.info("[preprocess] vision OK model=%s desc_len=%d", vision_model, len(description))
+                    if not content and reasoning_content:
+                        _log.warning(
+                            "[preprocess] vision returned description in reasoning_content only model=%s desc_len=%d",
+                            vision_model,
+                            len(description),
+                        )
+                    else:
+                        _log.info("[preprocess] vision OK model=%s desc_len=%d", vision_model, len(description))
                     return description.strip()
                 else:
                     _log.warning("[preprocess] vision returned empty content")

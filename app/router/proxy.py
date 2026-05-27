@@ -14,6 +14,7 @@ from app.database import (
     parse_model_id, add_request_record,
 )
 from app.core.text import friendly_error_msg, mask_key
+from app.core.policy import RouteTarget
 from app.core.state import (
     TOOL_ONLY_LIMIT,
     conversation_cache_key as _conversation_cache_key,
@@ -48,6 +49,7 @@ from app.protocols.egress import (
 )
 from app.services.lite_llm import create_chat_completion
 from app.services.preprocessing import has_image_content, preprocess_messages
+from app.services.routing_targets import candidate_targets, is_retryable_endpoint_error, provider_for_log, resolve_provider
 from app.services.logger import get_logger
 from app.config import get_default
 
@@ -64,12 +66,49 @@ _request_log = deque(maxlen=get_default("request_log_max", 200))
 _request_log_lock = threading.Lock()
 
 
-def _adapter_provider_id(provider_info: dict | None, provider_id: str = "") -> str:
-    return (provider_info or {}).get("id") or provider_id or ""
+async def _call_nonstream_target(target: RouteTarget, internal, *, temperature, max_tokens):
+    provider_info = resolve_provider(target.model, target.provider_id)
+    adapter_provider_id = provider_for_log(provider_info, target.provider_id)
+    if provider_info and provider_info.get("provider_type") == "anthropic":
+        output = await anthropic_messages_completion_for_internal(provider_info, internal)
+    else:
+        response = await anyio.to_thread.run_sync(
+            lambda: create_chat_completion(
+                model=target.model,
+                messages=chat_messages_from_internal(internal),
+                provider_id=adapter_provider_id,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                **chat_kwargs_from_internal(internal),
+            )
+        )
+        output = response_to_internal_output(response)
+    return output, provider_info, adapter_provider_id
 
 
-def _provider_for_log(provider_info: dict | None, provider_id: str = "") -> str:
-    return _adapter_provider_id(provider_info, provider_id)
+async def _call_nonstream_with_fallbacks(policy, internal, *, temperature, max_tokens, log_label: str):
+    original_model = internal.target_model
+    original_provider = internal.provider_id
+    last_exc = None
+    targets = candidate_targets(policy, original_model, original_provider)
+    for index, target in enumerate(targets):
+        internal.target_model = target.model
+        internal.provider_id = target.provider_id
+        try:
+            if index:
+                _app_log.warning(
+                    "[%s fallback] trying target=%s provider=%s after error=%s",
+                    log_label,
+                    target.model,
+                    target.provider_id or "-",
+                    friendly_error_msg(last_exc) if last_exc else "",
+                )
+            return await _call_nonstream_target(target, internal, temperature=temperature, max_tokens=max_tokens)
+        except Exception as exc:
+            last_exc = exc
+            if index >= len(targets) - 1 or not is_retryable_endpoint_error(exc):
+                raise
+    raise last_exc or RuntimeError("No routing target available")
 
 
 def _log_request(username: str, api_key: str, model: str, provider_id: str,
@@ -310,10 +349,40 @@ def ensure_model_allowed(user: dict, api_key: dict, model: str) -> None:
     allowed = allowed_models_for(user, api_key)
     if "*" in allowed:
         return
-    # ModelId.__eq__ handles composite/simple matching in both directions
-    if parse_model_id(model) in allowed:
-        return
+    requested = parse_model_id(model)
+    for allowed_model in allowed:
+        allowed_mid = parse_model_id(str(allowed_model))
+        if allowed_mid.is_composite:
+            if requested.is_composite and requested == allowed_mid:
+                return
+        elif requested.model_name == allowed_mid.model_name:
+            return
+    if any("/" in str(allowed_model) for allowed_model in allowed) and not requested.is_composite:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Model '{model}' is not allowed for this API key; use a provider-qualified model id",
+        )
     raise HTTPException(status_code=403, detail=f"Model '{model}' is not allowed for this API key")
+
+
+def ensure_routed_model_allowed(user: dict, api_key: dict, requested_model: str, target_model: str) -> None:
+    if requested_model == target_model:
+        return
+    allowed = allowed_models_for(user, api_key)
+    if "*" in allowed:
+        return
+    requested = parse_model_id(requested_model)
+    if requested.is_composite:
+        return
+    if any("/" in str(allowed_model) for allowed_model in allowed):
+        target = parse_model_id(target_model)
+        for allowed_model in allowed:
+            allowed_mid = parse_model_id(str(allowed_model))
+            if allowed_mid.is_composite and target.is_composite and target == allowed_mid:
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"Model '{requested_model}' is not allowed for this API key; request '{target_model}' directly",
+                )
 
 @router.get("/models")
 def list_models(authorization: Optional[str] = Header(None)):
@@ -384,24 +453,21 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
     )
     model = internal.target_model
     provider_id = internal.provider_id
+    ensure_routed_model_allowed(user, api_key, requested_model, model)
     conv_key = policy.conv_key
     provider_info = None
     adapter_provider_id = provider_id or ""
 
     try:
         extra = chat_kwargs_from_internal(internal)
-        from app.database import get_provider as _get_prov, find_provider_by_model as _find
-        if provider_id:
-            provider_info = _get_prov(provider_id)
-        else:
-            provider_info = _find(model)
+        provider_info = resolve_provider(model, provider_id)
         is_anthropic = provider_info and provider_info.get("provider_type") == "anthropic"
-        adapter_provider_id = _adapter_provider_id(provider_info, provider_id)
+        adapter_provider_id = provider_for_log(provider_info, provider_id)
 
         if stream:
             if is_anthropic:
                 anthropic_msgs, anthropic_body = anthropic_body_from_internal(internal)
-                adapter_provider_id = _adapter_provider_id(provider_info, provider_id)
+                adapter_provider_id = provider_for_log(provider_info, provider_id)
                 events = iter_anthropic_output_events(
                     provider_info=provider_info,
                     messages=anthropic_msgs,
@@ -436,21 +502,15 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
                 media_type="text/event-stream"
             )
 
-        if is_anthropic:
-            output = await anthropic_messages_completion_for_internal(provider_info, internal)
-            adapter_provider_id = _adapter_provider_id(provider_info, provider_id)
-        else:
-            response = await anyio.to_thread.run_sync(
-                lambda: create_chat_completion(
-                    model=model,
-                    messages=chat_messages_from_internal(internal),
-                    provider_id=adapter_provider_id,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    **extra
-                )
-            )
-            output = response_to_internal_output(response)
+        output, provider_info, adapter_provider_id = await _call_nonstream_with_fallbacks(
+            policy,
+            internal,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            log_label="chat",
+        )
+        model = internal.target_model
+        provider_id = internal.provider_id
         if output.reasoning:
             _remember_reasoning_content(conv_key, output.reasoning, [tool.id for tool in output.tool_calls])
             _app_log.debug("[chat_nonstream] STORED rc key=%s len=%d cache_hit=%d cache_miss=%d",
@@ -509,23 +569,20 @@ async def completions(request: Request, authorization: Optional[str] = Header(No
     )
     model = internal.target_model
     provider_id = internal.provider_id
+    ensure_routed_model_allowed(user, api_key, requested_model, model)
     conv_key = policy.conv_key
     provider_info = None
     adapter_provider_id = provider_id or ""
 
     try:
-        from app.database import get_provider as _get_prov, find_provider_by_model as _find
-        if provider_id:
-            provider_info = _get_prov(provider_id)
-        else:
-            provider_info = _find(model)
+        provider_info = resolve_provider(model, provider_id)
         is_anthropic = provider_info and provider_info.get("provider_type") == "anthropic"
-        adapter_provider_id = _adapter_provider_id(provider_info, provider_id)
+        adapter_provider_id = provider_for_log(provider_info, provider_id)
 
         if stream:
             if is_anthropic:
                 anthropic_msgs, anthropic_body = anthropic_body_from_internal(internal)
-                adapter_provider_id = _adapter_provider_id(provider_info, provider_id)
+                adapter_provider_id = provider_for_log(provider_info, provider_id)
                 events = iter_anthropic_output_events(
                     provider_info=provider_info,
                     messages=anthropic_msgs,
@@ -558,21 +615,15 @@ async def completions(request: Request, authorization: Optional[str] = Header(No
                 media_type="text/event-stream"
             )
 
-        if is_anthropic:
-            output = await anthropic_messages_completion_for_internal(provider_info, internal)
-            adapter_provider_id = _adapter_provider_id(provider_info, provider_id)
-        else:
-            response = await anyio.to_thread.run_sync(
-                lambda: create_chat_completion(
-                    model=model,
-                    messages=chat_messages_from_internal(internal),
-                    provider_id=adapter_provider_id,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    **chat_kwargs_from_internal(internal),
-                )
-            )
-            output = response_to_internal_output(response)
+        output, provider_info, adapter_provider_id = await _call_nonstream_with_fallbacks(
+            policy,
+            internal,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            log_label="completions",
+        )
+        model = internal.target_model
+        provider_id = internal.provider_id
         _log_request(username, api_key_value, model, adapter_provider_id or "", "completions", True, output.usage.get("total_tokens", 0), requested_model)
     
         increment_global_stats(success=True)
@@ -626,12 +677,9 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
     )
     model = internal.target_model
     provider_id = internal.provider_id
-    from app.database import get_provider as _get_prov, find_provider_by_model as _find
-    if provider_id:
-        provider_info = _get_prov(provider_id)
-    else:
-        provider_info = _find(model)
-    adapter_provider_id = _adapter_provider_id(provider_info, provider_id)
+    ensure_routed_model_allowed(user, api_key, requested_model, model)
+    provider_info = resolve_provider(model, provider_id)
+    adapter_provider_id = provider_for_log(provider_info, provider_id)
     previous_response_id = internal.previous_response_id
     max_tokens = internal.max_tokens
     temperature = internal.temperature
@@ -700,22 +748,15 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
                 media_type="text/event-stream"
             )
 
-        if provider_info and provider_info.get("provider_type") == "anthropic":
-            output = await anthropic_messages_completion_for_internal(provider_info, internal)
-        else:
-            adapter_messages = chat_messages_from_internal(internal)
-            adapter_extra = chat_kwargs_from_internal(internal)
-            _app_log.debug("[OPENAI_EXIT] model=%s msgs=%d tools=%s tool_choice=%s conv_key=%s",
-                          model, len(adapter_messages), "yes" if adapter_extra.get("tools") else "no",
-                          str(adapter_extra.get("tool_choice")), conv_key)
-            response = await anyio.to_thread.run_sync(
-                lambda: create_chat_completion(
-                    model=model, messages=adapter_messages, provider_id=adapter_provider_id,
-                    max_tokens=max_tokens, temperature=temperature,
-                    **adapter_extra,
-                )
-            )
-            output = response_to_internal_output(response)
+        output, provider_info, adapter_provider_id = await _call_nonstream_with_fallbacks(
+            policy,
+            internal,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            log_label="messages",
+        )
+        model = internal.target_model
+        provider_id = internal.provider_id
         if output.reasoning:
             _remember_reasoning_content(conv_key, output.reasoning, [tool.id for tool in output.tool_calls])
             _app_log.debug("[messages_nonstream] STORED rc key=%s len=%d cache_hit=%d cache_miss=%d",
@@ -800,6 +841,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
     )
     model = internal.target_model
     provider_id = internal.provider_id
+    ensure_routed_model_allowed(user, api_key, requested_model, model)
     conv_key = policy.conv_key
     provider_info = None
     adapter_provider_id = provider_id or ""
@@ -818,12 +860,8 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
         extra = dict(internal.extra)
 
         # Choose an upstream adapter after policy has finalized the internal request.
-        from app.database import get_provider as _get_prov, find_provider_by_model as _find
-        if provider_id:
-            provider_info = _get_prov(provider_id)
-        else:
-            provider_info = _find(model)
-        adapter_provider_id = _adapter_provider_id(provider_info, provider_id)
+        provider_info = resolve_provider(model, provider_id)
+        adapter_provider_id = provider_for_log(provider_info, provider_id)
         is_anthropic = provider_info and provider_info.get("provider_type") == "anthropic"
 
         if is_anthropic:
@@ -857,7 +895,13 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                     media_type="text/event-stream"
                 )
 
-            output = await anthropic_messages_completion_for_internal(provider_info, internal)
+            output, provider_info, adapter_provider_id = await _call_nonstream_with_fallbacks(
+                policy,
+                internal,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                log_label="responses",
+            )
         else:
             adapter_messages = chat_messages_from_internal(internal)
             adapter_extra = chat_kwargs_from_internal(internal)
@@ -889,17 +933,15 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                     media_type="text/event-stream"
                 )
 
-            response = await anyio.to_thread.run_sync(
-                lambda: create_chat_completion(
-                    model=model,
-                    messages=adapter_messages,
-                    provider_id=adapter_provider_id,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    **adapter_extra
-                )
+            output, provider_info, adapter_provider_id = await _call_nonstream_with_fallbacks(
+                policy,
+                internal,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                log_label="responses",
             )
-            output = response_to_internal_output(response)
+        model = internal.target_model
+        provider_id = internal.provider_id
         if output.reasoning:
             _remember_reasoning_content(conv_key, output.reasoning, [tool.id for tool in output.tool_calls])
             _app_log.debug("[responses_nonstream] STORED rc key=%s len=%d cache_hit=%d cache_miss=%d",
@@ -914,7 +956,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
             increment_user_usage(username, api_key_value, True, output.usage.get("total_tokens", 0))
         return render_response(output, model=model, previous_response_id=previous_response_id, response_id=resp_id)
     except Exception as e:
-        _log_request(username, api_key_value, "-", _provider_for_log(provider_info, provider_id), "responses", False, 0, requested_model)
+        _log_request(username, api_key_value, "-", provider_for_log(provider_info, provider_id), "responses", False, 0, requested_model)
         increment_global_stats(success=False)
         if username != "legacy":
             increment_user_usage(username, api_key_value, False, 0)

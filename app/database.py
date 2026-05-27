@@ -1,12 +1,12 @@
 import sqlite3
 import json
-import uuid
 import threading
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
 from contextlib import contextmanager
+from app.db import routing as routing_db
 
 _lock = threading.Lock()
 _initialized = False
@@ -36,6 +36,8 @@ def init_db(path: Optional[str] = None) -> None:
             _migrate_provider_models_created_at(conn)
             # Migration: add extra_headers to providers if missing
             _migrate_providers_extra_headers(conn)
+            # Migration: add fallback route chains to routing rules if missing
+            routing_db.migrate(conn)
         _initialized = True
 
 
@@ -158,7 +160,8 @@ CREATE TABLE IF NOT EXISTS routing_rules (
     api_key_pattern TEXT NOT NULL DEFAULT '',
     match_model TEXT NOT NULL DEFAULT '',
     target_model TEXT NOT NULL DEFAULT '',
-    target_provider TEXT NOT NULL DEFAULT ''
+    target_provider TEXT NOT NULL DEFAULT '',
+    fallback_models TEXT NOT NULL DEFAULT '[]'
 );
 
 CREATE TABLE IF NOT EXISTS global_stats (
@@ -798,53 +801,20 @@ def find_provider_by_model(model_id: str) -> Optional[dict]:
 # -- Routing rules --
 
 def get_routing_rules() -> list:
-    with get_db() as db:
-        rows = db.execute("SELECT * FROM routing_rules ORDER BY rowid").fetchall()
-        result = []
-        for r in rows:
-            d = _row_to_dict(r)
-            d["enabled"] = _to_bool(d["enabled"])
-            result.append(d)
-        return result
+    return routing_db.get_routing_rules(get_db)
 
 
 def get_routing_rule(rule_id: str) -> Optional[dict]:
-    with get_db() as db:
-        row = db.execute("SELECT * FROM routing_rules WHERE id = ?", (rule_id,)).fetchone()
-        if not row:
-            return None
-        d = _row_to_dict(row)
-        d["enabled"] = _to_bool(d["enabled"])
-        return d
+    return routing_db.get_routing_rule(get_db, rule_id)
 
 
 def add_routing_rule(rule: dict) -> dict:
-    entry_id = rule.get("id") or uuid.uuid4().hex[:8]
-    with get_db() as db:
-        db.execute(
-            "INSERT INTO routing_rules (id, name, enabled, username, api_key_pattern, match_model, target_model, target_provider) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (entry_id, rule.get("name", "New Rule"), 1 if rule.get("enabled", True) else 0,
-             rule.get("username", ""), rule.get("api_key_pattern", ""),
-             rule.get("match_model", ""), rule.get("target_model", ""), rule.get("target_provider", ""))
-        )
-    return get_routing_rule(entry_id)
+    return routing_db.add_routing_rule(get_db, get_routing_rule, rule)
 
 
 def update_routing_rule(rule_id: str, updates: dict) -> Optional[dict]:
-    with get_db() as db:
-        existing = db.execute("SELECT 1 FROM routing_rules WHERE id = ?", (rule_id,)).fetchone()
-        if not existing:
-            return None
-        for key in ("name", "enabled", "username", "api_key_pattern", "match_model", "target_model", "target_provider"):
-            if key in updates:
-                val = updates[key]
-                if key == "enabled":
-                    val = 1 if val else 0
-                db.execute(f"UPDATE routing_rules SET {key} = ? WHERE id = ?", (val, rule_id))
-    return get_routing_rule(rule_id)
+    return routing_db.update_routing_rule(get_db, get_routing_rule, rule_id, updates)
 
 
 def delete_routing_rule(rule_id: str) -> bool:
-    with get_db() as db:
-        cursor = db.execute("DELETE FROM routing_rules WHERE id = ?", (rule_id,))
-        return cursor.rowcount > 0
+    return routing_db.delete_routing_rule(get_db, rule_id)

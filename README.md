@@ -167,9 +167,14 @@ curl http://localhost:8000/v1/responses \
   "api_key_pattern": "",
   "match_model": "MiniMax-M2*",
   "target_model": "target-model",
-  "target_provider": "target-provider"
+  "target_provider": "target-provider",
+  "fallback_models": [
+    {"model": "backup-model", "provider_id": "backup-provider"}
+  ]
 }
 ```
+
+管理接口提供 `POST /admin/routing-rules/dry-run` 用于检查某个用户、API Key 片段和请求模型会命中哪条规则。提供商页面也提供健康检查入口，对 `/models` 可用性、延迟和模型数量做快速探测。非流式请求在主目标发生上游错误时会按 `fallback_models` 顺序尝试备用目标。
 
 ## 配置
 
@@ -223,7 +228,7 @@ curl http://localhost:8000/v1/responses \
 pytest tests/ -q
 ```
 
-当前预期结果：`308 passed`。
+当前预期结果：`318 passed`。
 
 真实烟测建议：
 

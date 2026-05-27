@@ -364,6 +364,12 @@ body {
   font-weight: 700;
   letter-spacing: -0.3px;
 }
+.section-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
 
 /* ═══════════════════════════════════ Buttons ═══════════════════════════════════ */
 
@@ -526,6 +532,47 @@ body {
   background: var(--hover);
   padding: 2px 8px;
   border-radius: 4px;
+}
+.dry-run-result {
+  margin: 12px 0 4px;
+  padding: 14px;
+  border: 1px solid var(--border-card);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+}
+.dry-run-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.dry-run-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 10px;
+}
+.dry-run-grid > div {
+  min-width: 0;
+}
+.dry-run-result .label {
+  display: block;
+  font-size: 12px;
+  color: var(--text-tertiary);
+  margin-bottom: 3px;
+}
+.dry-run-result code {
+  display: inline-block;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  background: var(--bg-input);
+  padding: 2px 7px;
+  border-radius: 4px;
+}
+.dry-run-reason {
+  margin-top: 12px;
+  font-size: 13px;
+  color: var(--text-secondary);
 }
 
 /* ── User List ── */

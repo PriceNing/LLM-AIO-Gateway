@@ -1,6 +1,6 @@
 import re
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Awaitable, Callable
 
 from app.database import get_routing_rules, parse_model_id
@@ -190,6 +190,7 @@ class RoutingDecision:
     requested_model: str
     resolved_model: str
     target: RouteTarget
+    fallbacks: list[RouteTarget] = field(default_factory=list)
     matched: bool = False
     rule_id: int | None = None
     rule_name: str = ""
@@ -203,6 +204,9 @@ class RoutingDecision:
     @property
     def target_provider(self) -> str:
         return self.target.provider_id
+
+    def candidate_targets(self) -> list[RouteTarget]:
+        return [self.target, *self.fallbacks]
 
 
 @dataclass(slots=True)
@@ -221,6 +225,22 @@ def wildcard_match(pattern: str, value: str) -> bool:
     """Simple glob-style wildcard matching: * matches any sequence."""
     regex = re.escape(pattern).replace(r"\*", ".*")
     return bool(re.fullmatch(regex, value, re.IGNORECASE))
+
+
+def _fallback_targets(raw_fallbacks) -> list[RouteTarget]:
+    targets = []
+    for item in raw_fallbacks or []:
+        if isinstance(item, str):
+            model = item.strip()
+            provider_id = ""
+        elif isinstance(item, dict):
+            model = str(item.get("model") or item.get("target_model") or "").strip()
+            provider_id = str(item.get("provider_id") or item.get("target_provider") or "").strip()
+        else:
+            continue
+        if model:
+            targets.append(RouteTarget(model=model, provider_id=provider_id))
+    return targets
 
 
 def apply_routing_rules(username: str, api_key_value: str, requested_model: str, resolved_model: str) -> RoutingDecision:
@@ -250,6 +270,7 @@ def apply_routing_rules(username: str, api_key_value: str, requested_model: str,
             requested_model=requested_model,
             resolved_model=resolved_model,
             target=RouteTarget(model=target_model, provider_id=target_provider),
+            fallbacks=_fallback_targets(rule.get("fallback_models")),
             matched=True,
             rule_id=rule.get("id"),
             rule_name=rule.get("name", ""),

@@ -167,9 +167,14 @@ Rule structure:
   "api_key_pattern": "",
   "match_model": "MiniMax-M2*",
   "target_model": "target-model",
-  "target_provider": "target-provider"
+  "target_provider": "target-provider",
+  "fallback_models": [
+    {"model": "backup-model", "provider_id": "backup-provider"}
+  ]
 }
 ```
+
+The admin API includes `POST /admin/routing-rules/dry-run` to inspect which rule would match a username, API-key fragment, and requested model. Provider cards also expose a health check that probes `/models` availability, latency, and model count. Non-streaming requests try `fallback_models` in order when the primary target fails with an upstream error.
 
 ## Configuration
 
@@ -223,7 +228,7 @@ Main code boundaries:
 pytest tests/ -q
 ```
 
-Expected current result: `308 passed`.
+Expected current result: `318 passed`.
 
 Live smoke matrix:
 

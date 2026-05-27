@@ -91,6 +91,7 @@ zh: {
     'providers.modelsCount': '{n} 个模型',
     'providers.edit': '编辑',
     'providers.refresh': '刷新',
+    'providers.health': '健康检查',
     'providers.delete': '删除',
     'providers.addTitle': '新增提供商',
     'providers.editTitle': '编辑提供商',
@@ -110,6 +111,8 @@ zh: {
     'providers.deleteFail': '删除失败',
     'providers.refreshOk': '刷新成功，发现 {n} 个模型',
     'providers.refreshFail': '刷新失败',
+    'providers.healthOk': '健康检查通过：{n} 个模型，{ms}ms',
+    'providers.healthFail': '健康检查失败',
     'providers.refreshAllDone': '刷新完成',
     'providers.refreshAllFail': '刷新失败',
 
@@ -133,6 +136,7 @@ zh: {
     'routing.matchModelHint': '支持 * 通配符，如 deepseek-*',
     'routing.targetModel': '目标模型',
     'routing.targetProvider': '目标提供商（空=自动）',
+    'routing.fallbackModels': 'Fallback 模型链（JSON，可选）',
     'routing.save': '保存',
     'routing.cancel': '取消',
     'routing.loadFail': '加载路由规则失败',
@@ -143,6 +147,20 @@ zh: {
     'routing.deleteFail': '删除规则失败',
     'routing.enabled': '启用',
     'routing.disabled': '禁用',
+    'routing.dryRun': 'Dry Run',
+    'routing.dryRunTitle': '路由 Dry Run',
+    'routing.dryRunUser': '用户名（可选）',
+    'routing.dryRunKey': 'API Key 或匹配片段（可选）',
+    'routing.dryRunModel': '请求模型',
+    'routing.dryRunResolvedModel': '解析后模型（可选）',
+    'routing.dryRunSubmit': '运行',
+    'routing.dryRunFail': '路由 Dry Run 失败',
+    'routing.dryRunNoModel': '请输入请求模型',
+    'routing.dryRunMatched': '命中规则',
+    'routing.dryRunNoMatch': '未命中规则',
+    'routing.dryRunProvider': '目标提供商',
+    'routing.dryRunEffective': '最终路由',
+    'routing.dryRunReason': '原因',
 
     'stats.title': '调用统计',
     'stats.loadFail': '加载统计失败',
@@ -322,6 +340,7 @@ en: {
     'providers.modelsCount': '{n} models',
     'providers.edit': 'Edit',
     'providers.refresh': 'Refresh',
+    'providers.health': 'Health',
     'providers.delete': 'Delete',
     'providers.addTitle': 'Add Provider',
     'providers.editTitle': 'Edit Provider',
@@ -341,6 +360,8 @@ en: {
     'providers.deleteFail': 'Failed to delete',
     'providers.refreshOk': 'Refresh OK — {n} models found',
     'providers.refreshFail': 'Refresh failed',
+    'providers.healthOk': 'Health OK: {n} models, {ms}ms',
+    'providers.healthFail': 'Health check failed',
     'providers.refreshAllDone': 'Refresh complete',
     'providers.refreshAllFail': 'Refresh failed',
 
@@ -364,6 +385,7 @@ en: {
     'routing.matchModelHint': 'Supports * wildcard, e.g. deepseek-*',
     'routing.targetModel': 'Target Model',
     'routing.targetProvider': 'Target Provider (empty=auto)',
+    'routing.fallbackModels': 'Fallback Model Chain (JSON, optional)',
     'routing.save': 'Save',
     'routing.cancel': 'Cancel',
     'routing.loadFail': 'Failed to load routing rules',
@@ -374,6 +396,20 @@ en: {
     'routing.deleteFail': 'Failed to delete rule',
     'routing.enabled': 'Enabled',
     'routing.disabled': 'Disabled',
+    'routing.dryRun': 'Dry Run',
+    'routing.dryRunTitle': 'Routing Dry Run',
+    'routing.dryRunUser': 'Username (optional)',
+    'routing.dryRunKey': 'API key or match fragment (optional)',
+    'routing.dryRunModel': 'Requested Model',
+    'routing.dryRunResolvedModel': 'Resolved Model (optional)',
+    'routing.dryRunSubmit': 'Run',
+    'routing.dryRunFail': 'Routing dry run failed',
+    'routing.dryRunNoModel': 'Requested model is required',
+    'routing.dryRunMatched': 'Matched Rule',
+    'routing.dryRunNoMatch': 'No Rule Matched',
+    'routing.dryRunProvider': 'Target Provider',
+    'routing.dryRunEffective': 'Effective Route',
+    'routing.dryRunReason': 'Reason',
 
     'stats.title': 'Statistics',
     'stats.loadFail': 'Failed to load stats',
@@ -1019,12 +1055,23 @@ function routingFormHtml(title, rule) {
             modelSelectHtml('ruleTargetModel', rule.target_model || '', false) + '</div>' +
         '<div class="form-group"><label>' + t('routing.targetProvider') + '</label>' +
             providerSelectHtml('ruleTargetProvider', rule.target_provider || '') + '</div>' +
+        '<div class="form-group"><label>' + t('routing.fallbackModels') + '</label>' +
+            '<textarea id="ruleFallbackModels" rows="4" style="font-family:monospace;font-size:12px" placeholder=\'[{"model":"backup-model","provider_id":"backup-provider"}]\'>' + escHtml(JSON.stringify(rule.fallback_models || [], null, 2)) + '</textarea></div>' +
         '<div class="form-actions">' +
             '<button class="btn btn-secondary" onclick="closeModal()">' + t('routing.cancel') + '</button>' +
             '<button class="btn btn-primary" id="ruleSaveBtn">' + t('routing.save') + '</button></div>';
 }
 
 function readRoutingForm() {
+    var fallbackModels = [];
+    var fallbackText = document.getElementById('ruleFallbackModels').value.trim();
+    if (fallbackText) {
+        try {
+            fallbackModels = JSON.parse(fallbackText);
+        } catch (e) {
+            toast('fallback_models JSON invalid: ' + e.message, 'error');
+        }
+    }
     return {
         name: document.getElementById('ruleName').value.trim(),
         enabled: document.getElementById('ruleEnabled').checked,
@@ -1032,7 +1079,8 @@ function readRoutingForm() {
         api_key_pattern: document.getElementById('ruleKeyPattern').value.trim(),
         match_model: document.getElementById('ruleMatchModel').value.trim(),
         target_model: document.getElementById('ruleTargetModel').value.trim(),
-        target_provider: document.getElementById('ruleTargetProvider').value.trim()
+        target_provider: document.getElementById('ruleTargetProvider').value.trim(),
+        fallback_models: fallbackModels
     };
 }
 
@@ -1128,6 +1176,7 @@ function renderProviders() {
             '<div class="card-actions">' +
                 '<button class="btn btn-secondary btn-sm" onclick="editProvider(\'' + jsEsc(p.id) + '\')">' + t('providers.edit') + '</button>' +
                 '<button class="btn btn-secondary btn-sm" onclick="refreshProvider(\'' + jsEsc(p.id) + '\')">' + t('providers.refresh') + '</button>' +
+                '<button class="btn btn-secondary btn-sm" onclick="checkProviderHealth(\'' + jsEsc(p.id) + '\')">' + t('providers.health') + '</button>' +
                 '<button class="btn btn-danger btn-sm" onclick="deleteProvider(\'' + jsEsc(p.id) + '\')">' + t('providers.delete') + '</button>' +
             '</div>' +
         '</div>';
@@ -1215,6 +1264,17 @@ async function refreshProvider(id) {
         toast(t('providers.refreshOk', {n: result.count}), 'success');
         await Promise.all([loadProviders(), loadModels()]);
     } catch (e) { toast(t('providers.refreshFail') + ': ' + e.message, 'error'); }
+}
+
+async function checkProviderHealth(id) {
+    try {
+        var result = await api('/admin/providers/' + encodeURIComponent(id) + '/health');
+        if (result.ok) {
+            toast(t('providers.healthOk', {n: result.model_count || 0, ms: result.latency_ms || 0}), 'success');
+        } else {
+            toast(t('providers.healthFail') + ': ' + (result.error || result.status || id), 'error');
+        }
+    } catch (e) { toast(t('providers.healthFail') + ': ' + e.message, 'error'); }
 }
 
 async function refreshAllModels() {

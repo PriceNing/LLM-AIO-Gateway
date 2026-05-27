@@ -8,9 +8,12 @@ from app.database import (
     get_routing_rules, get_routing_rule, add_routing_rule, update_routing_rule, delete_routing_rule,
     get_global_stats, reset_global_stats, reset_user_stats,
     get_history_stats,
+    find_provider_by_model, parse_model_id,
 )
+from app.core.policy import apply_routing_rules
+from app.core.text import mask_key
 from app.router.auth import require_admin_session
-from app.services.discovery import refresh_provider_models, refresh_all_providers
+from app.services.discovery import refresh_provider_models, refresh_all_providers, check_provider_health, check_all_provider_health
 from app.services.lite_llm import get_available_models
 from app.router.proxy import get_request_log, get_model_stats, clear_request_log, get_timeline_data, get_model_distribution, get_timeline_model_data
 from app.services.logger import get_logger
@@ -68,6 +71,20 @@ async def refresh_all(authorization: Optional[str] = Header(None)):
     await require_admin_session(authorization)
     results = await refresh_all_providers()
     return {"results": results}
+
+
+@router.get("/providers/health-all")
+async def provider_health_all(authorization: Optional[str] = Header(None)):
+    await require_admin_session(authorization)
+    return {"results": await check_all_provider_health()}
+
+
+@router.get("/providers/{provider_id}/health")
+async def provider_health(provider_id: str, authorization: Optional[str] = Header(None)):
+    await require_admin_session(authorization)
+    if not get_provider(provider_id):
+        raise HTTPException(status_code=404, detail="Provider not found")
+    return await check_provider_health(provider_id)
 
 
 @router.get("/models")
@@ -210,6 +227,61 @@ async def delete_routing_rule_endpoint(rule_id: str, authorization: Optional[str
     if not delete_routing_rule(rule_id):
         raise HTTPException(status_code=404, detail="Rule not found")
     return {"status": "deleted"}
+
+
+@router.post("/routing-rules/dry-run")
+async def dry_run_routing_rule(body: dict, authorization: Optional[str] = Header(None)):
+    await require_admin_session(authorization)
+    requested_model = str(body.get("model") or body.get("requested_model") or "").strip()
+    if not requested_model:
+        raise HTTPException(status_code=400, detail="model is required")
+
+    username = str(body.get("username") or "").strip()
+    api_key_value = str(body.get("api_key") or body.get("api_key_value") or body.get("key") or "")
+    resolved_model = str(body.get("resolved_model") or requested_model).strip()
+    decision = apply_routing_rules(username, api_key_value, requested_model, resolved_model)
+
+    provider_source = "target_provider" if decision.target_provider else "model_lookup"
+    provider = get_provider(decision.target_provider) if decision.target_provider else find_provider_by_model(decision.target_model)
+    mid = parse_model_id(requested_model)
+
+    return {
+        "input": {
+            "username": username,
+            "api_key": mask_key(api_key_value) if api_key_value else "",
+            "requested_model": requested_model,
+            "resolved_model": resolved_model,
+            "model_name": mid.model_name,
+            "provider_id": mid.provider_id,
+            "is_composite": mid.is_composite,
+        },
+        "routing": {
+            "matched": decision.matched,
+            "source": decision.source,
+            "rule_id": decision.rule_id,
+            "rule_name": decision.rule_name,
+            "reason": decision.reason,
+            "target_model": decision.target_model,
+            "target_provider": decision.target_provider,
+            "fallbacks": [
+                {"model": target.model, "provider_id": target.provider_id}
+                for target in decision.fallbacks
+            ],
+        },
+        "provider": {
+            "found": bool(provider),
+            "source": provider_source,
+            "id": provider.get("id", "") if provider else decision.target_provider,
+            "name": provider.get("name", "") if provider else "",
+            "provider_type": provider.get("provider_type", "") if provider else "",
+            "enabled": bool(provider.get("enabled", False)) if provider else False,
+        },
+        "effective": {
+            "model": decision.target_model,
+            "provider_id": provider.get("id", "") if provider else decision.target_provider,
+            "provider_type": provider.get("provider_type", "") if provider else "",
+        },
+    }
 
 
 @router.get("/stats/history")

@@ -205,12 +205,15 @@ def test_add_and_list_routing_rules():
         "name": "Test Rule", "enabled": True,
         "username": "", "api_key_pattern": "",
         "match_model": "test-*", "target_model": "target-model",
-        "target_provider": ""
+        "target_provider": "",
+        "fallback_models": [{"model": "fallback-model", "provider_id": "fallback-provider"}],
     })
     assert rule["name"] == "Test Rule"
+    assert rule["fallback_models"] == [{"model": "fallback-model", "provider_id": "fallback-provider"}]
     rules = get_routing_rules()
     assert len(rules) == 1
     assert rules[0]["match_model"] == "test-*"
+    assert rules[0]["fallback_models"][0]["model"] == "fallback-model"
 
 
 def test_update_routing_rule():
@@ -219,9 +222,10 @@ def test_update_routing_rule():
         "username": "", "api_key_pattern": "",
         "match_model": "*", "target_model": "t1", "target_provider": ""
     })
-    updated = update_routing_rule(rule["id"], {"name": "New Rule", "enabled": False})
+    updated = update_routing_rule(rule["id"], {"name": "New Rule", "enabled": False, "fallback_models": ["t2"]})
     assert updated["name"] == "New Rule"
     assert updated["enabled"] is False
+    assert updated["fallback_models"] == ["t2"]
 
 
 def test_delete_routing_rule():

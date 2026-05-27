@@ -114,7 +114,10 @@
                 <div id="routing-section" class="section" style="display:none;">
                     <div class="section-header">
                         <h2 data-i18n="routing.title">路由规则</h2>
-                        <button class="btn btn-primary" onclick="showAddRoutingRuleModal()" data-i18n="routing.add">新增规则</button>
+                        <div class="section-actions">
+                            <button class="btn btn-secondary" onclick="showRoutingDryRunModal()" data-i18n="routing.dryRun">Dry Run</button>
+                            <button class="btn btn-primary" onclick="showAddRoutingRuleModal()" data-i18n="routing.add">新增规则</button>
+                        </div>
                     </div>
                     <div id="routingRulesList" class="routing-list"></div>
                 </div>
@@ -147,5 +150,6 @@
     </div>
 
     <script src="app.js"></script>
+    <script src="js/routing-tools.js"></script>
 </body>
 </html>

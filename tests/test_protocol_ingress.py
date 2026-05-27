@@ -259,6 +259,26 @@ def test_ir_preserves_external_image_url_for_anthropic_as_text_placeholder():
     assert anthropic_messages[0]["content"][1] == {"type": "text", "text": "[image URL: https://example.com/a.png]"}
 
 
+@pytest.mark.parametrize(
+    ("image_item", "expected_source"),
+    [
+        ({"type": "image", "image_url": {"url": "https://example.com/opencode.png", "detail": "high"}}, {"kind": "url", "url": "https://example.com/opencode.png", "detail": "high"}),
+        ({"type": "image", "url": "https://example.com/top-level.png"}, {"kind": "url", "url": "https://example.com/top-level.png"}),
+        ({"type": "image", "data": "abc123", "mimeType": "image/jpeg"}, {"kind": "base64", "media_type": "image/jpeg", "data": "abc123"}),
+        ({"type": "file", "file_data": "data:image/png;base64,abc123"}, {"kind": "url", "url": "data:image/png;base64,abc123"}),
+    ],
+)
+def test_chat_completions_to_internal_accepts_opencode_image_variants(image_item, expected_source):
+    req = chat_completions_to_internal({
+        "model": "gpt-test",
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "see"}, image_item]}],
+    })
+
+    image = req.messages[0].parts[1]
+    assert image.kind == "image"
+    assert image.source == expected_source
+
+
 def test_policy_inject_reasoning_content_active_tool_segment_only():
     req = chat_completions_to_internal({
         "model": "gpt-test",

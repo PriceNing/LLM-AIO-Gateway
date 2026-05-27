@@ -277,6 +277,30 @@ async def test_describe_image_reasoning_content_fallback():
 
 
 @pytest.mark.asyncio
+async def test_describe_image_reasoning_content_fallback_logs_warning(caplog):
+    caplog.set_level("WARNING", logger="llmgw.app")
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {
+        "choices": [{"message": {"content": "", "reasoning_content": "Only reasoning text"}}]
+    }
+
+    with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+        mock_post.return_value = mock_response
+        result = await describe_image(
+            image_url="https://example.com/reasoning-only.jpg",
+            preprocessor_config={
+                "api_base": "http://127.0.0.1:8080/v1",
+                "model": "test-vision",
+                "api_key": "k",
+                "timeout": 30,
+            }
+        )
+
+    assert result == "Only reasoning text"
+
+
+@pytest.mark.asyncio
 async def test_describe_image_no_url_or_data():
     """Test behavior."""
     result = await describe_image(

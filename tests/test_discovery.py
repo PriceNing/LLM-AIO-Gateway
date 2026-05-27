@@ -1,8 +1,12 @@
+import pytest
+
 from app.services.discovery import (
     model_list_urls,
     parse_models,
     auth_headers,
+    check_provider_health,
 )
+from app.database import add_provider
 
 
 def test_anthropic_model_urls_add_v1_when_missing():
@@ -91,3 +95,81 @@ def test_auth_headers_empty_key():
     """Empty api_key should return [{}] - no auth header, not 'Bearer '."""
     headers = auth_headers("", "openai")
     assert headers == [{}]
+
+
+@pytest.mark.asyncio
+async def test_check_provider_health_ok(monkeypatch):
+    add_provider({
+        "id": "health-ok",
+        "name": "Health OK",
+        "provider_type": "openai",
+        "api_base": "https://api.example/v1",
+        "api_key": "sk-test",
+        "enabled": True,
+        "models": [],
+    })
+
+    class Response:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"data": [{"id": "m1"}]}
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url, headers=None):
+            return Response()
+
+    monkeypatch.setattr("app.services.discovery.httpx.AsyncClient", Client)
+
+    result = await check_provider_health("health-ok")
+    assert result["ok"] is True
+    assert result["status"] == "ok"
+    assert result["status_code"] == 200
+    assert result["model_count"] == 1
+    assert result["checked_url"] == "https://api.example/v1/models"
+
+
+@pytest.mark.asyncio
+async def test_check_provider_health_error(monkeypatch):
+    add_provider({
+        "id": "health-bad",
+        "name": "Health Bad",
+        "provider_type": "openai",
+        "api_base": "https://api.example/v1",
+        "api_key": "sk-test",
+        "enabled": True,
+        "models": [],
+    })
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url, headers=None):
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr("app.services.discovery.httpx.AsyncClient", Client)
+
+    result = await check_provider_health("health-bad")
+    assert result["ok"] is False
+    assert result["status"] == "error"
+    assert "boom" in result["error"]
+    assert result["attempts"][0]["url"] == "https://api.example/v1/models"

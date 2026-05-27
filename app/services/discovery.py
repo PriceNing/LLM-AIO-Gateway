@@ -1,3 +1,5 @@
+import time
+
 import httpx
 from app.database import get_provider, update_provider, get_providers, get_db
 
@@ -118,4 +120,58 @@ async def refresh_all_providers() -> list[dict]:
         if provider.get("enabled"):
             result = await refresh_provider_models(provider["id"])
             results.append(result)
+    return results
+
+
+async def check_provider_health(provider_id: str, timeout: float = 10.0) -> dict:
+    provider = get_provider(provider_id)
+    if not provider:
+        return {"provider_id": provider_id, "ok": False, "status": "not_found", "error": "Provider not found"}
+    if not provider.get("enabled"):
+        return {"provider_id": provider_id, "ok": False, "status": "disabled", "error": "Provider is disabled"}
+
+    started = time.perf_counter()
+    last_error = None
+    attempts = []
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        for url in model_list_urls(provider.get("api_base", ""), provider.get("provider_type", "openai")):
+            for headers in auth_headers(provider.get("api_key", ""), provider.get("provider_type", "openai")):
+                attempt = {"url": url, "ok": False, "status_code": None, "model_count": 0, "error": ""}
+                try:
+                    resp = await client.get(url, headers=headers)
+                    attempt["status_code"] = resp.status_code
+                    resp.raise_for_status()
+                    models = parse_models(resp.json())
+                    attempt["ok"] = True
+                    attempt["model_count"] = len(models)
+                    attempts.append(attempt)
+                    return {
+                        "provider_id": provider_id,
+                        "ok": True,
+                        "status": "ok",
+                        "latency_ms": int((time.perf_counter() - started) * 1000),
+                        "checked_url": url,
+                        "status_code": resp.status_code,
+                        "model_count": len(models),
+                        "attempts": attempts,
+                    }
+                except Exception as exc:
+                    last_error = exc
+                    attempt["error"] = str(exc)
+                    attempts.append(attempt)
+
+    return {
+        "provider_id": provider_id,
+        "ok": False,
+        "status": "error",
+        "latency_ms": int((time.perf_counter() - started) * 1000),
+        "error": str(last_error) if last_error else "No health endpoint succeeded",
+        "attempts": attempts,
+    }
+
+
+async def check_all_provider_health(timeout: float = 10.0) -> list[dict]:
+    results = []
+    for provider in get_providers():
+        results.append(await check_provider_health(provider["id"], timeout=timeout))
     return results
