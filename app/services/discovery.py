@@ -99,19 +99,50 @@ async def refresh_provider_models(provider_id: str) -> dict:
             "error": str(exc)
         }
 
-    if discovered:
-        existing_provider = get_provider(provider_id)
-        existing_ids = {m["id"] for m in existing_provider.get("models", [])}
-        new_models = [d for d in discovered if d["id"] not in existing_ids]
-        if new_models:
-            with get_db() as db:
-                for d in new_models:
-                    db.execute(
-                        "INSERT OR IGNORE INTO provider_models (provider_id, model_id, model_name, enabled) VALUES (?, ?, ?, 1)",
-                        (provider_id, d["id"], d["name"])
-                    )
+    added = 0
+    updated = 0
+    removed = 0
 
-    return {"provider_id": provider_id, "discovered": discovered, "count": len(discovered)}
+    if discovered:
+        discovered_by_id = {d["id"]: d for d in discovered}
+        discovered_ids = set(discovered_by_id)
+        with get_db() as db:
+            existing_rows = db.execute(
+                "SELECT model_id FROM provider_models WHERE provider_id = ?",
+                (provider_id,),
+            ).fetchall()
+            existing_ids = {row["model_id"] for row in existing_rows}
+
+            stale_ids = existing_ids - discovered_ids
+            if stale_ids:
+                db.executemany(
+                    "DELETE FROM provider_models WHERE provider_id = ? AND model_id = ?",
+                    [(provider_id, model_id) for model_id in stale_ids],
+                )
+                removed = len(stale_ids)
+
+            for model_id, model in discovered_by_id.items():
+                if model_id in existing_ids:
+                    db.execute(
+                        "UPDATE provider_models SET model_name = ? WHERE provider_id = ? AND model_id = ?",
+                        (model["name"], provider_id, model_id),
+                    )
+                    updated += 1
+                else:
+                    db.execute(
+                        "INSERT INTO provider_models (provider_id, model_id, model_name, enabled) VALUES (?, ?, ?, 1)",
+                        (provider_id, model_id, model["name"]),
+                    )
+                    added += 1
+
+    return {
+        "provider_id": provider_id,
+        "discovered": discovered,
+        "count": len(discovered),
+        "added": added,
+        "updated": updated,
+        "removed": removed,
+    }
 
 
 async def refresh_all_providers() -> list[dict]:

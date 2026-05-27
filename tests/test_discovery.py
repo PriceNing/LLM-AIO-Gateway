@@ -5,8 +5,9 @@ from app.services.discovery import (
     parse_models,
     auth_headers,
     check_provider_health,
+    refresh_provider_models,
 )
-from app.database import add_provider
+from app.database import add_provider, get_provider
 
 
 def test_anthropic_model_urls_add_v1_when_missing():
@@ -173,3 +174,40 @@ async def test_check_provider_health_error(monkeypatch):
     assert result["status"] == "error"
     assert "boom" in result["error"]
     assert result["attempts"][0]["url"] == "https://api.example/v1/models"
+
+
+@pytest.mark.asyncio
+async def test_refresh_provider_models_replaces_stale_models(monkeypatch):
+    add_provider({
+        "id": "refresh-sync",
+        "name": "Refresh Sync",
+        "provider_type": "openai",
+        "api_base": "https://api.example/v1",
+        "api_key": "sk-test",
+        "enabled": True,
+        "models": [
+            {"id": "old-model", "name": "Old Model", "enabled": True},
+            {"id": "renamed-model", "name": "Before", "enabled": False},
+        ],
+    })
+
+    async def discover(_provider_id):
+        return [
+            {"id": "renamed-model", "name": "After"},
+            {"id": "new-model", "name": "New Model"},
+        ]
+
+    monkeypatch.setattr("app.services.discovery.discover_models", discover)
+
+    result = await refresh_provider_models("refresh-sync")
+    provider = get_provider("refresh-sync")
+    models = {m["id"]: m for m in provider["models"]}
+
+    assert result["count"] == 2
+    assert result["added"] == 1
+    assert result["updated"] == 1
+    assert result["removed"] == 1
+    assert set(models) == {"renamed-model", "new-model"}
+    assert models["renamed-model"]["name"] == "After"
+    assert models["renamed-model"]["enabled"] is False
+    assert models["new-model"]["enabled"] is True
