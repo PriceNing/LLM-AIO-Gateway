@@ -1,4 +1,5 @@
 import json
+import copy
 import threading
 import time
 import uuid
@@ -11,7 +12,7 @@ from fastapi.responses import StreamingResponse
 from app.database import (
     get_providers, find_user_by_api_key,
     increment_global_stats, increment_user_usage, get_db,
-    parse_model_id, add_request_record,
+    parse_model_id, add_request_record, get_enabled_preprocessor,
 )
 from app.core.text import friendly_error_msg, mask_key
 from app.core.output import InternalOutputEvent
@@ -105,6 +106,15 @@ async def _call_nonstream_target(target: RouteTarget, internal, *, temperature, 
     return output, provider_info, adapter_provider_id
 
 
+async def _internal_for_target_attempt(internal, target: RouteTarget, *, is_fallback: bool):
+    if not is_fallback or not has_image_content(internal.messages):
+        return internal
+
+    attempt = copy.deepcopy(internal)
+    await _policy_preprocess_request(attempt, target.model, target.provider_id, target.model)
+    return attempt
+
+
 def _fallback_provider_id_for_target(target: RouteTarget) -> str:
     provider_info = resolve_provider(target.model, target.provider_id)
     return provider_for_log(provider_info, target.provider_id)
@@ -165,8 +175,9 @@ async def _call_nonstream_with_fallbacks(policy, internal, *, temperature, max_t
             break
 
     for index, target in enumerate(targets[1:], 1):
-        internal.target_model = target.model
-        internal.provider_id = target.provider_id
+        attempt_internal = await _internal_for_target_attempt(internal, target, is_fallback=True)
+        attempt_internal.target_model = target.model
+        attempt_internal.provider_id = target.provider_id
         try:
             _app_log.info(
                 "[%s fallback.attempt.start] index=%d target=%s provider=%s after_error=%s",
@@ -176,7 +187,7 @@ async def _call_nonstream_with_fallbacks(policy, internal, *, temperature, max_t
                 target.provider_id or "-",
                 friendly_error_msg(last_exc) if last_exc else "",
             )
-            return await _call_nonstream_target(target, internal, temperature=temperature, max_tokens=max_tokens, log_label=log_label, stage="fallback")
+            return await _call_nonstream_target(target, attempt_internal, temperature=temperature, max_tokens=max_tokens, log_label=log_label, stage="fallback")
         except Exception as exc:
             last_exc = exc
             _app_log.warning(
@@ -252,14 +263,15 @@ async def _stream_events_with_fallbacks(internal, *, temperature, max_tokens, lo
     while index < len(targets):
         target = targets[index]
         stage = "primary" if index == 0 else "fallback"
-        internal.target_model = target.model
-        internal.provider_id = target.provider_id
+        attempt_internal = await _internal_for_target_attempt(internal, target, is_fallback=index > 0)
+        attempt_internal.target_model = target.model
+        attempt_internal.provider_id = target.provider_id
         fallback_provider_id = _fallback_provider_id_for_target(target)
         emitted = False
         try:
             events, provider_info, adapter_provider_id = _stream_events_for_target(
                 target,
-                internal,
+                attempt_internal,
                 temperature=temperature,
                 max_tokens=max_tokens,
                 log_label=log_label,
@@ -421,18 +433,11 @@ async def _policy_preprocess_request(internal, model: str, provider_id: str, req
             _app_log.info("[preprocess.decision] enabled=False requested=%s reason=no_images", check_model)
         return False
 
-    from app.config import get_config
-    cfg = get_config().config.get("preprocessors", {})
-    preprocessor_config = None
-    preprocessor_id = ""
-    for pid, pcfg in cfg.items():
-        if isinstance(pcfg, dict) and pcfg.get("enabled", True):
-            preprocessor_config = dict(pcfg)
-            preprocessor_id = pid
-            break
+    preprocessor_config = get_enabled_preprocessor()
     if not preprocessor_config:
         _app_log.warning("[preprocess.decision] enabled=False requested=%s reason=no_enabled_preprocessor_config", check_model)
         return False
+    preprocessor_id = preprocessor_config.get("id", "")
     preprocessor_config["id"] = preprocessor_id
     await preprocess_messages(internal.messages, preprocessor_config)
     _app_log.info(

@@ -278,6 +278,8 @@ def preprocess_db(tmp_path):
     }
     config.save()
     init_db(db_path)
+    from app.database import import_preprocessors_from_config
+    import_preprocessors_from_config(config.config.get("preprocessors"))
     # Test section
     add_provider({
         "id": "native-provider",

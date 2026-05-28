@@ -3,17 +3,8 @@ Image preprocessing pipeline - intercepts image content, sends to a vision model
 for description, then replaces the image with text so non-multimodal models can
 "see" the image.
 
-Configuration (in config.json):
-  "preprocessors": {
-    "vision-model": {
-      "type": "vision",
-      "api_base": "http://127.0.0.1:8080/v1",
-      "model": "llamacpp",
-      "api_key": ""
-    }
-  }
-
-Database: config.json preprocessors section. The first enabled entry is auto-applied to all requests.
+Configuration is stored in SQLite preprocessors. Legacy config.json preprocessors
+are imported into the database during startup when the table is empty.
 """
 import hashlib
 import logging
@@ -64,7 +55,7 @@ async def describe_image(
     Args:
         image_url: HTTP(S) URL to the image.
         image_data: Base64 data URI (data:image/...;base64,...).
-        preprocessor_config: Preprocessor config dict from config.json.
+        preprocessor_config: Preprocessor config dict from SQLite.
     """
     if not preprocessor_config:
         return None
@@ -99,7 +90,7 @@ async def describe_image(
         "Authorization": f"Bearer {api_key}",
     }
 
-    max_tokens = preprocessor_config.get("max_tokens", 1024)
+    max_tokens = preprocessor_config.get("max_tokens", 2048)
     body = {
         "model": vision_model,
         "messages": [{"role": "user", "content": image_content}],
@@ -108,7 +99,7 @@ async def describe_image(
     }
 
     try:
-        async with httpx.AsyncClient(timeout=preprocessor_config.get("timeout", 60)) as client:
+        async with httpx.AsyncClient(timeout=preprocessor_config.get("timeout", 120)) as client:
             resp = await client.post(
                 f"{api_base}/chat/completions",
                 headers=headers,
@@ -185,8 +176,8 @@ async def preprocess_messages(
     _log.info("[preprocess:v2] processing %d new image(s) via preprocessor=%s (turn_start=%d)",
               len(unique_images), preprocessor_id, new_turn_start)
 
-    max_images = preprocessor_config.get("max_images", 5)
-    for img in unique_images[:preprocessor_config.get("max_images", 5)]:
+    max_images = preprocessor_config.get("max_images", 10)
+    for img in unique_images[:max_images]:
         desc = await describe_image(
             image_url=img.get("url", ""),
             image_data=img.get("data", ""),

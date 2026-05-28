@@ -37,6 +37,7 @@ def init_db(path: Optional[str] = None) -> None:
             _migrate_provider_models_created_at(conn)
             # Migration: add extra_headers to providers if missing
             _migrate_providers_extra_headers(conn)
+            _migrate_preprocessors(conn)
             # Routing and fallback policy migrations.
             routing_db.migrate(conn)
             fallback_db.migrate(conn)
@@ -71,6 +72,29 @@ def _migrate_providers_extra_headers(conn: sqlite3.Connection) -> None:
                 "UPDATE providers SET extra_headers = ? WHERE id = ?",
                 ('{"thinking": "enabled"}', pid)
             )
+
+
+def _migrate_preprocessors(conn: sqlite3.Connection) -> None:
+    """Add preprocessor columns if an older database created the table partially."""
+    columns = {
+        "api_base": "TEXT NOT NULL DEFAULT ''",
+        "model": "TEXT NOT NULL DEFAULT ''",
+        "api_key": "TEXT NOT NULL DEFAULT ''",
+        "timeout": "INTEGER NOT NULL DEFAULT 120",
+        "max_images": "INTEGER NOT NULL DEFAULT 10",
+        "prompt": "TEXT NOT NULL DEFAULT ''",
+        "enabled": "INTEGER NOT NULL DEFAULT 1",
+        "max_tokens": "INTEGER NOT NULL DEFAULT 2048",
+        "created_at": "TEXT NOT NULL DEFAULT ''",
+        "updated_at": "TEXT NOT NULL DEFAULT ''",
+    }
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(preprocessors)").fetchall()}
+    for col, ddl in columns.items():
+        if col not in existing:
+            try:
+                conn.execute(f"ALTER TABLE preprocessors ADD COLUMN {col} {ddl}")
+            except sqlite3.OperationalError:
+                pass
 
 
 def _ensure_init() -> None:
@@ -153,6 +177,20 @@ CREATE TABLE IF NOT EXISTS provider_models (
 );
 
 CREATE INDEX IF NOT EXISTS idx_provider_models_model_id ON provider_models(model_id);
+
+CREATE TABLE IF NOT EXISTS preprocessors (
+    id TEXT PRIMARY KEY,
+    api_base TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    api_key TEXT NOT NULL DEFAULT '',
+    timeout INTEGER NOT NULL DEFAULT 120,
+    max_images INTEGER NOT NULL DEFAULT 10,
+    prompt TEXT NOT NULL DEFAULT '',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    max_tokens INTEGER NOT NULL DEFAULT 2048,
+    created_at TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT ''
+);
 
 CREATE TABLE IF NOT EXISTS routing_rules (
     id TEXT PRIMARY KEY,
@@ -615,6 +653,134 @@ def reset_user_stats() -> None:
     with get_db() as db:
         db.execute("UPDATE users SET total_calls = 0, failed_calls = 0, total_tokens = 0")
         db.execute("UPDATE user_api_keys SET total_calls = 0, failed_calls = 0, total_tokens = 0")
+
+
+# -- Preprocessors --
+
+PREPROCESSOR_DEFAULTS = {
+    "api_base": "",
+    "model": "",
+    "api_key": "",
+    "timeout": 120,
+    "max_images": 10,
+    "prompt": "",
+    "enabled": True,
+    "max_tokens": 2048,
+}
+
+
+def _preprocessor_from_row(row: sqlite3.Row) -> dict:
+    data = _row_to_dict(row)
+    data["enabled"] = _to_bool(data.get("enabled"))
+    for key in ("timeout", "max_images", "max_tokens"):
+        try:
+            data[key] = int(data.get(key) or PREPROCESSOR_DEFAULTS[key])
+        except (TypeError, ValueError):
+            data[key] = PREPROCESSOR_DEFAULTS[key]
+    return data
+
+
+def _normalize_preprocessor_config(config: dict) -> dict:
+    normalized = dict(PREPROCESSOR_DEFAULTS)
+    normalized.update({k: v for k, v in (config or {}).items() if v is not None})
+    for key in ("api_base", "model", "api_key", "prompt"):
+        normalized[key] = str(normalized.get(key) or "")
+    for key in ("timeout", "max_images", "max_tokens"):
+        try:
+            normalized[key] = int(normalized.get(key) or PREPROCESSOR_DEFAULTS[key])
+        except (TypeError, ValueError):
+            normalized[key] = PREPROCESSOR_DEFAULTS[key]
+    normalized["enabled"] = _to_bool(normalized.get("enabled", True))
+    return normalized
+
+
+def get_preprocessors() -> dict:
+    with get_db() as db:
+        rows = db.execute("SELECT * FROM preprocessors ORDER BY id").fetchall()
+        return {row["id"]: {k: v for k, v in _preprocessor_from_row(row).items() if k != "id"} for row in rows}
+
+
+def get_enabled_preprocessor() -> Optional[dict]:
+    with get_db() as db:
+        row = db.execute(
+            "SELECT * FROM preprocessors WHERE enabled = 1 ORDER BY updated_at DESC, id LIMIT 1"
+        ).fetchone()
+        if not row:
+            return None
+        return _preprocessor_from_row(row)
+
+
+def upsert_preprocessor(preprocessor_id: str, config: dict) -> dict:
+    preprocessor_id = str(preprocessor_id or "").strip()
+    if not preprocessor_id:
+        raise ValueError("preprocessor id is required")
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    with get_db() as db:
+        current = db.execute("SELECT * FROM preprocessors WHERE id = ?", (preprocessor_id,)).fetchone()
+        merged = _preprocessor_from_row(current) if current else {}
+        merged.update(config or {})
+        normalized = _normalize_preprocessor_config(merged)
+        if normalized["enabled"]:
+            db.execute("UPDATE preprocessors SET enabled = 0 WHERE id <> ?", (preprocessor_id,))
+        if current:
+            db.execute(
+                """
+                UPDATE preprocessors
+                SET api_base = ?, model = ?, api_key = ?, timeout = ?, max_images = ?,
+                    prompt = ?, enabled = ?, max_tokens = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    normalized["api_base"], normalized["model"], normalized["api_key"],
+                    normalized["timeout"], normalized["max_images"], normalized["prompt"],
+                    1 if normalized["enabled"] else 0, normalized["max_tokens"], now,
+                    preprocessor_id,
+                ),
+            )
+        else:
+            db.execute(
+                """
+                INSERT INTO preprocessors
+                    (id, api_base, model, api_key, timeout, max_images, prompt, enabled, max_tokens, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    preprocessor_id, normalized["api_base"], normalized["model"], normalized["api_key"],
+                    normalized["timeout"], normalized["max_images"], normalized["prompt"],
+                    1 if normalized["enabled"] else 0, normalized["max_tokens"], now, now,
+                ),
+            )
+        row = db.execute("SELECT * FROM preprocessors WHERE id = ?", (preprocessor_id,)).fetchone()
+        return _preprocessor_from_row(row)
+
+
+def delete_preprocessor(preprocessor_id: str) -> bool:
+    with get_db() as db:
+        cursor = db.execute("DELETE FROM preprocessors WHERE id = ?", (preprocessor_id,))
+        return cursor.rowcount > 0
+
+
+def import_preprocessors_from_config(preprocessors: dict | None) -> int:
+    if not isinstance(preprocessors, dict) or not preprocessors:
+        return 0
+    with get_db() as db:
+        exists = db.execute("SELECT 1 FROM preprocessors LIMIT 1").fetchone()
+    if exists:
+        return 0
+    imported = 0
+    enabled_imported = False
+    for preprocessor_id, config in preprocessors.items():
+        if not isinstance(config, dict):
+            continue
+        import_config = dict(config)
+        if import_config.get("enabled", True):
+            if enabled_imported:
+                import_config["enabled"] = False
+            else:
+                enabled_imported = True
+        upsert_preprocessor(str(preprocessor_id), import_config)
+        imported += 1
+    return imported
 
 
 # -- Providers --

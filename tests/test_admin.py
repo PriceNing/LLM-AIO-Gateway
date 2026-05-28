@@ -2,7 +2,7 @@ import pytest
 from fastapi.testclient import TestClient
 from main import app
 from app.config import load_config
-from app.database import init_db, add_admin
+from app.database import init_db, add_admin, import_preprocessors_from_config
 from app.security import create_session, hash_password
 
 client = TestClient(app)
@@ -42,6 +42,7 @@ def temp_db(tmp_path):
     }
     config.save()
     init_db(db_path)
+    import_preprocessors_from_config(config.config.get("preprocessors"))
     add_admin("admin", hash_password("secret"), "Admin")
     token = create_session("admin")
     yield {"headers": {"Authorization": f"Bearer {token}"}}

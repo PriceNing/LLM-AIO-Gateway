@@ -1007,6 +1007,76 @@ def test_chat_completions_stream_uses_fallback_before_output(monkeypatch, temp_d
     assert calls == [("primary-stream-model", "primary-stream-fail"), ("fallback-stream-model", "fallback-stream-ok")]
 
 
+def test_chat_completions_stream_preprocesses_images_for_fallback_target(monkeypatch, temp_db):
+    from app.database import add_fallback_policy
+    from app.core.output import InternalOutputEvent
+    from app.core.types import text_part
+    import app.router.proxy as proxy
+
+    add_provider({
+        "id": "native-vision-fail",
+        "name": "Native Vision Fail",
+        "provider_type": "openai",
+        "api_base": "https://native-vision.example/v1",
+        "api_key": "upstream-key",
+        "enabled": True,
+        "models": [{"id": "native-vision-model", "name": "Native Vision", "enabled": True}],
+    })
+    add_provider({
+        "id": "text-fallback-ok",
+        "name": "Text Fallback OK",
+        "provider_type": "openai",
+        "api_base": "https://text-fallback.example/v1",
+        "api_key": "upstream-key",
+        "enabled": True,
+        "models": [{"id": "text-fallback-model", "name": "Text Fallback", "enabled": True}],
+    })
+    add_fallback_policy({
+        "name": "vision to text fallback", "enabled": True,
+        "match_provider": "native-vision-fail", "match_model": "native-vision-fail/native-vision-model",
+        "chain": [{"model": "text-fallback-model", "provider_id": "text-fallback-ok"}],
+    })
+
+    calls = []
+    fallback_messages = []
+
+    async def fake_policy_preprocess_request(internal, model, provider_id, requested_model):
+        if provider_id != "text-fallback-ok":
+            return False
+        assert model == "text-fallback-model"
+        for message in internal.messages:
+            if any(part.kind == "image" for part in message.parts):
+                message.parts = [text_part("[image described by fallback preprocessor]")]
+        return True
+
+    async def fake_stream_events(**kwargs):
+        calls.append((kwargs["model"], kwargs["provider_id"]))
+        if kwargs["provider_id"] == "native-vision-fail":
+            raise RuntimeError("native stream unavailable")
+        fallback_messages.extend(kwargs["messages"])
+        yield InternalOutputEvent(kind="message_start", role="assistant")
+        yield InternalOutputEvent(kind="text_delta", text="fallback saw text")
+        yield InternalOutputEvent(kind="message_done", finish_reason="stop")
+
+    monkeypatch.setattr(proxy, "_policy_preprocess_request", fake_policy_preprocess_request)
+    monkeypatch.setattr(proxy, "iter_openai_chat_output_events", fake_stream_events)
+
+    with client.stream("POST", "/v1/chat/completions", headers=temp_db["headers"], json={
+        "model": "native-vision-fail/native-vision-model",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "what is this"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ]}],
+        "stream": True,
+    }) as response:
+        body = response.read().decode("utf-8")
+
+    assert response.status_code == 200
+    assert "fallback saw text" in body
+    assert calls == [("native-vision-fail/native-vision-model", "native-vision-fail"), ("text-fallback-model", "text-fallback-ok")]
+    assert fallback_messages[-1]["content"] == "[image described by fallback preprocessor]"
+
+
 def test_chat_completions_stream_fallback_matches_resolved_provider(monkeypatch, temp_db):
     from app.database import add_fallback_policy
     from app.core.output import InternalOutputEvent

@@ -35,9 +35,11 @@ class RequestIdMiddleware(BaseHTTPMiddleware):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     from app.database import init_db
+    from app.database import import_preprocessors_from_config
     cfg = load_config()
     db_path = cfg.config.get("database", "data.db")
     init_db(db_path)
+    import_preprocessors_from_config(cfg.config.get("preprocessors"))
 
     init_logging(cfg.config.get("logging"))
     yield

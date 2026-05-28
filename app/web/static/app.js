@@ -1699,7 +1699,7 @@ function preprocessorCardHtml(id, p) {
             '</div>' +
             '<div class="preprocessor-field">' +
                 '<span class="preprocessor-label">' + t('preprocessors.timeout') + ':</span>' +
-                '<span>' + (p.timeout || 30) + 's</span>' +
+                '<span>' + (p.timeout || 120) + 's</span>' +
             '</div>' +
             '<div class="preprocessor-field">' +
                 '<span class="preprocessor-label">' + t('preprocessors.maxImages') + ':</span>' +
@@ -1707,7 +1707,7 @@ function preprocessorCardHtml(id, p) {
             '</div>' +
             '<div class="preprocessor-field">' +
                 '<span class="preprocessor-label">' + t('preprocessors.maxTokens') + ':</span>' +
-                '<span>' + (p.max_tokens || 1024) + '</span>' +
+                '<span>' + (p.max_tokens || 2048) + '</span>' +
             '</div>' +
             '<div class="preprocessor-field">' +
                 '<span class="status-dot ' + (p.enabled ? 'on' : 'off') + '"></span>' +
@@ -1737,11 +1737,11 @@ function preprocessorFormHtml(title, preprocessor, submitAction) {
             '<button class="btn btn-secondary btn-sm" type="button" onclick="fetchPreprocessorModels()">' + t('preprocessors.fetchModels') + '</button>' +
             '</div></div>' +
         '<div class="form-group"><label>' + t('preprocessors.timeout') + '</label>' +
-            '<input type="number" id="prepTimeout" value="' + (preprocessor.timeout || 30) + '" min="1" max="300"></div>' +
+            '<input type="number" id="prepTimeout" value="' + (preprocessor.timeout || 120) + '" min="1" max="300"></div>' +
         '<div class="form-group"><label>' + t('preprocessors.maxImages') + '</label>' +
-            '<input type="number" id="prepMaxImages" value="' + (preprocessor.max_images || 5) + '" min="1" max="50"></div>' +
+            '<input type="number" id="prepMaxImages" value="' + (preprocessor.max_images || 10) + '" min="1" max="50"></div>' +
         '<div class="form-group"><label>' + t('preprocessors.maxTokens') + '</label>' +
-            '<input type="number" id="prepMaxTokens" value="' + (preprocessor.max_tokens || 1024) + '" min="128" max="8192"></div>' +
+            '<input type="number" id="prepMaxTokens" value="' + (preprocessor.max_tokens || 2048) + '" min="128" max="8192"></div>' +
         '<div class="form-group"><label>' + t('preprocessors.prompt') + '</label>' +
             '<textarea id="prepPrompt" rows="3" style="width:100%;resize:vertical">' + escHtml(preprocessor.prompt || '') + '</textarea></div>' +
         '<div class="form-group"><label><input type="checkbox" id="prepEnabled"' + (preprocessor.enabled === false ? '' : ' checked') + '> ' + t('preprocessors.enabled') + '</label></div>' +
@@ -1776,9 +1776,9 @@ function readPreprocessorForm() {
         api_base: document.getElementById('prepApiBase').value.trim(),
         model: document.getElementById('prepModel').value.trim(),
         api_key: document.getElementById('prepApiKey').value.trim(),
-        timeout: parseInt(document.getElementById('prepTimeout').value) || 30,
-        max_images: parseInt(document.getElementById('prepMaxImages').value) || 5,
-        max_tokens: parseInt(document.getElementById('prepMaxTokens').value) || 1024,
+        timeout: parseInt(document.getElementById('prepTimeout').value) || 120,
+        max_images: parseInt(document.getElementById('prepMaxImages').value) || 10,
+        max_tokens: parseInt(document.getElementById('prepMaxTokens').value) || 2048,
         prompt: document.getElementById('prepPrompt').value.trim(),
         enabled: document.getElementById('prepEnabled').checked
     };

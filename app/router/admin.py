@@ -10,6 +10,7 @@ from app.database import (
     get_global_stats, reset_global_stats, reset_user_stats,
     get_history_stats,
     find_provider_by_model, parse_model_id,
+    get_preprocessors, upsert_preprocessor, delete_preprocessor as delete_preprocessor_config,
 )
 from app.core.policy import apply_fallback_policy, apply_routing_rules
 from app.core.text import mask_key
@@ -395,9 +396,7 @@ async def reset_stats(authorization: Optional[str] = Header(None)):
 @router.get("/preprocessors")
 async def list_preprocessors(authorization: Optional[str] = Header(None)):
     await require_admin_session(authorization)
-    from app.config import get_config
-    cfg = get_config()
-    preprocessors = cfg.config.get("preprocessors", {})
+    preprocessors = get_preprocessors()
     # Also return model preprocessor flags from DB using composite IDs to avoid same-name ambiguity
     from app.database import get_db
     models = []
@@ -415,30 +414,18 @@ async def list_preprocessors(authorization: Optional[str] = Header(None)):
 @router.put("/preprocessors/{preprocessor_id}")
 async def update_preprocessor(preprocessor_id: str, config: dict, authorization: Optional[str] = Header(None)):
     await require_admin_session(authorization)
-    from app.config import get_config, load_config
-    cfg = get_config()
-    preprocessors = cfg.config.setdefault("preprocessors", {})
-    current = preprocessors.get(preprocessor_id, {})
-    current.update({k: v for k, v in config.items() if v is not None})
-    # Only one preprocessor can be enabled at a time; enabling this one disables the others
-    if current.get("enabled", True):
-        for pid, pcfg in preprocessors.items():
-            if pid != preprocessor_id and isinstance(pcfg, dict):
-                pcfg["enabled"] = False
-    preprocessors[preprocessor_id] = current
-    cfg.save()
+    try:
+        current = upsert_preprocessor(preprocessor_id, config)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    current.pop("id", None)
     return {"id": preprocessor_id, "config": current}
 
 
 @router.delete("/preprocessors/{preprocessor_id}")
 async def delete_preprocessor(preprocessor_id: str, authorization: Optional[str] = Header(None)):
     await require_admin_session(authorization)
-    from app.config import get_config
-    cfg = get_config()
-    preprocessors = cfg.config.get("preprocessors", {})
-    if preprocessor_id in preprocessors:
-        del preprocessors[preprocessor_id]
-        cfg.save()
+    if delete_preprocessor_config(preprocessor_id):
         return {"status": "deleted"}
     raise HTTPException(status_code=404, detail="Preprocessor not found")
 
