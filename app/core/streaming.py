@@ -19,7 +19,7 @@ from app.services.logger import get_logger
 _app_log = get_logger("app")
 _error_log = get_logger("error")
 
-RequestLogger = Callable[[str, str, str, str, str, bool, int, str], None]
+RequestLogger = Callable[..., None]
 RememberResponseChainKey = Callable[[str, str], None]
 RememberReasoningContent = Callable[[str, str, Any], None]
 
@@ -98,6 +98,8 @@ async def stream_internal_output(
     total_tokens = 0
     final_model = model
     final_provider_id = provider_id or ""
+    visible_output_started = False
+    stream_details: dict[str, Any] = {"stream": True, "fallback_status": "unused"}
     _app_log.debug(
         "[stream_orchestrator] START endpoint=%s provider=%s model=%s requested=%s conv_key=%s previous_response_id=%s",
         endpoint,
@@ -109,7 +111,7 @@ async def stream_internal_output(
     )
 
     async def metered_events():
-        nonlocal total_tokens, final_model, final_provider_id
+        nonlocal total_tokens, final_model, final_provider_id, visible_output_started, stream_details
         async for event in record_streaming_events(
             events,
             conv_key=conv_key,
@@ -119,9 +121,26 @@ async def stream_internal_output(
             if event.kind == "metadata":
                 final_model = str(event.metadata.get("model") or final_model)
                 final_provider_id = str(event.metadata.get("provider_id") or final_provider_id)
+                for key in (
+                    "stream",
+                    "attempt_index",
+                    "fallback_status",
+                    "fallback_reason",
+                    "error_trigger",
+                    "error_stage",
+                    "attempted_model",
+                    "attempted_provider",
+                ):
+                    if key in event.metadata:
+                        stream_details[key] = event.metadata[key]
                 continue
             if event.kind == "usage":
                 total_tokens = event.usage.get("total_tokens", total_tokens) or total_tokens
+            if event.kind in ("text_delta", "reasoning_delta"):
+                if event.text or event.reasoning:
+                    visible_output_started = True
+            elif event.kind in ("tool_call_start", "tool_call_arguments_delta", "tool_call_done", "message_done"):
+                visible_output_started = True
             yield event
 
     response_id = f"resp_{uuid.uuid4().hex}" if endpoint == "responses" else None
@@ -146,7 +165,17 @@ async def stream_internal_output(
                 response_id=response_id,
             ):
                 yield line
-        log_request(username, api_key_value, final_model, final_provider_id, endpoint, True, total_tokens, requested_model)
+        log_request(
+            username,
+            api_key_value,
+            final_model,
+            final_provider_id,
+            endpoint,
+            True,
+            total_tokens,
+            requested_model,
+            details={**stream_details, "status": "ok", "partial_output": False},
+        )
         increment_global_stats(success=True)
         if username != "legacy":
             increment_user_usage(username, api_key_value, True, total_tokens)
@@ -159,8 +188,42 @@ async def stream_internal_output(
         )
     except Exception as exc:
         error_msg = friendly_error_msg(exc)
+        exc_details = getattr(exc, "request_details", None)
+        if not isinstance(exc_details, dict):
+            exc_details = {}
+        partial_output = bool(exc_details.get("partial_output", visible_output_started))
+        failure_details = {
+            **stream_details,
+            **exc_details,
+            "stream": True,
+            "status": "partial" if partial_output else "fail",
+            "partial_output": partial_output,
+            "error_message": exc_details.get("error_message") or error_msg,
+        }
+        logged_model = str(
+            failure_details.get("attempted_model")
+            or final_model
+            or model
+            or "-"
+        )
+        logged_provider = str(
+            failure_details.get("attempted_provider")
+            or final_provider_id
+            or provider_id
+            or ""
+        )
         _error_log.error("[%s_stream] %s", endpoint, str(exc))
-        log_request(username, api_key_value, "-", provider_id or "", endpoint, False, 0, requested_model)
+        log_request(
+            username,
+            api_key_value,
+            logged_model,
+            logged_provider,
+            endpoint,
+            False,
+            total_tokens,
+            requested_model,
+            details=failure_details,
+        )
         increment_global_stats(success=False)
         if username != "legacy":
             increment_user_usage(username, api_key_value, False, 0)

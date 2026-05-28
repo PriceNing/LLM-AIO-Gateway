@@ -1241,7 +1241,7 @@ def test_chat_completions_stream_logs_fallback_target_model(monkeypatch, temp_db
 
     logged = []
 
-    def fake_log_request(username, api_key, model, provider_id, endpoint, success, tokens, requested_model=""):
+    def fake_log_request(username, api_key, model, provider_id, endpoint, success, tokens, requested_model="", **kwargs):
         logged.append((model, provider_id, endpoint, success, requested_model))
 
     async def fake_stream_events(**kwargs):

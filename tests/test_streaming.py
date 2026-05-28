@@ -189,7 +189,7 @@ async def test_stream_internal_output_extracts_usage():
     """Usage events should be captured for request logging."""
     logged = {}
 
-    def fake_log(user, key, model, provider, endpoint, success, tokens, requested):
+    def fake_log(user, key, model, provider, endpoint, success, tokens, requested, **kwargs):
         logged["tokens"] = tokens
         logged["success"] = success
 
@@ -222,7 +222,7 @@ async def test_stream_internal_output_updates_model_from_metadata():
     """Metadata events should update the final model used for logging."""
     logged = {}
 
-    def fake_log(user, key, model, provider, endpoint, success, tokens, requested):
+    def fake_log(user, key, model, provider, endpoint, success, tokens, requested, **kwargs):
         logged["model"] = model
         logged["provider"] = provider
 
@@ -248,3 +248,51 @@ async def test_stream_internal_output_updates_model_from_metadata():
 
     assert logged["model"] == "real-model"
     assert logged["provider"] == "real-provider"
+
+
+@pytest.mark.asyncio
+async def test_stream_internal_output_logs_partial_failure_after_visible_output():
+    """Failures after SSE output starts should keep the attempted target and mark partial output."""
+    logged = {}
+
+    def fake_log(user, key, model, provider, endpoint, success, tokens, requested, **kwargs):
+        logged["model"] = model
+        logged["provider"] = provider
+        logged["success"] = success
+        logged["tokens"] = tokens
+        logged["details"] = kwargs.get("details") or {}
+
+    async def _events():
+        yield InternalOutputEvent(kind="metadata", metadata={"model": "real-model", "provider_id": "real-provider"})
+        yield InternalOutputEvent(kind="text_delta", text="hi")
+        exc = RuntimeError("upstream closed")
+        exc.request_details = {
+            "fallback_status": "skipped",
+            "fallback_reason": "client_output_started",
+            "error_trigger": "http_5xx",
+            "attempted_model": "real-model",
+            "attempted_provider": "real-provider",
+            "partial_output": True,
+        }
+        raise exc
+
+    result = []
+    async for line in stream_internal_output(
+        events=_events(),
+        endpoint="responses",
+        model="original-model",
+        username="u",
+        api_key_value="k",
+        provider_id="p1",
+        requested_model="orig",
+        log_request=fake_log,
+        conv_key="conv10",
+    ):
+        result.append(line)
+
+    assert logged["success"] is False
+    assert logged["model"] == "real-model"
+    assert logged["provider"] == "real-provider"
+    assert logged["details"]["status"] == "partial"
+    assert logged["details"]["partial_output"] is True
+    assert logged["details"]["fallback_status"] == "skipped"

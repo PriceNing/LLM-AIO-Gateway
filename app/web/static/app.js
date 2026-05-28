@@ -13,6 +13,7 @@ let models = [];
 let allModels = [];
 let users = [];
 let currentLang = localStorage.getItem(LANG_KEY) || 'zh';
+window._requestLogDetails = [];
 
 /* ═══════════════════════════════ i18n ═══════════════════════════════ */
 
@@ -576,6 +577,50 @@ en: {
     'common.no': 'No',
 }
 };
+
+Object.assign(I18N.zh, {
+    'stats.details': '详情',
+    'stats.requestDetails': '请求详情',
+    'stats.statusOk': 'OK',
+    'stats.statusFail': 'FAIL',
+    'stats.statusPartial': 'PARTIAL',
+    'stats.basicInfo': '基础信息',
+    'stats.routingInfo': '路由 / Fallback',
+    'stats.errorInfo': '错误信息',
+    'stats.fullTime': '完整时间',
+    'stats.provider': '提供商',
+    'stats.stream': '流式请求',
+    'stats.partialOutput': '已输出部分内容',
+    'stats.fallbackStatus': 'Fallback 状态',
+    'stats.fallbackReason': 'Fallback 原因',
+    'stats.errorTrigger': '错误触发类型',
+    'stats.errorStage': '错误阶段',
+    'stats.errorMessage': '错误消息',
+    'stats.attemptedModel': '尝试模型',
+    'stats.attemptedProvider': '尝试提供商'
+});
+
+Object.assign(I18N.en, {
+    'stats.details': 'Details',
+    'stats.requestDetails': 'Request Details',
+    'stats.statusOk': 'OK',
+    'stats.statusFail': 'FAIL',
+    'stats.statusPartial': 'PARTIAL',
+    'stats.basicInfo': 'Basic',
+    'stats.routingInfo': 'Routing / Fallback',
+    'stats.errorInfo': 'Error',
+    'stats.fullTime': 'Full Time',
+    'stats.provider': 'Provider',
+    'stats.stream': 'Stream',
+    'stats.partialOutput': 'Partial Output',
+    'stats.fallbackStatus': 'Fallback Status',
+    'stats.fallbackReason': 'Fallback Reason',
+    'stats.errorTrigger': 'Error Trigger',
+    'stats.errorStage': 'Error Stage',
+    'stats.errorMessage': 'Error Message',
+    'stats.attemptedModel': 'Attempted Model',
+    'stats.attemptedProvider': 'Attempted Provider'
+});
 
 function t(key, params) {
     let s = (I18N[currentLang] && I18N[currentLang][key]) || (I18N['zh'][key]) || key;
@@ -2212,13 +2257,15 @@ function _buildRealtimePanel(stats) {
     var log = stats.request_log || [];
     var tableHTML = '<div class="table-card glass"><h3>' + t('stats.realtime') + '</h3>' +
         '<table class="modern-table"><thead><tr>' +
-        '<th>' + t('stats.time') + '</th><th>' + t('stats.client') + '</th><th>' + t('stats.key') + '</th><th>' + t('stats.requestedModel') + '</th><th>' + t('stats.model') + '</th><th>' + t('stats.endpoint') + '</th><th>' + t('stats.tokens') + '</th><th>' + t('stats.status') + '</th>' +
+        '<th>' + t('stats.time') + '</th><th>' + t('stats.client') + '</th><th>' + t('stats.key') + '</th><th>' + t('stats.requestedModel') + '</th><th>' + t('stats.model') + '</th><th>' + t('stats.endpoint') + '</th><th>' + t('stats.tokens') + '</th><th>' + t('stats.status') + '</th><th>' + (t('stats.details') || 'Details') + '</th>' +
         '</tr></thead><tbody>';
 
     var displayLog = log.slice(0, 40);
+    window._requestLogDetails = displayLog;
     for (var i = 0; i < displayLog.length; i++) {
         var entry = displayLog[i];
-        var badge = entry.success ? 'badge-ok' : 'badge-fail';
+        var badge = requestStatusClass(entry);
+        var statusLabel = requestStatusLabel(entry);
         var reqModel = entry.requested_model || entry.model;
         var isFallback = reqModel !== entry.model;
         tableHTML += '<tr>' +
@@ -2229,7 +2276,8 @@ function _buildRealtimePanel(stats) {
             '<td>' + (isFallback ? '<span style="color:var(--warning)" title="fallback">' + escHtml(entry.model) + '</span>' : escHtml(entry.model)) + '</td>' +
             '<td><span class="badge-endpoint">' + escHtml(entry.endpoint) + '</span></td>' +
             '<td>' + entry.tokens.toLocaleString() + '</td>' +
-            '<td><span class="badge ' + badge + '">' + (entry.success ? 'OK' : 'FAIL') + '</span></td>' +
+            '<td><span class="badge ' + badge + '">' + escHtml(statusLabel) + '</span></td>' +
+            '<td><button class="request-detail-btn" onclick="showRequestDetail(' + i + ')" title="' + escHtml(t('stats.requestDetails') || 'Request Details') + '">i</button></td>' +
         '</tr>';
     }
     if (log.length === 0) {
@@ -2238,6 +2286,78 @@ function _buildRealtimePanel(stats) {
     tableHTML += '</tbody></table></div>';
 
     return { activeModels: activeModels, hasData: hasData, tableHTML: tableHTML };
+}
+
+function requestStatusLabel(entry) {
+    if (entry.status === 'partial' || entry.partial_output) return t('stats.statusPartial') || 'PARTIAL';
+    return entry.success ? (t('stats.statusOk') || 'OK') : (t('stats.statusFail') || 'FAIL');
+}
+
+function requestStatusClass(entry) {
+    if (entry.status === 'partial' || entry.partial_output) return 'badge-partial';
+    return entry.success ? 'badge-ok' : 'badge-fail';
+}
+
+function requestDetailValue(value) {
+    if (value === true) return 'true';
+    if (value === false) return 'false';
+    if (value === null || value === '') return '-';
+    if (typeof value === 'object') return JSON.stringify(value, null, 2);
+    return String(value);
+}
+
+function detailPick(primary, fallback) {
+    return primary === null || primary === '' ? fallback : primary;
+}
+
+function detailRow(label, value) {
+    return '<div class="detail-kv"><div class="detail-label">' + escHtml(label) + '</div><div class="detail-value">' + escHtml(requestDetailValue(value)) + '</div></div>';
+}
+
+function detailSection(title, rows) {
+    return '<div class="detail-section"><h3>' + escHtml(title) + '</h3><div class="detail-grid">' + rows.join('') + '</div></div>';
+}
+
+function showRequestDetail(index) {
+    var entry = (window._requestLogDetails || [])[index];
+    if (!entry) return;
+    var details = entry.details || {};
+    var modalContent = document.querySelector('.modal-content');
+    if (modalContent) modalContent.classList.add('modal-wide');
+
+    var basicRows = [
+        detailRow(t('stats.status') || 'Status', requestStatusLabel(entry)),
+        detailRow(t('stats.time') || 'Time', entry.time),
+        detailRow(t('stats.fullTime') || 'Full Time', entry.full_time),
+        detailRow(t('stats.client') || 'Client', entry.username),
+        detailRow(t('stats.key') || 'Key', entry.api_key),
+        detailRow(t('stats.endpoint') || 'Endpoint', entry.endpoint),
+        detailRow(t('stats.tokens') || 'Tokens', entry.tokens)
+    ];
+    var routeRows = [
+        detailRow(t('stats.requestedModel') || 'Requested', entry.requested_model || entry.model),
+        detailRow(t('stats.model') || 'Actual Model', entry.model),
+        detailRow(t('stats.provider') || 'Provider', entry.provider),
+        detailRow(t('stats.attemptedModel') || 'Attempted Model', entry.attempted_model || details.attempted_model),
+        detailRow(t('stats.attemptedProvider') || 'Attempted Provider', entry.attempted_provider || details.attempted_provider),
+        detailRow(t('stats.stream') || 'Stream', detailPick(entry.stream, details.stream)),
+        detailRow(t('stats.partialOutput') || 'Partial Output', detailPick(entry.partial_output, details.partial_output)),
+        detailRow(t('stats.fallbackStatus') || 'Fallback Status', entry.fallback_status || details.fallback_status),
+        detailRow(t('stats.fallbackReason') || 'Fallback Reason', entry.fallback_reason || details.fallback_reason),
+        detailRow(t('stats.errorTrigger') || 'Error Trigger', entry.error_trigger || details.error_trigger),
+        detailRow(t('stats.errorStage') || 'Error Stage', entry.error_stage || details.error_stage)
+    ];
+    var errorRows = [
+        detailRow(t('stats.errorMessage') || 'Error Message', entry.error_message || details.error_message)
+    ];
+
+    document.getElementById('modalContent').innerHTML = '<h3>' + escHtml(t('stats.requestDetails') || 'Request Details') + '</h3><div class="request-detail-view">' +
+        '<div class="detail-status-line"><span class="badge ' + requestStatusClass(entry) + '">' + escHtml(requestStatusLabel(entry)) + '</span><span class="mono">' + escHtml(entry.endpoint || '') + '</span></div>' +
+        detailSection(t('stats.basicInfo') || 'Basic', basicRows) +
+        detailSection(t('stats.routingInfo') || 'Routing / Fallback', routeRows) +
+        detailSection(t('stats.errorInfo') || 'Error', errorRows) +
+        '</div>';
+    document.getElementById('modal').style.display = 'flex';
 }
 
 function renderStats(stats, createCharts) {
@@ -2511,6 +2631,8 @@ async function copyText(text) {
 
 function closeModal() {
     document.getElementById('modal').style.display = 'none';
+    var modalContent = document.querySelector('.modal-content');
+    if (modalContent) modalContent.classList.remove('modal-wide');
 }
 
 // Close modal on overlay click

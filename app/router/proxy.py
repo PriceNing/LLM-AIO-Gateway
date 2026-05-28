@@ -68,6 +68,34 @@ _request_log = deque(maxlen=get_default("request_log_max", 200))
 _request_log_lock = threading.Lock()
 
 
+def _attach_request_details(exc: Exception, **details) -> Exception:
+    existing = getattr(exc, "request_details", None)
+    merged = dict(existing) if isinstance(existing, dict) else {}
+    for key, value in details.items():
+        if value is not None:
+            merged[key] = value
+            try:
+                setattr(exc, key, value)
+            except Exception:
+                pass
+    try:
+        setattr(exc, "request_details", merged)
+    except Exception:
+        pass
+    return exc
+
+
+def _request_details_from_exception(exc: Exception, **defaults) -> dict:
+    existing = getattr(exc, "request_details", None)
+    details = dict(existing) if isinstance(existing, dict) else {}
+    for key, value in defaults.items():
+        if key not in details and value is not None:
+            details[key] = value
+    details.setdefault("status", "fail")
+    details.setdefault("error_message", friendly_error_msg(exc))
+    return details
+
+
 async def _call_nonstream_target(target: RouteTarget, internal, *, temperature, max_tokens, log_label: str, stage: str):
     provider_info = resolve_provider(target.model, target.provider_id)
     adapter_provider_id = provider_for_log(provider_info, target.provider_id)
@@ -152,6 +180,18 @@ async def _call_nonstream_with_fallbacks(policy, internal, *, temperature, max_t
             fallback_provider_id = _fallback_provider_id_for_target(target)
             decision = apply_fallback_policy(fallback_provider_id, target.model, trigger)
             if not decision.matched:
+                _attach_request_details(
+                    exc,
+                    stream=False,
+                    status="fail",
+                    attempted_model=target.model,
+                    attempted_provider=fallback_provider_id or "",
+                    error_trigger=trigger,
+                    error_stage="primary",
+                    fallback_status="no_policy",
+                    fallback_reason=decision.reason,
+                    error_message=friendly_error_msg(exc),
+                )
                 _app_log.info(
                     "[%s fallback.decision] matched=False source=%s provider=%s trigger=%s reason=%s",
                     log_label,
@@ -190,6 +230,17 @@ async def _call_nonstream_with_fallbacks(policy, internal, *, temperature, max_t
             return await _call_nonstream_target(target, attempt_internal, temperature=temperature, max_tokens=max_tokens, log_label=log_label, stage="fallback")
         except Exception as exc:
             last_exc = exc
+            _attach_request_details(
+                exc,
+                stream=False,
+                status="fail",
+                attempted_model=target.model,
+                attempted_provider=target.provider_id or "",
+                error_trigger=classify_upstream_error(exc),
+                error_stage="fallback",
+                fallback_status="attempt_failed",
+                error_message=friendly_error_msg(exc),
+            )
             _app_log.warning(
                 "[%s fallback.attempt.failed] index=%d target=%s provider=%s trigger=%s error=%s",
                 log_label,
@@ -207,6 +258,8 @@ async def _call_nonstream_with_fallbacks(policy, internal, *, temperature, max_t
         max(len(targets) - 1, 0),
         friendly_error_msg(last_exc) if last_exc else "no target available",
     )
+    if last_exc is not None:
+        _attach_request_details(last_exc, fallback_status="exhausted", fallback_reason="all fallback targets failed")
     raise last_exc or RuntimeError("No routing target available")
 
 
@@ -277,7 +330,13 @@ async def _stream_events_with_fallbacks(internal, *, temperature, max_tokens, lo
                 log_label=log_label,
                 strip_thinking=strip_thinking,
             )
-            yield InternalOutputEvent(kind="metadata", metadata={"model": target.model, "provider_id": adapter_provider_id or ""})
+            yield InternalOutputEvent(kind="metadata", metadata={
+                "model": target.model,
+                "provider_id": adapter_provider_id or "",
+                "stream": True,
+                "attempt_index": index,
+                "fallback_status": "used" if index > 0 else "unused",
+            })
             async for event in events:
                 if _is_client_visible_stream_event(event):
                     emitted = True
@@ -304,6 +363,19 @@ async def _stream_events_with_fallbacks(internal, *, temperature, max_tokens, lo
                 friendly_error_msg(exc),
             )
             if emitted:
+                _attach_request_details(
+                    exc,
+                    stream=True,
+                    status="partial",
+                    partial_output=True,
+                    attempted_model=target.model,
+                    attempted_provider=fallback_provider_id or "",
+                    error_trigger=trigger,
+                    error_stage=stage,
+                    fallback_status="skipped",
+                    fallback_reason="client_output_started",
+                    error_message=friendly_error_msg(exc),
+                )
                 _app_log.info(
                     "[%s fallback.stream.skipped] target=%s provider=%s trigger=%s reason=client_output_started",
                     log_label,
@@ -315,6 +387,19 @@ async def _stream_events_with_fallbacks(internal, *, temperature, max_tokens, lo
             if index == 0:
                 decision = apply_fallback_policy(fallback_provider_id, target.model, trigger)
                 if not decision.matched:
+                    _attach_request_details(
+                        exc,
+                        stream=True,
+                        status="fail",
+                        partial_output=False,
+                        attempted_model=target.model,
+                        attempted_provider=fallback_provider_id or "",
+                        error_trigger=trigger,
+                        error_stage=stage,
+                        fallback_status="no_policy",
+                        fallback_reason=decision.reason,
+                        error_message=friendly_error_msg(exc),
+                    )
                     _app_log.info(
                         "[%s fallback.stream.decision] matched=False source=%s provider=%s trigger=%s reason=%s",
                         log_label,
@@ -355,12 +440,16 @@ async def _stream_events_with_fallbacks(internal, *, temperature, max_tokens, lo
         max(len(targets) - 1, 0),
         friendly_error_msg(last_exc) if last_exc else "no target available",
     )
+    if last_exc is not None:
+        _attach_request_details(last_exc, fallback_status="exhausted", fallback_reason="all fallback targets failed")
     raise last_exc or RuntimeError("No routing target available")
 
 
 def _log_request(username: str, api_key: str, model: str, provider_id: str,
                  endpoint: str, success: bool, tokens: int,
-                 requested_model: str = "") -> None:
+                 requested_model: str = "", *, details: dict | None = None) -> None:
+    detail = dict(details or {})
+    status = str(detail.get("status") or ("ok" if success else "fail"))
     entry = {
         "time": time.strftime("%H:%M:%S"),
         "full_time": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -372,7 +461,23 @@ def _log_request(username: str, api_key: str, model: str, provider_id: str,
         "endpoint": endpoint,
         "success": success,
         "tokens": tokens,
+        "status": status,
+        "details": detail,
     }
+    for key in (
+        "stream",
+        "partial_output",
+        "attempted_model",
+        "attempted_provider",
+        "fallback_status",
+        "fallback_reason",
+        "error_trigger",
+        "error_stage",
+        "error_message",
+        "attempt_index",
+    ):
+        if key in detail:
+            entry[key] = detail[key]
     with _request_log_lock:
         _request_log.appendleft(entry)
     # Also write to structured access log
@@ -798,7 +903,13 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
         return render_chat_completion(output, model=model)
     except Exception as e:
         _error_log.error("[chat] %s", str(e))
-        _log_request(username, api_key_value, requested_model, provider_id or "", "chat_completions", False, 0, requested_model)
+        details = _request_details_from_exception(
+            e,
+            stream=False,
+            attempted_model=getattr(e, "attempted_model", None) or model or requested_model,
+            attempted_provider=getattr(e, "attempted_provider", None) or provider_id or "",
+        )
+        _log_request(username, api_key_value, details.get("attempted_model") or requested_model, details.get("attempted_provider") or provider_id or "", "chat_completions", False, 0, requested_model, details=details)
         increment_global_stats(success=False)
         if username != "legacy":
             increment_user_usage(username, api_key_value, False, 0)
@@ -882,7 +993,13 @@ async def completions(request: Request, authorization: Optional[str] = Header(No
             increment_user_usage(username, api_key_value, True, output.usage.get("total_tokens", 0))
         return render_completion(output, model=model)
     except Exception as e:
-        _log_request(username, api_key_value, "-", provider_id or "", "completions", False, 0, requested_model)
+        details = _request_details_from_exception(
+            e,
+            stream=False,
+            attempted_model=getattr(e, "attempted_model", None) or model or requested_model,
+            attempted_provider=getattr(e, "attempted_provider", None) or provider_id or "",
+        )
+        _log_request(username, api_key_value, details.get("attempted_model") or model or requested_model, details.get("attempted_provider") or provider_id or "", "completions", False, 0, requested_model, details=details)
 
         increment_global_stats(success=False)
         if username != "legacy":
@@ -990,7 +1107,13 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
             increment_user_usage(username, api_key_value, True, output.usage.get("total_tokens", 0))
         return render_anthropic_message(output, model=model)
     except Exception as e:
-        _log_request(username, api_key_value, "-", adapter_provider_id, "messages", False, 0, requested_model)
+        details = _request_details_from_exception(
+            e,
+            stream=False,
+            attempted_model=getattr(e, "attempted_model", None) or model or requested_model,
+            attempted_provider=getattr(e, "attempted_provider", None) or adapter_provider_id or provider_id or "",
+        )
+        _log_request(username, api_key_value, details.get("attempted_model") or model or requested_model, details.get("attempted_provider") or adapter_provider_id or "", "messages", False, 0, requested_model, details=details)
         increment_global_stats(success=False)
         if username != "legacy":
             increment_user_usage(username, api_key_value, False, 0)
@@ -1128,7 +1251,13 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
             increment_user_usage(username, api_key_value, True, output.usage.get("total_tokens", 0))
         return render_response(output, model=model, previous_response_id=previous_response_id, response_id=resp_id)
     except Exception as e:
-        _log_request(username, api_key_value, "-", provider_for_log(provider_info, provider_id), "responses", False, 0, requested_model)
+        details = _request_details_from_exception(
+            e,
+            stream=False,
+            attempted_model=getattr(e, "attempted_model", None) or model or requested_model,
+            attempted_provider=getattr(e, "attempted_provider", None) or provider_for_log(provider_info, provider_id),
+        )
+        _log_request(username, api_key_value, details.get("attempted_model") or model or requested_model, details.get("attempted_provider") or provider_for_log(provider_info, provider_id), "responses", False, 0, requested_model, details=details)
         increment_global_stats(success=False)
         if username != "legacy":
             increment_user_usage(username, api_key_value, False, 0)
