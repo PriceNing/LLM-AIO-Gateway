@@ -175,6 +175,7 @@ async def preprocess_messages(
 
     seen_keys = set()
     unique_images = []
+    image_descriptions: dict[str, str] = {}
     for img in images_to_describe:
         key = _cache_key(img.get("url", ""), img.get("data", ""))
         if key not in seen_keys:
@@ -184,16 +185,16 @@ async def preprocess_messages(
     _log.info("[preprocess:v2] processing %d new image(s) via preprocessor=%s (turn_start=%d)",
               len(unique_images), preprocessor_id, new_turn_start)
 
-    descriptions = []
+    max_images = preprocessor_config.get("max_images", 5)
     for img in unique_images[:preprocessor_config.get("max_images", 5)]:
         desc = await describe_image(
             image_url=img.get("url", ""),
             image_data=img.get("data", ""),
             preprocessor_config=preprocessor_config,
         )
-        descriptions.append(desc or "[image: could not be described]")
+        image_descriptions[_cache_key(img.get("url", ""), img.get("data", ""))] = desc or "[image: could not be described]"
 
-    _strip_images_with_descriptions(messages, descriptions, new_turn_start)
+    _strip_images_with_descriptions(messages, image_descriptions, new_turn_start, max_images)
     return messages
 
 
@@ -258,27 +259,27 @@ def _strip_all_images(messages: list[InternalMessage]) -> None:
         msg.parts = _replace_images_in_parts(msg.parts, [], False, 0)[0]
 
 
-def _strip_images_with_descriptions(messages: list[InternalMessage], descriptions: list, turn_start: int) -> None:
-    desc_idx = 0
+def _strip_images_with_descriptions(messages: list[InternalMessage], descriptions: dict[str, str], turn_start: int, max_images: int) -> None:
+    image_idx = 0
     for idx, msg in enumerate(messages):
-        msg.parts, desc_idx = _replace_images_in_parts(msg.parts, descriptions, idx >= turn_start, desc_idx)
+        msg.parts, image_idx = _replace_images_in_parts(msg.parts, descriptions, idx >= turn_start, image_idx, max_images)
 
 
-def _replace_images_in_parts(parts: list[InternalPart], descriptions: list, is_current: bool, desc_idx: int):
+def _replace_images_in_parts(parts: list[InternalPart], descriptions, is_current: bool, desc_idx: int, max_images: int = 0):
     replaced = []
     for part in parts:
         if part.kind == "image":
             payload = _image_payload(part)
-            replaced.append(text_part(_build_inline_replacement(desc_idx, descriptions, is_current, payload.get("url", ""), payload.get("data", ""))))
+            replaced.append(text_part(_build_inline_replacement(desc_idx, descriptions, is_current, payload.get("url", ""), payload.get("data", ""), max_images)))
             if is_current:
                 desc_idx += 1
         elif part.kind == "tool_result":
-            inner, desc_idx = _replace_images_in_parts(part.parts, descriptions, is_current, desc_idx)
+            inner, desc_idx = _replace_images_in_parts(part.parts, descriptions, is_current, desc_idx, max_images)
             replaced.append(tool_result_part(part.tool_call_id, inner, raw=part.raw, extensions=part.extensions))
         elif part.kind == "text":
             text = part.text
             for _mime, data_uri in extract_image_data_uris(text):
-                text = text.replace(data_uri, _build_inline_replacement(desc_idx, descriptions, is_current, image_data=data_uri))
+                text = text.replace(data_uri, _build_inline_replacement(desc_idx, descriptions, is_current, image_data=data_uri, max_images=max_images))
                 if is_current:
                     desc_idx += 1
             replaced.append(text_part(text, raw=part.raw, extensions=part.extensions))
@@ -296,10 +297,16 @@ def _cached_image_replacement(image_url: str = "", image_data: str = "") -> str:
 
 
 def _build_inline_replacement(desc_idx: int, descriptions: list, is_current: bool,
-                              image_url: str = "", image_data: str = "") -> str:
+                              image_url: str = "", image_data: str = "", max_images: int = 0) -> str:
     """Build replacement text for an image. Current-turn images get description
     immediately after the placeholder so the LLM doesn't need remote index mapping."""
-    if is_current and desc_idx < len(descriptions):
+    if is_current and isinstance(descriptions, dict):
+        desc = descriptions.get(_cache_key(image_url, image_data))
+        if desc:
+            return f"[Image #{desc_idx + 1}]: {desc}"
+        if max_images and desc_idx >= max_images:
+            return "[image: skipped because max_images limit was reached]"
+    elif is_current and desc_idx < len(descriptions):
         desc = descriptions[desc_idx]
         return f"[Image #{desc_idx + 1}]: {desc}"
     return _cached_image_replacement(image_url, image_data)

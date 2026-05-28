@@ -259,6 +259,22 @@ def test_ir_preserves_external_image_url_for_anthropic_as_text_placeholder():
     assert anthropic_messages[0]["content"][1] == {"type": "text", "text": "[image URL: https://example.com/a.png]"}
 
 
+def test_ir_projects_openai_image_content_in_original_order():
+    req = chat_completions_to_internal({
+        "model": "gpt-test",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "before"},
+            {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}},
+            {"type": "text", "text": "after"},
+        ]}],
+    })
+
+    content = ir_to_openai_messages(req.messages)[0]["content"]
+    assert [part["type"] for part in content] == ["text", "image_url", "text"]
+    assert content[0]["text"] == "before"
+    assert content[2]["text"] == "after"
+
+
 @pytest.mark.parametrize(
     ("image_item", "expected_source"),
     [
@@ -438,6 +454,31 @@ async def test_preprocess_messages_replaces_current_images(monkeypatch):
     projected = ir_to_openai_messages(req.messages)
     assert "A test image" in projected[0]["content"]
     assert "image_url" not in str(projected[0]["content"])
+
+
+@pytest.mark.asyncio
+async def test_preprocess_messages_maps_duplicate_images_to_same_description(monkeypatch):
+    req = chat_completions_to_internal({
+        "model": "gpt-test",
+        "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "https://example.com/a.jpg"}},
+            {"type": "image_url", "image_url": {"url": "https://example.com/a.jpg"}},
+            {"type": "image_url", "image_url": {"url": "https://example.com/b.jpg"}},
+        ]}],
+    })
+    calls = []
+
+    async def fake_describe(image_url="", image_data="", preprocessor_config=None):
+        calls.append(image_url or image_data)
+        return "A image" if image_url.endswith("a.jpg") else "B image"
+
+    monkeypatch.setattr("app.services.preprocessing.describe_image", fake_describe)
+    await preprocess_messages(req.messages, {"id": "vision", "enabled": True, "max_images": 5})
+
+    text = ir_to_openai_messages(req.messages)[0]["content"]
+    assert calls == ["https://example.com/a.jpg", "https://example.com/b.jpg"]
+    assert text.count("A image") == 2
+    assert text.count("B image") == 1
 
 
 def test_chat_completions_to_internal_accepts_native_image_blocks():

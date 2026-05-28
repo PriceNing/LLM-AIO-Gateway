@@ -29,6 +29,43 @@ def _text_from_parts(parts: list[InternalPart]) -> str:
     return "\n".join(part.text for part in parts if part.kind == "text" and part.text)
 
 
+def _append_anthropic_image_content(content: list[dict[str, Any]], part: InternalPart) -> None:
+    source = part.source
+    if source.get("kind") == "base64":
+        content.append({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": source.get("media_type") or "image/png",
+                "data": source.get("data", ""),
+            },
+        })
+    elif source.get("url", "").startswith("data:"):
+        url = source.get("url", "")
+        media = url.split(";")[0].replace("data:", "")
+        data = url.split(",", 1)[1] if "," in url else ""
+        content.append({"type": "image", "source": {"type": "base64", "media_type": media, "data": data}})
+    elif source.get("url"):
+        content.append({"type": "text", "text": f"[image URL: {source.get('url')}]"})
+
+
+def _anthropic_tool_result_content(parts: list[InternalPart]) -> Any:
+    has_non_text = any(part.kind != "text" for part in parts or [])
+    if not has_non_text:
+        return _text_from_parts(parts) or "(tool output)"
+
+    content: list[dict[str, Any]] = []
+    for part in parts or []:
+        if part.kind == "text":
+            if part.text:
+                content.append({"type": "text", "text": part.text})
+        elif part.kind == "image":
+            _append_anthropic_image_content(content, part)
+        elif part.raw is not None:
+            content.append(part.raw if isinstance(part.raw, dict) else {"type": "text", "text": str(part.raw)})
+    return content or "(tool output)"
+
+
 def _parts_to_openai_content(parts: list[InternalPart]) -> Any:
     text = _text_from_parts(parts)
     images = [part for part in parts if part.kind == "image"]
@@ -36,20 +73,21 @@ def _parts_to_openai_content(parts: list[InternalPart]) -> Any:
     if not images and not unknown:
         return text
     content = []
-    if text:
-        content.append({"type": "text", "text": text})
-    for part in images:
-        source = part.source
-        if source.get("kind") == "url":
-            image_url = {"url": source.get("url", "")}
-            if source.get("detail"):
-                image_url["detail"] = source["detail"]
-            content.append({"type": "image_url", "image_url": image_url})
-        elif source.get("kind") == "base64":
-            media = source.get("media_type") or "image/png"
-            content.append({"type": "image_url", "image_url": {"url": f"data:{media};base64,{source.get('data', '')}"}})
-    for raw in unknown:
-        content.append(raw if isinstance(raw, dict) else {"type": "text", "text": str(raw)})
+    for part in parts:
+        if part.kind == "text" and part.text:
+            content.append({"type": "text", "text": part.text})
+        elif part.kind == "image":
+            source = part.source
+            if source.get("kind") == "url":
+                image_url = {"url": source.get("url", "")}
+                if source.get("detail"):
+                    image_url["detail"] = source["detail"]
+                content.append({"type": "image_url", "image_url": image_url})
+            elif source.get("kind") == "base64":
+                media = source.get("media_type") or "image/png"
+                content.append({"type": "image_url", "image_url": {"url": f"data:{media};base64,{source.get('data', '')}"}})
+        elif part.kind == "unknown" and part.raw is not None:
+            content.append(part.raw if isinstance(part.raw, dict) else {"type": "text", "text": str(part.raw)})
     return content
 
 
@@ -485,7 +523,7 @@ def ir_to_anthropic_messages(messages: list[InternalMessage]) -> tuple[list[dict
                 if part.kind == "tool_result":
                     anthropic_messages.append({
                         "role": "user",
-                        "content": [{"type": "tool_result", "tool_use_id": part.tool_call_id, "content": _text_from_parts(part.parts) or "(tool output)"}],
+                        "content": [{"type": "tool_result", "tool_use_id": part.tool_call_id, "content": _anthropic_tool_result_content(part.parts)}],
                     })
     system = ""
     if system_parts:
@@ -505,21 +543,12 @@ def _parts_to_anthropic_content(parts: list[InternalPart]) -> list[dict[str, Any
                 block["cache_control"] = part.extensions["cache_control"]
             content.append(block)
         elif part.kind == "image":
-            source = part.source
-            if source.get("kind") == "base64":
-                content.append({"type": "image", "source": {"type": "base64", "media_type": source.get("media_type") or "image/png", "data": source.get("data", "")}})
-            elif source.get("url", "").startswith("data:"):
-                url = source.get("url", "")
-                media = url.split(";")[0].replace("data:", "")
-                data = url.split(",", 1)[1] if "," in url else ""
-                content.append({"type": "image", "source": {"type": "base64", "media_type": media, "data": data}})
-            elif source.get("url"):
-                content.append({"type": "text", "text": f"[image URL: {source.get('url')}]"})
+            _append_anthropic_image_content(content, part)
         elif part.kind == "tool_call":
             args = part.arguments if part.arguments is not None else _parse_arguments(part.raw_arguments)
             content.append({"type": "tool_use", "id": part.tool_call_id, "name": part.name, "input": args or {}})
         elif part.kind == "tool_result":
-            content.append({"type": "tool_result", "tool_use_id": part.tool_call_id, "content": _text_from_parts(part.parts) or "(tool output)"})
+            content.append({"type": "tool_result", "tool_use_id": part.tool_call_id, "content": _anthropic_tool_result_content(part.parts)})
         elif part.kind == "reasoning":
             content.append({"type": "thinking", "thinking": part.text})
         elif part.raw is not None:

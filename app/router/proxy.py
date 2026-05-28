@@ -655,16 +655,49 @@ def list_models(authorization: Optional[str] = Header(None)):
                         "owned_by": provider["name"],
                         "provider": provider["id"]
                     }
-                    # Models with a vision preprocessor advertise image support so clients such as Codex/OpenCode
-                    # will send images, which the gateway intercepts and describes with a vision model.
-                    # Set several common fields because different clients check different keys.
-                    if model.get("preprocessor"):
+                    # Models with native vision support or a vision preprocessor should advertise image support
+                    # so clients such as Codex/OpenCode send image blocks instead of text placeholders.
+                    if _model_should_advertise_vision(provider, model):
                         entry["supports_vision"] = True
                         entry["image_support"] = True
                         entry["multimodal"] = True
                     models.append(entry)
 
     return {"object": "list", "data": models}
+
+
+def _model_supports_native_vision(provider: dict, model: dict) -> bool:
+    """Best-effort client capability hint for models that accept images natively."""
+    model_id = str(model.get("id") or "").lower()
+    model_name = str(model.get("name") or "").lower()
+    text = f"{model_id} {model_name}"
+
+    if any(marker in text for marker in ("embedding", "rerank", "audio", "tts", "whisper", "image-")):
+        return False
+
+    vision_markers = (
+        "gpt-4o",
+        "gpt-4.1",
+        "gpt-5",
+        "claude-3",
+        "claude-opus-4",
+        "claude-sonnet-4",
+        "gemini",
+        "qwen-vl",
+        "qwen2-vl",
+        "qwen2.5-vl",
+        "qwen3-vl",
+        "minicpm-v",
+        "llava",
+        "vision",
+        "vl-",
+        "-vl",
+    )
+    return any(marker in text for marker in vision_markers)
+
+
+def _model_should_advertise_vision(provider: dict, model: dict) -> bool:
+    return bool(model.get("preprocessor")) or _model_supports_native_vision(provider, model)
 
 @router.post("/chat/completions")
 async def chat_completions(request: Request, authorization: Optional[str] = Header(None)):

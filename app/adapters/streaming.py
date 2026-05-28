@@ -46,8 +46,8 @@ async def iter_stream_async(stream_func):
             if stream_gen is not None:
                 try:
                     stream_gen.close()
-                except Exception:
-                    _app_log.warning("streaming: error putting sentinel %s", e)
+                except Exception as close_err:
+                    _app_log.warning("[iter_stream_async] error closing generator: %s", close_err)
             chunk_queue.put(_STREAM_SENTINEL)
             done.set()
 
@@ -69,6 +69,8 @@ async def iter_stream_async(stream_func):
         if error:
             raise error
     finally:
+        if not done.is_set():
+            _app_log.debug("[iter_stream_async] client disconnected, cancelling bg thread")
         cancel.set()
         if bg_thread is not None and bg_thread.is_alive():
             try:
@@ -76,5 +78,5 @@ async def iter_stream_async(stream_func):
                     ctypes.c_long(bg_thread.ident),
                     ctypes.py_object(GeneratorExit),
                 )
-            except Exception:
-                _app_log.warning("streaming: error in async generator %s", e)
+            except Exception as cancel_err:
+                _app_log.warning("[iter_stream_async] error cancelling bg thread: %s", cancel_err)

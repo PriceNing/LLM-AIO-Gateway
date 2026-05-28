@@ -77,6 +77,30 @@ OPENAI_HOSTS = ("api.openai.com", "azure.com")
 MIN_IMAGE_MAX_TOKENS = get_default("min_image_max_tokens", 2000)
 
 
+def _model_name_suggests_vision(model: str) -> bool:
+    text = str(model or "").lower()
+    if any(marker in text for marker in ("embedding", "rerank", "audio", "tts", "whisper", "image-")):
+        return False
+    return any(marker in text for marker in (
+        "gpt-4o",
+        "gpt-4.1",
+        "gpt-5",
+        "claude-3",
+        "claude-opus-4",
+        "claude-sonnet-4",
+        "gemini",
+        "qwen-vl",
+        "qwen2-vl",
+        "qwen2.5-vl",
+        "qwen3-vl",
+        "minicpm-v",
+        "llava",
+        "vision",
+        "vl-",
+        "-vl",
+    ))
+
+
 def get_litellm_model_name(model: str, provider: dict) -> str:
     """Build the liteLLM model name for OpenAI-compatible providers."""
     provider_type = provider.get("provider_type", "openai")
@@ -106,6 +130,12 @@ def build_completion_args(model: str, provider_id: Optional[str] = None) -> tupl
         params["api_base"] = api_base
 
     litellm_model = get_litellm_model_name(model, provider)
+    # Register only likely vision-capable custom models so liteLLM capability checks
+    # do not incorrectly advertise image support for every OpenAI-compatible model.
+    if (litellm_model.startswith("openai/")
+            and litellm_model not in litellm.model_cost
+            and _model_name_suggests_vision(litellm_model)):
+        litellm.model_cost[litellm_model] = {"supports_vision": True}
     # Per-provider thinking mode: configured via provider.extra_headers.
     # If not set, no thinking parameter is sent (each provider defaults).
     extra_headers = provider.get("extra_headers", {}) or {}

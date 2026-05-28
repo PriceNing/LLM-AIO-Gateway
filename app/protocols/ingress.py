@@ -1,6 +1,9 @@
 from typing import Any
 
 from app.config import get_default
+from app.services.logger import get_logger
+
+_app_log = get_logger("app")
 from app.core.types import InternalRequest, tools_from_chat
 from app.protocols.ir import (
     anthropic_messages_to_ir,
@@ -68,6 +71,8 @@ def responses_tools_to_chat_tools(tools: list[Any] | None) -> list[dict[str, Any
 
 def chat_completions_to_internal(body: dict[str, Any]) -> InternalRequest:
     model = body.get("model")
+    _app_log.debug("[ingress] chat_completions model=%s stream=%s msgs=%d tools=%s",
+                   model, body.get("stream"), len(body.get("messages", [])), bool(body.get("tools")))
     extra_keys = {"top_p", "presence_penalty", "frequency_penalty", "stop", "response_format", "user"}
     extra = {key: body[key] for key in extra_keys if key in body}
     tool_choice = body.get("tool_choice")
@@ -94,6 +99,8 @@ def chat_completions_to_internal(body: dict[str, Any]) -> InternalRequest:
 def completions_to_internal(body: dict[str, Any]) -> InternalRequest:
     model = body.get("model")
     prompt = _completion_prompt_to_text(body.get("prompt", ""))
+    _app_log.debug("[ingress] completions model=%s stream=%s prompt_len=%d",
+                   model, body.get("stream"), len(prompt))
     extra_keys = {"top_p", "presence_penalty", "frequency_penalty", "stop", "suffix", "echo", "logprobs", "user"}
     extra = {key: body[key] for key in extra_keys if key in body}
     messages = openai_messages_to_ir([{"role": "user", "content": prompt}])
@@ -114,6 +121,8 @@ def completions_to_internal(body: dict[str, Any]) -> InternalRequest:
 
 def anthropic_messages_to_internal(body: dict[str, Any]) -> InternalRequest:
     model = body.get("model")
+    _app_log.debug("[ingress] messages model=%s stream=%s msgs=%d tools=%s",
+                   model, body.get("stream"), len(body.get("messages", [])), bool(body.get("tools")))
     system_prompt = strip_billing_header(body.get("system", ""))
     anthropic_messages = body.get("messages", [])
     messages = anthropic_messages_to_ir(anthropic_messages, system_prompt)
@@ -146,6 +155,9 @@ def responses_to_internal(body: dict[str, Any]) -> InternalRequest:
     model = body.get("model")
     input_data = body.get("input", "")
     instructions = body.get("instructions", "")
+    input_count = len(input_data) if isinstance(input_data, list) else 0
+    _app_log.debug("[ingress] responses model=%s stream=%s input_items=%d instructions_len=%d",
+                   model, body.get("stream"), input_count, len(instructions) if instructions else 0)
     messages = responses_input_to_ir(input_data, instructions)
 
     extra_keys = {"top_p", "presence_penalty", "frequency_penalty", "stop", "response_format", "user"}

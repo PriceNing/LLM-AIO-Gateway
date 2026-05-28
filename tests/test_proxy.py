@@ -57,6 +57,31 @@ def test_list_models_filters_by_user_key():
     assert [item["id"] for item in data] == ["test-provider/allowed-model"]
 
 
+def test_list_models_advertises_native_vision_without_preprocessor():
+    from app.database import get_db
+    add_provider({
+        "id": "pixel-api",
+        "name": "pixel-api",
+        "provider_type": "anthropic",
+        "api_base": "https://ai-pixel.online",
+        "api_key": "upstream-key",
+        "enabled": True,
+        "models": [{"id": "gpt-5.5", "name": "gpt-5.5", "enabled": True}],
+    })
+    with get_db() as db:
+        db.execute("UPDATE user_api_keys SET allowed_models = ? WHERE key = 'user-key'", ('["pixel-api/gpt-5.5"]',))
+
+    response = client.get("/v1/models", headers=headers)
+
+    assert response.status_code == 200
+    model = response.json()["data"][0]
+    assert model["id"] == "pixel-api/gpt-5.5"
+    assert model["supports_vision"] is True
+    assert model["image_support"] is True
+    assert model["multimodal"] is True
+    assert "preprocessor" not in model
+
+
 def test_list_models_unauthorized():
     response = client.get("/v1/models")
     assert response.status_code == 401

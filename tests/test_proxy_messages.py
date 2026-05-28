@@ -7,6 +7,8 @@ from app.core.policy import inject_reasoning_content
 from app.core.text import friendly_error_msg as _friendly_error_msg
 from app.core.text import mask_key as _mask_key
 from app.core.text import strip_billing_header as _strip_billing_header
+from app.core.text import message_text as _message_text
+from app.core.text import attr as _attr
 from app.core.think import extract_and_strip_think as _extract_and_strip_think
 from app.core.think import strip_think_tags as _strip_think_tags
 from app.core.tool_args import fix_tool_args as _fix_tool_args
@@ -190,6 +192,52 @@ def test_ir_projects_anthropic_user_image_to_openai_image_shape():
     assert content[0]["type"] == "text"
     assert content[1]["type"] == "image_url"
     assert "data:image/jpeg;base64," in content[1]["image_url"]["url"]
+
+
+def test_ir_projects_anthropic_tool_result_image_back_to_anthropic_shape():
+    messages, system = ir_to_anthropic_messages(anthropic_messages_to_ir([{
+        "role": "user",
+        "content": [{
+            "type": "tool_result",
+            "tool_use_id": "call_1",
+            "content": [
+                {"type": "text", "text": "Screenshot:"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": _IMG1}},
+            ],
+        }],
+    }]))
+
+    assert system == ""
+    tool_result = messages[0]["content"][0]
+    assert tool_result["type"] == "tool_result"
+    assert tool_result["tool_use_id"] == "call_1"
+    assert isinstance(tool_result["content"], list)
+    assert tool_result["content"][0] == {"type": "text", "text": "Screenshot:"}
+    assert tool_result["content"][1] == {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": _IMG1},
+    }
+
+
+def test_ir_projects_openai_tool_result_image_back_to_anthropic_shape():
+    messages, system = ir_to_anthropic_messages(openai_messages_to_ir([{
+        "role": "tool",
+        "tool_call_id": "call_1",
+        "content": [
+            {"type": "text", "text": "Screenshot:"},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{_IMG1}"}},
+        ],
+    }]))
+
+    assert system == ""
+    tool_result = messages[0]["content"][0]
+    assert tool_result["type"] == "tool_result"
+    assert tool_result["tool_use_id"] == "call_1"
+    assert tool_result["content"][0] == {"type": "text", "text": "Screenshot:"}
+    assert tool_result["content"][1] == {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": _IMG1},
+    }
 
 
 # Test section
@@ -1008,3 +1056,56 @@ def test_ir_projects_anthropic_image_only_user_without_empty_text():
     assert isinstance(content, list)
     assert len(content) == 1
     assert content[0]["type"] == "image_url"
+
+# --- message_text ---
+
+def test_message_text_string():
+    assert _message_text("hello") == "hello"
+
+def test_message_text_empty_string():
+    assert _message_text("") == ""
+
+def test_message_text_list_of_text_parts():
+    content = [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]
+    assert _message_text(content) == "a\nb"
+
+def test_message_text_list_with_string_parts():
+    content = ["hello", "world"]
+    assert _message_text(content) == "hello\nworld"
+
+def test_message_text_list_mixed():
+    content = ["plain", {"type": "text", "text": "structured"}]
+    assert _message_text(content) == "plain\nstructured"
+
+def test_message_text_list_skips_non_text():
+    content = [{"type": "image_url", "image_url": {"url": "x"}}, {"type": "text", "text": "ok"}]
+    assert _message_text(content) == "ok"
+
+def test_message_text_none():
+    assert _message_text(None) == ""
+
+def test_message_text_empty_list():
+    assert _message_text([]) == ""
+
+def test_message_text_empty_text_filtered():
+    content = [{"type": "text", "text": ""}, {"type": "text", "text": "ok"}]
+    assert _message_text(content) == "ok"
+
+
+# --- attr ---
+
+def test_attr_dict():
+    assert _attr({"a": 1}, "a") == 1
+    assert _attr({"a": 1}, "b") is None
+    assert _attr({"a": 1}, "b", 99) == 99
+
+def test_attr_object():
+    class Obj:
+        x = 42
+    assert _attr(Obj(), "x") == 42
+    assert _attr(Obj(), "y") is None
+    assert _attr(Obj(), "y", 0) == 0
+
+def test_attr_dict_none_obj():
+    assert _attr(None, "x") is None
+    assert _attr(None, "x", "default") == "default"

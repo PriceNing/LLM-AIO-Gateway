@@ -1,6 +1,9 @@
 from typing import Any
 
 from app.core.types import InternalRequest
+from app.services.logger import get_logger
+
+_app_log = get_logger("app")
 from app.protocols.ir import ir_to_openai_messages
 
 
@@ -45,4 +48,11 @@ def chat_kwargs_from_internal(internal: InternalRequest) -> dict[str, Any]:
         kwargs.pop("tool_choice", None)
     else:
         kwargs["tool_choice"] = projected_tool_choice
+    _app_log.debug(
+        "[openai_adapter] tools=%d tool_choice=%s -> %s extra_keys=%s",
+        len(internal.tools or []),
+        raw_tool_choice,
+        projected_tool_choice,
+        list(internal.extra.keys()),
+    )
     return kwargs

@@ -309,3 +309,83 @@ def test_zero_pad_timeline_month_does_not_overflow():
     assert labels == ["2026-01", "2026-02", "2026-03"]
     assert len(padded_rows) == 3
     assert len(padded_model_rows) == 1
+
+# --- db/routing.py helpers ---
+
+def test_routing_json_loads_valid():
+    from app.db.routing import json_loads
+    assert json_loads('[1, 2]') == [1, 2]
+    assert json_loads('{"a": 1}') == {"a": 1}
+
+def test_routing_json_loads_invalid():
+    from app.db.routing import json_loads
+    assert json_loads('{bad}') is None
+    assert json_loads('') is None
+    assert json_loads(None) is None
+
+def test_routing_json_dumps_list():
+    from app.db.routing import json_dumps_list
+    assert json_dumps_list([1, 2]) == '[1, 2]'
+    assert json_dumps_list('already string') == 'already string'
+    assert json_dumps_list(None) == '[]'
+    assert json_dumps_list(42) == '[]'
+
+def test_routing_to_bool():
+    from app.db.routing import to_bool
+    assert to_bool(True) is True
+    assert to_bool(False) is False
+    assert to_bool(1) is True
+    assert to_bool(0) is False
+    assert to_bool('true') is True
+    assert to_bool('True') is True
+    assert to_bool('1') is True
+    assert to_bool('yes') is True
+    assert to_bool('false') is False
+    assert to_bool('no') is False
+    assert to_bool(None) is False
+
+def test_routing_row_to_dict():
+    from app.db.routing import row_to_dict
+    assert row_to_dict(None) is None
+
+def test_routing_normalize_rule_none():
+    from app.db.routing import normalize_rule
+    assert normalize_rule(None) is None
+
+
+# --- db/fallback.py helpers ---
+
+def test_fallback_json_loads_with_fallback():
+    from app.db.fallback import json_loads
+    assert json_loads('[1]', []) == [1]
+    assert json_loads('', []) == []
+    assert json_loads(None, [42]) == [42]
+    assert json_loads('{bad}', {'x': 1}) == {'x': 1}
+
+def test_fallback_json_dumps():
+    from app.db.fallback import json_dumps
+    assert json_dumps([1, 2], []) == '[1, 2]'
+    assert json_dumps('already', []) == 'already'
+    assert json_dumps(None, [42]) == '[42]'
+
+def test_fallback_to_bool():
+    from app.db.fallback import to_bool
+    assert to_bool(True) is True
+    assert to_bool(False) is False
+    assert to_bool(1) is True
+    assert to_bool(0) is False
+    assert to_bool('true') is True
+    assert to_bool('1') is True
+    assert to_bool(None) is False
+
+def test_fallback_normalize_policy_none():
+    from app.db.fallback import normalize_policy
+    assert normalize_policy(None) is None
+
+def test_fallback_default_triggers():
+    from app.db.fallback import DEFAULT_TRIGGERS
+    assert DEFAULT_TRIGGERS['timeout'] is True
+    assert DEFAULT_TRIGGERS['connection_error'] is True
+    assert DEFAULT_TRIGGERS['http_429'] is True
+    assert DEFAULT_TRIGGERS['http_5xx'] is True
+    assert DEFAULT_TRIGGERS['http_4xx'] is False

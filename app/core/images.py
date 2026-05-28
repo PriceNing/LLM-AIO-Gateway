@@ -1,5 +1,8 @@
-import logging
 import re
+
+from app.services.logger import get_logger
+
+_app_log = get_logger("app")
 
 
 _DATA_IMAGE_RE = re.compile(r"data:image/(\w+);base64,([A-Za-z0-9+/=]+)")
@@ -52,7 +55,7 @@ def normalize_image_content(messages: list) -> list:
                     new_parts.append({"type": "image_url", "image_url": {"url": data_uri}})
                 msg["content"] = new_parts
     if fixed:
-        logging.getLogger("llmgw.app").info("Normalized image data URIs to image_url content parts")
+        _app_log.info("[images] normalized data URIs to image_url content parts")
     return messages
 
 
