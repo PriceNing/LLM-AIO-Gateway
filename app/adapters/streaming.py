@@ -40,14 +40,14 @@ async def iter_stream_async(stream_func):
                 _error_log.error("[iter_stream_async] type=%s msg=%s", type(e).__name__, str(e)[:200])
                 _error_log.error("[iter_stream_async] %s", tb.format_exc())
             except Exception:
-                pass
+                _app_log.warning("streaming: error in sync generator %s", e)
             error = e
         finally:
             if stream_gen is not None:
                 try:
                     stream_gen.close()
                 except Exception:
-                    pass
+                    _app_log.warning("streaming: error putting sentinel %s", e)
             chunk_queue.put(_STREAM_SENTINEL)
             done.set()
 
@@ -77,4 +77,4 @@ async def iter_stream_async(stream_func):
                     ctypes.py_object(GeneratorExit),
                 )
             except Exception:
-                pass
+                _app_log.warning("streaming: error in async generator %s", e)

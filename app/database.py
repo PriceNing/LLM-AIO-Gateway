@@ -439,7 +439,7 @@ def find_user_by_api_key(key: str) -> Optional[tuple[dict, dict]]:
 
 def add_request_record(model: str, username: str, success: bool, tokens: int = 0) -> None:
     """Insert a request record for historical stats. Called from _log_request."""
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
     with get_db() as db:
         db.execute(
             "INSERT INTO request_records (timestamp, model, username, success, tokens) VALUES (?, ?, ?, ?, ?)",

@@ -78,7 +78,7 @@ def _cleanup_expired_sessions() -> None:
                 for t in expired:
                     _sessions.pop(t, None)
         except Exception:
-            pass
+            pass  # cleanup is best-effort
         _stop_cleanup.wait(300)  # Every 5 minutes
 
 

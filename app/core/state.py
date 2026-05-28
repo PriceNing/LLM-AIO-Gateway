@@ -160,7 +160,7 @@ def conversation_cache_key(api_key: str, messages: list, response_chain_id: str 
         if text:
             user_fingerprints.append(text[:200])
     fingerprint = "\n---\n".join(user_fingerprints)[:2000]
-    conv_hash = hashlib.md5(fingerprint.encode()).hexdigest()[:16]
+    conv_hash = hashlib.md5(fingerprint.encode(), usedforsecurity=False).hexdigest()[:16]
     return f"{api_key}:{conv_hash}"
 
 

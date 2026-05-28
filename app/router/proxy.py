@@ -15,7 +15,7 @@ from app.database import (
 )
 from app.core.text import friendly_error_msg, mask_key
 from app.core.output import InternalOutputEvent
-from app.core.policy import RouteTarget, apply_fallback_policy
+
 from app.core.state import (
     TOOL_ONLY_LIMIT,
     conversation_cache_key as _conversation_cache_key,
@@ -33,7 +33,7 @@ from app.protocols.ingress import (
     completions_to_internal,
     responses_to_internal,
 )
-from app.core.policy import prepare_request_policy
+from app.core.policy import RouteTarget, apply_fallback_policy, prepare_request_policy
 from app.adapters.anthropic import (
     anthropic_body_from_internal,
     anthropic_messages_completion_for_internal,
@@ -373,8 +373,8 @@ def _log_request(username: str, api_key: str, model: str, provider_id: str,
     # Write to persistent history for stats
     try:
         add_request_record(model=requested_model or model, username=username, success=success, tokens=tokens)
-    except Exception:
-        pass  # Never let DB errors block the response
+    except Exception as e:
+        _app_log.warning("Failed to log request: %s", e)
 
 
 def _log_request_body(username: str, model: str, endpoint: str, body: dict) -> None:

@@ -227,7 +227,7 @@ class LogManager:
                 if handler not in litellm_logger.handlers:
                     litellm_logger.addHandler(handler)
         except Exception:
-            pass
+            pass  # liteLLM logger capture is best-effort
         self._litellm_captured = True
 
     def _emit_startup_diagnostics(self) -> None:
@@ -244,7 +244,7 @@ class LogManager:
             for channel, handler in self._handlers.items():
                 app_logger.debug("[logging] handler channel=%s file=%s", channel, getattr(handler, "baseFilename", ""))
         except Exception:
-            pass
+            pass  # liteLLM handler removal is best-effort
 
 
 def init_logging(config: Optional[dict] = None) -> LogManager:

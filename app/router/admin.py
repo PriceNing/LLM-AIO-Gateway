@@ -368,11 +368,11 @@ async def dry_run_fallback_policy(body: dict, authorization: Optional[str] = Hea
 async def get_stats_history(from_ts: Optional[str] = None, to_ts: Optional[str] = None, granularity: Optional[str] = "day", authorization: Optional[str] = Header(None)):
     await require_admin_session(authorization)
     if not to_ts:
-        to_ts = datetime.now().strftime("%Y-%m-%d 23:59:59")
+        to_ts = datetime.now(UTC).strftime("%Y-%m-%d 23:59:59")
     else:
         to_ts = to_ts + " 23:59:59" if len(to_ts) == 10 else to_ts
     if not from_ts:
-        from_ts = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d 00:00:00")
+        from_ts = (datetime.now(UTC) - timedelta(days=30)).strftime("%Y-%m-%d 00:00:00")
     else:
         from_ts = from_ts + " 00:00:00" if len(from_ts) == 10 else from_ts
     if granularity not in ("hour", "day", "week", "month"):
@@ -462,7 +462,7 @@ async def fetch_preprocessor_models(api_base: str, api_key: str = "",
                     models = data.get("data") or data.get("models") or []
                     return {"models": [m.get("id") or m.get("name", "?") for m in models if isinstance(m, dict)]}
                 except Exception:
-                    continue
+                    continue  # skip model that failed to fetch
     raise HTTPException(status_code=502, detail="Failed to fetch models from server")
 
 

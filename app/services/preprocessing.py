@@ -38,7 +38,7 @@ MAX_CACHE_SIZE = get_default("image_cache_max_size", 500)
 def _cache_key(image_url: str, image_data: str = "") -> str:
     """Derive a stable cache key from an image URL or data URI."""
     raw = image_url or image_data or ""
-    return hashlib.md5(raw.encode()).hexdigest()[:16]
+    return hashlib.md5(raw.encode(), usedforsecurity=False).hexdigest()[:16]
 
 
 def _get_cached_description(url_or_data: str) -> Optional[str]:

@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Optional, Any
+from typing import Optional
 
 class ModelInfo(BaseModel):
     id: str = Field(pattern=r"^[a-zA-Z0-9._-]+$")
@@ -36,28 +36,9 @@ class StatsResponse(BaseModel):
     failed_calls: int
     success_rate: float
     last_reset: str
-    stats_by_model: dict = {}
-    request_log: list = []
-    users: list = []
-    timeline: dict = {}
-    distribution: dict = {}
-    timeline_models: dict = {}
-
-class ChatMessage(BaseModel):
-    role: str
-    content: Any
-
-class ChatCompletionRequest(BaseModel):
-    model: str
-    messages: list[ChatMessage]
-    temperature: Optional[float] = 0.7
-    max_tokens: Optional[int] = None
-    stream: Optional[bool] = False
-
-class ChatCompletionResponse(BaseModel):
-    id: str
-    object: str = "chat.completion"
-    created: int
-    model: str
-    choices: list
-    usage: dict
+    stats_by_model: dict = Field(default_factory=dict)
+    request_log: list = Field(default_factory=list)
+    users: list = Field(default_factory=list)
+    timeline: dict = Field(default_factory=dict)
+    distribution: dict = Field(default_factory=dict)
+    timeline_models: dict = Field(default_factory=dict)
