@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException, Header
 from typing import Optional
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from app.database import (
     get_providers, get_provider, add_provider, update_provider, delete_provider,
     get_users, get_user, add_user, update_user, delete_user,

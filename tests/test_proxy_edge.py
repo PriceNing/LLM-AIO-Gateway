@@ -778,6 +778,79 @@ def test_completions_anthropic_provider_uses_direct_adapter(monkeypatch, temp_db
     assert called == {"provider_type": "anthropic", "endpoint": "completions", "prompt": "Complete me"}
 
 
+def test_root_proxy_aliases_are_registered_and_callable(monkeypatch, temp_db):
+    from app.core.output import InternalOutputMessage
+
+    add_provider({
+        "id": "root-alias",
+        "name": "Root Alias",
+        "provider_type": "openai",
+        "api_base": "https://root-alias.example/v1",
+        "api_key": "upstream-key",
+        "enabled": True,
+        "models": [{"id": "alias-model", "name": "Alias Model", "enabled": True}],
+    })
+
+    def fake_completion(**kwargs):
+        class Usage:
+            prompt_tokens = 1
+            completion_tokens = 1
+            total_tokens = 2
+
+        class Message:
+            content = "alias ok"
+            tool_calls = None
+            reasoning_content = None
+
+        class Choice:
+            message = Message()
+            finish_reason = "stop"
+
+        class Response:
+            choices = [Choice()]
+            usage = Usage()
+
+        return Response()
+
+    async def fake_internal_completion(provider_info, internal):
+        return InternalOutputMessage(role="assistant", text="alias ok", finish_reason="stop", usage={"total_tokens": 2})
+
+    monkeypatch.setattr("app.router.proxy.create_chat_completion", fake_completion)
+    monkeypatch.setattr("app.router.proxy.anthropic_messages_completion_for_internal", fake_internal_completion)
+
+    models = client.get("/models", headers=temp_db["headers"])
+    assert models.status_code == 200
+    assert "root-alias/alias-model" in [item["id"] for item in models.json()["data"]]
+
+    chat = client.post("/chat/completions", headers=temp_db["headers"], json={
+        "model": "root-alias/alias-model",
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert chat.status_code == 200
+    assert chat.json()["choices"][0]["message"]["content"] == "alias ok"
+
+    completion = client.post("/completions", headers=temp_db["headers"], json={
+        "model": "root-alias/alias-model",
+        "prompt": "hi",
+    })
+    assert completion.status_code == 200
+    assert completion.json()["choices"][0]["text"] == "alias ok"
+
+    messages = client.post("/messages", headers=temp_db["headers"], json={
+        "model": "root-alias/alias-model",
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert messages.status_code == 200
+    assert messages.json()["content"][0]["text"] == "alias ok"
+
+    responses = client.post("/responses", headers=temp_db["headers"], json={
+        "model": "root-alias/alias-model",
+        "input": "hi",
+    })
+    assert responses.status_code == 200
+    assert responses.json()["output"][0]["content"][0]["text"] == "alias ok"
+
+
 def test_completions_openai_provider_uses_ir_chat_adapter(monkeypatch, temp_db):
     add_provider({
         "id": "openai-text",

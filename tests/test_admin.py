@@ -152,6 +152,18 @@ def test_logout_invalidates_session(temp_db):
     assert response2.status_code == 401
 
 
+def test_change_password(temp_db):
+    response = client.put("/auth/password", headers=temp_db["headers"], json={
+        "current_password": "secret",
+        "new_password": "new-secret",
+    })
+    assert response.status_code == 200
+
+    login = client.post("/auth/login", json={"username": "admin", "password": "new-secret"})
+    assert login.status_code == 200
+    assert login.json()["token"]
+
+
 def test_me_endpoint(temp_db):
     response = client.get("/auth/me", headers=temp_db["headers"])
     assert response.status_code == 200
@@ -346,6 +358,10 @@ def test_fallback_policy_crud_and_dry_run(temp_db):
     assert created.status_code == 200
     policy_id = created.json()["id"]
 
+    fetched = client.get(f"/admin/fallback-policies/{policy_id}", headers=temp_db["headers"])
+    assert fetched.status_code == 200
+    assert fetched.json()["id"] == policy_id
+
     dry = client.post("/admin/fallback-policies/dry-run", json={
         "provider_id": "primary-provider",
         "model": "primary-model",
@@ -378,6 +394,14 @@ def test_reset_stats(temp_db):
     response = client.post("/admin/stats/reset", headers=temp_db["headers"])
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
+
+
+def test_stats_history(temp_db):
+    response = client.get("/admin/stats/history", headers=temp_db["headers"])
+    assert response.status_code == 200
+    data = response.json()
+    assert "overall" in data
+    assert "timeline" in data
 
 
 # -- Model listing --
@@ -425,6 +449,33 @@ def test_provider_health_all_endpoint(temp_db, monkeypatch):
 def test_provider_health_endpoint_missing_provider(temp_db):
     response = client.get("/admin/providers/missing/health", headers=temp_db["headers"])
     assert response.status_code == 404
+
+
+def test_provider_refresh_routes(monkeypatch, temp_db):
+    import app.router.admin as admin_router
+
+    client.post("/admin/providers", json={
+        "id": "refreshable", "name": "Refreshable", "provider_type": "openai",
+        "api_base": "https://refresh.example/v1", "api_key": "key", "enabled": True,
+        "models": [],
+    }, headers=temp_db["headers"])
+
+    async def fake_refresh_provider_models(provider_id):
+        return {"provider_id": provider_id, "status": "ok"}
+
+    async def fake_refresh_all_providers():
+        return [{"provider_id": "refreshable", "status": "ok"}]
+
+    monkeypatch.setattr(admin_router, "refresh_provider_models", fake_refresh_provider_models)
+    monkeypatch.setattr(admin_router, "refresh_all_providers", fake_refresh_all_providers)
+
+    one = client.post("/admin/providers/refreshable/refresh", headers=temp_db["headers"])
+    assert one.status_code == 200
+    assert one.json() == {"provider_id": "refreshable", "status": "ok"}
+
+    all_resp = client.post("/admin/providers/refresh-all", headers=temp_db["headers"])
+    assert all_resp.status_code == 200
+    assert all_resp.json()["results"] == [{"provider_id": "refreshable", "status": "ok"}]
 
 
 # -- Preprocessor endpoints --
