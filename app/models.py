@@ -28,9 +28,6 @@ class ProviderUpdate(BaseModel):
     models: Optional[list[ModelInfo]] = None
     extra_headers: Optional[dict] = None
 
-class ProviderResponse(ProviderBase):
-    pass
-
 class StatsResponse(BaseModel):
     total_calls: int
     failed_calls: int
