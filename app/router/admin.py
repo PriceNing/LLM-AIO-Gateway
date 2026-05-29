@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException, Header
 from typing import Optional
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from app.database import (
     get_providers, get_provider, add_provider, update_provider, delete_provider,
     get_users, get_user, add_user, update_user, delete_user,
@@ -368,12 +368,13 @@ async def dry_run_fallback_policy(body: dict, authorization: Optional[str] = Hea
 @router.get("/stats/history")
 async def get_stats_history(from_ts: Optional[str] = None, to_ts: Optional[str] = None, granularity: Optional[str] = "day", authorization: Optional[str] = Header(None)):
     await require_admin_session(authorization)
+    local_now = datetime.now().astimezone()
     if not to_ts:
-        to_ts = datetime.now(UTC).strftime("%Y-%m-%d 23:59:59")
+        to_ts = local_now.strftime("%Y-%m-%d 23:59:59")
     else:
         to_ts = to_ts + " 23:59:59" if len(to_ts) == 10 else to_ts
     if not from_ts:
-        from_ts = (datetime.now(UTC) - timedelta(days=30)).strftime("%Y-%m-%d 00:00:00")
+        from_ts = (local_now - timedelta(days=30)).strftime("%Y-%m-%d 00:00:00")
     else:
         from_ts = from_ts + " 00:00:00" if len(from_ts) == 10 else from_ts
     if granularity not in ("hour", "day", "week", "month"):

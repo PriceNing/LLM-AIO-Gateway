@@ -2,10 +2,12 @@
 Unit tests for app.database - stats, provider lookup, routing rules, TTLDict.
 """
 import time
+from datetime import timedelta, timezone
 import pytest
 from app.database import (
     init_db, get_db,
     increment_global_stats, get_global_stats, reset_global_stats,
+    get_history_stats,
     find_provider_by_model, parse_model_id,
     add_provider, get_provider, get_providers, update_provider, delete_provider,
     add_routing_rule, get_routing_rules, update_routing_rule, delete_routing_rule,
@@ -54,6 +56,24 @@ def test_reset_global_stats():
     assert stats["total_calls"] == 0
     assert stats["failed_calls"] == 0
     assert stats["last_reset"] != ""
+
+
+def test_history_stats_queries_local_day_against_utc_records(monkeypatch):
+    import app.database as db_mod
+
+    monkeypatch.setattr(db_mod, "_local_tz", lambda: timezone(timedelta(hours=8)))
+    with get_db() as db:
+        db.execute(
+            "INSERT INTO request_records (timestamp, model, username, success, tokens) VALUES (?, ?, ?, ?, ?)",
+            ("2026-05-29 08:30:00", "model-a", "alice", 1, 123),
+        )
+
+    stats = get_history_stats("2026-05-29", "2026-05-29", "hour")
+
+    assert stats["overall"] == {"total_calls": 1, "failed_calls": 0, "total_tokens": 123}
+    assert stats["timeline"]["labels"][16] == "2026-05-29 16:00"
+    assert stats["timeline"]["total"][16] == 1
+    assert stats["timeline"]["tokens"][16] == 123
 
 
 # -- Provider CRUD --
