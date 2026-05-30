@@ -499,15 +499,40 @@ _HISTORY_STEP_FMT = {"hour": "%Y-%m-%d %H:00", "day": "%Y-%m-%d",
                       "week": "%Y-%U", "month": "%Y-%m"}
 
 
+def _local_tz():
+    return datetime.now().astimezone().tzinfo
+
+
+def _parse_history_boundary(ts: str, end_of_day: bool = False) -> datetime:
+    value = str(ts or "").strip().replace("T", " ")
+    if len(value) == 10:
+        value += " 23:59:59" if end_of_day else " 00:00:00"
+    fmt = "%Y-%m-%d %H:%M:%S" if len(value) >= 19 else "%Y-%m-%d %H:%M"
+    parsed = datetime.strptime(value[:19] if fmt.endswith("%S") else value[:16], fmt)
+    return parsed.replace(tzinfo=_local_tz())
+
+
+def _history_query_bounds(from_ts: str, to_ts: str) -> tuple[str, str, datetime, datetime]:
+    start_local = _parse_history_boundary(from_ts, end_of_day=False)
+    end_local = _parse_history_boundary(to_ts, end_of_day=True)
+    start_utc = start_local.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    end_utc = end_local.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    return start_utc, end_utc, start_local, end_local
+
+
+def _bucket_for_timestamp(timestamp: str, granularity: str) -> str:
+    dt_utc = datetime.strptime(timestamp[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    local_dt = dt_utc.astimezone(_local_tz())
+    return local_dt.strftime(_HISTORY_STEP_FMT[granularity])
+
+
 def _zero_pad_timeline(rows, from_ts, to_ts, granularity, model_bucket_rows):
     """Fill in missing buckets so the timeline has no gaps."""
-    fmt = _HISTORY_GRANULARITY[granularity]
     step_fmt = _HISTORY_STEP_FMT[granularity]
     delta = _HISTORY_DELTA[granularity]
 
-    # Parse from/to boundaries in the bucket format
-    start = datetime.strptime(from_ts[:19] if len(from_ts) > 10 else from_ts[:10], from_ts[:19].count(":") == 0 and "%Y-%m-%d" or "%Y-%m-%d %H:%M:%S")
-    end = datetime.strptime(to_ts[:19] if len(to_ts) > 10 else to_ts[:10], to_ts[:19].count(":") == 0 and "%Y-%m-%d" or "%Y-%m-%d %H:%M:%S")
+    start = _parse_history_boundary(from_ts, end_of_day=False)
+    end = _parse_history_boundary(to_ts, end_of_day=True)
 
     # Build a dict from bucket -> row data
     row_map = {r["bucket"] or "": r for r in rows}
@@ -547,19 +572,19 @@ def _zero_pad_timeline(rows, from_ts, to_ts, granularity, model_bucket_rows):
 
 def get_history_stats(from_ts: str, to_ts: str, granularity: str = "day") -> dict:
     """Aggregate historical stats by granularity. Returns timeline + model breakdown."""
-    fmt = _HISTORY_GRANULARITY.get(granularity, "%Y-%m-%d")
+    from_query, to_query, _, _ = _history_query_bounds(from_ts, to_ts)
     with get_db() as db:
         # Timeline: total calls, failures, tokens per bucket
         rows = db.execute("""
-            SELECT strftime(?, timestamp) AS bucket,
+            SELECT timestamp,
                    COUNT(*) AS total,
                    SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) AS failed,
                    SUM(tokens) AS tokens
             FROM request_records
             WHERE timestamp >= ? AND timestamp <= ?
-            GROUP BY bucket
-            ORDER BY bucket
-        """, (fmt, from_ts, to_ts)).fetchall()
+            GROUP BY timestamp
+            ORDER BY timestamp
+        """, (from_query, to_query)).fetchall()
 
         # Model breakdown for the period
         model_rows = db.execute("""
@@ -570,7 +595,7 @@ def get_history_stats(from_ts: str, to_ts: str, granularity: str = "day") -> dic
             WHERE timestamp >= ? AND timestamp <= ?
             GROUP BY model
             ORDER BY total DESC
-        """, (from_ts, to_ts)).fetchall()
+        """, (from_query, to_query)).fetchall()
 
         # User breakdown for the period
         user_rows = db.execute("""
@@ -581,18 +606,37 @@ def get_history_stats(from_ts: str, to_ts: str, granularity: str = "day") -> dic
             WHERE timestamp >= ? AND timestamp <= ?
             GROUP BY username
             ORDER BY total DESC
-        """, (from_ts, to_ts)).fetchall()
+        """, (from_query, to_query)).fetchall()
 
         # Per-model per-bucket breakdown for trend chart
         model_bucket_rows = db.execute("""
-            SELECT strftime(?, timestamp) AS bucket, model,
+            SELECT timestamp, model,
                    COUNT(*) AS total,
                    SUM(tokens) AS tokens
             FROM request_records
             WHERE timestamp >= ? AND timestamp <= ?
-            GROUP BY bucket, model
-            ORDER BY bucket, model
-        """, (fmt, from_ts, to_ts)).fetchall()
+            GROUP BY timestamp, model
+            ORDER BY timestamp, model
+        """, (from_query, to_query)).fetchall()
+
+    bucket_rows = {}
+    for row in rows:
+        bucket = _bucket_for_timestamp(row["timestamp"], granularity)
+        current = bucket_rows.setdefault(bucket, {"bucket": bucket, "total": 0, "failed": 0, "tokens": 0})
+        current["total"] += row["total"] or 0
+        current["failed"] += row["failed"] or 0
+        current["tokens"] += row["tokens"] or 0
+
+    bucket_model_rows = {}
+    for row in model_bucket_rows:
+        bucket = _bucket_for_timestamp(row["timestamp"], granularity)
+        key = (bucket, row["model"])
+        current = bucket_model_rows.setdefault(key, {"bucket": bucket, "model": row["model"], "total": 0, "tokens": 0})
+        current["total"] += row["total"] or 0
+        current["tokens"] += row["tokens"] or 0
+
+    rows = [bucket_rows[key] for key in sorted(bucket_rows)]
+    model_bucket_rows = [bucket_model_rows[key] for key in sorted(bucket_model_rows)]
 
     # Zero-pad the timeline so every bucket is present
     rows, bucket_labels, model_bucket_rows = _zero_pad_timeline(rows, from_ts, to_ts, granularity, model_bucket_rows)

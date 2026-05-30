@@ -566,7 +566,7 @@ def clear_request_log() -> None:
 
 
 def get_timeline_data() -> dict:
-    """Aggregate requests by minute for timeline chart. Zero-fills gaps."""
+    """Aggregate requests by minute for timeline chart."""
     with _request_log_lock:
         snapshot = list(_request_log)
     if not snapshot:
@@ -581,25 +581,6 @@ def get_timeline_data() -> dict:
         else:
             buckets[minute]["failed"] += 1
     sorted_keys = sorted(buckets.keys())
-    # Zero-fill gaps between first and last minute
-    if len(sorted_keys) >= 2:
-        from datetime import datetime, timedelta
-        def _parse_minute(s):
-            for fmt in ("%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M"):
-                try:
-                    return datetime.strptime(s[:16].replace("T", " "), "%Y-%m-%d %H:%M")
-                except ValueError:
-                    continue
-            return datetime.strptime(s[:16], "%Y-%m-%d %H:%M")
-        start = _parse_minute(sorted_keys[0])
-        end = _parse_minute(sorted_keys[-1])
-        cur = start
-        while cur <= end:
-            key = cur.strftime("%Y-%m-%d %H:%M")
-            if key not in buckets:
-                label = cur.strftime("%H:%M")
-                buckets[key] = {"label": label, "success": 0, "failed": 0}
-            cur += timedelta(minutes=1)
     sorted_buckets = sorted(buckets.items(), key=lambda x: x[0])
     return {
         "labels": [b["label"] for _, b in sorted_buckets],
@@ -640,7 +621,7 @@ def get_model_stats() -> dict:
 
 
 def get_timeline_model_data() -> dict:
-    """Per-model per-minute breakdown from request log for stacked bar chart. Zero-fills gaps."""
+    """Per-model per-minute breakdown from request log for stacked bar chart."""
     with _request_log_lock:
         snapshot = list(_request_log)
     if not snapshot:
@@ -656,20 +637,6 @@ def get_timeline_model_data() -> dict:
         buckets[minute][model]["total"] += 1
         buckets[minute][model]["tokens"] += entry["tokens"]
     sorted_keys = sorted(buckets.keys())
-    # Zero-fill gaps between first and last minute
-    if len(sorted_keys) >= 2:
-        from datetime import datetime, timedelta
-        def _parse_minute_ts(s):
-            return datetime.strptime(s[:16].replace("T", " "), "%Y-%m-%d %H:%M")
-        start = _parse_minute_ts(sorted_keys[0])
-        end = _parse_minute_ts(sorted_keys[-1])
-        cur = start
-        while cur <= end:
-            key = cur.strftime("%Y-%m-%d %H:%M")
-            if key not in buckets:
-                buckets[key] = {}
-            cur += timedelta(minutes=1)
-        sorted_keys = sorted(buckets.keys())
     all_models = sorted({m for b in buckets.values() for m in b})
     return {
         "labels": [k[-5:] for k in sorted_keys],
