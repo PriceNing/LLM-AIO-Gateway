@@ -18,6 +18,7 @@ config.json
 tools/live-eval.config.json
 tools/live-eval.config.local.json
 tools/run-live-eval.bat
+svn-update-docker.sh
 *.log
 data/
 
