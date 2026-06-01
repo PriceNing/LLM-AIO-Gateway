@@ -44,10 +44,10 @@ python tools/standalone/scripts/build_standalone.py --target all
 
 ```
 dist/standalone/
-├── LLM-AIO-Gateway-windows-x86_64-v0.1.0.zip
-├── LLM-AIO-Gateway-macos-arm64-v0.1.0.zip
-├── LLM-AIO-Gateway-macos-x86_64-v0.1.0.zip
-├── LLM-AIO-Gateway-linux-x86_64-v0.1.0.tar.gz
+├── LLM-AIO-Gateway-windows-x86_64-v0.1.1.zip
+├── LLM-AIO-Gateway-macos-arm64-v0.1.1.zip
+├── LLM-AIO-Gateway-macos-x86_64-v0.1.1.zip
+├── LLM-AIO-Gateway-linux-x86_64-v0.1.1.tar.gz
 ├── version.json
 └── cache/                       # wheels + PBS，重复构建会复用
 ```
@@ -89,11 +89,11 @@ LLM-AIO-Gateway/
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "0.1.1",
   "released_at": "2026-06-15T00:00:00Z",
   "notes": "修复 xxx",
   "artifacts": [
-    {"target": "windows", "filename": "LLM-AIO-Gateway-windows-x86_64-v0.1.0.zip",
+    {"target": "windows", "filename": "LLM-AIO-Gateway-windows-x86_64-v0.1.1.zip",
      "size": 188743424, "sha256": "abc..."},
     ...
   ]
