@@ -14,6 +14,10 @@ on:
 permissions:
   contents: write
 
+env:
+  # Pin GitHub-hosted JS actions to Node 24 before June 16, 2026 cutover
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   build:
     name: build green package (${{ matrix.target }})
@@ -44,21 +48,9 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install uv
-        run: pip install uv
-
-      - name: Create venv and install project deps
-        run: |
-          python -m venv venv
-          source venv/bin/activate
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
       - name: Build green package (${{ matrix.target }})
         shell: bash
-        run: |
-          source venv/bin/activate
-          python tools/dist_tools/scripts/build_standalone.py --target ${{ matrix.target }}
+        run: python tools/dist_tools/scripts/build_standalone.py --target ${{ matrix.target }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

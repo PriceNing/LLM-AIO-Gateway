@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python
+#!/usr/bin/env python
 """
 LLM AIO Gateway 绿色版构建脚本
 
@@ -24,6 +24,7 @@ import hashlib
 import json
 import re
 import shutil
+import subprocess
 import sys
 import tarfile
 import time
@@ -41,7 +42,6 @@ PKG_ROOT = STAGING_DIR / APP_SLUG
 PBS_VERSION = "20260510"
 PY_VERSION = "3.12.13"
 REQUIREMENTS = REPO_ROOT / "requirements.txt"
-VENV_SITE = REPO_ROOT / "venv" / "Lib" / "site-packages"
 
 PBS_TARGETS = {
     "windows":       "x86_64-pc-windows-msvc-install_only.tar.gz",
@@ -86,17 +86,27 @@ def read_version() -> str:
     return time.strftime("%Y.%m.%d")
 
 
-def collect_dependencies() -> list[Path]:
-    if not VENV_SITE.exists():
-        sys.exit(f"找不到本机 venv: {VENV_SITE}\n请先 pip install -r requirements.txt")
-    items: list[Path] = []
-    for child in VENV_SITE.iterdir():
-        if child.name in ("__pycache__", ".cache", "_pytest", "tests"):
-            continue
-        if child.is_dir() and child.name.endswith(".dist-info"):
-            continue
-        items.append(child)
-    return items
+def install_dependencies_to(site: Path, pbs_python: Path) -> None:
+    """Install requirements into ``site`` using the freshly extracted PBS Python.
+
+    Works on every platform: on Windows ``pbs_python`` is
+    ``runtime/python/python.exe``, on macOS / Linux it is
+    ``runtime/python/bin/python3``. We invoke it as a subprocess because
+    PBS does not put itself on the host sys.path.
+    """
+    print(f"  · 用 PBS Python 装依赖到 {site} ...", flush=True)
+    cmd = [
+        str(pbs_python), "-m", "pip", "install",
+        "--target", str(site),
+        "--no-cache",
+        "--disable-pip-version-check",
+        "--upgrade",
+        "-r", str(REQUIREMENTS),
+    ]
+    print(f"    {' '.join(cmd)}", flush=True)
+    proc = subprocess.run(cmd, check=False)
+    if proc.returncode != 0:
+        sys.exit(f"依赖安装失败 (rc={proc.returncode})。检查上面的 pip 输出。")
 
 
 def stage(target: str, pbs_tar: Path) -> Path:
@@ -116,7 +126,12 @@ def stage(target: str, pbs_tar: Path) -> Path:
     shutil.copy(pbs_tar, runtime / "python.tar.gz")
     print("  · 解压 Python ...", flush=True)
     with tarfile.open(pbs_tar, "r:*") as tf:
-        tf.extractall(runtime)
+        # Python 3.14+ requires an explicit filter; pass it now to stay
+        # forward-compatible and silence the DeprecationWarning.
+        try:
+            tf.extractall(runtime, filter="data")
+        except TypeError:
+            tf.extractall(runtime)
     inner = runtime / "python"
     for child in runtime.iterdir():
         if child.is_dir() and child.name == "python" and child != inner:
@@ -126,18 +141,17 @@ def stage(target: str, pbs_tar: Path) -> Path:
             break
 
     # 2. 依赖（site-packages 模式）
-    print("  · 复制依赖（从本机 venv）...", flush=True)
     site = runtime / "site-packages"
-    site.mkdir(exist_ok=True)
-    deps = collect_dependencies()
-    for item in deps:
-        dest = site / item.name
-        if item.is_dir():
-            shutil.copytree(item, dest, ignore=shutil.ignore_patterns(
-                "__pycache__", "*.pyc", "*.dist-info"))
-        else:
-            shutil.copy(item, dest)
-    print(f"    共复制 {len(deps)} 项", flush=True)
+    if site.exists():
+        shutil.rmtree(site)
+    site.mkdir()
+    pbs_python = (
+        runtime / "python" / ("python.exe" if target == "windows" else "bin" / "python3")
+    )
+    if not pbs_python.exists():
+        sys.exit(f"找不到 PBS 解压后的 Python: {pbs_python}")
+    install_dependencies_to(site, pbs_python)
+    print(f"    site-packages 项目数: {sum(1 for _ in site.iterdir())}", flush=True)
 
     # 3. 应用代码
     print("  · 复制应用代码 ...", flush=True)
