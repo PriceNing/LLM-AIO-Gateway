@@ -120,6 +120,53 @@ def test_get_stats(temp_db):
     assert "success_rate" in data
 
 
+def test_realtime_stats_timeline_skips_large_idle_gaps(temp_db):
+    import app.router.proxy as proxy
+
+    proxy.clear_request_log()
+    try:
+        proxy._log_request("alice", "sk-test", "model-a", "provider-a", "chat", True, 10)
+        with proxy._request_log_lock:
+            proxy._request_log[0]["full_time"] = "2026-05-29 10:00:00"
+            proxy._request_log[0]["time"] = "10:00:00"
+
+        proxy._log_request("alice", "sk-test", "model-a", "provider-a", "chat", True, 10)
+        with proxy._request_log_lock:
+            proxy._request_log[0]["full_time"] = "2026-05-29 16:00:00"
+            proxy._request_log[0]["time"] = "16:00:00"
+
+        data = proxy.get_timeline_model_data()
+
+        assert data["labels"] == ["10:00", "16:00"]
+        assert data["calls"] == [[1, 1]]
+    finally:
+        proxy.clear_request_log()
+
+
+def test_realtime_stats_timeline_preserves_small_idle_gaps(temp_db):
+    import app.router.proxy as proxy
+
+    proxy.clear_request_log()
+    try:
+        proxy._log_request("alice", "sk-test", "model-a", "provider-a", "chat", True, 10)
+        with proxy._request_log_lock:
+            proxy._request_log[0]["full_time"] = "2026-05-29 10:00:00"
+            proxy._request_log[0]["time"] = "10:00:00"
+
+        proxy._log_request("alice", "sk-test", "model-a", "provider-a", "chat", False, 0)
+        with proxy._request_log_lock:
+            proxy._request_log[0]["full_time"] = "2026-05-29 10:02:00"
+            proxy._request_log[0]["time"] = "10:02:00"
+
+        timeline = proxy.get_timeline_data()
+
+        assert timeline["labels"] == ["10:00", "10:01", "10:02"]
+        assert timeline["success"] == [1, 0, 0]
+        assert timeline["failed"] == [0, 0, 1]
+    finally:
+        proxy.clear_request_log()
+
+
 # -- Auth edge cases --
 
 def test_auth_status_returns_has_admin():
@@ -575,6 +622,24 @@ def test_toggle_model_preprocessor(temp_db):
     }, headers=headers)
     assert resp2.status_code == 200
     assert resp2.json()["preprocessor"] is False
+
+
+def test_toggle_model_preprocessor_rejects_non_boolean_enabled(temp_db):
+    headers = temp_db["headers"]
+    from app.database import add_provider
+    add_provider({
+        "id": "pp-bool-test", "name": "PP Bool Test", "provider_type": "openai",
+        "api_base": "", "api_key": "", "enabled": True,
+        "models": [{"id": "pp-model", "name": "PP Model", "enabled": True}]
+    })
+
+    resp = client.put("/admin/models/preprocessor", json={
+        "model_id": "pp-bool-test/pp-model",
+        "enabled": "false"
+    }, headers=headers)
+
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == "enabled must be a boolean"
 
 
 def test_fetch_preprocessor_models_requires_auth():

@@ -462,7 +462,9 @@ async def toggle_model_preprocessor(body: dict, authorization: Optional[str] = H
     model_id = body.get("model_id", "")
     if not model_id:
         raise HTTPException(status_code=400, detail="model_id is required")
-    enabled = bool(body.get("enabled", False))
+    enabled = body.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise HTTPException(status_code=400, detail="enabled must be a boolean")
     value = "1" if enabled else ""
     # Parse composite ID in provider/model format
     mid = parse_model_id(model_id)

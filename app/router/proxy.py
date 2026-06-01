@@ -565,44 +565,56 @@ def clear_request_log() -> None:
         _request_log.clear()
 
 
+def _minute_key_from_log_entry(entry: dict) -> str:
+    return entry.get("full_time", entry["time"])[:16].replace("T", " ")
+
+
+def _parse_minute_key(value: str):
+    from datetime import datetime
+
+    return datetime.strptime(value[:16].replace("T", " "), "%Y-%m-%d %H:%M")
+
+
+def _realtime_minute_keys_with_small_gaps(keys: list[str], max_gap_minutes: int = 30) -> list[str]:
+    """Fill short gaps, but keep realtime charts focused when activity is sparse."""
+    sorted_keys = sorted(set(keys))
+    if len(sorted_keys) < 2:
+        return sorted_keys
+
+    from datetime import timedelta
+
+    expanded = [sorted_keys[0]]
+    previous = _parse_minute_key(sorted_keys[0])
+    for key in sorted_keys[1:]:
+        current = _parse_minute_key(key)
+        gap_minutes = int((current - previous).total_seconds() // 60)
+        if 1 < gap_minutes <= max_gap_minutes:
+            cursor = previous + timedelta(minutes=1)
+            while cursor < current:
+                expanded.append(cursor.strftime("%Y-%m-%d %H:%M"))
+                cursor += timedelta(minutes=1)
+        expanded.append(key)
+        previous = current
+    return expanded
+
+
 def get_timeline_data() -> dict:
-    """Aggregate requests by minute for timeline chart. Zero-fills gaps."""
+    """Aggregate requests by minute for the realtime chart."""
     with _request_log_lock:
         snapshot = list(_request_log)
     if not snapshot:
         return {"labels": [], "success": [], "failed": []}
     buckets: dict[str, dict] = {}
     for entry in snapshot:
-        minute = entry.get("full_time", entry["time"])[:16]
+        minute = _minute_key_from_log_entry(entry)
         if minute not in buckets:
             buckets[minute] = {"label": minute[-5:], "success": 0, "failed": 0}
         if entry["success"]:
             buckets[minute]["success"] += 1
         else:
             buckets[minute]["failed"] += 1
-    sorted_keys = sorted(buckets.keys())
-    # Zero-fill gaps between first and last minute so charts keep a stable time axis.
-    if len(sorted_keys) >= 2:
-        from datetime import datetime, timedelta
-
-        def _parse_minute(s):
-            for fmt in ("%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M"):
-                try:
-                    return datetime.strptime(s[:16].replace("T", " "), "%Y-%m-%d %H:%M")
-                except ValueError:
-                    continue
-            return datetime.strptime(s[:16], "%Y-%m-%d %H:%M")
-
-        start = _parse_minute(sorted_keys[0])
-        end = _parse_minute(sorted_keys[-1])
-        cur = start
-        while cur <= end:
-            key = cur.strftime("%Y-%m-%d %H:%M")
-            if key not in buckets:
-                label = cur.strftime("%H:%M")
-                buckets[key] = {"label": label, "success": 0, "failed": 0}
-            cur += timedelta(minutes=1)
-    sorted_buckets = sorted(buckets.items(), key=lambda x: x[0])
+    sorted_keys = _realtime_minute_keys_with_small_gaps(list(buckets.keys()))
+    sorted_buckets = [(key, buckets.get(key, {"label": key[-5:], "success": 0, "failed": 0})) for key in sorted_keys]
     return {
         "labels": [b["label"] for _, b in sorted_buckets],
         "success": [b["success"] for _, b in sorted_buckets],
@@ -642,14 +654,14 @@ def get_model_stats() -> dict:
 
 
 def get_timeline_model_data() -> dict:
-    """Per-model per-minute breakdown from request log for stacked bar chart. Zero-fills gaps."""
+    """Per-model per-minute breakdown from request log for the realtime chart."""
     with _request_log_lock:
         snapshot = list(_request_log)
     if not snapshot:
         return {"labels": [], "models": [], "calls": [], "tokens": []}
     buckets: dict[str, dict] = {}
     for entry in snapshot:
-        minute = entry.get("full_time", entry["time"])[:16]
+        minute = _minute_key_from_log_entry(entry)
         if minute not in buckets:
             buckets[minute] = {}
         model = entry["model"]
@@ -657,29 +669,13 @@ def get_timeline_model_data() -> dict:
             buckets[minute][model] = {"total": 0, "tokens": 0}
         buckets[minute][model]["total"] += 1
         buckets[minute][model]["tokens"] += entry["tokens"]
-    sorted_keys = sorted(buckets.keys())
-    # Zero-fill gaps between first and last minute so model series align with the timeline.
-    if len(sorted_keys) >= 2:
-        from datetime import datetime, timedelta
-
-        def _parse_minute_ts(s):
-            return datetime.strptime(s[:16].replace("T", " "), "%Y-%m-%d %H:%M")
-
-        start = _parse_minute_ts(sorted_keys[0])
-        end = _parse_minute_ts(sorted_keys[-1])
-        cur = start
-        while cur <= end:
-            key = cur.strftime("%Y-%m-%d %H:%M")
-            if key not in buckets:
-                buckets[key] = {}
-            cur += timedelta(minutes=1)
-        sorted_keys = sorted(buckets.keys())
+    sorted_keys = _realtime_minute_keys_with_small_gaps(list(buckets.keys()))
     all_models = sorted({m for b in buckets.values() for m in b})
     return {
         "labels": [k[-5:] for k in sorted_keys],
         "models": all_models,
-        "calls": [[buckets[k].get(m, {}).get("total", 0) for k in sorted_keys] for m in all_models],
-        "tokens": [[buckets[k].get(m, {}).get("tokens", 0) for k in sorted_keys] for m in all_models],
+        "calls": [[buckets.get(k, {}).get(m, {}).get("total", 0) for k in sorted_keys] for m in all_models],
+        "tokens": [[buckets.get(k, {}).get(m, {}).get("tokens", 0) for k in sorted_keys] for m in all_models],
     }
 
 

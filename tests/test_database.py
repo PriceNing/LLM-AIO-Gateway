@@ -83,7 +83,7 @@ def test_add_and_get_provider():
         "id": "test-p", "name": "Test P",
         "provider_type": "openai", "api_base": "https://api.t.com/v1",
         "api_key": "k", "enabled": True,
-        "models": [{"id": "m1", "name": "Model 1", "enabled": True}]
+        "models": [{"id": "m1", "name": "Model 1", "enabled": True, "preprocessor": "1"}]
     })
     p = get_provider("test-p")
     assert p is not None
@@ -91,6 +91,7 @@ def test_add_and_get_provider():
     assert p["provider_type"] == "openai"
     assert len(p["models"]) == 1
     assert p["models"][0]["id"] == "m1"
+    assert p["models"][0]["preprocessor"] == "1"
 
 
 def test_add_duplicate_provider_raises():

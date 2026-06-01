@@ -871,8 +871,14 @@ def add_provider(provider: dict) -> dict:
             raise ValueError(f"Provider '{provider['id']}' already exists")
         for m in provider.get("models", []):
             db.execute(
-                "INSERT OR IGNORE INTO provider_models (provider_id, model_id, model_name, enabled) VALUES (?, ?, ?, ?)",
-                (provider["id"], m["id"], m.get("name", m["id"]), 1 if m.get("enabled", True) else 0)
+                "INSERT OR IGNORE INTO provider_models (provider_id, model_id, model_name, enabled, preprocessor) VALUES (?, ?, ?, ?, ?)",
+                (
+                    provider["id"],
+                    m["id"],
+                    m.get("name", m["id"]),
+                    1 if m.get("enabled", True) else 0,
+                    m.get("preprocessor", ""),
+                )
             )
     return {
         "id": provider["id"],
@@ -881,7 +887,15 @@ def add_provider(provider: dict) -> dict:
         "api_base": provider.get("api_base", ""),
         "api_key": provider.get("api_key", ""),
         "enabled": provider.get("enabled", True),
-        "models": [{"id": m["id"], "name": m.get("name", m["id"]), "enabled": m.get("enabled", True)} for m in provider.get("models", [])]
+        "models": [
+            {
+                "id": m["id"],
+                "name": m.get("name", m["id"]),
+                "enabled": m.get("enabled", True),
+                "preprocessor": m.get("preprocessor", ""),
+            }
+            for m in provider.get("models", [])
+        ]
     }
 
 
