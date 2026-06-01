@@ -1,4 +1,4 @@
-name: release
+﻿name: release
 
 on:
   push:
@@ -28,9 +28,6 @@ jobs:
           - target: windows
             os: windows-latest
             artifact: LLM-AIO-Gateway-windows-x86_64
-          - target: macos-x86_64
-            os: macos-13
-            artifact: LLM-AIO-Gateway-macos-x86_64
           - target: macos-arm64
             os: macos-14
             artifact: LLM-AIO-Gateway-macos-arm64
@@ -90,3 +87,4 @@ jobs:
             artifacts/**/*.tar.gz
             artifacts/**/*.zip.sha256
             artifacts/**/*.tar.gz.sha256
+
