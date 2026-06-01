@@ -146,7 +146,7 @@ def stage(target: str, pbs_tar: Path) -> Path:
         shutil.rmtree(site)
     site.mkdir()
     pbs_python = (
-        runtime / "python" / ("python.exe" if target == "windows" else "bin" / "python3")
+        runtime / "python" / ("python.exe" if target == "windows" else "bin/python3")
     )
     if not pbs_python.exists():
         sys.exit(f"找不到 PBS 解压后的 Python: {pbs_python}")
