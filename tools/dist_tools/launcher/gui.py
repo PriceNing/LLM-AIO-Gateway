@@ -1,4 +1,4 @@
-﻿"""
+"""
 LLM AIO Gateway 绿色版启动器（双击即用）
 
 - 首次启动：自动解压嵌入式 Python
@@ -42,9 +42,11 @@ DATA_DIR = ROOT_DIR / "data"
 CONFIG_FILE = DATA_DIR / "config.json"
 VENV_MARKER = PYTHON_DIR / "aio_installed.marker"
 LOG_FILE = ROOT_DIR / "launcher.log"
+# Self-update URL: switched from raw.githubusercontent.com (dist/ is gitignored)
+# to the GitHub Releases API. Override with env var LLM_AIO_UPDATE_URL.
 UPDATE_URL = os.environ.get(
     "LLM_AIO_UPDATE_URL",
-    "https://raw.githubusercontent.com/your-org/llm-aio-gateway/main/dist/standalone/version.json",
+    "https://api.github.com/repos/PriceNing/LLM-AIO-Gateway/releases/latest",
 )
 
 DEFAULT_PORT = 8000
@@ -359,12 +361,16 @@ def check_update(current_version: str) -> tuple[bool, str, str]:
         info = json.loads(body.decode("utf-8-sig"))
     except json.JSONDecodeError as exc:
         return False, "", f"更新文件解析失败: {exc}"
-    latest = info.get("version", "")
-    notes = info.get("notes", "")
+    # 同时支持自定义 version.json {version, notes} 和 GitHub Releases API
+    # (返回 {tag_name: "vX.Y.Z", body: "release notes", html_url: "..."})。
+    tag = info.get("tag_name", "") or info.get("version", "")
+    latest = tag.lstrip("v") if tag else ""
+    notes = info.get("body", "") or info.get("notes", "")
+    release_url = info.get("html_url", "")
     if latest and latest != current_version:
-        return True, latest, notes or "有可用更新"
+        suffix = f"\n\n{release_url}" if release_url else ""
+        return True, latest, (notes or "有可用更新") + suffix
     return False, latest or current_version, "已是最新版本"
-
 
 # --------------------------------------------------------------------------- #
 # GUI

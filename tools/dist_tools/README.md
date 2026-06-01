@@ -89,11 +89,11 @@ LLM-AIO-Gateway/
 
 ```json
 {
-  "version": "0.2.0",
+  "version": "0.1.0",
   "released_at": "2026-06-15T00:00:00Z",
   "notes": "修复 xxx",
   "artifacts": [
-    {"target": "windows", "filename": "LLM-AIO-Gateway-windows-x86_64-v0.2.0.zip",
+    {"target": "windows", "filename": "LLM-AIO-Gateway-windows-x86_64-v0.1.0.zip",
      "size": 188743424, "sha256": "abc..."},
     ...
   ]

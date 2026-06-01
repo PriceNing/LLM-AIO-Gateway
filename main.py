@@ -4,7 +4,7 @@ import io
 # Reconfigure stdout/stderr to UTF-8 so diagnostic prints don't crash.
 for _stream in (sys.stdout, sys.stderr):
     try:
-        _stream.reconfigure(encoding='utf-8')
+        _stream.reconfigure(encoding="utf-8")
     except Exception:
         pass
 
@@ -14,6 +14,7 @@ from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
+from app import __version__
 from app.config import load_config, get_config
 from app.services.logger import init_logging, set_request_id, generate_request_id
 from app.router import admin, auth, proxy
@@ -45,7 +46,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="LLM AIO Gateway", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="LLM AIO Gateway", version=__version__, lifespan=lifespan)
 
 app.add_middleware(RequestIdMiddleware)
 app.add_middleware(

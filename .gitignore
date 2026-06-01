@@ -18,6 +18,10 @@ config.json
 tools/live-eval.config.json
 tools/live-eval.config.local.json
 tools/run-live-eval.bat
+
+# live_eval/ (renamed from tools/live-eval.*): never commit user configs (contain secrets)
+tools/live_eval/live-eval.config.json
+tools/live_eval/live-eval.config.local.json
 svn-update-docker.sh
 *.log
 data/
