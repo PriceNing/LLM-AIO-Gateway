@@ -56,7 +56,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: dist/standalone/*.zip
+          path: |
+            dist/standalone/*.zip
+            dist/standalone/*.tar.gz
           if-no-files-found: error
 
   release:
@@ -73,7 +75,8 @@ jobs:
       - name: Compute sha256 for every archive
         run: |
           set -e
-          for f in artifacts/**/*.zip; do
+          for f in artifacts/**/*.zip artifacts/**/*.tar.gz; do
+            [ -f "$f" ] || continue
             sha256sum "$f" | tee "$f.sha256"
           done
 
@@ -84,4 +87,6 @@ jobs:
           generate_release_notes: true
           files: |
             artifacts/**/*.zip
+            artifacts/**/*.tar.gz
             artifacts/**/*.zip.sha256
+            artifacts/**/*.tar.gz.sha256

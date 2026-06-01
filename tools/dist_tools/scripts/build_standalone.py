@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import re
 import shutil
@@ -31,6 +32,15 @@ import time
 import urllib.request
 import zipfile
 from pathlib import Path
+
+# Windows runners (and many local Windows shells) use cp1252, which
+# cannot encode CJK characters in banner() prints. Force UTF-8 everywhere.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 
 REPO_ROOT = Path(__file__).resolve().parents[3]  # tools/dist_tools/scripts -> repo root
 DIST_DIR = REPO_ROOT / "dist" / "standalone"
