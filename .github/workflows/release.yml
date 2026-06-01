@@ -6,9 +6,9 @@ on:
       - "v*"
   workflow_dispatch:
     inputs:
-      version:
-        description: "Version to build (e.g. 0.1.0). Defaults to the tag name."
-        required: false
+      tag_name:
+        description: "Tag to publish to (e.g. v0.1.1). Tag must already exist on the local checkout."
+        required: true
         default: ""
 
 permissions:
@@ -61,9 +61,22 @@ jobs:
   release:
     name: github release
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-22.04
+    env:
+      RELEASE_TAG: ${{ github.event.inputs.tag_name || github.ref_name }}
     steps:
+      - name: Ensure tag is pushed to origin (workflow_dispatch only)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$RELEASE_TAG" -m "Release $RELEASE_TAG" || true
+          git push origin "$RELEASE_TAG"
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -80,7 +93,7 @@ jobs:
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          name: ${{ github.ref_name }}
+          name: ${{ env.RELEASE_TAG }}
           generate_release_notes: true
           files: |
             artifacts/**/*.zip
