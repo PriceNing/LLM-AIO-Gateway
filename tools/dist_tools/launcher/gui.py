@@ -196,11 +196,20 @@ def _child_env() -> dict:
 # --------------------------------------------------------------------------- #
 # 启动 / 停止后端
 # --------------------------------------------------------------------------- #
+# 后端状态机
+STATE_IDLE = "idle"
+STATE_STARTING = "starting"
+STATE_RUNNING = "running"
+STATE_ERROR = "error"
+
+
 class Backend:
     def __init__(self) -> None:
         self.proc: subprocess.Popen | None = None
         self.lock = threading.Lock()
         self.port = DEFAULT_PORT
+        self.state = STATE_IDLE
+        self.last_error = ""
         self._configure()
 
     def _configure(self) -> None:
@@ -211,51 +220,122 @@ class Backend:
             except (OSError, ValueError):
                 pass
 
-    def is_running(self) -> bool:
+    def is_alive(self) -> bool:
+        """进程是否还活着（不管端口）"""
         with self.lock:
             if self.proc and self.proc.poll() is None:
                 return True
             return False
 
-    def start(self) -> tuple[bool, str]:
+    def is_running(self) -> bool:
+        """进程活着 + 端口可连接 = 真正可服务"""
+        return self.is_alive() and not free_port_hint(self.port)
+
+    def is_starting(self) -> bool:
+        return self.state == STATE_STARTING
+
+    def get_state_label(self) -> str:
+        if self.state == STATE_STARTING:
+            return f"启动中... · 端口 {self.port}"
+        if self.is_alive():
+            if not free_port_hint(self.port):
+                return f"运行中 · 端口 {self.port}"
+            return f"等待端口 · {self.port}"
+        return "未启动"
+
+    def start_async(self, on_done) -> None:
+        """
+        异步启动：launch + 等待端口都在后台线程做。
+        主线程通过 on_done(ok, msg) 收结果。
+        中间状态由 _poll_status() 轮询显示，不需要回调。
+        """
         with self.lock:
             if self.proc and self.proc.poll() is None:
-                return False, "后端已经在运行"
+                on_done(False, "后端已经在运行")
+                return
             if not free_port_hint(self.port):
-                return False, f"端口 {self.port} 已被占用"
+                on_done(False, f"端口 {self.port} 已被占用")
+                return
+            self.state = STATE_STARTING
+            self.last_error = ""
 
-            DATA_DIR.mkdir(parents=True, exist_ok=True)
-            log_path = DATA_DIR / "logs" / "backend.log"
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            log_file = log_path.open("ab", buffering=0)
-
-            env = _child_env()
-            env["PYTHONUNBUFFERED"] = "1"
-            cmd = [str(PY_EXE), "-u", "-m", "uvicorn", "main:app",
-                   "--host", "0.0.0.0", "--port", str(self.port)]
-            log("launch: " + " ".join(cmd))
+        def worker():
             try:
+                self._launch_and_wait(on_done)
+            except Exception as exc:
+                # 任何未预期异常都不能让 on_done 丢失
+                with self.lock:
+                    self.state = STATE_ERROR
+                    self.last_error = f"启动器异常: {exc}"
+                    if self.proc and self.proc.poll() is None:
+                        self.proc.terminate()
+                    self.proc = None
+                on_done(False, self.last_error)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _launch_and_wait(self, on_done) -> None:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        log_path = DATA_DIR / "logs" / "backend.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_file = log_path.open("ab", buffering=0)
+
+        env = _child_env()
+        env["PYTHONUNBUFFERED"] = "1"
+        cmd = [str(PY_EXE), "-u", "-m", "uvicorn", "main:app",
+               "--host", "0.0.0.0", "--port", str(self.port)]
+        log("launch: " + " ".join(cmd))
+        try:
+            with self.lock:
                 self.proc = subprocess.Popen(
                     cmd, cwd=ROOT_DIR, env=env,
                     stdin=subprocess.DEVNULL,
                     stdout=log_file, stderr=log_file,
                     creationflags=(subprocess.CREATE_NO_WINDOW if IS_WINDOWS else 0),
                 )
-            except OSError as exc:
-                return False, f"启动失败: {exc}"
+        except OSError as exc:
+            with self.lock:
+                self.proc = None
+                self.state = STATE_ERROR
+                self.last_error = f"启动失败: {exc}"
+            on_done(False, self.last_error)
+            return
 
-            for _ in range(40):
-                time.sleep(0.25)
-                if not free_port_hint(self.port):
-                    return True, f"后端已启动 (PID {self.proc.pid})"
-                if self.proc.poll() is not None:
-                    return False, "后端进程已退出，详情见 logs/backend.log"
-            return False, "等待端口超时"
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            time.sleep(0.3)
+            if self.proc.poll() is not None:
+                with self.lock:
+                    self.proc = None
+                    self.state = STATE_ERROR
+                    self.last_error = "后端进程已退出，详情见 logs/backend.log"
+                on_done(False, self.last_error)
+                return
+            if not free_port_hint(self.port):
+                with self.lock:
+                    self.state = STATE_RUNNING
+                on_done(True, f"后端已启动 (PID {self.proc.pid})")
+                return
+
+        # 超时：把残留进程清掉，避免孤儿
+        with self.lock:
+            proc = self.proc
+            self.proc = None
+            self.state = STATE_ERROR
+            self.last_error = "等待端口超时（60s）"
+        if proc and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        on_done(False, "等待端口超时（60s）。请检查 logs/backend.log")
 
     def stop(self) -> tuple[bool, str]:
         with self.lock:
             if not self.proc or self.proc.poll() is not None:
                 self.proc = None
+                self.state = STATE_IDLE
                 return False, "后端未在运行"
             self.proc.terminate()
             try:
@@ -264,6 +344,7 @@ class Backend:
                 self.proc.kill()
                 self.proc.wait(timeout=3)
             self.proc = None
+            self.state = STATE_IDLE
             return True, "后端已停止"
 
 
@@ -391,9 +472,22 @@ class App:
         if not self.bootstrap_done:
             messagebox.showinfo(APP_NAME, "正在完成首次安装，请稍候 ...")
             return
-        ok, msg = self.backend.start()
-        (messagebox.showinfo if ok else messagebox.showerror)(APP_NAME, msg)
+        if self.backend.is_starting():
+            return  # 已经在启动中，重复点击直接忽略
+
+        self.progress_var.set("启动中 ...")
+        self.backend.start_async(
+            lambda ok, msg: self.root.after(0, lambda: self._after_start(ok, msg))
+        )
+
+    def _after_start(self, ok, msg):
         self._append_log(msg)
+        if ok:
+            messagebox.showinfo(APP_NAME, msg)
+            self.progress_var.set("已就绪")
+        else:
+            messagebox.showerror(APP_NAME, msg)
+            self.progress_var.set("启动失败")
 
     def on_stop(self) -> None:
         ok, msg = self.backend.stop()
@@ -452,10 +546,19 @@ class App:
         self.root.after(150, self._poll_log)
 
     def _poll_status(self) -> None:
-        if self.backend.is_running():
+        if self.backend.is_starting():
+            self.status_var.set(self.backend.get_state_label())
+            self.dot_var.set("●")
+            self.dot_color = "#d68f00"  # 橙色
+        elif self.backend.is_alive() and not free_port_hint(self.backend.port):
             self.status_var.set(f"运行中 · 端口 {self.backend.port}")
             self.dot_var.set("●")
             self.dot_color = "#2ea44f"
+        elif self.backend.is_alive():
+            # 进程在跑但端口还没起（在 start_async 等待循环里）
+            self.status_var.set(self.backend.get_state_label())
+            self.dot_var.set("●")
+            self.dot_color = "#d68f00"
         else:
             self.status_var.set("未启动")
             self.dot_var.set("●")
