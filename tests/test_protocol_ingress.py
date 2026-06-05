@@ -98,6 +98,23 @@ def test_anthropic_messages_to_internal_converts_for_openai_provider():
     assert req.tool_choice is None
 
 
+def test_anthropic_unknown_blocks_project_to_openai_text_placeholders():
+    req = anthropic_messages_to_internal({
+        "model": "openai-test",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "Use this"},
+            {"type": "tool_reference", "id": "toolu_1", "name": "artifact"},
+        ]}],
+    })
+
+    projected = chat_messages_from_internal(req)
+
+    assert projected[0] == {"role": "user", "content": [
+        {"type": "text", "text": "Use this"},
+        {"type": "text", "text": "[tool_reference: artifact]"},
+    ]}
+
+
 def test_anthropic_messages_to_internal_preserves_any_tool_choice():
     req = anthropic_messages_to_internal({
         "model": "claude-test",

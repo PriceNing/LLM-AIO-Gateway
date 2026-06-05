@@ -87,8 +87,25 @@ def _parts_to_openai_content(parts: list[InternalPart]) -> Any:
                 media = source.get("media_type") or "image/png"
                 content.append({"type": "image_url", "image_url": {"url": f"data:{media};base64,{source.get('data', '')}"}})
         elif part.kind == "unknown" and part.raw is not None:
-            content.append(part.raw if isinstance(part.raw, dict) else {"type": "text", "text": str(part.raw)})
+            text = _unknown_part_text(part.raw)
+            if text:
+                content.append({"type": "text", "text": text})
     return content
+
+
+def _unknown_part_text(raw: Any) -> str:
+    if raw is None:
+        return ""
+    if isinstance(raw, str):
+        return raw
+    if isinstance(raw, dict):
+        raw_type = raw.get("type", "unknown")
+        for key in ("text", "content", "output", "name", "id"):
+            value = raw.get(key)
+            if isinstance(value, str) and value:
+                return f"[{raw_type}: {value}]"
+        return f"[{raw_type}: {json.dumps(raw, ensure_ascii=False, default=str)}]"
+    return str(raw)
 
 
 def _coerce_image_source(item: dict[str, Any]) -> dict[str, Any] | None:
@@ -552,5 +569,7 @@ def _parts_to_anthropic_content(parts: list[InternalPart]) -> list[dict[str, Any
         elif part.kind == "reasoning":
             content.append({"type": "thinking", "thinking": part.text})
         elif part.raw is not None:
-            content.append(part.raw if isinstance(part.raw, dict) else {"type": "text", "text": str(part.raw)})
+            text = _unknown_part_text(part.raw)
+            if text:
+                content.append({"type": "text", "text": text})
     return content or [{"type": "text", "text": ""}]
