@@ -67,8 +67,15 @@ def banner(msg: str) -> None:
 
 def download(url: str, dest: Path) -> None:
     if dest.exists() and dest.stat().st_size > 1024 * 1024:
-        print(f"  · 已缓存 {dest.name} ({dest.stat().st_size // 1024 // 1024} MB)", flush=True)
-        return
+        try:
+            with tarfile.open(dest, "r:*") as tf:
+                for _ in tf:
+                    pass
+            print(f"  · 已缓存 {dest.name} ({dest.stat().st_size // 1024 // 1024} MB)", flush=True)
+            return
+        except (tarfile.TarError, EOFError, OSError) as exc:
+            print(f"  · 缓存损坏，重新下载 {dest.name}: {exc}", flush=True)
+            dest.unlink()
     print(f"  · 下载 {url}", flush=True)
     dest.parent.mkdir(parents=True, exist_ok=True)
     with urllib.request.urlopen(url) as r, dest.open("wb") as f:
@@ -220,7 +227,32 @@ exec "$DIR/runtime/python/bin/python3" "$DIR/launcher/gui.py" "$@"
 _WIN_BAT = r"""@echo off
 setlocal
 cd /d "%~dp0"
+set "LOCK_DIR=%~dp0runtime\launcher.lock"
+
+mkdir "%LOCK_DIR%" 2>nul
+if errorlevel 1 (
+    if not exist "%LOCK_DIR%\pid.txt" goto locked
+    set /p LOCK_PID=<"%LOCK_DIR%\pid.txt"
+    tasklist /fi "PID eq %LOCK_PID%" /nh | findstr /r "^[^ ]" >nul
+    if errorlevel 1 (
+        rmdir /s /q "%LOCK_DIR%" 2>nul
+        mkdir "%LOCK_DIR%" 2>nul
+        if not errorlevel 1 goto acquired
+    )
+
+    :locked
+    echo LLM AIO Gateway is already starting or running.
+    timeout /t 2 /nobreak >nul
+    exit /b 0
+)
+
+:acquired
+set "LLM_AIO_LAUNCHER_LOCK_DIR=%LOCK_DIR%"
 start "" "%~dp0runtime\python\pythonw.exe" "%~dp0launcher\gui.py"
+if errorlevel 1 (
+    rmdir "%LOCK_DIR%" 2>nul
+    exit /b 1
+)
 """
 
 _LINUX_LAUNCH = r"""#!/usr/bin/env bash

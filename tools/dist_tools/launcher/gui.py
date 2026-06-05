@@ -8,9 +8,12 @@ LLM AIO Gateway 绿色版启动器（双击即用）
 """
 from __future__ import annotations
 
+import ctypes
+import hashlib
 import json
 import os
 import queue
+import re
 import shutil
 import socket
 import subprocess
@@ -20,6 +23,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import webbrowser
 import zipfile
 from pathlib import Path
 from tkinter import (
@@ -42,6 +46,7 @@ DATA_DIR = ROOT_DIR / "data"
 CONFIG_FILE = DATA_DIR / "config.json"
 VENV_MARKER = PYTHON_DIR / "aio_installed.marker"
 LOG_FILE = ROOT_DIR / "launcher.log"
+LAUNCHER_LOCK_DIR_ENV = "LLM_AIO_LAUNCHER_LOCK_DIR"
 # Self-update URL: switched from raw.githubusercontent.com (dist/ is gitignored)
 # to the GitHub Releases API. Override with env var LLM_AIO_UPDATE_URL.
 UPDATE_URL = os.environ.get(
@@ -58,6 +63,58 @@ PY_EXE = (
 )
 
 CHILD_ENV_BASE = os.environ.copy()
+
+_entrypoint_lock_dir = os.environ.get(LAUNCHER_LOCK_DIR_ENV, "")
+_single_instance_handle = None
+
+
+def acquire_single_instance() -> bool:
+    """Return False when another launcher for this install directory exists."""
+    global _single_instance_handle
+    if not IS_WINDOWS:
+        return True
+    key = hashlib.sha256(str(ROOT_DIR).lower().encode("utf-8")).hexdigest()[:16]
+    mutex_name = f"Local\\{APP_SLUG}-{key}"
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    handle = kernel32.CreateMutexW(None, False, mutex_name)
+    if not handle:
+        log(f"CreateMutexW failed: {ctypes.get_last_error()}")
+        return True
+    _single_instance_handle = handle
+    return ctypes.get_last_error() != 183
+
+
+def release_single_instance() -> None:
+    global _single_instance_handle
+    if not _single_instance_handle:
+        return
+    try:
+        ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(_single_instance_handle)
+    finally:
+        _single_instance_handle = None
+
+
+def write_entrypoint_lock_pid() -> None:
+    if not _entrypoint_lock_dir:
+        return
+    try:
+        lock_dir = Path(_entrypoint_lock_dir)
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        (lock_dir / "pid.txt").write_text(str(os.getpid()), encoding="ascii")
+    except OSError as exc:
+        log(f"write launcher lock pid failed: {exc}")
+
+
+def release_entrypoint_lock() -> None:
+    """Release the short-lived lock created by the Windows .bat entrypoint."""
+    if not _entrypoint_lock_dir:
+        return
+    try:
+        lock_dir = Path(_entrypoint_lock_dir)
+        (lock_dir / "pid.txt").unlink(missing_ok=True)
+        lock_dir.rmdir()
+    except OSError as exc:
+        log(f"release launcher lock failed: {exc}")
 
 
 # --------------------------------------------------------------------------- #
@@ -353,24 +410,52 @@ class Backend:
 # --------------------------------------------------------------------------- #
 # 更新检查
 # --------------------------------------------------------------------------- #
-def check_update(current_version: str) -> tuple[bool, str, str]:
+def _version_key(version: str) -> tuple:
+    parts = re.findall(r"\d+|[a-zA-Z]+", version.lstrip("vV"))
+    key = []
+    for part in parts:
+        key.append((0, int(part)) if part.isdigit() else (1, part.lower()))
+    return tuple(key)
+
+
+def _current_target() -> str:
+    if IS_WINDOWS:
+        return "windows"
+    if IS_MAC:
+        return "macos"
+    return "linux"
+
+
+def _pick_download_url(info: dict) -> str:
+    target = _current_target()
+    for asset in info.get("assets", []) or []:
+        name = asset.get("name", "").lower()
+        if target in name and asset.get("browser_download_url"):
+            return asset["browser_download_url"]
+    for artifact in info.get("artifacts", []) or []:
+        artifact_target = str(artifact.get("target", "")).lower()
+        if target in artifact_target:
+            return artifact.get("url", "") or artifact.get("download_url", "")
+    return info.get("html_url", "") or info.get("url", "")
+
+
+def check_update(current_version: str) -> tuple[bool, str, str, str]:
     body = http_get(UPDATE_URL, timeout=5.0)
     if not body:
-        return False, "", "无法访问更新服务器"
+        return False, "", "无法访问更新服务器", ""
     try:
         info = json.loads(body.decode("utf-8-sig"))
     except json.JSONDecodeError as exc:
-        return False, "", f"更新文件解析失败: {exc}"
+        return False, "", f"更新文件解析失败: {exc}", ""
     # 同时支持自定义 version.json {version, notes} 和 GitHub Releases API
     # (返回 {tag_name: "vX.Y.Z", body: "release notes", html_url: "..."})。
     tag = info.get("tag_name", "") or info.get("version", "")
     latest = tag.lstrip("v") if tag else ""
     notes = info.get("body", "") or info.get("notes", "")
-    release_url = info.get("html_url", "")
-    if latest and latest != current_version:
-        suffix = f"\n\n{release_url}" if release_url else ""
-        return True, latest, (notes or "有可用更新") + suffix
-    return False, latest or current_version, "已是最新版本"
+    download_url = _pick_download_url(info)
+    if latest and _version_key(latest) > _version_key(current_version):
+        return True, latest, notes or "有可用更新", download_url
+    return False, latest or current_version, "已是最新版本", download_url
 
 # --------------------------------------------------------------------------- #
 # GUI
@@ -426,9 +511,10 @@ class App:
 
         self.status_var = StringVar(value="未启动")
         self.dot_var = StringVar(value="●")
-        self.dot_color = "red"
-        ttk.Label(status_box, textvariable=self.dot_var, foreground=self.dot_color,
-                  font=("Segoe UI", 18, "bold")).grid(row=0, column=0, padx=(0, 8))
+        self.dot_label = ttk.Label(status_box, textvariable=self.dot_var,
+                                   foreground="#cc3344",
+                                   font=("Segoe UI", 18, "bold"))
+        self.dot_label.grid(row=0, column=0, padx=(0, 8))
         ttk.Label(status_box, textvariable=self.status_var,
                   font=("Segoe UI", 12)).grid(row=0, column=1, sticky="w")
 
@@ -501,7 +587,6 @@ class App:
         self._append_log(msg)
 
     def on_open_panel(self) -> None:
-        import webbrowser
         webbrowser.open(self.url_var.get())
 
     def on_open_data(self) -> None:
@@ -509,11 +594,26 @@ class App:
         self._reveal(DATA_DIR)
 
     def on_check_update(self) -> None:
+        self.progress_var.set("正在检查更新 ...")
+
         def worker():
-            has, ver, notes = check_update(self.current_version)
-            self.root.after(0, lambda: messagebox.showinfo(
-                APP_NAME, f"当前版本：v{self.current_version}\n最新版本：v{ver}\n\n{notes}"))
+            has, ver, notes, url = check_update(self.current_version)
+            self.root.after(0, lambda: self._after_check_update(has, ver, notes, url))
         threading.Thread(target=worker, daemon=True).start()
+
+    def _after_check_update(self, has_update: bool, latest: str,
+                            notes: str, url: str) -> None:
+        self.progress_var.set("已就绪")
+        if has_update:
+            msg = (f"当前版本：v{self.current_version}\n"
+                   f"最新版本：v{latest}\n\n{notes}\n\n是否打开下载页面？")
+            if messagebox.askyesno(APP_NAME, msg) and url:
+                webbrowser.open(url)
+            return
+        messagebox.showinfo(
+            APP_NAME,
+            f"当前版本：v{self.current_version}\n最新版本：v{latest}\n\n{notes}",
+        )
 
     def _reveal(self, path: Path) -> None:
         if IS_MAC:
@@ -554,21 +654,19 @@ class App:
     def _poll_status(self) -> None:
         if self.backend.is_starting():
             self.status_var.set(self.backend.get_state_label())
-            self.dot_var.set("●")
-            self.dot_color = "#d68f00"  # 橙色
+            dot_color = "#d68f00"  # 橙色
         elif self.backend.is_alive() and not free_port_hint(self.backend.port):
             self.status_var.set(f"运行中 · 端口 {self.backend.port}")
-            self.dot_var.set("●")
-            self.dot_color = "#2ea44f"
+            dot_color = "#2ea44f"
         elif self.backend.is_alive():
             # 进程在跑但端口还没起（在 start_async 等待循环里）
             self.status_var.set(self.backend.get_state_label())
-            self.dot_var.set("●")
-            self.dot_color = "#d68f00"
+            dot_color = "#d68f00"
         else:
             self.status_var.set("未启动")
-            self.dot_var.set("●")
-            self.dot_color = "#cc3344"
+            dot_color = "#cc3344"
+        self.dot_var.set("●")
+        self.dot_label.configure(foreground=dot_color)
         self.root.after(600, self._poll_status)
 
     def _append_log(self, text: str) -> None:
@@ -587,10 +685,16 @@ class App:
 
 def main() -> int:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if not acquire_single_instance():
+        release_entrypoint_lock()
+        return 0
     try:
         app = App()
+        write_entrypoint_lock_pid()
         app.root.mainloop()
     except Exception as exc:
+        release_single_instance()
+        release_entrypoint_lock()
         import traceback
         traceback.print_exc()
         try:
@@ -598,6 +702,8 @@ def main() -> int:
         except Exception:
             pass
         return 1
+    release_single_instance()
+    release_entrypoint_lock()
     return 0
 
 
