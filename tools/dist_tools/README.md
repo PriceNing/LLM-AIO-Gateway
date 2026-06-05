@@ -1,4 +1,4 @@
-﻿# LLM AIO Gateway 绿色版（零安装发布包）
+# LLM AIO Gateway 绿色版（零安装发布包）
 
 面向非程序员用户的"双击即用"发布方式。把 Python 解释器、全部依赖和应用代码打包成单一目录（Windows 上是 `.zip`、macOS 是 `.app` + zip、Linux 是 `.tar.gz`），用户解压后双击即可启动 GUI 启动器，启动器会自动解压 Python、装依赖、跑服务。
 
@@ -44,10 +44,10 @@ python tools/standalone/scripts/build_standalone.py --target all
 
 ```
 dist/standalone/
-├── LLM-AIO-Gateway-windows-x86_64-v0.1.2.zip
-├── LLM-AIO-Gateway-macos-arm64-v0.1.2.zip
-├── LLM-AIO-Gateway-macos-x86_64-v0.1.2.zip
-├── LLM-AIO-Gateway-linux-x86_64-v0.1.2.tar.gz
+├── LLM-AIO-Gateway-windows-x86_64-v0.1.3.zip
+├── LLM-AIO-Gateway-macos-arm64-v0.1.3.zip
+├── LLM-AIO-Gateway-macos-x86_64-v0.1.3.zip
+├── LLM-AIO-Gateway-linux-x86_64-v0.1.3.tar.gz
 ├── version.json
 └── cache/                       # wheels + PBS，重复构建会复用
 ```
@@ -89,11 +89,11 @@ LLM-AIO-Gateway/
 
 ```json
 {
-  "version": "0.1.2",
+  "version": "0.1.3",
   "released_at": "2026-06-15T00:00:00Z",
   "notes": "修复 xxx",
   "artifacts": [
-    {"target": "windows", "filename": "LLM-AIO-Gateway-windows-x86_64-v0.1.2.zip",
+    {"target": "windows", "filename": "LLM-AIO-Gateway-windows-x86_64-v0.1.3.zip",
      "size": 188743424, "sha256": "abc..."},
     ...
   ]
