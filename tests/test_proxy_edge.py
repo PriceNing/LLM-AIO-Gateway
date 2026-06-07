@@ -21,7 +21,7 @@ from app.core.state import (
     response_chain_cache as _response_chain_cache,
 )
 from app.router.proxy import (
-    ensure_model_allowed, allowed_models_for,
+    ensure_model_allowed, ensure_routed_model_allowed, allowed_models_for,
 )
 from app.services.routing_targets import adapter_provider_id
 
@@ -349,6 +349,25 @@ def test_ensure_model_allowed_blocked():
     with pytest.raises(HTTPException) as exc:
         ensure_model_allowed({}, {"allowed_models": ["gpt-4"]}, "claude-3")
     assert exc.value.status_code == 403
+
+
+def test_ensure_routed_model_allowed_accepts_allowed_composite_target():
+    ensure_routed_model_allowed(
+        {},
+        {"allowed_models": ["PixelAPI/gpt-5.5"]},
+        "gpt-5.4",
+        "PixelAPI/gpt-5.5",
+    )
+
+
+def test_ensure_routed_model_allowed_accepts_provider_target_pair():
+    ensure_routed_model_allowed(
+        {},
+        {"allowed_models": ["PixelAPI/gpt-5.5"]},
+        "gpt-5.4",
+        "gpt-5.5",
+        "PixelAPI",
+    )
 
 
 # -- Anthropic adapter model extraction --
@@ -849,6 +868,69 @@ def test_root_proxy_aliases_are_registered_and_callable(monkeypatch, temp_db):
     })
     assert responses.status_code == 200
     assert responses.json()["output"][0]["content"][0]["text"] == "alias ok"
+
+
+def test_responses_allows_alias_when_route_target_is_allowed(monkeypatch, temp_db):
+    from app.database import add_routing_rule, get_db
+
+    add_provider({
+        "id": "PixelAPI",
+        "name": "PixelAPI",
+        "provider_type": "openai",
+        "api_base": "https://pixel.example/v1",
+        "api_key": "upstream-key",
+        "enabled": True,
+        "models": [{"id": "gpt-5.5", "name": "gpt-5.5", "enabled": True}],
+    })
+    with get_db() as db:
+        db.execute("UPDATE user_api_keys SET allowed_models = ? WHERE key = 'user-key'", ('["PixelAPI/gpt-5.5"]',))
+    add_routing_rule({
+        "name": "Codex alias",
+        "enabled": True,
+        "match_model": "gpt-5.4",
+        "target_model": "PixelAPI/gpt-5.5",
+    })
+
+    called = {}
+
+    def fake_completion(**kwargs):
+        called["model"] = kwargs["model"]
+        called["provider_id"] = kwargs["provider_id"]
+
+        class Usage:
+            prompt_tokens = 1
+            completion_tokens = 1
+            total_tokens = 2
+
+        class Message:
+            content = "route ok"
+            tool_calls = None
+            reasoning_content = None
+
+        class Choice:
+            message = Message()
+            finish_reason = "stop"
+
+        class Response:
+            choices = [Choice()]
+            usage = Usage()
+
+        return Response()
+
+    async def fail_anthropic(provider_info, internal):
+        raise AssertionError("OpenAI-compatible route should use liteLLM adapter")
+
+    monkeypatch.setattr("app.router.proxy.create_chat_completion", fake_completion)
+    monkeypatch.setattr("app.router.proxy.anthropic_messages_completion_for_internal", fail_anthropic)
+
+    response = client.post("/responses", headers=temp_db["headers"], json={
+        "model": "gpt-5.4",
+        "input": "hi",
+    })
+
+    assert response.status_code == 200
+    assert response.json()["output"][0]["content"][0]["text"] == "route ok"
+    assert called == {"model": "PixelAPI/gpt-5.5", "provider_id": "PixelAPI"}
 
 
 def test_completions_openai_provider_uses_ir_chat_adapter(monkeypatch, temp_db):

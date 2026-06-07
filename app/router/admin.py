@@ -1,3 +1,7 @@
+import time
+
+import anyio
+import httpx
 from fastapi import APIRouter, HTTPException, Header
 from typing import Optional
 from datetime import datetime, timedelta, timezone
@@ -13,10 +17,15 @@ from app.database import (
     get_preprocessors, upsert_preprocessor, delete_preprocessor as delete_preprocessor_config,
 )
 from app.core.policy import apply_fallback_policy, apply_routing_rules
+from app.adapters.anthropic import anthropic_messages_completion_for_internal
+from app.adapters.openai import chat_kwargs_from_internal, chat_messages_from_internal
+from app.adapters.output import response_to_internal_output
 from app.core.text import mask_key
+from app.core.types import InternalMessage, InternalRequest, text_part
 from app.router.auth import require_admin_session
 from app.services.discovery import refresh_provider_models, refresh_all_providers, check_provider_health, check_all_provider_health
-from app.services.lite_llm import get_available_models
+from app.services.lite_llm import create_chat_completion, get_available_models
+from app.services.routing_targets import provider_for_log, resolve_provider
 from app.router.proxy import (
     get_request_log, get_model_stats, clear_request_log,
     get_timeline_data, get_model_distribution, get_timeline_model_data,
@@ -101,6 +110,169 @@ async def list_models(authorization: Optional[str] = Header(None)):
     await require_admin_session(authorization)
     models = get_available_models()
     return {"models": models}
+
+
+def _test_latency_ms(start_time: float) -> int:
+    return int((time.perf_counter() - start_time) * 1000)
+
+
+def _test_preview(output) -> str:
+    preview = (getattr(output, "text", "") or getattr(output, "reasoning", "") or "").strip()
+    return preview[:500]
+
+
+def _model_test_request(model_id: str, provider_id: str) -> InternalRequest:
+    mid = parse_model_id(model_id)
+    return InternalRequest(
+        endpoint="chat_completions",
+        requested_model=mid.composite,
+        target_model=mid.model_name,
+        provider_id=provider_id,
+        messages=[InternalMessage(role="user", parts=[text_part("请只回复 OK，用于连通性测试。")])],
+        stream=False,
+        temperature=0,
+        max_tokens=16,
+        raw_body={"model": mid.composite, "messages": []},
+    )
+
+
+async def _run_model_test(model_id: str) -> dict:
+    mid = parse_model_id(model_id)
+    if not mid.model_name:
+        raise HTTPException(status_code=400, detail="model_id is required")
+    provider_info = resolve_provider(mid.model_name, mid.provider_id)
+    if not provider_info:
+        raise HTTPException(status_code=404, detail="Model provider not found")
+
+    provider_id = provider_for_log(provider_info, mid.provider_id)
+    internal = _model_test_request(mid.composite, provider_id)
+    provider_type = provider_info.get("provider_type", "openai")
+    with anyio.fail_after(20):
+        if provider_type == "anthropic":
+            output = await anthropic_messages_completion_for_internal(provider_info, internal)
+        else:
+            response = await anyio.to_thread.run_sync(
+                lambda: create_chat_completion(
+                    model=internal.target_model,
+                    messages=chat_messages_from_internal(internal),
+                    provider_id=provider_id,
+                    temperature=internal.temperature,
+                    max_tokens=internal.max_tokens,
+                    **chat_kwargs_from_internal(internal),
+                ),
+                abandon_on_cancel=True,
+            )
+            output = response_to_internal_output(response)
+    return {
+        "status": "ok",
+        "provider_id": provider_id,
+        "provider_type": provider_type,
+        "model": internal.target_model,
+        "preview": _test_preview(output),
+        "usage": getattr(output, "usage", {}) or {},
+    }
+
+
+@router.post("/models/test")
+async def test_model(body: dict, authorization: Optional[str] = Header(None)):
+    await require_admin_session(authorization)
+    model_id = str(body.get("model_id") or "").strip()
+    start_time = time.perf_counter()
+    try:
+        result = await _run_model_test(model_id)
+        result["latency_ms"] = _test_latency_ms(start_time)
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _app_log.warning("Model test failed for %s: %s", model_id, exc)
+        return {
+            "status": "fail",
+            "model": model_id,
+            "latency_ms": _test_latency_ms(start_time),
+            "error": str(exc)[:500],
+        }
+
+
+_PREPROCESSOR_TEST_IMAGE = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+)
+
+
+def _preprocessor_test_url(api_base: str) -> str:
+    base = (api_base or "").rstrip("/")
+    if base.endswith("/chat/completions"):
+        return base
+    if base.endswith("/v1"):
+        return f"{base}/chat/completions"
+    return f"{base}/v1/chat/completions"
+
+
+async def _run_preprocessor_test(preprocessor_id: str) -> dict:
+    preprocessors = get_preprocessors()
+    preprocessor = preprocessors.get(preprocessor_id)
+    if not preprocessor_id:
+        raise HTTPException(status_code=400, detail="preprocessor_id is required")
+    if not preprocessor:
+        raise HTTPException(status_code=404, detail="Preprocessor not found")
+    api_base = preprocessor.get("api_base") or ""
+    model = preprocessor.get("model") or ""
+    if not api_base or not model:
+        raise HTTPException(status_code=400, detail="Preprocessor api_base and model are required")
+
+    timeout = min(max(int(preprocessor.get("timeout") or 20), 1), 20)
+    headers = {"Content-Type": "application/json"}
+    api_key = preprocessor.get("api_key") or ""
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    payload = {
+        "model": model,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "这是连通性测试图片，请简短回复 OK 或描述图片。"},
+                {"type": "image_url", "image_url": {"url": _PREPROCESSOR_TEST_IMAGE}},
+            ],
+        }],
+        "max_tokens": min(int(preprocessor.get("max_tokens") or 128), 128),
+        "temperature": 0,
+    }
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.post(_preprocessor_test_url(api_base), headers=headers, json=payload)
+    if resp.status_code != 200:
+        raise RuntimeError((resp.text or f"HTTP {resp.status_code}")[:500])
+    data = resp.json()
+    message = ((data.get("choices") or [{}])[0].get("message") or {})
+    preview = str(message.get("content") or data.get("content") or "").strip()[:500]
+    return {
+        "status": "ok",
+        "preprocessor_id": preprocessor_id,
+        "model": model,
+        "preview": preview,
+        "usage": data.get("usage") or {},
+    }
+
+
+@router.post("/preprocessors/test")
+async def test_preprocessor(body: dict, authorization: Optional[str] = Header(None)):
+    await require_admin_session(authorization)
+    preprocessor_id = str(body.get("preprocessor_id") or "").strip()
+    start_time = time.perf_counter()
+    try:
+        result = await _run_preprocessor_test(preprocessor_id)
+        result["latency_ms"] = _test_latency_ms(start_time)
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _app_log.warning("Preprocessor test failed for %s: %s", preprocessor_id, exc)
+        return {
+            "status": "fail",
+            "preprocessor_id": preprocessor_id,
+            "latency_ms": _test_latency_ms(start_time),
+            "error": str(exc)[:500],
+        }
 
 
 @router.get("/users")

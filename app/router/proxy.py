@@ -705,18 +705,26 @@ def allowed_models_for(user: dict, api_key: dict) -> list:
         return ["*"]
     return key_models  # explicit list, empty = deny all
 
-def ensure_model_allowed(user: dict, api_key: dict, model: str) -> None:
-    allowed = allowed_models_for(user, api_key)
-    if "*" in allowed:
-        return
+
+def _model_allowed_by_list(allowed: list, model: str) -> bool:
     requested = parse_model_id(model)
     for allowed_model in allowed:
         allowed_mid = parse_model_id(str(allowed_model))
         if allowed_mid.is_composite:
             if requested.is_composite and requested == allowed_mid:
-                return
+                return True
         elif requested.model_name == allowed_mid.model_name:
-            return
+            return True
+    return False
+
+
+def ensure_model_allowed(user: dict, api_key: dict, model: str) -> None:
+    allowed = allowed_models_for(user, api_key)
+    if "*" in allowed:
+        return
+    requested = parse_model_id(model)
+    if _model_allowed_by_list(allowed, model):
+        return
     if any("/" in str(allowed_model) for allowed_model in allowed) and not requested.is_composite:
         raise HTTPException(
             status_code=403,
@@ -725,24 +733,29 @@ def ensure_model_allowed(user: dict, api_key: dict, model: str) -> None:
     raise HTTPException(status_code=403, detail=f"Model '{model}' is not allowed for this API key")
 
 
-def ensure_routed_model_allowed(user: dict, api_key: dict, requested_model: str, target_model: str) -> None:
-    if requested_model == target_model:
+def ensure_routed_model_allowed(user: dict, api_key: dict, requested_model: str, target_model: str, target_provider: str = "") -> None:
+    if requested_model == target_model and not target_provider:
+        ensure_model_allowed(user, api_key, requested_model)
         return
     allowed = allowed_models_for(user, api_key)
     if "*" in allowed:
         return
-    requested = parse_model_id(requested_model)
-    if requested.is_composite:
+
+    target = parse_model_id(target_model)
+    effective_target = f"{target_provider}/{target.model_name}" if target_provider and not target.is_composite else target.composite
+    if _model_allowed_by_list(allowed, effective_target):
         return
-    if any("/" in str(allowed_model) for allowed_model in allowed):
-        target = parse_model_id(target_model)
-        for allowed_model in allowed:
-            allowed_mid = parse_model_id(str(allowed_model))
-            if allowed_mid.is_composite and target.is_composite and target == allowed_mid:
-                raise HTTPException(
-                    status_code=403,
-                    detail=f"Model '{requested_model}' is not allowed for this API key; request '{target_model}' directly",
-                )
+
+    if _model_allowed_by_list(allowed, requested_model):
+        return
+
+    requested = parse_model_id(requested_model)
+    if any("/" in str(allowed_model) for allowed_model in allowed) and not requested.is_composite:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Model '{requested_model}' is not allowed for this API key; use a provider-qualified model id",
+        )
+    raise HTTPException(status_code=403, detail=f"Model '{requested_model}' is not allowed for this API key")
 
 @router.get("/models")
 def list_models(authorization: Optional[str] = Header(None)):
@@ -830,8 +843,6 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
     if not internal.messages:
         raise HTTPException(status_code=400, detail="messages is required")
 
-    ensure_model_allowed(user, api_key, model)
-
     requested_model = model
     policy = await prepare_request_policy(
         internal,
@@ -846,7 +857,7 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
     )
     model = internal.target_model
     provider_id = internal.provider_id
-    ensure_routed_model_allowed(user, api_key, requested_model, model)
+    ensure_routed_model_allowed(user, api_key, requested_model, model, provider_id)
     conv_key = policy.conv_key
     provider_info = None
     adapter_provider_id = provider_id or ""
@@ -949,8 +960,6 @@ async def completions(request: Request, authorization: Optional[str] = Header(No
     if not model:
         raise HTTPException(status_code=400, detail="model is required")
 
-    ensure_model_allowed(user, api_key, model)
-
     username = user.get("username", "legacy")
     _log_request_body(username, model, "completions", body)
     api_key_value = api_key.get("key", "")
@@ -968,7 +977,7 @@ async def completions(request: Request, authorization: Optional[str] = Header(No
     )
     model = internal.target_model
     provider_id = internal.provider_id
-    ensure_routed_model_allowed(user, api_key, requested_model, model)
+    ensure_routed_model_allowed(user, api_key, requested_model, model, provider_id)
     conv_key = policy.conv_key
     provider_info = None
     adapter_provider_id = provider_id or ""
@@ -1063,7 +1072,6 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
 
     if not model:
         raise HTTPException(status_code=400, detail="model is required")
-    ensure_model_allowed(user, api_key, model)
 
     username = user.get("username", "legacy")
     api_key_value = api_key.get("key", "")
@@ -1081,7 +1089,7 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
     )
     model = internal.target_model
     provider_id = internal.provider_id
-    ensure_routed_model_allowed(user, api_key, requested_model, model)
+    ensure_routed_model_allowed(user, api_key, requested_model, model, provider_id)
     provider_info = resolve_provider(model, provider_id)
     adapter_provider_id = provider_for_log(provider_info, provider_id)
     previous_response_id = internal.previous_response_id
@@ -1210,9 +1218,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
     else:
         _app_log.debug("[responses] model=%s stream=%s tools=%d input_len=%d instructions_len=%d", model, stream, tools_count, input_len, instructions_len)
 
-    # Check permission on requested model BEFORE routing
     requested_model = model
-    ensure_model_allowed(user, api_key, requested_model)
     username = user.get("username", "legacy")
     api_key_value = api_key.get("key", "")
 
@@ -1241,7 +1247,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
     )
     model = internal.target_model
     provider_id = internal.provider_id
-    ensure_routed_model_allowed(user, api_key, requested_model, model)
+    ensure_routed_model_allowed(user, api_key, requested_model, model, provider_id)
     conv_key = policy.conv_key
     provider_info = None
     adapter_provider_id = provider_id or ""

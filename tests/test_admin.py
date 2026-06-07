@@ -645,3 +645,108 @@ def test_toggle_model_preprocessor_rejects_non_boolean_enabled(temp_db):
 def test_fetch_preprocessor_models_requires_auth():
     response = client.get("/admin/preprocessors/fetch-models", params={"api_base": "http://x"})
     assert response.status_code == 401
+
+
+def test_model_test_requires_auth():
+    response = client.post("/admin/models/test", json={"model_id": "p/m"})
+    assert response.status_code == 401
+
+
+def test_model_test_openai_success(temp_db, monkeypatch):
+    from types import SimpleNamespace
+    from app.database import add_provider
+
+    add_provider({
+        "id": "test-openai", "name": "Test OpenAI", "provider_type": "openai",
+        "api_base": "http://example.test/v1", "api_key": "test-key", "enabled": True,
+        "models": [{"id": "chat-model", "name": "Chat Model", "enabled": True}]
+    })
+
+    def fake_create_chat_completion(**kwargs):
+        assert kwargs["model"] == "chat-model"
+        assert kwargs["provider_id"] == "test-openai"
+        return SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content="OK", reasoning_content=""),
+                finish_reason="stop",
+            )],
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+        )
+
+    monkeypatch.setattr("app.router.admin.create_chat_completion", fake_create_chat_completion)
+
+    response = client.post(
+        "/admin/models/test",
+        json={"model_id": "test-openai/chat-model"},
+        headers=temp_db["headers"],
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "ok"
+    assert data["provider_id"] == "test-openai"
+    assert data["model"] == "chat-model"
+    assert data["preview"] == "OK"
+    assert isinstance(data["latency_ms"], int)
+
+
+def test_model_test_missing_model_id(temp_db):
+    response = client.post("/admin/models/test", json={}, headers=temp_db["headers"])
+    assert response.status_code == 400
+
+
+def test_preprocessor_test_requires_auth():
+    response = client.post("/admin/preprocessors/test", json={"preprocessor_id": "vision-model"})
+    assert response.status_code == 401
+
+
+def test_preprocessor_test_success(temp_db, monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {
+                "choices": [{"message": {"content": "OK vision"}}],
+                "usage": {"total_tokens": 3},
+            }
+
+    class FakeAsyncClient:
+        def __init__(self, timeout=None):
+            captured["timeout"] = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, url, headers=None, json=None):
+            captured["url"] = url
+            captured["headers"] = headers
+            captured["json"] = json
+            return FakeResponse()
+
+    monkeypatch.setattr("app.router.admin.httpx.AsyncClient", FakeAsyncClient)
+
+    response = client.post(
+        "/admin/preprocessors/test",
+        json={"preprocessor_id": "vision-model"},
+        headers=temp_db["headers"],
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "ok"
+    assert data["preprocessor_id"] == "vision-model"
+    assert data["model"] == "test-vision"
+    assert data["preview"] == "OK vision"
+    assert captured["url"] == "http://127.0.0.1:8080/v1/chat/completions"
+    assert captured["headers"]["Authorization"] == "Bearer test-key"
+    assert captured["json"]["messages"][0]["content"][1]["type"] == "image_url"
+
+
+def test_preprocessor_test_missing_id(temp_db):
+    response = client.post("/admin/preprocessors/test", json={}, headers=temp_db["headers"])
+    assert response.status_code == 400

@@ -123,6 +123,9 @@ zh: {
     'models.search': '搜索模型...',
     'models.refreshAll': '刷新所有模型',
     'models.copyId': '复制 ID',
+    'models.test': '测试',
+    'models.testRunning': '测试中...',
+    'models.testFail': '模型测试失败',
     'models.count': '个模型',
     'models.loadFail': '加载模型失败',
 
@@ -284,6 +287,9 @@ zh: {
     'preprocessors.modelsFound': '个模型已获取',
     'preprocessors.noModels': '未发现可用模型',
     'preprocessors.fetchFail': '获取模型列表失败',
+    'preprocessors.test': '测试',
+    'preprocessors.testRunning': '测试中...',
+    'preprocessors.testFail': '视觉模型测试失败',
 
     'common.save': '保存',
     'common.cancel': '取消',
@@ -402,6 +408,9 @@ en: {
     'models.search': 'Search models...',
     'models.refreshAll': 'Refresh All',
     'models.copyId': 'Copy ID',
+    'models.test': 'Test',
+    'models.testRunning': 'Testing...',
+    'models.testFail': 'Model test failed',
     'models.count': 'models',
     'models.loadFail': 'Failed to load models',
 
@@ -564,6 +573,9 @@ en: {
     'preprocessors.modelsFound': 'models found',
     'preprocessors.noModels': 'No models found',
     'preprocessors.fetchFail': 'Failed to fetch models',
+    'preprocessors.test': 'Test',
+    'preprocessors.testRunning': 'Testing...',
+    'preprocessors.testFail': 'Vision model test failed',
 
     'common.save': 'Save',
     'common.cancel': 'Cancel',
@@ -597,7 +609,17 @@ Object.assign(I18N.zh, {
     'stats.errorStage': '错误阶段',
     'stats.errorMessage': '错误消息',
     'stats.attemptedModel': '尝试模型',
-    'stats.attemptedProvider': '尝试提供商'
+    'stats.attemptedProvider': '尝试提供商',
+    'testResult.title': '测试结果',
+    'testResult.status': '状态',
+    'testResult.latency': '延迟',
+    'testResult.model': '模型',
+    'testResult.provider': '提供商',
+    'testResult.preview': '响应预览',
+    'testResult.error': '错误',
+    'testResult.usage': 'Token 用量',
+    'testResult.ok': '可用',
+    'testResult.fail': '失败'
 });
 
 Object.assign(I18N.en, {
@@ -619,7 +641,17 @@ Object.assign(I18N.en, {
     'stats.errorStage': 'Error Stage',
     'stats.errorMessage': 'Error Message',
     'stats.attemptedModel': 'Attempted Model',
-    'stats.attemptedProvider': 'Attempted Provider'
+    'stats.attemptedProvider': 'Attempted Provider',
+    'testResult.title': 'Test Result',
+    'testResult.status': 'Status',
+    'testResult.latency': 'Latency',
+    'testResult.model': 'Model',
+    'testResult.provider': 'Provider',
+    'testResult.preview': 'Preview',
+    'testResult.error': 'Error',
+    'testResult.usage': 'Usage',
+    'testResult.ok': 'OK',
+    'testResult.fail': 'Failed'
 });
 
 function t(key, params) {
@@ -1630,7 +1662,10 @@ function renderModels() {
                     '<span class="model-name">' + escHtml(m.name || m.id) + '</span>' +
                     '<span class="model-id mono">' + escHtml(m.id) + '</span>' +
                 '</div>' +
-                '<button class="btn btn-secondary btn-sm" onclick="copyText(\'' + jsEsc(m.id) + '\')">' + t('models.copyId') + '</button>' +
+                '<div class="model-actions">' +
+                    '<button class="btn btn-secondary btn-sm" onclick="copyText(\'' + jsEsc(m.id) + '\')">' + t('models.copyId') + '</button>' +
+                    '<button class="btn btn-primary btn-sm" onclick="testModel(\'' + jsEsc(m.id) + '\', this)">' + t('models.test') + '</button>' +
+                '</div>' +
             '</div>';
         }
 
@@ -1638,6 +1673,22 @@ function renderModels() {
     }
 
     container.innerHTML = html;
+}
+
+async function testModel(modelId, btn) {
+    var oldText = btn ? btn.textContent : '';
+    if (btn) { btn.disabled = true; btn.textContent = t('models.testRunning'); }
+    try {
+        var result = await api('/admin/models/test', {
+            method: 'POST',
+            body: JSON.stringify({ model_id: modelId })
+        });
+        showTestResult(t('testResult.title') + ' - ' + modelId, result);
+    } catch (e) {
+        toast(t('models.testFail') + ': ' + e.message, 'error');
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = oldText || t('models.test'); }
+    }
 }
 
 /* ═══════════════════════════════ Preprocessors ═══════════════════════════════ */
@@ -1731,6 +1782,7 @@ function preprocessorCardHtml(id, p) {
         '<div class="preprocessor-card-header">' +
             '<div class="preprocessor-card-title">' + escHtml(id) + '</div>' +
             '<div class="preprocessor-card-actions">' +
+                '<button class="btn btn-primary btn-sm" onclick="testPreprocessor(\'' + jsEsc(id) + '\', this)">' + t('preprocessors.test') + '</button>' +
                 '<button class="btn btn-secondary btn-sm" onclick="editPreprocessor(\'' + jsEsc(id) + '\')">' + t('common.edit') + '</button>' +
                 '<button class="btn btn-danger btn-sm" onclick="deletePreprocessor(\'' + jsEsc(id) + '\')">' + t('preprocessors.delete') + '</button>' +
             '</div>' +
@@ -1815,6 +1867,42 @@ async function fetchPreprocessorModels() {
         }
     } catch(e) { toast(t('preprocessors.fetchFail') + ': ' + e.message, 'error'); }
     finally { btn.disabled = false; btn.textContent = t('preprocessors.fetchModels'); }
+}
+
+async function testPreprocessor(id, btn) {
+    var oldText = btn ? btn.textContent : '';
+    if (btn) { btn.disabled = true; btn.textContent = t('preprocessors.testRunning'); }
+    try {
+        var result = await api('/admin/preprocessors/test', {
+            method: 'POST',
+            body: JSON.stringify({ preprocessor_id: id })
+        });
+        showTestResult(t('testResult.title') + ' - ' + id, result);
+    } catch (e) {
+        toast(t('preprocessors.testFail') + ': ' + e.message, 'error');
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = oldText || t('preprocessors.test'); }
+    }
+}
+
+function showTestResult(title, result) {
+    result = result || {};
+    var statusText = result.status === 'ok' ? t('testResult.ok') : t('testResult.fail');
+    var statusClass = result.status === 'ok' ? 'badge-ok' : 'badge-fail';
+    var latency = result.latency_ms === '' || result.latency_ms === null ? '-' : result.latency_ms + 'ms';
+    var rows = [
+        '<div class="detail-kv"><div class="detail-label">' + escHtml(t('testResult.status')) + '</div><div class="detail-value"><span class="status-badge ' + statusClass + '">' + escHtml(statusText) + '</span></div></div>',
+        detailRow(t('testResult.latency'), latency),
+        detailRow(t('testResult.model'), result.model || result.preprocessor_id || '-'),
+        detailRow(t('testResult.provider'), result.provider_id || result.provider_type || '-'),
+        detailRow(t('testResult.preview'), result.preview || '-'),
+        detailRow(t('testResult.error'), result.error || '-'),
+        detailRow(t('testResult.usage'), result.usage || {})
+    ];
+    document.getElementById('modalContent').innerHTML = '<h2>' + escHtml(title) + '</h2>' +
+        '<div class="detail-section"><div class="detail-grid">' + rows.join('') + '</div></div>' +
+        '<div class="form-actions"><button class="btn btn-primary" onclick="closeModal()">OK</button></div>';
+    document.getElementById('modal').style.display = 'flex';
 }
 
 function readPreprocessorForm() {
