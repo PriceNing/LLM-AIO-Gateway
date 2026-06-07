@@ -854,6 +854,8 @@ function showSection(section, evt) {
     if (section === 'fallbacks') { loadFallbackPolicies(); loadModels(); loadProviders(); }
     if (section === 'stats') loadStats();
     if (section === 'preprocessors') loadPreprocessors();
+    if (section === 'request-logs') loadRequestLogs();
+    if (section === 'config') {/* lazy load */}
 }
 
 /* ═══════════════════════════════ Users ═══════════════════════════════ */
@@ -2657,6 +2659,286 @@ function jsEsc(value) {
         .replace(/"/g, '&quot;');
 }
 
+/* ════════════════════════════════ Request Logs ════════════════════════════════ */
+
+var _logFilterTimer = null;
+function onLogFilterInput() {
+    if (_logFilterTimer) clearTimeout(_logFilterTimer);
+    _logFilterTimer = setTimeout(loadRequestLogs, 350);
+}
+
+async function loadRequestLogs() {
+    var container = document.getElementById('requestLogsContent');
+    if (!container) return;
+    container.innerHTML = '<div class="loading-spinner"><span class="spinner"></span><p>' + escHtml(t('stats.loading') || 'Loading...') + '</p></div>';
+    try {
+        var endpoint = document.getElementById('logEndpointFilter').value;
+        var username = document.getElementById('logUsernameFilter').value.trim();
+        var status = document.getElementById('logStatusFilter').value;
+        var params = [];
+        if (endpoint) params.push('endpoint=' + encodeURIComponent(endpoint));
+        if (username) params.push('username=' + encodeURIComponent(username));
+        if (status) params.push('status=' + encodeURIComponent(status));
+        var url = '/admin/request-logs';
+        if (params.length) url += '?' + params.join('&');
+        var data = await api(url);
+        renderRequestLogs(data);
+    } catch (e) {
+        container.innerHTML = '<div class="empty-state"><div class="empty-icon">⚠;</div><p>' + escHtml(e.message) + '</p></div>';
+        toast(t('stats.loadFail') + ': ' + e.message, 'error');
+    }
+}
+
+function renderRequestLogs(data) {
+    var container = document.getElementById('requestLogsContent');
+    if (!container) return;
+    var items = (data && data.items) || [];
+    var total = (data && data.total) || 0;
+    if (!items.length) {
+        container.innerHTML = '<div class="empty-state"><div class="empty-icon">☰;</div><p>' + escHtml(t('logs.empty') || 'No request logs yet') + '</p></div>';
+        return;
+    }
+    var tableHTML = '<div class="table-wrap"><table class="data-table"><thead><tr>';
+    tableHTML += '<th>' + escHtml(t('logs.colTime') || 'Time') + '</th>';
+    tableHTML += '<th>' + escHtml(t('logs.colEndpoint') || 'Endpoint') + '</th>';
+    tableHTML += '<th>' + escHtml(t('logs.colUser') || 'User') + '</th>';
+    tableHTML += '<th>' + escHtml(t('logs.colModel') || 'Model') + '</th>';
+    tableHTML += '<th>' + escHtml(t('logs.colStatus') || 'Status') + '</th>';
+    tableHTML += '<th>' + escHtml(t('logs.colTokens') || 'Tokens') + '</th>';
+    tableHTML += '<th>' + escHtml(t('logs.colActions') || 'Actions') + '</th>';
+    tableHTML += '</tr></thead><tbody>';
+    items.forEach(function(entry) {
+        var ts = (entry.timestamp || '').slice(11) || entry.timestamp || '';
+        var badgeClass = entry.status === 'ok' ? 'badge-ok' : (entry.status === 'partial' ? 'badge-partial' : 'badge-fail');
+        var statusLabel = entry.status || '-';
+        tableHTML += '<tr>';
+        tableHTML += '<td class="mono">' + escHtml(ts) + '</td>';
+        tableHTML += '<td class="mono">' + escHtml(entry.endpoint || '-') + '</td>';
+        tableHTML += '<td>' + escHtml(entry.username || '-') + '</td>';
+        tableHTML += '<td class="mono">' + escHtml(entry.model || '-') + '</td>';
+        tableHTML += '<td><span class="badge ' + badgeClass + '">' + escHtml(statusLabel) + '</span></td>';
+        tableHTML += '<td>' + (entry.tokens || 0) + '</td>';
+        tableHTML += '<td><button class="icon-btn" onclick="showRequestLogDetail(' + entry.id + ')" title="' + escHtml(t('logs.viewDetail') || 'View') + '">ℹ</button> ';
+        tableHTML += '<button class="icon-btn" onclick="deleteRequestLog(' + entry.id + ')" title="' + escHtml(t('logs.delete') || 'Delete') + '">✖</button></td>';
+        tableHTML += '</tr>';
+    });
+    tableHTML += '</tbody></table></div>';
+    var summary = '<div class="history-summary"><span class="history-stat"><strong>' + total + '</strong> ' + escHtml(t('logs.total') || 'total') + '</span></div>';
+    container.innerHTML = summary + tableHTML;
+}
+
+async function showRequestLogDetail(logId) {
+    try {
+        var entry = await api('/admin/request-logs/' + logId);
+        var content = document.querySelector('.modal-content');
+        if (content) content.classList.add('modal-wide');
+        var body = '';
+        body += '<h3>' + escHtml(t('logs.detailTitle') || 'Request Detail') + ' #' + entry.id + '</h3>';
+        body += '<div class="detail-status-line"><span class="badge ' + (entry.status === 'ok' ? 'badge-ok' : (entry.status === 'partial' ? 'badge-partial' : 'badge-fail')) + '">' + escHtml(entry.status || '-') + '</span><span class="mono">' + escHtml(entry.endpoint || '-') + '</span></div>';
+        body += '<div class="detail-grid">';
+        body += detailRow(t('logs.colTime') || 'Time', entry.timestamp);
+        body += detailRow(t('logs.colUser') || 'User', entry.username);
+        body += detailRow(t('logs.colEndpoint') || 'Endpoint', entry.endpoint);
+        body += detailRow(t('logs.colModel') || 'Model', entry.model);
+        body += detailRow(t('logs.colProvider') || 'Provider', entry.provider);
+        body += detailRow(t('logs.colTokens') || 'Tokens', entry.tokens);
+        body += detailRow(t('logs.colStatus') || 'Status', entry.status);
+        body += detailRow(t('logs.colError') || 'Error', entry.error || '-');
+        body += '</div>';
+        body += '<div class="detail-section"><h3>' + escHtml(t('logs.requestBody') || 'Request Body') + '</h3><pre class="json-block">' + escHtml(JSON.stringify(entry.request_body, null, 2)) + '</pre></div>';
+        body += '<div class="detail-section"><h3>' + escHtml(t('logs.responseBody') || 'Response Body') + '</h3><pre class="json-block">' + escHtml(JSON.stringify(entry.response_body, null, 2)) + '</pre></div>';
+        body += '<div class="detail-section"><h3>' + escHtml(t('logs.details') || 'Routing / Details') + '</h3><pre class="json-block">' + escHtml(JSON.stringify(entry.details, null, 2)) + '</pre></div>';
+        document.getElementById('modalContent').innerHTML = body;
+        document.getElementById('modal').style.display = 'flex';
+    } catch (e) {
+        toast(t('logs.loadDetailFail') + ': ' + e.message, 'error');
+    }
+}
+
+async function deleteRequestLog(logId) {
+    if (!confirm(t('logs.confirmDelete') || 'Delete this log entry?')) return;
+    try {
+        await api('/admin/request-logs/' + logId, { method: 'DELETE' });
+        toast(t('logs.deleted') || 'Deleted', 'success');
+        loadRequestLogs();
+    } catch (e) {
+        toast(t('logs.deleteFail') + ': ' + e.message, 'error');
+    }
+}
+
+async function confirmClearRequestLogs() {
+    if (!confirm(t('logs.confirmClear') || 'Clear ALL request logs?')) return;
+    try {
+        var r = await api('/admin/request-logs/clear', { method: 'POST' });
+        toast((t('logs.cleared') || 'Cleared') + ' (' + (r.removed || 0) + ')', 'success');
+        loadRequestLogs();
+    } catch (e) {
+        toast(t('logs.clearFail') + ': ' + e.message, 'error');
+    }
+}
+
+/* ════════════════════════════════ Config import/export ════════════════════════════════ */
+
+async function exportConfig() {
+    try {
+        var include = document.getElementById('exportIncludeSecrets').checked;
+        var r = await fetch('/admin/config/export?include_secrets=' + (include ? 'true' : 'false'), {
+            headers: { 'Authorization': 'Bearer ' + localStorage.getItem(SESSION_KEY) }
+        });
+        if (!r.ok) throw new Error(await r.text());
+        var blob = await r.blob();
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement('a');
+        var ts = new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19);
+        a.href = url;
+        a.download = 'llm-aio-config-' + ts + '.json';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+        toast(t('config.exported') || 'Exported', 'success');
+    } catch (e) {
+        toast(t('config.exportFail') + ': ' + e.message, 'error');
+    }
+}
+
+async function importConfig() {
+    var fileInput = document.getElementById('configFileInput');
+    var modeSel = document.getElementById('configImportMode');
+    var resultEl = document.getElementById('configImportResult');
+    if (!fileInput.files || !fileInput.files[0]) {
+        toast(t('config.chooseFile') || 'Please select a JSON file first', 'error');
+        return;
+    }
+    try {
+        var text = await fileInput.files[0].text();
+        var payload = JSON.parse(text);
+        payload.mode = modeSel.value || 'skip';
+        var r = await api('/admin/config/import', { method: 'POST', body: JSON.stringify(payload) });
+        var summary = r.summary || {};
+        var lines = [];
+        lines.push((t('config.resultProviders') || 'Providers:') + ' ' + JSON.stringify(summary.providers || {}));
+        lines.push((t('config.resultRouting') || 'Routing rules:') + ' ' + JSON.stringify(summary.routing_rules || {}));
+        lines.push((t('config.resultFallbacks') || 'Fallback policies:') + ' ' + JSON.stringify(summary.fallback_policies || {}));
+        if (resultEl) resultEl.innerHTML = '<pre class="json-block">' + escHtml(lines.join('\n')) + '</pre>';
+        toast(t('config.imported') || 'Imported', 'success');
+    } catch (e) {
+        if (resultEl) resultEl.innerHTML = '<div class="error-text">' + escHtml(e.message) + '</div>';
+        toast(t('config.importFail') + ': ' + e.message, 'error');
+    }
+}
+
+/* ════════════════════════════════ i18n additions ════════════════════════════════ */
+
+Object.assign(I18N.zh, {
+    'nav.requestLogs': '请求日志',
+    'nav.config': '配置导入/导出',
+    'logs.title': '请求/响应日志',
+    'logs.allEndpoints': '全部端点',
+    'logs.allStatus': '全部状态',
+    'logs.filterUser': '按用户名筛选',
+    'logs.refresh': '刷新',
+    'logs.clear': '清空',
+    'logs.empty': '还没有请求日志',
+    'logs.colTime': '时间',
+    'logs.colEndpoint': '端点',
+    'logs.colUser': '用户',
+    'logs.colModel': '模型',
+    'logs.colStatus': '状态',
+    'logs.colTokens': 'Tokens',
+    'logs.colActions': '操作',
+    'logs.colProvider': 'Provider',
+    'logs.colError': '错误',
+    'logs.viewDetail': '查看详情',
+    'logs.delete': '删除',
+    'logs.detailTitle': '请求详情',
+    'logs.requestBody': '请求体',
+    'logs.responseBody': '响应体',
+    'logs.details': '路由/详情',
+    'logs.total': '总记录',
+    'logs.confirmDelete': '确认删除该条日志？',
+    'logs.deleted': '已删除',
+    'logs.deleteFail': '删除失败',
+    'logs.confirmClear': '确认清空所有请求日志？',
+    'logs.cleared': '已清空',
+    'logs.clearFail': '清空失败',
+    'logs.loadDetailFail': '加载详情失败',
+    'config.title': '配置导入/导出',
+    'config.exportTitle': '导出配置',
+    'config.exportHint': '生成 providers / routing rules / fallback policies 的 JSON 备份。',
+    'config.includeSecrets': '含 api_key（明文）',
+    'config.export': '下载 JSON',
+    'config.exported': '已导出',
+    'config.exportFail': '导出失败',
+    'config.importTitle': '导入配置',
+    'config.importHint': '上传之前导出的 JSON 文件，可选择 skip / replace / merge 冲突策略。',
+    'config.mode': '冲突策略',
+    'config.modeSkip': 'skip (保留现有)',
+    'config.modeReplace': 'replace (覆盖)',
+    'config.modeMerge': 'merge (仅更新非空字段)',
+    'config.import': '导入',
+    'config.chooseFile': '请选择 JSON 文件',
+    'config.imported': '导入完成',
+    'config.importFail': '导入失败',
+    'config.resultProviders': 'Providers:',
+    'config.resultRouting': 'Routing rules:',
+    'config.resultFallbacks': 'Fallback policies:'
+});
+
+Object.assign(I18N.en, {
+    'nav.requestLogs': 'Request Logs',
+    'nav.config': 'Config Import/Export',
+    'logs.title': 'Request/Response Logs',
+    'logs.allEndpoints': 'All endpoints',
+    'logs.allStatus': 'All statuses',
+    'logs.filterUser': 'Filter by user',
+    'logs.refresh': 'Refresh',
+    'logs.clear': 'Clear',
+    'logs.empty': 'No request logs yet',
+    'logs.colTime': 'Time',
+    'logs.colEndpoint': 'Endpoint',
+    'logs.colUser': 'User',
+    'logs.colModel': 'Model',
+    'logs.colStatus': 'Status',
+    'logs.colTokens': 'Tokens',
+    'logs.colActions': 'Actions',
+    'logs.colProvider': 'Provider',
+    'logs.colError': 'Error',
+    'logs.viewDetail': 'View detail',
+    'logs.delete': 'Delete',
+    'logs.detailTitle': 'Request Detail',
+    'logs.requestBody': 'Request Body',
+    'logs.responseBody': 'Response Body',
+    'logs.details': 'Routing / Details',
+    'logs.total': 'total',
+    'logs.confirmDelete': 'Delete this log entry?',
+    'logs.deleted': 'Deleted',
+    'logs.deleteFail': 'Delete failed',
+    'logs.confirmClear': 'Clear ALL request logs?',
+    'logs.cleared': 'Cleared',
+    'logs.clearFail': 'Clear failed',
+    'logs.loadDetailFail': 'Failed to load detail',
+    'config.title': 'Config Import/Export',
+    'config.exportTitle': 'Export Config',
+    'config.exportHint': 'Generate a JSON backup of providers, routing rules, and fallback policies.',
+    'config.includeSecrets': 'Include api_key (plaintext)',
+    'config.export': 'Download JSON',
+    'config.exported': 'Exported',
+    'config.exportFail': 'Export failed',
+    'config.importTitle': 'Import Config',
+    'config.importHint': 'Upload a previously exported JSON file. Choose skip / replace / merge strategy.',
+    'config.mode': 'Conflict mode',
+    'config.modeSkip': 'skip (keep existing)',
+    'config.modeReplace': 'replace (overwrite)',
+    'config.modeMerge': 'merge (only update non-empty fields)',
+    'config.import': 'Import',
+    'config.chooseFile': 'Please select a JSON file',
+    'config.imported': 'Imported',
+    'config.importFail': 'Import failed',
+    'config.resultProviders': 'Providers:',
+    'config.resultRouting': 'Routing rules:',
+    'config.resultFallbacks': 'Fallback policies:'
+});
 /* ═══════════════════════════════ Init ═══════════════════════════════ */
 
 document.addEventListener('DOMContentLoaded', function() {

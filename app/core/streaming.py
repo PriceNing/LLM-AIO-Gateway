@@ -20,6 +20,7 @@ _app_log = get_logger("app")
 _error_log = get_logger("error")
 
 RequestLogger = Callable[..., None]
+RequestDetailRecorder = Callable[..., None]
 RememberResponseChainKey = Callable[[str, str], None]
 RememberReasoningContent = Callable[[str, str, Any], None]
 
@@ -89,6 +90,7 @@ async def stream_internal_output(
     provider_id: str,
     requested_model: str,
     log_request: RequestLogger,
+    record_request_log: RequestDetailRecorder | None = None,
     previous_response_id: str | None = None,
     conv_key: str = "",
     remember_response_chain_key: RememberResponseChainKey | None = None,
@@ -100,6 +102,11 @@ async def stream_internal_output(
     final_provider_id = provider_id or ""
     visible_output_started = False
     stream_details: dict[str, Any] = {"stream": True, "fallback_status": "unused"}
+    streamed_text_parts: list[str] = []
+    streamed_reasoning_parts: list[str] = []
+    streamed_tool_calls: list[dict[str, Any]] = []
+    current_tool: dict[str, Any] | None = None
+    streamed_usage: dict[str, Any] = {}
     _app_log.debug(
         "[stream_orchestrator] START endpoint=%s provider=%s model=%s requested=%s conv_key=%s previous_response_id=%s",
         endpoint,
@@ -112,6 +119,7 @@ async def stream_internal_output(
 
     async def metered_events():
         nonlocal total_tokens, final_model, final_provider_id, visible_output_started, stream_details
+        nonlocal streamed_text_parts, streamed_reasoning_parts, streamed_tool_calls, current_tool, streamed_usage
         async for event in record_streaming_events(
             events,
             conv_key=conv_key,
@@ -136,11 +144,48 @@ async def stream_internal_output(
                 continue
             if event.kind == "usage":
                 total_tokens = event.usage.get("total_tokens", total_tokens) or total_tokens
+                streamed_usage.update(event.usage or {})
             if event.kind in ("text_delta", "reasoning_delta"):
                 if event.text or event.reasoning:
                     visible_output_started = True
-            elif event.kind in ("tool_call_start", "tool_call_arguments_delta", "tool_call_done", "message_done"):
+                if event.kind == "text_delta" and event.text:
+                    streamed_text_parts.append(event.text)
+                elif event.kind == "reasoning_delta" and event.reasoning:
+                    streamed_reasoning_parts.append(event.reasoning)
+            elif event.kind == "tool_call_start":
                 visible_output_started = True
+                if event.tool_call_id or event.name:
+                    current_tool = {
+                        "id": event.tool_call_id or "",
+                        "name": event.name or "",
+                        "arguments": "",
+                    }
+            elif event.kind == "tool_call_arguments_delta":
+                if current_tool is None:
+                    current_tool = {
+                        "id": event.tool_call_id or "",
+                        "name": event.name or "",
+                        "arguments": "",
+                    }
+                if event.name:
+                    current_tool["name"] = event.name
+                if event.tool_call_id:
+                    current_tool["id"] = event.tool_call_id
+                current_tool["arguments"] = event.arguments or (
+                    (current_tool.get("arguments") or "") + (event.arguments_delta or "")
+                )
+            elif event.kind == "tool_call_done" and current_tool is not None:
+                if event.name:
+                    current_tool["name"] = event.name
+                if event.tool_call_id:
+                    current_tool["id"] = event.tool_call_id
+                streamed_tool_calls.append(current_tool)
+                current_tool = None
+            elif event.kind == "message_done":
+                visible_output_started = True
+                if current_tool is not None:
+                    streamed_tool_calls.append(current_tool)
+                    current_tool = None
             yield event
 
     response_id = f"resp_{uuid.uuid4().hex}" if endpoint == "responses" else None
@@ -175,6 +220,20 @@ async def stream_internal_output(
             total_tokens,
             requested_model,
             details={**stream_details, "status": "ok", "partial_output": False},
+        )
+        _invoke_record_request_log(
+            record_request_log,
+            success=True,
+            status="ok",
+            tokens=total_tokens,
+            details={**stream_details, "partial_output": False},
+            streamed_text_parts=streamed_text_parts,
+            streamed_reasoning_parts=streamed_reasoning_parts,
+            streamed_tool_calls=streamed_tool_calls,
+            streamed_usage=streamed_usage,
+            final_model=final_model,
+            final_provider_id=final_provider_id,
+            visible_output_started=visible_output_started,
         )
         increment_global_stats(success=True)
         if username != "legacy":
@@ -224,6 +283,21 @@ async def stream_internal_output(
             requested_model,
             details=failure_details,
         )
+        _invoke_record_request_log(
+            record_request_log,
+            success=False,
+            status=failure_details.get("status", "fail"),
+            tokens=total_tokens,
+            details=failure_details,
+            streamed_text_parts=streamed_text_parts,
+            streamed_reasoning_parts=streamed_reasoning_parts,
+            streamed_tool_calls=streamed_tool_calls,
+            streamed_usage=streamed_usage,
+            final_model=logged_model,
+            final_provider_id=logged_provider,
+            visible_output_started=visible_output_started,
+            error_message=failure_details.get("error_message"),
+        )
         increment_global_stats(success=False)
         if username != "legacy":
             increment_user_usage(username, api_key_value, False, 0)
@@ -237,3 +311,40 @@ async def stream_internal_output(
         else:
             yield f"data: {json.dumps({'error': {'message': error_msg, 'type': 'server_error'}})}\n\n"
             yield "data: [DONE]\n\n"
+
+
+def _invoke_record_request_log(
+    recorder: RequestDetailRecorder | None,
+    *,
+    success: bool,
+    status: str,
+    tokens: int,
+    details: dict[str, Any],
+    streamed_text_parts: list[str],
+    streamed_reasoning_parts: list[str],
+    streamed_tool_calls: list[dict[str, Any]],
+    streamed_usage: dict[str, Any],
+    final_model: str,
+    final_provider_id: str,
+    visible_output_started: bool,
+    error_message: str | None = None,
+) -> None:
+    if recorder is None:
+        return
+    try:
+        recorder(
+            success=success,
+            status=status,
+            tokens=tokens,
+            details=details,
+            streamed_text="".join(streamed_text_parts),
+            streamed_reasoning="".join(streamed_reasoning_parts),
+            streamed_tool_calls=streamed_tool_calls,
+            usage=streamed_usage,
+            final_model=final_model,
+            final_provider_id=final_provider_id,
+            partial_output=visible_output_started,
+            error_message=error_message,
+        )
+    except Exception as exc:
+        _app_log.warning("record_request_log callback failed: %s", exc)

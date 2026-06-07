@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Optional
 from contextlib import contextmanager
 from app.db import fallback as fallback_db
+from app.db import request_logs as request_logs_db
 from app.db import routing as routing_db
 
 _lock = threading.Lock()
@@ -41,6 +42,7 @@ def init_db(path: Optional[str] = None) -> None:
             # Routing and fallback policy migrations.
             routing_db.migrate(conn)
             fallback_db.migrate(conn)
+            request_logs_db.migrate(conn)
         _initialized = True
 
 
@@ -228,6 +230,25 @@ CREATE TABLE IF NOT EXISTS request_records (
     tokens INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_req_ts ON request_records(timestamp);
+CREATE TABLE IF NOT EXISTS request_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    endpoint TEXT NOT NULL,
+    username TEXT NOT NULL DEFAULT '',
+    api_key TEXT NOT NULL DEFAULT '',
+    requested_model TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    provider TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT '',
+    stream INTEGER NOT NULL DEFAULT 0,
+    tokens INTEGER NOT NULL DEFAULT 0,
+    request_body TEXT,
+    response_body TEXT,
+    details TEXT NOT NULL DEFAULT '{}',
+    error TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_reqlog_ts ON request_logs(timestamp);
+CREATE INDEX IF NOT EXISTS idx_reqlog_endpoint ON request_logs(endpoint);
 """
 
 # -- Helpers --
@@ -1074,3 +1095,86 @@ def update_fallback_policy(policy_id: str, updates: dict) -> Optional[dict]:
 
 def delete_fallback_policy(policy_id: str) -> bool:
     return fallback_db.delete_fallback_policy(get_db, policy_id)
+
+
+# -- Request logs (full request/response viewer) --
+
+def add_request_log(
+    timestamp: str,
+    endpoint: str,
+    username: str,
+    api_key: str,
+    requested_model: str,
+    model: str,
+    provider: str,
+    status: str,
+    stream: bool,
+    tokens: int,
+    request_body=None,
+    response_body=None,
+    details: Optional[dict] = None,
+    error: Optional[str] = None,
+) -> int:
+    return request_logs_db.add_request_log(
+        get_db,
+        timestamp=timestamp,
+        endpoint=endpoint,
+        username=username,
+        api_key=api_key,
+        requested_model=requested_model,
+        model=model,
+        provider=provider,
+        status=status,
+        stream=stream,
+        tokens=tokens,
+        request_body=request_body,
+        response_body=response_body,
+        details=details,
+        error=error,
+    )
+
+
+def list_request_logs(
+    limit: int = 100,
+    offset: int = 0,
+    endpoint: Optional[str] = None,
+    username: Optional[str] = None,
+    status: Optional[str] = None,
+) -> list:
+    return request_logs_db.list_request_logs(
+        get_db,
+        limit=limit,
+        offset=offset,
+        endpoint=endpoint,
+        username=username,
+        status=status,
+    )
+
+
+def count_request_logs(
+    endpoint: Optional[str] = None,
+    username: Optional[str] = None,
+    status: Optional[str] = None,
+) -> int:
+    return request_logs_db.count_request_logs(
+        get_db,
+        endpoint=endpoint,
+        username=username,
+        status=status,
+    )
+
+
+def get_request_log(log_id: int) -> Optional[dict]:
+    return request_logs_db.get_request_log(get_db, log_id)
+
+
+def delete_request_log(log_id: int) -> bool:
+    return request_logs_db.delete_request_log(get_db, log_id)
+
+
+def clear_request_logs() -> int:
+    return request_logs_db.clear_request_logs(get_db)
+
+
+def trim_request_logs(keep: int) -> int:
+    return request_logs_db.trim_request_logs(get_db, keep)

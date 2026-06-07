@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException, Header
 from typing import Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from app.database import (
     get_providers, get_provider, add_provider, update_provider, delete_provider,
     get_users, get_user, add_user, update_user, delete_user,
@@ -17,7 +17,14 @@ from app.core.text import mask_key
 from app.router.auth import require_admin_session
 from app.services.discovery import refresh_provider_models, refresh_all_providers, check_provider_health, check_all_provider_health
 from app.services.lite_llm import get_available_models
-from app.router.proxy import get_request_log, get_model_stats, clear_request_log, get_timeline_data, get_model_distribution, get_timeline_model_data
+from app.router.proxy import (
+    get_request_log, get_model_stats, clear_request_log,
+    get_timeline_data, get_model_distribution, get_timeline_model_data,
+)
+from app.database import (
+    list_request_logs, count_request_logs, get_request_log as db_get_request_log,
+    delete_request_log as db_delete_request_log, clear_request_logs,
+)
 from app.services.logger import get_logger
 from app.models import ProviderCreate, ProviderUpdate, StatsResponse
 
@@ -480,3 +487,193 @@ async def toggle_model_preprocessor(body: dict, authorization: Optional[str] = H
                 (value, mid.model_name)
             )
     return {"model_id": model_id, "preprocessor": enabled}
+
+
+
+# -- Request/Response detail logs --
+
+_VALID_ENDPOINTS = {"chat_completions", "completions", "messages", "responses"}
+
+
+@router.get("/request-logs")
+async def list_request_logs_endpoint(
+    limit: int = 50,
+    offset: int = 0,
+    endpoint: Optional[str] = None,
+    username: Optional[str] = None,
+    status: Optional[str] = None,
+    authorization: Optional[str] = Header(None),
+):
+    await require_admin_session(authorization)
+    limit = max(1, min(int(limit), 200))
+    offset = max(0, int(offset))
+    if endpoint and endpoint not in _VALID_ENDPOINTS:
+        raise HTTPException(status_code=400, detail="invalid endpoint")
+    rows = list_request_logs(
+        limit=limit,
+        offset=offset,
+        endpoint=endpoint,
+        username=username,
+        status=status,
+    )
+    total = count_request_logs(endpoint=endpoint, username=username, status=status)
+    return {"items": rows, "total": total, "limit": limit, "offset": offset}
+
+
+@router.get("/request-logs/{log_id}")
+async def get_request_log_endpoint(log_id: int, authorization: Optional[str] = Header(None)):
+    await require_admin_session(authorization)
+    entry = db_get_request_log(int(log_id))
+    if not entry:
+        raise HTTPException(status_code=404, detail="request log not found")
+    return entry
+
+
+@router.delete("/request-logs/{log_id}")
+async def delete_request_log_endpoint(log_id: int, authorization: Optional[str] = Header(None)):
+    await require_admin_session(authorization)
+    if not db_delete_request_log(int(log_id)):
+        raise HTTPException(status_code=404, detail="request log not found")
+    return {"status": "deleted", "log_id": int(log_id)}
+
+
+@router.post("/request-logs/clear")
+async def clear_request_logs_endpoint(authorization: Optional[str] = Header(None)):
+    username = await require_admin_session(authorization)
+    removed = clear_request_logs()
+    _app_log.warning("Request logs cleared by admin '%s' (removed=%d)", username, removed)
+    return {"status": "ok", "removed": removed}
+
+
+# -- Config export / import --
+
+_CONFIG_VERSION = 1
+_IMPORT_MODES = {"skip", "replace", "merge"}
+
+
+def _export_config(include_secrets: bool) -> dict:
+    providers = get_providers()
+    if not include_secrets:
+        for p in providers:
+            p["api_key"] = ""
+            p.pop("extra_headers", None)
+    return {
+        "version": _CONFIG_VERSION,
+        "exported_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "include_secrets": include_secrets,
+        "providers": providers,
+        "routing_rules": get_routing_rules(),
+        "fallback_policies": get_fallback_policies(),
+    }
+
+
+@router.get("/config/export")
+async def export_config_endpoint(
+    include_secrets: bool = False,
+    authorization: Optional[str] = Header(None),
+):
+    await require_admin_session(authorization)
+    return _export_config(bool(include_secrets))
+
+
+def _validate_config_payload(payload) -> tuple[list, list, list]:
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="config must be a JSON object")
+    providers = payload.get("providers", [])
+    routing = payload.get("routing_rules", [])
+    fallbacks = payload.get("fallback_policies", [])
+    if not isinstance(providers, list):
+        raise HTTPException(status_code=400, detail="providers must be a list")
+    if not isinstance(routing, list):
+        raise HTTPException(status_code=400, detail="routing_rules must be a list")
+    if not isinstance(fallbacks, list):
+        raise HTTPException(status_code=400, detail="fallback_policies must be a list")
+    for entry in providers:
+        if not isinstance(entry, dict) or not entry.get("id"):
+            raise HTTPException(status_code=400, detail="each provider must be an object with id")
+    for entry in routing:
+        if not isinstance(entry, dict) or not entry.get("id"):
+            raise HTTPException(status_code=400, detail="each routing_rule must be an object with id")
+    for entry in fallbacks:
+        if not isinstance(entry, dict) or not entry.get("id"):
+            raise HTTPException(status_code=400, detail="each fallback_policy must be an object with id")
+    return providers, routing, fallbacks
+
+
+def _import_provider(entry: dict, mode: str) -> str:
+    """Return one of 'created', 'updated', 'skipped'."""
+    pid = str(entry.get("id") or "").strip()
+    if not pid:
+        return "skipped"
+    existing = get_provider(pid)
+    payload = dict(entry)
+    if not payload.get("api_key"):
+        payload.pop("api_key", None)
+    if mode == "skip" and existing:
+        return "skipped"
+    if mode == "merge" and existing:
+        merged = {**existing, **{k: v for k, v in payload.items() if v not in (None, "", [], {})}}
+        update_provider(pid, merged)
+        return "updated"
+    if existing:
+        update_provider(pid, payload)
+        return "updated"
+    add_provider(payload)
+    return "created"
+
+
+def _import_routing_rule(entry: dict, mode: str) -> str:
+    rid = str(entry.get("id") or "").strip()
+    if not rid:
+        return "skipped"
+    existing = get_routing_rule(rid)
+    payload = {k: entry.get(k) for k in (
+        "name", "enabled", "username", "api_key_pattern", "match_model", "target_model", "target_provider"
+    ) if k in entry}
+    if mode == "skip" and existing:
+        return "skipped"
+    if existing:
+        update_routing_rule(rid, payload)
+        return "updated"
+    add_routing_rule({**payload, "id": rid})
+    return "created"
+
+
+def _import_fallback_policy(entry: dict, mode: str) -> str:
+    pid = str(entry.get("id") or "").strip()
+    if not pid:
+        return "skipped"
+    existing = get_fallback_policy(pid)
+    payload = {k: entry.get(k) for k in (
+        "name", "enabled", "match_provider", "match_model", "triggers", "chain"
+    ) if k in entry}
+    if mode == "skip" and existing:
+        return "skipped"
+    if existing:
+        update_fallback_policy(pid, payload)
+        return "updated"
+    add_fallback_policy({**payload, "id": pid})
+    return "created"
+
+
+@router.post("/config/import")
+async def import_config_endpoint(payload: dict, authorization: Optional[str] = Header(None)):
+    username = await require_admin_session(authorization)
+    mode = str(payload.get("mode") or "skip").lower()
+    if mode not in _IMPORT_MODES:
+        raise HTTPException(status_code=400, detail=f"mode must be one of {sorted(_IMPORT_MODES)}")
+    providers, routing, fallbacks = _validate_config_payload(payload)
+
+    summary = {"providers": {}, "routing_rules": {}, "fallback_policies": {}}
+    for entry in providers:
+        outcome = _import_provider(entry, mode)
+        summary["providers"][outcome] = summary["providers"].get(outcome, 0) + 1
+    for entry in routing:
+        outcome = _import_routing_rule(entry, mode)
+        summary["routing_rules"][outcome] = summary["routing_rules"].get(outcome, 0) + 1
+    for entry in fallbacks:
+        outcome = _import_fallback_policy(entry, mode)
+        summary["fallback_policies"][outcome] = summary["fallback_policies"].get(outcome, 0) + 1
+
+    _app_log.info("Config imported by '%s' mode=%s summary=%s", username, mode, summary)
+    return {"status": "ok", "mode": mode, "summary": summary}

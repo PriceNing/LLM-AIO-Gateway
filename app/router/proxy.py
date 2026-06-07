@@ -12,7 +12,7 @@ from fastapi.responses import StreamingResponse
 from app.database import (
     get_providers, find_user_by_api_key,
     increment_global_stats, increment_user_usage, get_db,
-    parse_model_id, add_request_record, get_enabled_preprocessor,
+    parse_model_id, add_request_record, add_request_log, trim_request_logs, get_enabled_preprocessor,
 )
 from app.core.text import friendly_error_msg, mask_key
 from app.core.output import InternalOutputEvent
@@ -869,6 +869,7 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
                     provider_id=adapter_provider_id,
                     requested_model=requested_model,
                     log_request=_log_request,
+                    record_request_log=_build_stream_recorder("chat_completions", username, api_key_value, requested_model, body),
                     conv_key=conv_key,
                     remember_reasoning_content=_remember_reasoning_content,
                     tool_only_turns=_tool_only_turns,
@@ -896,11 +897,20 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
         else:
             _tool_only_turns.reset(conv_key)
 
+        rendered = render_chat_completion(output, model=model)
+        _record_request_log(
+            endpoint="chat_completions",
+            username=username, api_key_value=api_key_value, requested_model=requested_model,
+            final_model=model, final_provider=adapter_provider_id or "",
+            request_body=body, response_body=rendered,
+            success=True, status="ok", tokens=output.usage.get("total_tokens", 0),
+            usage=output.usage,
+        )
         _log_request(username, api_key_value, model, adapter_provider_id or "", "chat_completions", True, output.usage.get("total_tokens", 0), requested_model)
         increment_global_stats(success=True)
         if username != "legacy":
             increment_user_usage(username, api_key_value, True, output.usage.get("total_tokens", 0))
-        return render_chat_completion(output, model=model)
+        return rendered
     except Exception as e:
         _error_log.error("[chat] %s", str(e))
         details = _request_details_from_exception(
@@ -910,6 +920,15 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
             attempted_provider=getattr(e, "attempted_provider", None) or provider_id or "",
         )
         _log_request(username, api_key_value, details.get("attempted_model") or requested_model, details.get("attempted_provider") or provider_id or "", "chat_completions", False, 0, requested_model, details=details)
+        _record_request_log(
+            endpoint="chat_completions",
+            username=username, api_key_value=api_key_value, requested_model=requested_model,
+            final_model=details.get("attempted_model") or requested_model,
+            final_provider=details.get("attempted_provider") or provider_id or "",
+            request_body=body, response_body=None,
+            success=False, status=details.get("status", "fail"),
+            tokens=0, details=details, error_message=friendly_error_msg(e),
+        )
         increment_global_stats(success=False)
         if username != "legacy":
             increment_user_usage(username, api_key_value, False, 0)
@@ -972,6 +991,7 @@ async def completions(request: Request, authorization: Optional[str] = Header(No
                     provider_id=adapter_provider_id,
                     requested_model=requested_model,
                     log_request=_log_request,
+                    record_request_log=_build_stream_recorder("completions", username, api_key_value, requested_model, body),
                     conv_key=conv_key,
                 ),
                 media_type="text/event-stream"
@@ -986,12 +1006,20 @@ async def completions(request: Request, authorization: Optional[str] = Header(No
         )
         model = internal.target_model
         provider_id = internal.provider_id
+        rendered = render_completion(output, model=model)
         _log_request(username, api_key_value, model, adapter_provider_id or "", "completions", True, output.usage.get("total_tokens", 0), requested_model)
-    
+        _record_request_log(
+            endpoint="completions",
+            username=username, api_key_value=api_key_value, requested_model=requested_model,
+            final_model=model, final_provider=adapter_provider_id or "",
+            request_body=body, response_body=rendered,
+            success=True, status="ok", tokens=output.usage.get("total_tokens", 0),
+            usage=output.usage,
+        )
         increment_global_stats(success=True)
         if username != "legacy":
             increment_user_usage(username, api_key_value, True, output.usage.get("total_tokens", 0))
-        return render_completion(output, model=model)
+        return rendered
     except Exception as e:
         details = _request_details_from_exception(
             e,
@@ -1000,7 +1028,15 @@ async def completions(request: Request, authorization: Optional[str] = Header(No
             attempted_provider=getattr(e, "attempted_provider", None) or provider_id or "",
         )
         _log_request(username, api_key_value, details.get("attempted_model") or model or requested_model, details.get("attempted_provider") or provider_id or "", "completions", False, 0, requested_model, details=details)
-
+        _record_request_log(
+            endpoint="completions",
+            username=username, api_key_value=api_key_value, requested_model=requested_model,
+            final_model=details.get("attempted_model") or model or requested_model,
+            final_provider=details.get("attempted_provider") or provider_id or "",
+            request_body=body, response_body=None,
+            success=False, status=details.get("status", "fail"),
+            tokens=0, details=details, error_message=friendly_error_msg(e),
+        )
         increment_global_stats(success=False)
         if username != "legacy":
             increment_user_usage(username, api_key_value, False, 0)
@@ -1081,6 +1117,7 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
                     provider_id=adapter_provider_id,
                     requested_model=requested_model,
                     log_request=_log_request,
+                    record_request_log=_build_stream_recorder("messages", username, api_key_value, requested_model, body),
                     conv_key=conv_key,
                     remember_reasoning_content=_remember_reasoning_content,
                 ),
@@ -1101,11 +1138,20 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
             _app_log.debug("[messages_nonstream] STORED rc key=%s len=%d cache_hit=%d cache_miss=%d",
                           conv_key[:60], len(output.reasoning),
                           output.usage.get("prompt_cache_hit_tokens", 0), output.usage.get("prompt_cache_miss_tokens", 0))
+        rendered = render_anthropic_message(output, model=model)
         _log_request(username, api_key_value, model, adapter_provider_id, "messages", True, output.usage.get("total_tokens", 0), requested_model)
+        _record_request_log(
+            endpoint="messages",
+            username=username, api_key_value=api_key_value, requested_model=requested_model,
+            final_model=model, final_provider=adapter_provider_id,
+            request_body=body, response_body=rendered,
+            success=True, status="ok", tokens=output.usage.get("total_tokens", 0),
+            usage=output.usage,
+        )
         increment_global_stats(success=True)
         if username != "legacy":
             increment_user_usage(username, api_key_value, True, output.usage.get("total_tokens", 0))
-        return render_anthropic_message(output, model=model)
+        return rendered
     except Exception as e:
         details = _request_details_from_exception(
             e,
@@ -1114,6 +1160,15 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
             attempted_provider=getattr(e, "attempted_provider", None) or adapter_provider_id or provider_id or "",
         )
         _log_request(username, api_key_value, details.get("attempted_model") or model or requested_model, details.get("attempted_provider") or adapter_provider_id or "", "messages", False, 0, requested_model, details=details)
+        _record_request_log(
+            endpoint="messages",
+            username=username, api_key_value=api_key_value, requested_model=requested_model,
+            final_model=details.get("attempted_model") or model or requested_model,
+            final_provider=details.get("attempted_provider") or adapter_provider_id or "",
+            request_body=body, response_body=None,
+            success=False, status=details.get("status", "fail"),
+            tokens=0, details=details, error_message=friendly_error_msg(e),
+        )
         increment_global_stats(success=False)
         if username != "legacy":
             increment_user_usage(username, api_key_value, False, 0)
@@ -1219,6 +1274,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                     provider_id=adapter_provider_id,
                     requested_model=requested_model,
                     log_request=_log_request,
+                    record_request_log=_build_stream_recorder("responses", username, api_key_value, requested_model, body),
                     previous_response_id=previous_response_id,
                     conv_key=conv_key,
                     remember_response_chain_key=_remember_response_chain_key,
@@ -1245,11 +1301,20 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
 
         resp_id = f"resp_{uuid.uuid4().hex}"
         _remember_response_chain_key(resp_id, conv_key)
+        rendered = render_response(output, model=model, previous_response_id=previous_response_id, response_id=resp_id)
         _log_request(username, api_key_value, model, adapter_provider_id, "responses", True, output.usage.get("total_tokens", 0), requested_model)
+        _record_request_log(
+            endpoint="responses",
+            username=username, api_key_value=api_key_value, requested_model=requested_model,
+            final_model=model, final_provider=adapter_provider_id,
+            request_body=body, response_body=rendered,
+            success=True, status="ok", tokens=output.usage.get("total_tokens", 0),
+            usage=output.usage, details={"response_id": resp_id},
+        )
         increment_global_stats(success=True)
         if username != "legacy":
             increment_user_usage(username, api_key_value, True, output.usage.get("total_tokens", 0))
-        return render_response(output, model=model, previous_response_id=previous_response_id, response_id=resp_id)
+        return rendered
     except Exception as e:
         details = _request_details_from_exception(
             e,
@@ -1258,8 +1323,192 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
             attempted_provider=getattr(e, "attempted_provider", None) or provider_for_log(provider_info, provider_id),
         )
         _log_request(username, api_key_value, details.get("attempted_model") or model or requested_model, details.get("attempted_provider") or provider_for_log(provider_info, provider_id), "responses", False, 0, requested_model, details=details)
+        _record_request_log(
+            endpoint="responses",
+            username=username, api_key_value=api_key_value, requested_model=requested_model,
+            final_model=details.get("attempted_model") or model or requested_model,
+            final_provider=details.get("attempted_provider") or provider_for_log(provider_info, provider_id),
+            request_body=body, response_body=None,
+            success=False, status=details.get("status", "fail"),
+            tokens=0, details=details, error_message=friendly_error_msg(e),
+        )
         increment_global_stats(success=False)
         if username != "legacy":
             increment_user_usage(username, api_key_value, False, 0)
         _error_log.error("FAILED: %s", str(e))
         raise HTTPException(status_code=500, detail=friendly_error_msg(e))
+
+
+# -- Request/Response detail log recorder --
+_PAYLOAD_MAX_BYTES = 64 * 1024
+_STREAMED_TEXT_MAX = 16 * 1024
+_STREAMED_REASONING_MAX = 16 * 1024
+_STREAMED_TOOL_MAX = 8
+
+def _truncate_payload(value, max_bytes=_PAYLOAD_MAX_BYTES):
+    if value is None:
+        return None
+    try:
+        encoded = json.dumps(value, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        encoded = repr(value)
+    if len(encoded.encode('utf-8')) <= max_bytes:
+        return value
+    truncated = encoded.encode('utf-8')[:max_bytes].decode('utf-8', errors='ignore')
+    return {'_truncated': True, 'original_bytes': len(encoded.encode('utf-8')), 'data': truncated + '...'}
+
+def _compact_text(value, max_chars):
+    if value is None:
+        return None
+    if len(value) <= max_chars:
+        return value
+    return value[:max_chars] + '...'
+
+
+def _request_log_response_body(
+    *,
+    endpoint,
+    final_model,
+    response_body=None,
+    streamed_text=None,
+    streamed_reasoning=None,
+    streamed_tool_calls=None,
+    usage=None,
+    success,
+    status,
+    error_message=None,
+):
+    if response_body is not None:
+        return response_body
+    if streamed_text is not None or streamed_reasoning is not None or streamed_tool_calls is not None:
+        return {
+            'type': 'stream_summary',
+            'endpoint': endpoint,
+            'status': status,
+            'model': final_model or '',
+            'text': _compact_text(streamed_text or '', _STREAMED_TEXT_MAX),
+            'reasoning': _compact_text(streamed_reasoning or '', _STREAMED_REASONING_MAX),
+            'tool_calls': (streamed_tool_calls or [])[:_STREAMED_TOOL_MAX],
+            'usage': usage or {},
+        }
+    if not success or error_message:
+        return {
+            'error': {
+                'message': error_message or 'request failed',
+                'type': 'server_error',
+            },
+            'status': status,
+            'model': final_model or '',
+        }
+    return None
+
+
+def _record_request_log(
+    *,
+    endpoint,
+    username,
+    api_key_value,
+    requested_model,
+    final_model,
+    final_provider,
+    request_body,
+    response_body=None,
+    streamed_text=None,
+    streamed_reasoning=None,
+    streamed_tool_calls=None,
+    usage=None,
+    success,
+    status,
+    tokens,
+    details=None,
+    partial_output=False,
+    error_message=None,
+):
+    payload_details = dict(details or {})
+    if usage and 'usage' not in payload_details:
+        payload_details['usage'] = usage
+    if streamed_text is not None:
+        compact = _compact_text(streamed_text, _STREAMED_TEXT_MAX)
+        payload_details['streamed_text'] = compact
+        if compact != streamed_text:
+            payload_details['streamed_text_truncated'] = True
+    if streamed_reasoning is not None:
+        compact = _compact_text(streamed_reasoning, _STREAMED_REASONING_MAX)
+        payload_details['streamed_reasoning'] = compact
+        if compact != streamed_reasoning:
+            payload_details['streamed_reasoning_truncated'] = True
+    if streamed_tool_calls is not None:
+        if len(streamed_tool_calls) > _STREAMED_TOOL_MAX:
+            payload_details['streamed_tool_calls'] = streamed_tool_calls[:_STREAMED_TOOL_MAX]
+            payload_details['streamed_tool_calls_truncated'] = True
+        else:
+            payload_details['streamed_tool_calls'] = streamed_tool_calls
+    if partial_output and 'partial_output' not in payload_details:
+        payload_details['partial_output'] = True
+    if error_message and 'error_message' not in payload_details:
+        payload_details['error_message'] = error_message
+    final_response_body = _request_log_response_body(
+        endpoint=endpoint,
+        final_model=final_model,
+        response_body=response_body,
+        streamed_text=streamed_text,
+        streamed_reasoning=streamed_reasoning,
+        streamed_tool_calls=streamed_tool_calls,
+        usage=usage,
+        success=success,
+        status=status,
+        error_message=error_message,
+    )
+    try:
+        add_request_log(
+            timestamp=time.strftime('%Y-%m-%d %H:%M:%S'),
+            endpoint=endpoint,
+            username=username or '',
+            api_key=mask_key(api_key_value or ''),
+            requested_model=requested_model or '',
+            model=final_model or '',
+            provider=final_provider or '',
+            status=status,
+            stream=response_body is None and (streamed_text is not None or streamed_reasoning is not None or streamed_tool_calls is not None),
+            tokens=int(tokens or 0),
+            request_body=_truncate_payload(request_body),
+            response_body=_truncate_payload(final_response_body),
+            details=payload_details,
+            error=(error_message or ''),
+        )
+    except Exception as exc:
+        _app_log.warning('add_request_log failed: %s', exc)
+    try:
+        trim_request_logs(get_default('request_log_max', 500))
+    except Exception as exc:
+        _app_log.warning('trim_request_logs failed: %s', exc)
+
+def _build_stream_recorder(
+    endpoint,
+    username,
+    api_key_value,
+    requested_model,
+    request_body,
+):
+    def _record(**payload):
+        _record_request_log(
+            endpoint=endpoint,
+            username=username,
+            api_key_value=api_key_value,
+            requested_model=requested_model,
+            final_model=payload.get('final_model') or '',
+            final_provider=payload.get('final_provider_id') or '',
+            request_body=request_body,
+            response_body=None,
+            streamed_text=payload.get('streamed_text'),
+            streamed_reasoning=payload.get('streamed_reasoning'),
+            streamed_tool_calls=payload.get('streamed_tool_calls') or [],
+            usage=payload.get('usage') or {},
+            success=payload.get('success', True),
+            status=payload.get('status', 'ok'),
+            tokens=payload.get('tokens', 0),
+            details=payload.get('details') or {},
+            partial_output=payload.get('partial_output', False),
+            error_message=payload.get('error_message'),
+        )
+    return _record

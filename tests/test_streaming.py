@@ -296,3 +296,49 @@ async def test_stream_internal_output_logs_partial_failure_after_visible_output(
     assert logged["details"]["status"] == "partial"
     assert logged["details"]["partial_output"] is True
     assert logged["details"]["fallback_status"] == "skipped"
+
+
+@pytest.mark.asyncio
+async def test_stream_internal_output_records_tool_arguments_for_request_log():
+    recorded = {}
+
+    def fake_log(user, key, model, provider, endpoint, success, tokens, requested, **kwargs):
+        pass
+
+    def fake_record(**kwargs):
+        recorded.update(kwargs)
+
+    async def _events():
+        yield InternalOutputEvent(kind="tool_call_start", tool_call_id="call_1", name="lookup")
+        yield InternalOutputEvent(
+            kind="tool_call_arguments_delta",
+            tool_call_id="call_1",
+            name="lookup",
+            arguments_delta='{"q"',
+        )
+        yield InternalOutputEvent(
+            kind="tool_call_arguments_delta",
+            tool_call_id="call_1",
+            name="lookup",
+            arguments_delta=':"x"}',
+        )
+        yield InternalOutputEvent(kind="tool_call_done", tool_call_id="call_1", name="lookup")
+        yield InternalOutputEvent(kind="message_done", finish_reason="tool_calls")
+
+    async for _ in stream_internal_output(
+        events=_events(),
+        endpoint="chat_completions",
+        model="test-model",
+        username="u",
+        api_key_value="k",
+        provider_id="p",
+        requested_model="test-model",
+        log_request=fake_log,
+        record_request_log=fake_record,
+        conv_key="conv-tools",
+    ):
+        pass
+
+    assert recorded["streamed_tool_calls"] == [
+        {"id": "call_1", "name": "lookup", "arguments": '{"q":"x"}'}
+    ]

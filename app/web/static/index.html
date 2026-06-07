@@ -79,6 +79,12 @@
                 <button class="nav-btn" onclick="showSection('stats', event)" data-section="stats">
                     <span class="nav-icon">&#128200;</span><span data-i18n="nav.stats">统计</span>
                 </button>
+                <button class="nav-btn" onclick="showSection('request-logs', event)" data-section="request-logs">
+                    <span class="nav-icon">&#128203;</span><span data-i18n="nav.requestLogs">请求日志</span>
+                </button>
+                <button class="nav-btn" onclick="showSection('config', event)" data-section="config">
+                    <span class="nav-icon">&#128190;</span><span data-i18n="nav.config">配置导入/导出</span>
+                </button>
             </aside>
 
             <!-- Content -->
@@ -148,6 +154,72 @@
                         <h2 data-i18n="preprocessors.title">视觉模型注入</h2>
                     </div>
                     <div id="preprocessorsContent" class="preprocessors-grid"></div>
+                </div>
+
+                <!-- Request Logs -->
+                <div id="request-logs-section" class="section" style="display:none;">
+                    <div class="section-header">
+                        <h2 data-i18n="logs.title">请求/响应日志</h2>
+                        <div class="section-actions">
+                            <select id="logEndpointFilter" class="select-input" onchange="loadRequestLogs()">
+                                <option value="" data-i18n="logs.allEndpoints">全部端点</option>
+                                <option value="chat_completions">chat_completions</option>
+                                <option value="completions">completions</option>
+                                <option value="messages">messages</option>
+                                <option value="responses">responses</option>
+                            </select>
+                            <input type="text" id="logUsernameFilter" class="text-input" data-i18n-placeholder="logs.filterUser" placeholder="按用户名筛选" oninput="onLogFilterInput()">
+                            <select id="logStatusFilter" class="select-input" onchange="loadRequestLogs()">
+                                <option value="" data-i18n="logs.allStatus">全部状态</option>
+                                <option value="ok">ok</option>
+                                <option value="partial">partial</option>
+                                <option value="fail">fail</option>
+                            </select>
+                            <button class="btn btn-secondary" onclick="loadRequestLogs()" data-i18n="logs.refresh">刷新</button>
+                            <button class="btn btn-danger" onclick="confirmClearRequestLogs()" data-i18n="logs.clear">清空</button>
+                        </div>
+                    </div>
+                    <div id="requestLogsContent"></div>
+                </div>
+
+                <!-- Config import/export -->
+                <div id="config-section" class="section" style="display:none;">
+                    <div class="section-header">
+                        <h2 data-i18n="config.title">配置导入/导出</h2>
+                    </div>
+                    <div class="config-grid">
+                        <div class="config-card glass">
+                            <h3 data-i18n="config.exportTitle">导出配置</h3>
+                            <p class="muted" data-i18n="config.exportHint">生成 providers / routing rules / fallback policies 的 JSON 备份。</p>
+                            <div class="form-row">
+                                <label class="checkbox">
+                                    <input type="checkbox" id="exportIncludeSecrets"> <span data-i18n="config.includeSecrets">包含 api_key（明文）</span>
+                                </label>
+                            </div>
+                            <div class="form-row">
+                                <button class="btn btn-primary" onclick="exportConfig()" data-i18n="config.export">下载 JSON</button>
+                            </div>
+                        </div>
+                        <div class="config-card glass">
+                            <h3 data-i18n="config.importTitle">导入配置</h3>
+                            <p class="muted" data-i18n="config.importHint">上传之前导出的 JSON 文件，可选择 skip / replace / merge 冲突策略。</p>
+                            <div class="form-row">
+                                <input type="file" id="configFileInput" accept="application/json,.json">
+                            </div>
+                            <div class="form-row">
+                                <label data-i18n="config.mode">冲突策略</label>
+                                <select id="configImportMode" class="select-input">
+                                    <option value="skip" data-i18n="config.modeSkip">skip (保留现有)</option>
+                                    <option value="replace" data-i18n="config.modeReplace">replace (覆盖)</option>
+                                    <option value="merge" data-i18n="config.modeMerge">merge (仅更新非空字段)</option>
+                                </select>
+                            </div>
+                            <div class="form-row">
+                                <button class="btn btn-primary" onclick="importConfig()" data-i18n="config.import">导入</button>
+                            </div>
+                            <div id="configImportResult" class="config-result"></div>
+                        </div>
+                    </div>
                 </div>
             </main>
         </div>
