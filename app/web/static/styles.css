@@ -289,6 +289,14 @@ body {
   font-size: 18px;
   backdrop-filter: blur(8px);
 }
+a.icon-btn { text-decoration: none; }
+.github-link {
+  width: auto;
+  padding: 0 12px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0;
+}
 .icon-btn:hover {
   background: var(--bg-surface-hover);
   border-color: var(--accent);

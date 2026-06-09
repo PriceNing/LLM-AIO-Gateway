@@ -6,6 +6,7 @@ const API_BASE = '';
 const SESSION_KEY = 'llm_gateway_admin_session';
 const LANG_KEY = 'llm_gateway_lang';
 const THEME_KEY = 'llm_gateway_theme';
+const SESSION_EXPIRED_EVENT = 'llm-gateway-session-expired';
 
 let authMode = 'login';
 let providers = [];
@@ -13,6 +14,7 @@ let models = [];
 let allModels = [];
 let users = [];
 let currentLang = localStorage.getItem(LANG_KEY) || 'zh';
+let sessionExpiredShown = false;
 window._requestLogDetails = [];
 
 /* ═══════════════════════════════ i18n ═══════════════════════════════ */
@@ -38,9 +40,11 @@ zh: {
     'nav.stats': '统计',
     'nav.preprocessors': '视觉模型注入',
     'nav.logout': '退出',
+    'nav.github': 'GitHub 项目地址',
     'nav.switchLang': '切换语言',
     'nav.switchTheme': '切换主题',
     'nav.changePassword': '修改密码',
+    'auth.expired': '登录已过期，请重新登录',
 
     'password.title': '修改密码',
     'password.current': '当前密码',
@@ -323,9 +327,11 @@ en: {
     'nav.stats': 'Stats',
     'nav.preprocessors': 'Vision Model Injection',
     'nav.logout': 'Logout',
+    'nav.github': 'GitHub Project',
     'nav.switchLang': 'Switch Language',
     'nav.switchTheme': 'Toggle Theme',
     'nav.changePassword': 'Change Password',
+    'auth.expired': 'Your session has expired. Please log in again.',
 
     'password.title': 'Change Password',
     'password.current': 'Current Password',
@@ -762,8 +768,34 @@ async function api(path, options) {
         headers: Object.assign({}, getHeaders(), options.headers || {})
     }));
     const data = await res.json().catch(function() { return {}; });
+    if (res.status === 401 && isSessionAuthError(data.detail)) handleSessionExpired();
     if (!res.ok) throw new Error(data.detail || 'HTTP ' + res.status);
     return data;
+}
+
+function isSessionAuthError(detail) {
+    return detail === 'Missing session token'
+        || detail === 'Invalid or expired session'
+        || detail === 'Admin disabled';
+}
+
+function handleSessionExpired() {
+    if (!getToken()) return;
+    localStorage.removeItem(SESSION_KEY);
+    if (sessionExpiredShown) return;
+    sessionExpiredShown = true;
+    window.dispatchEvent(new CustomEvent(SESSION_EXPIRED_EVENT));
+}
+
+function showAuthView(message) {
+    stopStatsTimer();
+    closeModal();
+    document.getElementById('appView').style.display = 'none';
+    document.getElementById('authView').style.display = 'flex';
+    document.getElementById('adminPassword').value = '';
+    document.getElementById('adminPassword').focus();
+    updateAuthHint();
+    if (message) toast(message, 'error');
 }
 
 function updateAuthHint() {
@@ -813,6 +845,7 @@ async function submitAuth() {
 }
 
 function enterApp(admin) {
+    sessionExpiredShown = false;
     document.getElementById('authView').style.display = 'none';
     document.getElementById('appView').style.display = 'block';
     document.getElementById('currentAdmin').textContent = admin.display_name || admin.username;
@@ -2907,7 +2940,17 @@ async function exportConfig() {
         var r = await fetch('/admin/config/export?include_secrets=' + (include ? 'true' : 'false'), {
             headers: { 'Authorization': 'Bearer ' + localStorage.getItem(SESSION_KEY) }
         });
-        if (!r.ok) throw new Error(await r.text());
+        if (r.status === 401) {
+            var errData = await r.json().catch(function() { return {}; });
+            if (isSessionAuthError(errData.detail)) {
+                handleSessionExpired();
+                return;
+            }
+            throw new Error(errData.detail || 'HTTP ' + r.status);
+        }
+        if (!r.ok) {
+            throw new Error(await r.text());
+        }
         var blob = await r.blob();
         var url = URL.createObjectURL(blob);
         var a = document.createElement('a');
@@ -3066,6 +3109,9 @@ Object.assign(I18N.en, {
 document.addEventListener('DOMContentLoaded', function() {
     initTheme();
     applyI18n();
+    window.addEventListener(SESSION_EXPIRED_EVENT, function() {
+        showAuthView(t('auth.expired'));
+    });
     initAuth().catch(function(err) {
         toast(t('auth.initFail') + ': ' + err.message, 'error');
     });
