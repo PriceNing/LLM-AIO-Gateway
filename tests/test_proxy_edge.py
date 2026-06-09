@@ -268,6 +268,27 @@ def test_fallback_policy_matches_current_target(temp_db):
     assert decision.chain[1].model == "fallback-b"
 
 
+def test_fallback_policy_prefers_specific_model_over_wildcard(temp_db):
+    from app.core.policy import apply_fallback_policy
+    from app.database import add_fallback_policy
+    add_fallback_policy({
+        "name": "wildcard-fallback", "enabled": True,
+        "match_provider": "primary-provider", "match_model": "*",
+        "chain": [{"model": "wildcard-backup", "provider_id": "backup-provider"}],
+    })
+    add_fallback_policy({
+        "name": "specific-fallback", "enabled": True,
+        "match_provider": "primary-provider", "match_model": "gpt-5.5",
+        "chain": [{"model": "specific-backup", "provider_id": "backup-provider"}],
+    })
+
+    decision = apply_fallback_policy("primary-provider", "gpt-5.5", "http_5xx")
+
+    assert decision.matched is True
+    assert decision.policy_name == "specific-fallback"
+    assert decision.chain[0].model == "specific-backup"
+
+
 def test_routing_rules_do_not_carry_fallback_chain(temp_db):
     from app.database import add_routing_rule
     add_routing_rule({

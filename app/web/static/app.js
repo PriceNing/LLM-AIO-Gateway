@@ -1125,8 +1125,14 @@ function renderRoutingRules() {
     }).join('');
 }
 
-function modelSelectHtml(id, selected, includeWildcard) {
-    var models = (allModels || []).map(function(m) { return m.id; });
+function modelsForProvider(providerId) {
+    return (allModels || []).filter(function(m) {
+        return !providerId || m.provider === providerId;
+    }).map(function(m) { return m.id; });
+}
+
+function modelSelectHtml(id, selected, includeWildcard, providerId) {
+    var models = modelsForProvider(providerId || '');
     var opts = includeWildcard ? '<option value="*">* (' + t('routing.matchModelHint') + ')</option>' : '<option value="">--</option>';
     var found = selected === '*' || selected === '';
     for (var i = 0; i < models.length; i++) {
@@ -1135,20 +1141,47 @@ function modelSelectHtml(id, selected, includeWildcard) {
         opts += '<option value="' + escHtml(models[i]) + '"' + sel + '>' + escHtml(models[i]) + '</option>';
     }
     // Preserve custom values (e.g. wildcards) when editing
-    if (selected && !found) {
+    if (selected && !found && !providerId) {
         opts += '<option value="' + escHtml(selected) + '" selected>' + escHtml(selected) + '</option>';
     }
     return '<select id="' + id + '" style="width:100%">' + opts + '</select>';
 }
 
-function providerSelectHtml(id, selected) {
+function providerSelectHtml(id, selected, onchange) {
     var provs = (providers || []).map(function(p) { return p.id; });
     var opts = '<option value="">' + t('routing.targetProvider') + '</option>';
     for (var i = 0; i < provs.length; i++) {
         var sel = provs[i] === selected ? ' selected' : '';
         opts += '<option value="' + escHtml(provs[i]) + '"' + sel + '>' + escHtml(provs[i]) + '</option>';
     }
-    return '<select id="' + id + '" style="width:100%">' + opts + '</select>';
+    var handler = onchange ? ' onchange="' + onchange + '"' : '';
+    return '<select id="' + id + '" style="width:100%"' + handler + '>' + opts + '</select>';
+}
+
+function refreshModelSelectForProvider(modelSelectId, providerSelectId) {
+    var modelSelect = document.getElementById(modelSelectId);
+    var providerSelect = document.getElementById(providerSelectId);
+    if (!modelSelect || !providerSelect) return;
+    var current = modelSelect.value;
+    var providerId = providerSelect.value.trim();
+    var replacement = document.createElement('div');
+    replacement.innerHTML = modelSelectHtml(modelSelectId, current, false, providerId);
+    modelSelect.replaceWith(replacement.firstChild);
+}
+
+function refreshFallbackMatchModelsForProvider() {
+    var providerSelect = document.getElementById('fallbackMatchProvider');
+    var modelInput = document.getElementById('fallbackMatchModel');
+    var providerId = providerSelect ? providerSelect.value.trim() : '';
+    if (modelInput && providerId) {
+        var selectedModel = modelInput.value.trim();
+        var providerModels = modelsForProvider(providerId);
+        var knownModels = (allModels || []).map(function(m) { return m.id; });
+        if (selectedModel && knownModels.indexOf(selectedModel) !== -1 && providerModels.indexOf(selectedModel) === -1) {
+            modelInput.value = '';
+        }
+    }
+    populateFallbackModelDatalist(providerId);
 }
 
 function userSelectHtml(id, selected) {
@@ -1192,9 +1225,9 @@ function routingFormHtml(title, rule) {
             '<input type="text" id="ruleMatchModel" list="matchModelList" value="' + escHtml(rule.match_model || '') + '" placeholder="*">' +
             '<datalist id="matchModelList"></datalist></div>' +
         '<div class="form-group"><label>' + t('routing.targetModel') + '</label>' +
-            modelSelectHtml('ruleTargetModel', rule.target_model || '', false) + '</div>' +
+            modelSelectHtml('ruleTargetModel', rule.target_model || '', false, rule.target_provider || '') + '</div>' +
         '<div class="form-group"><label>' + t('routing.targetProvider') + '</label>' +
-            providerSelectHtml('ruleTargetProvider', rule.target_provider || '') + '</div>' +
+            providerSelectHtml('ruleTargetProvider', rule.target_provider || '', "refreshModelSelectForProvider('ruleTargetModel','ruleTargetProvider')") + '</div>' +
         '<div class="form-actions">' +
             '<button class="btn btn-secondary" onclick="closeModal()">' + t('routing.cancel') + '</button>' +
             '<button class="btn btn-primary" id="ruleSaveBtn">' + t('routing.save') + '</button></div>';
@@ -1336,7 +1369,7 @@ function fallbackPolicyFormHtml(title, policy) {
             '<input type="text" id="fallbackName" value="' + escHtml(policy.name || '') + '"></div>' +
         '<div class="form-group"><label><input type="checkbox" id="fallbackEnabled"' + (policy.enabled === false ? '' : ' checked') + '> ' + t('fallbacks.enabled') + '</label></div>' +
         '<div class="form-group"><label>' + t('fallbacks.matchProvider') + '</label>' +
-            providerSelectHtml('fallbackMatchProvider', policy.match_provider || '') + '</div>' +
+            providerSelectHtml('fallbackMatchProvider', policy.match_provider || '', 'refreshFallbackMatchModelsForProvider()') + '</div>' +
         '<div class="form-group"><label>' + t('fallbacks.matchModel') + '</label>' +
             '<input type="text" id="fallbackMatchModel" list="fallbackModelList" value="' + escHtml(policy.match_model || '*') + '" placeholder="*">' +
             '<datalist id="fallbackModelList"></datalist></div>' +
@@ -1363,19 +1396,20 @@ function fallbackTriggerCheckbox(id, label, checked) {
 function fallbackChainRowHtml(target, index) {
     target = target || {};
     if (typeof target === 'string') target = { model: target, provider_id: '' };
+    var providerId = target.provider_id || target.target_provider || '';
     return '<div class="fallback-chain-row" data-index="' + index + '">' +
-        providerSelectHtml('fallbackProvider' + index, target.provider_id || target.target_provider || '') +
-        modelSelectHtml('fallbackModel' + index, target.model || target.target_model || '', false) +
+        providerSelectHtml('fallbackProvider' + index, providerId, "refreshModelSelectForProvider('fallbackModel" + index + "','fallbackProvider" + index + "')") +
+        modelSelectHtml('fallbackModel' + index, target.model || target.target_model || '', false, providerId) +
         '<button class="btn btn-secondary btn-sm" type="button" onclick="moveFallbackTargetRow(this, -1)">&#8593;</button>' +
         '<button class="btn btn-secondary btn-sm" type="button" onclick="moveFallbackTargetRow(this, 1)">&#8595;</button>' +
         '<button class="btn btn-danger btn-sm" type="button" onclick="removeFallbackTargetRow(this)">' + t('common.delete') + '</button>' +
     '</div>';
 }
 
-function populateFallbackModelDatalist() {
+function populateFallbackModelDatalist(providerId) {
     var dl = document.getElementById('fallbackModelList');
     if (!dl) return;
-    var models = (allModels || []).map(function(m) { return m.id; });
+    var models = modelsForProvider(providerId || '');
     dl.innerHTML = '<option value="*">' + models.map(function(id) { return '<option value="' + escHtml(id) + '">'; }).join('');
 }
 
@@ -1418,7 +1452,7 @@ function readFallbackPolicyForm() {
 
 function showAddFallbackPolicyModal() {
     document.getElementById('modalContent').innerHTML = fallbackPolicyFormHtml(t('fallbacks.addTitle'), {});
-    populateFallbackModelDatalist();
+    refreshFallbackMatchModelsForProvider();
     document.getElementById('fallbackSaveBtn').onclick = addFallbackPolicy;
     document.getElementById('modal').style.display = 'flex';
 }
@@ -1427,7 +1461,7 @@ function showEditFallbackPolicyModal(policyId) {
     var policy = fallbackPolicies.find(function(p) { return p.id === policyId; });
     if (!policy) return;
     document.getElementById('modalContent').innerHTML = fallbackPolicyFormHtml(t('fallbacks.editTitle'), policy);
-    populateFallbackModelDatalist();
+    refreshFallbackMatchModelsForProvider();
     document.getElementById('fallbackSaveBtn').onclick = function() { updateFallbackPolicy(policyId); };
     document.getElementById('modal').style.display = 'flex';
 }

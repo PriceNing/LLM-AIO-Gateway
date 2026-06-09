@@ -265,7 +265,11 @@ def _target_label(provider_id: str, model: str) -> str:
 
 def apply_fallback_policy(provider_id: str, model: str, trigger: str = "") -> FallbackDecision:
     target = RouteTarget(model=model, provider_id=provider_id)
-    for policy in get_fallback_policies():
+    policies = sorted(
+        get_fallback_policies(),
+        key=lambda policy: 1 if (policy.get("match_model", "*") or "*").strip() == "*" else 0,
+    )
+    for policy in policies:
         if not policy.get("enabled", True):
             continue
         match_provider = policy.get("match_provider", "")
