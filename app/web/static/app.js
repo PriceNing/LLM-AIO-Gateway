@@ -69,6 +69,7 @@ zh: {
     'users.username': '用户名',
     'users.displayName': '显示名称',
     'users.allowedModels': '允许模型',
+    'users.filterModels': '筛选模型或提供商...',
     'users.save': '保存',
     'users.cancel': '取消',
     'users.addFail': '新增用户失败',
@@ -356,6 +357,7 @@ en: {
     'users.username': 'Username',
     'users.displayName': 'Display Name',
     'users.allowedModels': 'Allowed Models',
+    'users.filterModels': 'Filter models or providers...',
     'users.save': 'Save',
     'users.cancel': 'Cancel',
     'users.addFail': 'Failed to add user',
@@ -966,12 +968,12 @@ function renderUsers() {
             '<div class="key-list">' +
                 (user.api_keys || []).map(function(key) {
                     return '<div class="key-row">' +
-                        '<span><strong>' + escHtml(key.name) + '</strong> ' + fmtModels(key.allowed_models) + '</span>' +
-                        '<code>' + escHtml(maskKey(key.key)) + '</code>' +
-                        '<span class="key-stats">' + t('users.calls') + ' ' + ((key.stats && key.stats.total_calls) || 0).toLocaleString() + '</span>' +
+                        '<div class="key-main"><div class="key-models"><strong>' + escHtml(key.name) + '</strong> ' + fmtModels(key.allowed_models) + '</div>' +
+                        '<code>' + escHtml(maskKey(key.key)) + '</code></div>' +
+                        '<div class="key-actions"><span class="key-stats">' + t('users.calls') + ' ' + ((key.stats && key.stats.total_calls) || 0).toLocaleString() + '</span>' +
                         '<button class="btn btn-secondary btn-xs" data-editkey="' + encodeURIComponent(JSON.stringify({u: user.username, k: key.key, n: key.name, m: key.allowed_models || []})) + '" onclick="editUserKeyFromBtn(this)">' + t('users.keyEdit') + '</button>' +
                         '<button class="btn btn-secondary btn-xs" onclick="copyText(\'' + jsEsc(key.key) + '\')">' + t('common.copy') + '</button>' +
-                        '<button class="btn btn-danger btn-xs" onclick="deleteUserKey(\'' + jsEsc(user.username) + '\',\'' + jsEsc(key.key) + '\')">' + t('common.delete') + '</button>' +
+                        '<button class="btn btn-danger btn-xs" onclick="deleteUserKey(\'' + jsEsc(user.username) + '\',\'' + jsEsc(key.key) + '\')">' + t('common.delete') + '</button></div>' +
                     '</div>';
                 }).join('') +
             '</div>' +
@@ -1159,9 +1161,43 @@ function renderRoutingRules() {
 }
 
 function modelsForProvider(providerId) {
+    var seen = {};
     return (allModels || []).filter(function(m) {
         return !providerId || m.provider === providerId;
-    }).map(function(m) { return m.id; });
+    }).map(function(m) {
+        return modelValueForProvider(m, providerId || '');
+    }).filter(function(id) {
+        if (seen[id]) return false;
+        seen[id] = true;
+        return true;
+    });
+}
+
+function modelValueForProvider(model, providerId) {
+    var id = model.id || '';
+    if (providerId && model.provider === providerId) {
+        return stripProviderPrefix(id, providerId);
+    }
+    return id;
+}
+
+function stripProviderPrefix(modelId, providerId) {
+    var prefix = providerId ? providerId + '/' : '';
+    return prefix && modelId.indexOf(prefix) === 0 ? modelId.slice(prefix.length) : modelId;
+}
+
+function knownModelIds() {
+    var ids = [];
+    for (var i = 0; i < (allModels || []).length; i++) {
+        var m = allModels[i];
+        ids.push(m.id);
+        if (m.provider) ids.push(stripProviderPrefix(m.id, m.provider));
+    }
+    return ids;
+}
+
+function isKnownModelId(modelId) {
+    return knownModelIds().indexOf(modelId) !== -1;
 }
 
 function modelSelectHtml(id, selected, includeWildcard, providerId) {
@@ -1195,26 +1231,44 @@ function refreshModelSelectForProvider(modelSelectId, providerSelectId) {
     var modelSelect = document.getElementById(modelSelectId);
     var providerSelect = document.getElementById(providerSelectId);
     if (!modelSelect || !providerSelect) return;
-    var current = modelSelect.value;
     var providerId = providerSelect.value.trim();
+    var current = stripProviderPrefix(modelSelect.value, providerId);
     var replacement = document.createElement('div');
     replacement.innerHTML = modelSelectHtml(modelSelectId, current, false, providerId);
     modelSelect.replaceWith(replacement.firstChild);
 }
 
-function refreshFallbackMatchModelsForProvider() {
-    var providerSelect = document.getElementById('fallbackMatchProvider');
-    var modelInput = document.getElementById('fallbackMatchModel');
-    var providerId = providerSelect ? providerSelect.value.trim() : '';
-    if (modelInput && providerId) {
-        var selectedModel = modelInput.value.trim();
-        var providerModels = modelsForProvider(providerId);
-        var knownModels = (allModels || []).map(function(m) { return m.id; });
-        if (selectedModel && knownModels.indexOf(selectedModel) !== -1 && providerModels.indexOf(selectedModel) === -1) {
-            modelInput.value = '';
-        }
+function populateModelDatalistForProvider(datalistId, providerId, includeWildcard) {
+    var dl = document.getElementById(datalistId);
+    if (!dl) return;
+    var modelIds = modelsForProvider(providerId || '');
+    var opts = includeWildcard ? '<option value="*">' : '';
+    for (var i = 0; i < modelIds.length; i++) {
+        opts += '<option value="' + escHtml(modelIds[i]) + '">';
     }
-    populateFallbackModelDatalist(providerId);
+    dl.innerHTML = opts;
+}
+
+function clearKnownModelOutsideProvider(inputId, providerId) {
+    var input = document.getElementById(inputId);
+    if (!input || !providerId) return;
+    var selectedModel = stripProviderPrefix(input.value.trim(), providerId);
+    if (selectedModel !== input.value.trim()) input.value = selectedModel;
+    if (!selectedModel || selectedModel === '*' || !isKnownModelId(selectedModel)) return;
+    if (modelsForProvider(providerId).indexOf(selectedModel) === -1) {
+        input.value = '';
+    }
+}
+
+function refreshModelDatalistForProvider(inputId, datalistId, providerSelectId, includeWildcard) {
+    var providerSelect = document.getElementById(providerSelectId);
+    var providerId = providerSelect ? providerSelect.value.trim() : '';
+    clearKnownModelOutsideProvider(inputId, providerId);
+    populateModelDatalistForProvider(datalistId, providerId, includeWildcard);
+}
+
+function refreshFallbackMatchModelsForProvider() {
+    refreshModelDatalistForProvider('fallbackMatchModel', 'fallbackModelList', 'fallbackMatchProvider', true);
 }
 
 function userSelectHtml(id, selected) {
@@ -1255,12 +1309,12 @@ function routingFormHtml(title, rule) {
         '<div class="form-group"><label>' + t('routing.keyPattern') + '</label>' +
             keySelectHtml('ruleKeyPattern', rule.api_key_pattern || '') + '</div>' +
         '<div class="form-group"><label>' + t('routing.matchModel') + ' (' + t('routing.matchModelHint') + ')</label>' +
-            '<input type="text" id="ruleMatchModel" list="matchModelList" value="' + escHtml(rule.match_model || '') + '" placeholder="*">' +
+            '<input type="text" id="ruleMatchModel" list="matchModelList" value="' + escHtml(rule.match_model || '') + '" placeholder="*" autocomplete="off">' +
             '<datalist id="matchModelList"></datalist></div>' +
-        '<div class="form-group"><label>' + t('routing.targetModel') + '</label>' +
-            modelSelectHtml('ruleTargetModel', rule.target_model || '', false, rule.target_provider || '') + '</div>' +
         '<div class="form-group"><label>' + t('routing.targetProvider') + '</label>' +
             providerSelectHtml('ruleTargetProvider', rule.target_provider || '', "refreshModelSelectForProvider('ruleTargetModel','ruleTargetProvider')") + '</div>' +
+        '<div class="form-group"><label>' + t('routing.targetModel') + '</label>' +
+            modelSelectHtml('ruleTargetModel', rule.target_model || '', false, rule.target_provider || '') + '</div>' +
         '<div class="form-actions">' +
             '<button class="btn btn-secondary" onclick="closeModal()">' + t('routing.cancel') + '</button>' +
             '<button class="btn btn-primary" id="ruleSaveBtn">' + t('routing.save') + '</button></div>';
@@ -1286,14 +1340,7 @@ function showAddRoutingRuleModal() {
 }
 
 function populateMatchModelDatalist() {
-    var dl = document.getElementById('matchModelList');
-    if (!dl) return;
-    var models = (allModels || []).map(function(m) { return m.id; });
-    var opts = '<option value="*">';
-    for (var i = 0; i < models.length; i++) {
-        opts += '<option value="' + escHtml(models[i]) + '">';
-    }
-    dl.innerHTML = opts;
+    populateModelDatalistForProvider('matchModelList', '', true);
 }
 
 async function addRoutingRule() {
@@ -1404,7 +1451,7 @@ function fallbackPolicyFormHtml(title, policy) {
         '<div class="form-group"><label>' + t('fallbacks.matchProvider') + '</label>' +
             providerSelectHtml('fallbackMatchProvider', policy.match_provider || '', 'refreshFallbackMatchModelsForProvider()') + '</div>' +
         '<div class="form-group"><label>' + t('fallbacks.matchModel') + '</label>' +
-            '<input type="text" id="fallbackMatchModel" list="fallbackModelList" value="' + escHtml(policy.match_model || '*') + '" placeholder="*">' +
+            '<input type="text" id="fallbackMatchModel" list="fallbackModelList" value="' + escHtml(policy.match_model || '*') + '" placeholder="*" autocomplete="off">' +
             '<datalist id="fallbackModelList"></datalist></div>' +
         '<div class="form-group"><label>' + t('fallbacks.triggers') + '</label>' +
             '<div class="checkbox-grid">' +
@@ -1440,10 +1487,7 @@ function fallbackChainRowHtml(target, index) {
 }
 
 function populateFallbackModelDatalist(providerId) {
-    var dl = document.getElementById('fallbackModelList');
-    if (!dl) return;
-    var models = modelsForProvider(providerId || '');
-    dl.innerHTML = '<option value="*">' + models.map(function(id) { return '<option value="' + escHtml(id) + '">'; }).join('');
+    populateModelDatalistForProvider('fallbackModelList', providerId || '', true);
 }
 
 function addFallbackTargetRow() {
@@ -1898,7 +1942,7 @@ function preprocessorFormHtml(title, preprocessor, submitAction) {
             '<input type="password" id="prepApiKey" value="' + escHtml(preprocessor.api_key || '') + '" placeholder="' + t('preprocessors.apiKeyPlaceholder') + '"></div>' +
         '<div class="form-group"><label>' + t('preprocessors.model') + '</label>' +
             '<div class="input-row">' +
-            '<input type="text" id="prepModel" list="prepModelList" value="' + escHtml(preprocessor.model || '') + '" placeholder="' + t('preprocessors.modelPlaceholder') + '" style="flex:1">' +
+            '<input type="text" id="prepModel" list="prepModelList" value="' + escHtml(preprocessor.model || '') + '" placeholder="' + t('preprocessors.modelPlaceholder') + '" style="flex:1" autocomplete="off">' +
             '<datalist id="prepModelList"></datalist>' +
             '<button class="btn btn-secondary btn-sm" type="button" onclick="fetchPreprocessorModels()">' + t('preprocessors.fetchModels') + '</button>' +
             '</div></div>' +
@@ -2699,7 +2743,9 @@ function modelSelectorHtml(selectedModels, prefix) {
         grouped[pname].push(m);
     }
 
-    var html = '<div class="model-selector">';
+    var html = '<div class="model-selector-wrap">';
+    html += '<input type="text" class="model-selector-filter" id="' + prefix + '_filter" placeholder="' + escAttr(t('users.filterModels')) + '" oninput="filterModelSelector(\'' + prefix + '\')" autocomplete="off">';
+    html += '<div class="model-selector">';
     html += '<div class="model-selector-all"><label class="model-selector-item">' +
         '<input type="checkbox" id="' + prefix + '_all"' + (allChecked ? ' checked' : '') + ' onchange="toggleModelAll(\'' + prefix + '\')">' +
         '<strong>' + t('users.allModels') + '</strong> <span style="color:var(--text-tertiary);margin-left:4px;font-size:11px;">(' + t('users.wildcard') + ')</span>' +
@@ -2709,19 +2755,41 @@ function modelSelectorHtml(selectedModels, prefix) {
     for (var gi = 0; gi < pnames.length; gi++) {
         var pname = pnames[gi];
         var pmodels = grouped[pname];
-        html += '<div class="model-selector-group"><div class="model-selector-provider">' + escHtml(pname) + '</div>';
+        html += '<div class="model-selector-group" data-filter-text="' + escAttr(pname) + '"><div class="model-selector-provider">' + escHtml(pname) + '</div>';
         for (var mi = 0; mi < pmodels.length; mi++) {
             var m = pmodels[mi];
             var modelChecked = allChecked || selected.has(m.id);
-            html += '<label class="model-selector-item">' +
+            var filterText = [pname, m.provider || '', m.name || '', m.id || ''].join(' ');
+            html += '<label class="model-selector-item" data-filter-text="' + escAttr(filterText) + '">' +
                 '<input type="checkbox" class="' + prefix + '_model" id="' + prefix + '_' + escAttr(m.id) + '" value="' + escAttr(m.id) + '"' + (modelChecked ? ' checked' : '') + (allChecked ? ' disabled' : '') + '>' +
                 escHtml(m.name || m.id) +
             '</label>';
         }
         html += '</div>';
     }
-    html += '</div>';
+    html += '</div></div>';
     return html;
+}
+
+function filterModelSelector(prefix) {
+    var input = document.getElementById(prefix + '_filter');
+    var query = input ? input.value.trim().toLowerCase() : '';
+    var groups = document.querySelectorAll('.model-selector-group');
+    for (var gi = 0; gi < groups.length; gi++) {
+        var group = groups[gi];
+        var groupText = (group.getAttribute('data-filter-text') || '').toLowerCase();
+        var groupMatches = !query || groupText.indexOf(query) !== -1;
+        var visibleCount = 0;
+        var items = group.querySelectorAll('.model-selector-item');
+        for (var ii = 0; ii < items.length; ii++) {
+            var item = items[ii];
+            var itemText = (item.getAttribute('data-filter-text') || '').toLowerCase();
+            var visible = groupMatches || itemText.indexOf(query) !== -1;
+            item.style.display = visible ? '' : 'none';
+            if (visible) visibleCount += 1;
+        }
+        group.style.display = visibleCount ? '' : 'none';
+    }
 }
 
 function toggleModelAll(prefix) {

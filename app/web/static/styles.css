@@ -95,6 +95,20 @@ body {
   overflow-x: hidden;
 }
 
+select {
+  color-scheme: dark;
+  cursor: pointer;
+}
+
+select option {
+  background: var(--input-bg);
+  color: var(--input-fg);
+}
+
+[data-theme="light"] select {
+  color-scheme: light;
+}
+
 /* ── Animated Background Blobs ── */
 @keyframes blob1 {
   0%, 100% { transform: translate(0, 0) scale(1); }
@@ -640,6 +654,20 @@ a.icon-btn { text-decoration: none; }
   font-size: 13px;
   flex-wrap: wrap;
 }
+.key-row .key-main {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1 1 420px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+.key-row .key-models {
+  flex: 1 1 280px;
+  min-width: 0;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
 .key-row code {
   font-family: var(--font-mono);
   font-size: 11px;
@@ -649,11 +677,26 @@ a.icon-btn { text-decoration: none; }
   border-radius: 4px;
   word-break: break-all;
 }
-.key-row .key-stats {
+.key-row .key-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex: 0 0 auto;
   margin-left: auto;
+  white-space: nowrap;
+}
+.key-row .key-stats {
   font-size: 12px;
   color: var(--text-tertiary);
   white-space: nowrap;
+}
+
+@media (max-width: 760px) {
+  .key-row { align-items: flex-start; }
+  .key-row .key-main,
+  .key-row .key-actions { flex-basis: 100%; }
+  .key-row .key-actions { justify-content: flex-start; margin-left: 0; flex-wrap: wrap; }
 }
 
 /* ── Model List ── */
@@ -902,10 +945,6 @@ a.icon-btn { text-decoration: none; }
   color: var(--input-fg);
   font-size: 13px;
   font-family: inherit;
-}
-.history-toolbar select option {
-  background: var(--input-bg);
-  color: var(--input-fg);
 }
 .history-summary {
   display: flex;
@@ -1224,12 +1263,7 @@ a.icon-btn { text-decoration: none; }
   border-color: var(--border-focus);
   box-shadow: 0 0 0 3px var(--accent-glow);
 }
-.form-group select { cursor: pointer; color-scheme: dark; }
-.form-group select option { background: #1e1e2e; color: #e0e0e0; }
-[data-theme="light"] .form-group select { color-scheme: light; }
-[data-theme="light"] .form-group select option { background: #fff; color: #1e1b2e; }
-[data-theme="light"] .select-input, [data-theme="light"] .text-input { color-scheme: light; }
-[data-theme="light"] .select-input option { background: #fff; color: #1e1b2e; }
+[data-theme="light"] .text-input { color-scheme: light; }
 .form-group textarea { resize: vertical; min-height: 80px; }
 .form-group input[type="checkbox"] { width: auto; margin-right: 8px; vertical-align: middle; }
 .form-group label:has(input[type="checkbox"]) {
@@ -1242,6 +1276,26 @@ a.icon-btn { text-decoration: none; }
   cursor: pointer;
 }
 
+.model-selector-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.model-selector-filter {
+  width: 100%;
+  padding: 8px 12px;
+  background: var(--bg-input);
+  border: 1px solid var(--border-input);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  font-size: 13px;
+  font-family: inherit;
+  outline: none;
+}
+.model-selector-filter:focus {
+  border-color: var(--border-focus);
+  box-shadow: 0 0 0 3px var(--accent-glow);
+}
 .model-selector {
   max-height: 260px;
   overflow-y: auto;
@@ -1365,7 +1419,7 @@ a.icon-btn { text-decoration: none; }
 /* Request log & config import/export */
 
 .section-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-.text-input, .select-input { background: var(--bg-input, rgba(0,0,0,0.04)); border: 1px solid var(--border, rgba(0,0,0,0.1)); color: var(--text-primary); padding: 6px 10px; border-radius: 6px; font-size: 14px; color-scheme: dark; }
+.text-input, .select-input { background: var(--bg-input, rgba(0,0,0,0.04)); border: 1px solid var(--border, rgba(0,0,0,0.1)); color: var(--text-primary); padding: 6px 10px; border-radius: 6px; font-size: 14px; }
 .text-input:focus, .select-input:focus { outline: 2px solid var(--accent, #4f8ef7); outline-offset: 0; }
 .btn-danger { background: var(--danger, #d33); color: #fff; }
 .btn-danger:hover { background: var(--danger-hover, #b22); }
@@ -1402,14 +1456,3 @@ a.icon-btn { text-decoration: none; }
 
 .modal-wide { max-width: 90vw; width: 720px; }
 
-#configImportMode,
-#configImportMode option {
-  background: #1e1e2e;
-  color: #e0e0e0;
-}
-
-[data-theme="light"] #configImportMode,
-[data-theme="light"] #configImportMode option {
-  background: #fff;
-  color: #1e1b2e;
-}

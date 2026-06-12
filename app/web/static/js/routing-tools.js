@@ -5,11 +5,13 @@ function showRoutingDryRunModal() {
         '<div class="form-group"><label>' + t('routing.dryRunKey') + '</label>' +
             '<input type="text" id="dryRunKey" list="dryRunKeyList" placeholder="sk-...">' +
             '<datalist id="dryRunKeyList"></datalist></div>' +
+        '<div class="form-group"><label>' + t('routing.dryRunProvider') + '</label>' +
+            providerSelectHtml('dryRunProvider', '', "refreshDryRunModelsForProvider()") + '</div>' +
         '<div class="form-group"><label>' + t('routing.dryRunModel') + '</label>' +
-            '<input type="text" id="dryRunModel" list="dryRunModelList" placeholder="provider/model">' +
+            '<input type="text" id="dryRunModel" list="dryRunModelList" placeholder="provider/model" autocomplete="off">' +
             '<datalist id="dryRunModelList"></datalist></div>' +
         '<div class="form-group"><label>' + t('routing.dryRunResolvedModel') + '</label>' +
-            '<input type="text" id="dryRunResolvedModel" list="dryRunModelList"></div>' +
+            '<input type="text" id="dryRunResolvedModel" list="dryRunModelList" autocomplete="off"></div>' +
         '<div id="dryRunResult" class="dry-run-result" style="display:none;"></div>' +
         '<div class="form-actions">' +
             '<button class="btn btn-secondary" onclick="closeModal()">' + t('common.cancel') + '</button>' +
@@ -19,11 +21,7 @@ function showRoutingDryRunModal() {
 }
 
 function populateDryRunDatalists() {
-    var modelList = document.getElementById('dryRunModelList');
-    if (modelList) {
-        var modelIds = (allModels || []).map(function(m) { return m.id; });
-        modelList.innerHTML = modelIds.map(function(id) { return '<option value="' + escHtml(id) + '">'; }).join('');
-    }
+    refreshDryRunModelsForProvider();
     var keyList = document.getElementById('dryRunKeyList');
     if (keyList) {
         var opts = [];
@@ -39,6 +37,11 @@ function populateDryRunDatalists() {
         }
         keyList.innerHTML = opts.join('');
     }
+}
+
+function refreshDryRunModelsForProvider() {
+    refreshModelDatalistForProvider('dryRunModel', 'dryRunModelList', 'dryRunProvider', false);
+    refreshModelDatalistForProvider('dryRunResolvedModel', 'dryRunModelList', 'dryRunProvider', false);
 }
 
 async function runRoutingDryRun() {
