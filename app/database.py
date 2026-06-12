@@ -825,29 +825,6 @@ def delete_preprocessor(preprocessor_id: str) -> bool:
         return cursor.rowcount > 0
 
 
-def import_preprocessors_from_config(preprocessors: dict | None) -> int:
-    if not isinstance(preprocessors, dict) or not preprocessors:
-        return 0
-    with get_db() as db:
-        exists = db.execute("SELECT 1 FROM preprocessors LIMIT 1").fetchone()
-    if exists:
-        return 0
-    imported = 0
-    enabled_imported = False
-    for preprocessor_id, config in preprocessors.items():
-        if not isinstance(config, dict):
-            continue
-        import_config = dict(config)
-        if import_config.get("enabled", True):
-            if enabled_imported:
-                import_config["enabled"] = False
-            else:
-                enabled_imported = True
-        upsert_preprocessor(str(preprocessor_id), import_config)
-        imported += 1
-    return imported
-
-
 # -- Providers --
 
 def get_providers() -> list:

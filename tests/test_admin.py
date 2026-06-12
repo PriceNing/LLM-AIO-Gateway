@@ -2,7 +2,7 @@ import pytest
 from fastapi.testclient import TestClient
 from main import app
 from app.config import load_config
-from app.database import init_db, add_admin, import_preprocessors_from_config
+from app.database import init_db, add_admin, upsert_preprocessor
 from app.security import create_session, hash_password
 
 client = TestClient(app)
@@ -19,30 +19,27 @@ def temp_db(tmp_path):
         "port": 8000,
         "database": db_path,
         "logging": {"enabled": False, "level": "INFO", "log_dir": "logs", "retention_days": 30, "console": False},
-        "preprocessors": {
-            "vision-model": {
-                "api_base": "http://127.0.0.1:8080/v1",
-                "model": "test-vision",
-                "api_key": "test-key",
-                "timeout": 30,
-                "max_images": 20,
-                "prompt": "Please describe the image content.",
-                "enabled": True,
-            },
-            "disabled-vision": {
-                "api_base": "http://127.0.0.1:8081/v1",
-                "model": "disabled-vision",
-                "api_key": "",
-                "timeout": 30,
-                "max_images": 20,
-                "prompt": "Describe",
-                "enabled": False,
-            },
-        }
     }
     config.save()
     init_db(db_path)
-    import_preprocessors_from_config(config.config.get("preprocessors"))
+    upsert_preprocessor("vision-model", {
+        "api_base": "http://127.0.0.1:8080/v1",
+        "model": "test-vision",
+        "api_key": "test-key",
+        "timeout": 30,
+        "max_images": 20,
+        "prompt": "Please describe the image content.",
+        "enabled": True,
+    })
+    upsert_preprocessor("disabled-vision", {
+        "api_base": "http://127.0.0.1:8081/v1",
+        "model": "disabled-vision",
+        "api_key": "",
+        "timeout": 30,
+        "max_images": 20,
+        "prompt": "Describe",
+        "enabled": False,
+    })
     add_admin("admin", hash_password("secret"), "Admin")
     token = create_session("admin")
     yield {"headers": {"Authorization": f"Bearer {token}"}}

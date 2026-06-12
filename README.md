@@ -130,26 +130,7 @@ curl http://localhost:8000/v1/responses \
 
 视觉模型注入用于让纯文本模型处理图片输入。为请求模型启用预处理器后，网关会将当前轮次图片交给配置的视觉模型描述，剥离原始图片数据，并把描述文本注入对话。
 
-在 `config.json` 中配置预处理器：
-
-```json
-{
-  "preprocessors": {
-    "my-vision": {
-      "api_base": "http://127.0.0.1:8080/v1",
-      "model": "MiniCPM-V-4.6",
-      "api_key": "",
-      "timeout": 60,
-      "max_images": 20,
-      "max_tokens": 1024,
-      "prompt": "Please describe this image in detail.",
-      "enabled": true
-    }
-  }
-}
-```
-
-然后在管理面板为目标模型开启预处理器。是否预处理取决于用户请求的原始模型，而不是路由后的目标模型。
+在管理面板的“视觉模型注入”页面添加预处理器，然后为目标模型开启预处理器。预处理器配置和模型开关存储在 SQLite 数据库中，不再写入 `config.json`。是否预处理取决于用户请求的原始模型，而不是路由后的目标模型。
 
 ## 路由规则
 

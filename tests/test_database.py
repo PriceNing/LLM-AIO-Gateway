@@ -12,7 +12,7 @@ from app.database import (
     add_provider, get_provider, get_providers, update_provider, delete_provider,
     add_routing_rule, get_routing_rules, update_routing_rule, delete_routing_rule,
     add_fallback_policy, get_fallback_policies, update_fallback_policy, delete_fallback_policy,
-    delete_preprocessor, get_enabled_preprocessor, get_preprocessors, import_preprocessors_from_config,
+    delete_preprocessor, get_enabled_preprocessor, get_preprocessors,
     upsert_preprocessor,
 )
 
@@ -429,32 +429,6 @@ def test_preprocessor_defaults_and_single_enabled():
     assert preprocessors["vision-a"]["enabled"] is False
     assert preprocessors["vision-b"]["enabled"] is True
     assert get_enabled_preprocessor()["id"] == "vision-b"
-
-
-def test_import_preprocessors_from_config_only_when_empty():
-    imported = import_preprocessors_from_config({
-        "vision-a": {"api_base": "http://a", "model": "va", "timeout": 30},
-        "vision-b": {"api_base": "http://b", "model": "vb", "enabled": False},
-    })
-    assert imported == 2
-    assert get_preprocessors()["vision-a"]["timeout"] == 30
-
-    skipped = import_preprocessors_from_config({"vision-c": {"api_base": "http://c", "model": "vc"}})
-    assert skipped == 0
-    assert "vision-c" not in get_preprocessors()
-
-
-def test_import_preprocessors_preserves_first_enabled_entry():
-    imported = import_preprocessors_from_config({
-        "vision-a": {"api_base": "http://a", "model": "va", "enabled": True},
-        "vision-b": {"api_base": "http://b", "model": "vb", "enabled": True},
-    })
-
-    assert imported == 2
-    preprocessors = get_preprocessors()
-    assert preprocessors["vision-a"]["enabled"] is True
-    assert preprocessors["vision-b"]["enabled"] is False
-    assert get_enabled_preprocessor()["id"] == "vision-a"
 
 
 def test_delete_preprocessor_config():

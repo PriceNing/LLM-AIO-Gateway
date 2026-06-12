@@ -130,26 +130,7 @@ curl http://localhost:8000/v1/responses \
 
 Vision injection lets text-only models handle image input. When enabled for the requested model, the gateway describes current-turn images with a configured vision model, strips original image data, and injects descriptions into the conversation.
 
-Configure preprocessors in `config.json`:
-
-```json
-{
-  "preprocessors": {
-    "my-vision": {
-      "api_base": "http://127.0.0.1:8080/v1",
-      "model": "MiniCPM-V-4.6",
-      "api_key": "",
-      "timeout": 60,
-      "max_images": 20,
-      "max_tokens": 1024,
-      "prompt": "Please describe this image in detail.",
-      "enabled": true
-    }
-  }
-}
-```
-
-Then enable preprocessing for the target model in the admin panel. The decision is based on the originally requested model, not the routed target model.
+Add preprocessors in the admin panel under Vision Model Injection, then enable preprocessing for target models there. Preprocessor definitions and model toggles are stored in SQLite, not `config.json`. The decision is based on the originally requested model, not the routed target model.
 
 ## Routing Rules
 

@@ -34,26 +34,6 @@ def temp_config(tmp_path):
         "port": 8000,
         "database": db_path,
         "logging": {"enabled": False, "level": "INFO", "log_dir": "logs", "retention_days": 30, "console": False},
-        "preprocessors": {
-            "vision-model": {
-                "api_base": "http://127.0.0.1:8080/v1",
-                "model": "test-vision",
-                "api_key": "test-key",
-                "timeout": 30,
-                "max_images": 20,
-                "prompt": "Please describe the image content.",
-                "enabled": True,
-            },
-            "disabled-vision": {
-                "api_base": "http://127.0.0.1:8081/v1",
-                "model": "disabled-vision",
-                "api_key": "",
-                "timeout": 30,
-                "max_images": 20,
-                "prompt": "Describe",
-                "enabled": False,
-            },
-        }
     }
     config.save()
     init_db(db_path)

@@ -3,8 +3,8 @@ Image preprocessing pipeline - intercepts image content, sends to a vision model
 for description, then replaces the image with text so non-multimodal models can
 "see" the image.
 
-Configuration is stored in SQLite preprocessors. Legacy config.json preprocessors
-are imported into the database during startup when the table is empty.
+Configuration is stored in SQLite preprocessors and model switches are stored on
+provider_models rows.
 """
 import hashlib
 import logging

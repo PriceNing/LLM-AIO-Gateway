@@ -21,17 +21,5 @@
     "tool_only_turns_ttl": 600,
     "tool_only_turns_max_size": 2000,
     "image_cache_max_size": 500
-  },
-  "preprocessors": {
-    "your-vision-model": {
-      "api_base": "http://127.0.0.1:8080/v1",
-      "model": "your-vision-model",
-      "api_key": "",
-      "timeout": 60,
-      "max_images": 20,
-      "max_tokens": 1024,
-      "prompt": "Please describe this image in detail.",
-      "enabled": false
-    }
   }
 }
