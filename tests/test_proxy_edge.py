@@ -1367,7 +1367,7 @@ def test_chat_completions_stream_logs_fallback_target_model(monkeypatch, temp_db
 
     assert response.status_code == 200
     assert "fallback stream response" in body
-    assert logged[-1] == ("fallback-stream-log-model", "fallback-stream-log-ok", "chat_completions", True, "stream-log-source")
+    assert logged[-1] == ("fallback-stream-log-ok/fallback-stream-log-model", "fallback-stream-log-ok", "chat_completions", True, "stream-log-source")
 
 
 def test_chat_completions_stream_does_not_fallback_after_output(monkeypatch, temp_db):

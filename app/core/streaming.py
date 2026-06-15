@@ -138,6 +138,7 @@ async def stream_internal_output(
                     "error_stage",
                     "attempted_model",
                     "attempted_provider",
+                    "fallback_attempts",
                 ):
                     if key in event.metadata:
                         stream_details[key] = event.metadata[key]

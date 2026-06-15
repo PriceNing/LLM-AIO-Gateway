@@ -613,6 +613,11 @@ Object.assign(I18N.zh, {
     'stats.partialOutput': '已输出部分内容',
     'stats.fallbackStatus': 'Fallback 状态',
     'stats.fallbackReason': 'Fallback 原因',
+    'stats.fallbackAttempts': 'Fallback 链路',
+    'stats.fallbackAttempt': '节点',
+    'stats.fallbackAttemptStarted': '尝试中',
+    'stats.fallbackAttemptSuccess': '成功',
+    'stats.fallbackAttemptFailed': '失败',
     'stats.errorTrigger': '错误触发类型',
     'stats.errorStage': '错误阶段',
     'stats.errorMessage': '错误消息',
@@ -645,6 +650,11 @@ Object.assign(I18N.en, {
     'stats.partialOutput': 'Partial Output',
     'stats.fallbackStatus': 'Fallback Status',
     'stats.fallbackReason': 'Fallback Reason',
+    'stats.fallbackAttempts': 'Fallback Chain',
+    'stats.fallbackAttempt': 'Attempt',
+    'stats.fallbackAttemptStarted': 'Started',
+    'stats.fallbackAttemptSuccess': 'Success',
+    'stats.fallbackAttemptFailed': 'Failed',
     'stats.errorTrigger': 'Error Trigger',
     'stats.errorStage': 'Error Stage',
     'stats.errorMessage': 'Error Message',
@@ -2548,6 +2558,13 @@ function showRequestDetail(index) {
         detailRow(t('stats.errorTrigger') || 'Error Trigger', entry.error_trigger || details.error_trigger),
         detailRow(t('stats.errorStage') || 'Error Stage', entry.error_stage || details.error_stage)
     ];
+    var fallbackAttempts = entry.fallback_attempts || details.fallback_attempts;
+    if (Array.isArray(fallbackAttempts) && fallbackAttempts.length) {
+        var fbRows = fallbackAttempts.map(function(att) {
+            return fallbackAttemptRow(att);
+        });
+        routeRows.push(detailSection(t('stats.fallbackAttempts') || 'Fallback Chain', fbRows));
+    }
     var errorRows = [
         detailRow(t('stats.errorMessage') || 'Error Message', entry.error_message || details.error_message)
     ];
@@ -3184,3 +3201,23 @@ document.addEventListener('DOMContentLoaded', function() {
         toast(t('auth.initFail') + ': ' + err.message, 'error');
     });
 });
+function fallbackAttemptRow(att) {
+    var statusLabel = att.status === 'success' ? (t('stats.fallbackAttemptSuccess') || 'Success')
+        : att.status === 'failed' ? (t('stats.fallbackAttemptFailed') || 'Failed')
+        : (t('stats.fallbackAttemptStarted') || 'Started');
+    var modelLabel = att.model || '-';
+    var providerLabel = att.provider || '';
+    var targetLabel = providerLabel && modelLabel.indexOf(providerLabel + '/') !== 0
+        ? providerLabel + '/' + modelLabel
+        : modelLabel;
+    var parts = [
+        '#' + (att.index + 1),
+        '[' + statusLabel + ']',
+        targetLabel,
+    ];
+    if (att.trigger) parts.push('(' + att.trigger + ')');
+    var summary = parts.join(' ');
+    var detail = att.error_message || '';
+    if (detail) summary += '\n' + detail;
+    return '<div class="detail-kv" style="grid-column:1/-1"><div class="detail-label">' + escHtml(t('stats.fallbackAttempt') || 'Attempt') + '</div><div class="detail-value">' + escHtml(summary) + '</div></div>';
+}
