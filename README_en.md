@@ -41,6 +41,19 @@ The service starts on `http://localhost:8000` by default. On first startup it cr
 
 ### Docker
 
+Use the published GHCR image:
+
+```bash
+docker pull ghcr.io/pricening/llm-aio-gateway:latest
+docker run -d --name llm-aio-gateway \
+  -p 8000:8000 \
+  -v llm-aio-data:/app/data \
+  -v llm-aio-logs:/app/logs \
+  ghcr.io/pricening/llm-aio-gateway:latest
+```
+
+Or build locally from source:
+
 ```bash
 docker compose up -d
 ```

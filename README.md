@@ -41,6 +41,19 @@ python main.py
 
 ### Docker
 
+使用已发布的 GHCR 镜像：
+
+```bash
+docker pull ghcr.io/pricening/llm-aio-gateway:latest
+docker run -d --name llm-aio-gateway \
+  -p 8000:8000 \
+  -v llm-aio-data:/app/data \
+  -v llm-aio-logs:/app/logs \
+  ghcr.io/pricening/llm-aio-gateway:latest
+```
+
+或从源码本地构建：
+
 ```bash
 docker compose up -d
 ```
