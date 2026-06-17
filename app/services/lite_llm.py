@@ -128,6 +128,8 @@ def build_completion_args(model: str, provider_id: Optional[str] = None) -> tupl
     api_base = provider.get("api_base", "").rstrip("/")
     if api_base:
         params["api_base"] = api_base
+    params["timeout"] = provider.get("request_timeout", 120)
+    params["num_retries"] = provider.get("retry_count", 0)
 
     litellm_model = get_litellm_model_name(model, provider)
     # Register only likely vision-capable custom models so liteLLM capability checks

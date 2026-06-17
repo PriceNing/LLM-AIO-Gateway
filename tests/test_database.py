@@ -83,6 +83,7 @@ def test_add_and_get_provider():
         "id": "test-p", "name": "Test P",
         "provider_type": "openai", "api_base": "https://api.t.com/v1",
         "api_key": "k", "enabled": True,
+        "request_timeout": 45, "retry_count": 2, "retry_backoff": 1.5,
         "models": [{"id": "m1", "name": "Model 1", "enabled": True, "preprocessor": "1"}]
     })
     p = get_provider("test-p")
@@ -92,6 +93,9 @@ def test_add_and_get_provider():
     assert len(p["models"]) == 1
     assert p["models"][0]["id"] == "m1"
     assert p["models"][0]["preprocessor"] == "1"
+    assert p["request_timeout"] == 45
+    assert p["retry_count"] == 2
+    assert p["retry_backoff"] == 1.5
 
 
 def test_add_duplicate_provider_raises():
@@ -105,8 +109,11 @@ def test_add_duplicate_provider_raises():
 def test_update_provider():
     add_provider({"id": "up", "name": "Old", "provider_type": "openai",
                   "api_base": "", "api_key": "", "enabled": True, "models": []})
-    result = update_provider("up", {"name": "New Name"})
+    result = update_provider("up", {"name": "New Name", "request_timeout": 60, "retry_count": 3, "retry_backoff": 2})
     assert result["name"] == "New Name"
+    assert result["request_timeout"] == 60
+    assert result["retry_count"] == 3
+    assert result["retry_backoff"] == 2
 
 
 def test_update_nonexistent_provider():

@@ -8,11 +8,19 @@ client = TestClient(app)
 
 def _registered_routes() -> set[tuple[str, str]]:
     routes = set()
-    for route in app.routes:
-        path = getattr(route, "path", "")
-        for method in getattr(route, "methods", set()) or set():
-            if method != "HEAD":
-                routes.add((method, path))
+    def visit(route_list, prefix=""):
+        for route in route_list:
+            original_router = getattr(route, "original_router", None)
+            include_context = getattr(route, "include_context", None)
+            if original_router is not None and include_context is not None:
+                visit(original_router.routes, prefix + include_context.prefix)
+                continue
+            path = prefix + getattr(route, "path", "")
+            for method in getattr(route, "methods", set()) or set():
+                if method != "HEAD":
+                    routes.add((method, path))
+
+    visit(app.routes)
     return routes
 
 
@@ -39,6 +47,8 @@ def test_expected_http_routes_are_registered():
         ("GET", "/admin/models"),
         ("GET", "/admin/users"),
         ("POST", "/admin/users"),
+        ("GET", "/admin/users/export"),
+        ("POST", "/admin/users/import"),
         ("PUT", "/admin/users/{username}"),
         ("DELETE", "/admin/users/{username}"),
         ("POST", "/admin/users/{username}/api-keys"),

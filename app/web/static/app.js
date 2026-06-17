@@ -111,6 +111,9 @@ zh: {
     'providers.typeAnthropic': 'Anthropic 兼容',
     'providers.apiBase': 'API Base URL',
     'providers.apiKey': '上游 API Key',
+    'providers.requestTimeout': '请求超时（秒）',
+    'providers.retryCount': '重试次数',
+    'providers.retryBackoff': '重试退避（秒）',
     'providers.extraHeaders': '扩展 Headers (JSON)',
     'providers.addFail': '新增失败',
     'providers.updateFail': '更新失败',
@@ -399,6 +402,9 @@ en: {
     'providers.typeAnthropic': 'Anthropic Compatible',
     'providers.apiBase': 'API Base URL',
     'providers.apiKey': 'Upstream API Key',
+    'providers.requestTimeout': 'Request Timeout (s)',
+    'providers.retryCount': 'Retry Count',
+    'providers.retryBackoff': 'Retry Backoff (s)',
     'providers.extraHeaders': 'Extra Headers (JSON)',
     'providers.addFail': 'Failed to add',
     'providers.updateFail': 'Failed to update',
@@ -1609,6 +1615,7 @@ function renderProviders() {
                         '<span class="status-dot ' + (p.enabled ? 'on' : 'off') + '"></span>' +
                         '<span>' + (p.enabled ? t('providers.enabled') : t('providers.disabled')) + '</span>' +
                         '<span>' + t('providers.modelsCount', {n: modelCount}) + '</span>' +
+                        '<span>' + escHtml((p.request_timeout || 120) + 's / retry ' + (p.retry_count || 0)) + '</span>' +
                     '</div>' +
                 '</div>' +
                 '<span class="provider-type">' + escHtml(p.provider_type) + '</span>' +
@@ -1643,6 +1650,14 @@ function providerFormHtml(title, provider, submitAction) {
             '<input type="text" id="providerApiBase" value="' + escHtml(provider.api_base || '') + '" placeholder="https://api.openai.com/v1"></div>' +
         '<div class="form-group"><label>' + t('providers.apiKey') + '</label>' +
             '<input type="password" id="providerApiKey" value="' + escHtml(provider.api_key || '') + '"></div>' +
+        '<div class="form-row">' +
+            '<div class="form-group"><label>' + t('providers.requestTimeout') + '</label>' +
+                '<input type="number" id="providerRequestTimeout" value="' + escHtml(provider.request_timeout || 120) + '" min="1" max="3600"></div>' +
+            '<div class="form-group"><label>' + t('providers.retryCount') + '</label>' +
+                '<input type="number" id="providerRetryCount" value="' + escHtml(provider.retry_count || 0) + '" min="0" max="10"></div>' +
+            '<div class="form-group"><label>' + t('providers.retryBackoff') + '</label>' +
+                '<input type="number" id="providerRetryBackoff" value="' + escHtml(provider.retry_backoff == null ? 0.5 : provider.retry_backoff) + '" min="0" max="60" step="0.1"></div>' +
+        '</div>' +
         '<div class="form-group"><label><input type="checkbox" id="providerEnabled"' + (provider.enabled === false ? '' : ' checked') + '> ' + t('providers.enabled') + '</label></div>' +
         '<div class="form-group"><label>' + t('providers.extraHeaders') + '</label>' +
             '<textarea id="providerExtraHeaders" rows="3" style="font-family:monospace;font-size:12px" placeholder=\'{"thinking": "enabled"}\'>' + escHtml(JSON.stringify(provider.extra_headers || {}, null, 2)) + '</textarea></div>' +
@@ -1662,7 +1677,10 @@ function readProviderForm() {
         api_base: document.getElementById('providerApiBase').value.trim(),
         api_key: document.getElementById('providerApiKey').value.trim(),
         enabled: document.getElementById('providerEnabled').checked,
-        extra_headers: extraHeaders
+        extra_headers: extraHeaders,
+        request_timeout: parseInt(document.getElementById('providerRequestTimeout').value, 10) || 120,
+        retry_count: parseInt(document.getElementById('providerRetryCount').value, 10) || 0,
+        retry_backoff: parseFloat(document.getElementById('providerRetryBackoff').value) || 0
     };
 }
 
@@ -3078,6 +3096,66 @@ async function importConfig() {
     }
 }
 
+async function downloadJson(endpoint, filenamePrefix, successKey, failKey) {
+    try {
+        var r = await fetch(endpoint, {
+            headers: { 'Authorization': 'Bearer ' + localStorage.getItem(SESSION_KEY) }
+        });
+        if (r.status === 401) {
+            var errData = await r.json().catch(function() { return {}; });
+            if (isSessionAuthError(errData.detail)) {
+                handleSessionExpired();
+                return;
+            }
+            throw new Error(errData.detail || 'HTTP ' + r.status);
+        }
+        if (!r.ok) throw new Error(await r.text());
+        var blob = await r.blob();
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement('a');
+        var ts = new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19);
+        a.href = url;
+        a.download = filenamePrefix + '-' + ts + '.json';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+        toast(t(successKey) || 'Exported', 'success');
+    } catch (e) {
+        toast((t(failKey) || 'Export failed') + ': ' + e.message, 'error');
+    }
+}
+
+async function exportUsers() {
+    await downloadJson('/admin/users/export', 'llm-aio-users', 'config.usersExported', 'config.usersExportFail');
+}
+
+async function importUsers() {
+    var fileInput = document.getElementById('usersFileInput');
+    var modeSel = document.getElementById('usersImportMode');
+    var resultEl = document.getElementById('usersImportResult');
+    if (!fileInput.files || !fileInput.files[0]) {
+        toast(t('config.chooseFile') || 'Please select a JSON file first', 'error');
+        return;
+    }
+    try {
+        var text = await fileInput.files[0].text();
+        var payload = JSON.parse(text);
+        payload.mode = modeSel.value || 'skip';
+        var r = await api('/admin/users/import', { method: 'POST', body: JSON.stringify(payload) });
+        var summary = r.summary || {};
+        var lines = [];
+        lines.push((t('config.resultUsers') || 'Users:') + ' ' + JSON.stringify(summary.users || {}));
+        lines.push((t('config.resultApiKeys') || 'API keys:') + ' ' + JSON.stringify(summary.api_keys || {}));
+        if (resultEl) resultEl.innerHTML = '<pre class="json-block">' + escHtml(lines.join('\n')) + '</pre>';
+        toast(t('config.usersImported') || 'Imported', 'success');
+        await loadUsers();
+    } catch (e) {
+        if (resultEl) resultEl.innerHTML = '<div class="error-text">' + escHtml(e.message) + '</div>';
+        toast((t('config.usersImportFail') || 'Import failed') + ': ' + e.message, 'error');
+    }
+}
+
 /* ════════════════════════════════ i18n additions ════════════════════════════════ */
 
 Object.assign(I18N.zh, {
@@ -3132,7 +3210,19 @@ Object.assign(I18N.zh, {
     'config.importFail': '导入失败',
     'config.resultProviders': 'Providers:',
     'config.resultRouting': 'Routing rules:',
-    'config.resultFallbacks': 'Fallback policies:'
+    'config.resultFallbacks': 'Fallback policies:',
+    'config.exportUsersTitle': '导出用户',
+    'config.exportUsersHint': '单独导出用户和 API Key，方便迁移到另一台机器。',
+    'config.exportUsers': '下载用户 JSON',
+    'config.importUsersTitle': '导入用户',
+    'config.importUsersHint': '上传用户 JSON，可选择 skip / replace / merge 冲突策略。',
+    'config.importUsers': '导入用户',
+    'config.usersExported': '用户已导出',
+    'config.usersExportFail': '用户导出失败',
+    'config.usersImported': '用户导入完成',
+    'config.usersImportFail': '用户导入失败',
+    'config.resultUsers': '用户:',
+    'config.resultApiKeys': 'API Keys:'
 });
 
 Object.assign(I18N.en, {
@@ -3187,7 +3277,19 @@ Object.assign(I18N.en, {
     'config.importFail': 'Import failed',
     'config.resultProviders': 'Providers:',
     'config.resultRouting': 'Routing rules:',
-    'config.resultFallbacks': 'Fallback policies:'
+    'config.resultFallbacks': 'Fallback policies:',
+    'config.exportUsersTitle': 'Export Users',
+    'config.exportUsersHint': 'Export users and API keys separately for migration to another machine.',
+    'config.exportUsers': 'Download Users JSON',
+    'config.importUsersTitle': 'Import Users',
+    'config.importUsersHint': 'Upload a users JSON file. Choose skip / replace / merge strategy.',
+    'config.importUsers': 'Import Users',
+    'config.usersExported': 'Users exported',
+    'config.usersExportFail': 'User export failed',
+    'config.usersImported': 'Users imported',
+    'config.usersImportFail': 'User import failed',
+    'config.resultUsers': 'Users:',
+    'config.resultApiKeys': 'API keys:'
 });
 /* ═══════════════════════════════ Init ═══════════════════════════════ */
 

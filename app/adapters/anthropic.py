@@ -1,4 +1,5 @@
 import json
+import asyncio
 
 import httpx
 from fastapi import HTTPException
@@ -87,6 +88,31 @@ def _anthropic_headers(provider_info: dict) -> dict:
         "anthropic-version": "2023-06-01",
         "Content-Type": "application/json",
     }
+
+
+def provider_request_timeout(provider_info: dict, default: int = 120) -> int:
+    try:
+        return max(1, min(3600, int(provider_info.get("request_timeout") or default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def provider_retry_count(provider_info: dict) -> int:
+    try:
+        return max(0, min(10, int(provider_info.get("retry_count") or 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def provider_retry_backoff(provider_info: dict) -> float:
+    try:
+        return max(0.0, min(60.0, float(provider_info.get("retry_backoff") or 0.5)))
+    except (TypeError, ValueError):
+        return 0.5
+
+
+def _is_retryable_status(status_code: int) -> bool:
+    return status_code == 429 or 500 <= status_code <= 599
 
 
 def _upstream_error_message(resp) -> str:
@@ -199,12 +225,28 @@ async def anthropic_messages_completion(
         temperature,
         model,
     )
-    async with httpx.AsyncClient(timeout=120) as client:
-        resp = await client.post(
-            _anthropic_message_url(provider_info.get("api_base") or ""),
-            headers=_anthropic_headers(provider_info),
-            json=req_body,
-        )
-        if resp.status_code != 200:
-            raise HTTPException(status_code=502, detail=f"Upstream: {_upstream_error_message(resp)}")
-        return _anthropic_response_to_internal(resp.json())
+    timeout = provider_request_timeout(provider_info, 120)
+    retries = provider_retry_count(provider_info)
+    backoff = provider_retry_backoff(provider_info)
+    last_exc = None
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        for attempt in range(retries + 1):
+            try:
+                resp = await client.post(
+                    _anthropic_message_url(provider_info.get("api_base") or ""),
+                    headers=_anthropic_headers(provider_info),
+                    json=req_body,
+                )
+                if resp.status_code == 200:
+                    return _anthropic_response_to_internal(resp.json())
+                if attempt < retries and _is_retryable_status(resp.status_code):
+                    await asyncio.sleep(backoff * (2 ** attempt))
+                    continue
+                raise HTTPException(status_code=502, detail=f"Upstream: {_upstream_error_message(resp)}")
+            except (httpx.TimeoutException, httpx.TransportError) as exc:
+                last_exc = exc
+                if attempt < retries:
+                    await asyncio.sleep(backoff * (2 ** attempt))
+                    continue
+                raise
+    raise last_exc or RuntimeError("Anthropic upstream request failed")

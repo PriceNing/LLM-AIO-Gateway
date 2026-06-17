@@ -38,6 +38,7 @@ def init_db(path: Optional[str] = None) -> None:
             _migrate_provider_models_created_at(conn)
             # Migration: add extra_headers to providers if missing
             _migrate_providers_extra_headers(conn)
+            _migrate_provider_request_options(conn)
             _migrate_preprocessors(conn)
             # Routing and fallback policy migrations.
             routing_db.migrate(conn)
@@ -74,6 +75,22 @@ def _migrate_providers_extra_headers(conn: sqlite3.Connection) -> None:
                 "UPDATE providers SET extra_headers = ? WHERE id = ?",
                 ('{"thinking": "enabled"}', pid)
             )
+
+
+def _migrate_provider_request_options(conn: sqlite3.Connection) -> None:
+    """Add per-provider upstream timeout/retry options for existing databases."""
+    columns = {
+        "request_timeout": "INTEGER NOT NULL DEFAULT 120",
+        "retry_count": "INTEGER NOT NULL DEFAULT 0",
+        "retry_backoff": "REAL NOT NULL DEFAULT 0.5",
+    }
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(providers)").fetchall()}
+    for col, ddl in columns.items():
+        if col not in existing:
+            try:
+                conn.execute(f"ALTER TABLE providers ADD COLUMN {col} {ddl}")
+            except sqlite3.OperationalError:
+                pass
 
 
 def _migrate_preprocessors(conn: sqlite3.Connection) -> None:
@@ -163,7 +180,10 @@ CREATE TABLE IF NOT EXISTS providers (
     api_base TEXT NOT NULL DEFAULT '',
     api_key TEXT NOT NULL DEFAULT '',
     enabled INTEGER NOT NULL DEFAULT 1,
-    extra_headers TEXT NOT NULL DEFAULT '{}'
+    extra_headers TEXT NOT NULL DEFAULT '{}',
+    request_timeout INTEGER NOT NULL DEFAULT 120,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    retry_backoff REAL NOT NULL DEFAULT 0.5
 );
 
 CREATE TABLE IF NOT EXISTS provider_models (
@@ -276,6 +296,22 @@ def _to_bool(v) -> bool:
     if isinstance(v, str):
         return v.lower() in ("1", "true", "yes")
     return False
+
+
+def _clamp_int(value, default: int, min_value: int, max_value: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(min_value, min(max_value, parsed))
+
+
+def _clamp_float(value, default: float, min_value: float, max_value: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(min_value, min(max_value, parsed))
 
 
 # -- Global stats --
@@ -827,16 +863,36 @@ def delete_preprocessor(preprocessor_id: str) -> bool:
 
 # -- Providers --
 
+PROVIDER_REQUEST_DEFAULTS = {
+    "request_timeout": 120,
+    "retry_count": 0,
+    "retry_backoff": 0.5,
+}
+
+
+def _normalize_provider_request_options(provider: dict) -> dict:
+    return {
+        "request_timeout": _clamp_int(provider.get("request_timeout"), 120, 1, 3600),
+        "retry_count": _clamp_int(provider.get("retry_count"), 0, 0, 10),
+        "retry_backoff": _clamp_float(provider.get("retry_backoff"), 0.5, 0, 60),
+    }
+
+
+def _provider_from_row(row: sqlite3.Row) -> dict:
+    p = _row_to_dict(row)
+    p["enabled"] = _to_bool(p["enabled"])
+    p["extra_headers"] = _json_loads(p.get("extra_headers", "{}")) or {}
+    p.update(_normalize_provider_request_options(p))
+    return p
+
 def get_providers() -> list:
     with get_db() as db:
         rows = db.execute("SELECT * FROM providers ORDER BY id").fetchall()
         result = []
         for r in rows:
-            p = _row_to_dict(r)
-            p["enabled"] = _to_bool(p["enabled"])
+            p = _provider_from_row(r)
             models_rows = db.execute("SELECT * FROM provider_models WHERE provider_id = ? ORDER BY model_id", (p["id"],)).fetchall()
             p["models"] = [{"id": m["model_id"], "name": m["model_name"], "enabled": _to_bool(m["enabled"]), "preprocessor": m["preprocessor"] or ""} for m in models_rows]
-            p["extra_headers"] = _json_loads(p.get("extra_headers", "{}")) or {}
             result.append(p)
         return result
 
@@ -846,11 +902,9 @@ def get_provider(provider_id: str) -> Optional[dict]:
         row = db.execute("SELECT * FROM providers WHERE id = ?", (provider_id,)).fetchone()
         if not row:
             return None
-        p = _row_to_dict(row)
-        p["enabled"] = _to_bool(p["enabled"])
+        p = _provider_from_row(row)
         models_rows = db.execute("SELECT * FROM provider_models WHERE provider_id = ? ORDER BY model_id", (provider_id,)).fetchall()
         p["models"] = [{"id": m["model_id"], "name": m["model_name"], "enabled": _to_bool(m["enabled"]), "preprocessor": m["preprocessor"] or ""} for m in models_rows]
-        p["extra_headers"] = _json_loads(p.get("extra_headers", "{}")) or {}
         return p
 
 
@@ -858,12 +912,17 @@ def add_provider(provider: dict) -> dict:
     with get_db() as db:
         try:
             extra_headers_json = json.dumps(provider.get("extra_headers", {}), ensure_ascii=False)
+            options = _normalize_provider_request_options(provider)
             db.execute(
-                "INSERT INTO providers (id, name, provider_type, api_base, api_key, enabled, extra_headers) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                """
+                INSERT INTO providers
+                    (id, name, provider_type, api_base, api_key, enabled, extra_headers, request_timeout, retry_count, retry_backoff)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
                 (provider["id"], provider["name"], provider.get("provider_type", "openai"),
                  provider.get("api_base", ""), provider.get("api_key", ""),
                  1 if provider.get("enabled", True) else 0,
-                 extra_headers_json)
+                 extra_headers_json, options["request_timeout"], options["retry_count"], options["retry_backoff"])
             )
         except sqlite3.IntegrityError:
             raise ValueError(f"Provider '{provider['id']}' already exists")
@@ -878,6 +937,7 @@ def add_provider(provider: dict) -> dict:
                     m.get("preprocessor", ""),
                 )
             )
+    options = _normalize_provider_request_options(provider)
     return {
         "id": provider["id"],
         "name": provider["name"],
@@ -885,6 +945,8 @@ def add_provider(provider: dict) -> dict:
         "api_base": provider.get("api_base", ""),
         "api_key": provider.get("api_key", ""),
         "enabled": provider.get("enabled", True),
+        "extra_headers": provider.get("extra_headers", {}),
+        **options,
         "models": [
             {
                 "id": m["id"],
@@ -906,6 +968,11 @@ def update_provider(provider_id: str, updates: dict) -> Optional[dict]:
         for key in _updatable:
             if key in updates:
                 db.execute(f"UPDATE providers SET {key} = ? WHERE id = ?", (updates[key], provider_id))
+        if any(key in updates for key in PROVIDER_REQUEST_DEFAULTS):
+            options = _normalize_provider_request_options({**PROVIDER_REQUEST_DEFAULTS, **updates})
+            for key, value in options.items():
+                if key in updates:
+                    db.execute(f"UPDATE providers SET {key} = ? WHERE id = ?", (value, provider_id))
         if "extra_headers" in updates:
             db.execute("UPDATE providers SET extra_headers = ? WHERE id = ?",
                        (json.dumps(updates["extra_headers"], ensure_ascii=False), provider_id))
@@ -928,8 +995,7 @@ def update_provider(provider_id: str, updates: dict) -> Optional[dict]:
         row = db.execute("SELECT * FROM providers WHERE id = ?", (provider_id,)).fetchone()
         if not row:
             return None
-        p = _row_to_dict(row)
-        p["enabled"] = _to_bool(p["enabled"])
+        p = _provider_from_row(row)
         models_rows = db.execute("SELECT * FROM provider_models WHERE provider_id = ? ORDER BY model_id", (provider_id,)).fetchall()
         p["models"] = [{"id": m["model_id"], "name": m["model_name"], "enabled": _to_bool(m["enabled"]), "preprocessor": m["preprocessor"] or ""} for m in models_rows]
         return p

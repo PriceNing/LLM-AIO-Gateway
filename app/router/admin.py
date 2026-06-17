@@ -1,4 +1,5 @@
 import time
+import json
 
 import anyio
 import httpx
@@ -721,6 +722,7 @@ async def clear_request_logs_endpoint(authorization: Optional[str] = Header(None
 
 _CONFIG_VERSION = 1
 _IMPORT_MODES = {"skip", "replace", "merge"}
+_USER_EXPORT_VERSION = 1
 
 
 def _export_config(include_secrets: bool) -> dict:
@@ -737,6 +739,113 @@ def _export_config(include_secrets: bool) -> dict:
         "routing_rules": get_routing_rules(),
         "fallback_policies": get_fallback_policies(),
     }
+
+
+def _export_users() -> dict:
+    return {
+        "version": _USER_EXPORT_VERSION,
+        "exported_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "users": get_users(),
+    }
+
+
+@router.get("/users/export")
+async def export_users_endpoint(authorization: Optional[str] = Header(None)):
+    await require_admin_session(authorization)
+    return _export_users()
+
+
+def _validate_users_payload(payload) -> list:
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="users export must be a JSON object")
+    users = payload.get("users", [])
+    if not isinstance(users, list):
+        raise HTTPException(status_code=400, detail="users must be a list")
+    for entry in users:
+        if not isinstance(entry, dict) or not str(entry.get("username") or "").strip():
+            raise HTTPException(status_code=400, detail="each user must be an object with username")
+        if "api_keys" in entry and not isinstance(entry.get("api_keys"), list):
+            raise HTTPException(status_code=400, detail="api_keys must be a list")
+    return users
+
+
+def _import_user_api_key(username: str, entry: dict, mode: str) -> str:
+    key = str(entry.get("key") or "").strip()
+    if not key:
+        return "skipped"
+    allowed_models = entry.get("allowed_models") if isinstance(entry.get("allowed_models"), list) else ["*"]
+    name = str(entry.get("name") or "default")
+    enabled = bool(entry.get("enabled", True))
+    existing_user = get_user(username)
+    existing_key = next((item for item in (existing_user or {}).get("api_keys", []) if item.get("key") == key), None)
+    if mode == "skip" and existing_key:
+        return "skipped"
+    if existing_key:
+        update_user_api_key(username, key, {"name": name, "allowed_models": allowed_models, "enabled": enabled})
+        return "updated"
+    from app.database import get_db
+    created_at = str(entry.get("created_at") or datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+    stats = entry.get("stats") if isinstance(entry.get("stats"), dict) else {}
+    with get_db() as db:
+        db.execute(
+            """
+            INSERT INTO user_api_keys
+                (key, username, name, allowed_models, enabled, total_calls, failed_calls, total_tokens, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                key, username, name, json.dumps(allowed_models, ensure_ascii=False), 1 if enabled else 0,
+                int(stats.get("total_calls") or 0), int(stats.get("failed_calls") or 0),
+                int(stats.get("total_tokens") or 0), created_at,
+            ),
+        )
+    return "created"
+
+
+def _import_user(entry: dict, mode: str) -> tuple[str, dict]:
+    username = str(entry.get("username") or "").strip()
+    existing = get_user(username)
+    user_payload = {
+        "username": username,
+        "display_name": str(entry.get("display_name") or username),
+        "enabled": bool(entry.get("enabled", True)),
+    }
+    if mode == "skip" and existing:
+        user_outcome = "skipped"
+    elif existing:
+        if mode == "merge":
+            update_user(username, {k: v for k, v in user_payload.items() if k != "username" and v not in (None, "")})
+        else:
+            update_user(username, {k: v for k, v in user_payload.items() if k != "username"})
+        user_outcome = "updated"
+    else:
+        add_user(user_payload)
+        user_outcome = "created"
+
+    key_summary = {}
+    if not (mode == "skip" and existing):
+        for key_entry in entry.get("api_keys", []) or []:
+            if isinstance(key_entry, dict):
+                outcome = _import_user_api_key(username, key_entry, mode)
+                key_summary[outcome] = key_summary.get(outcome, 0) + 1
+    return user_outcome, key_summary
+
+
+@router.post("/users/import")
+async def import_users_endpoint(payload: dict, authorization: Optional[str] = Header(None)):
+    username = await require_admin_session(authorization)
+    mode = str(payload.get("mode") or "skip").lower()
+    if mode not in _IMPORT_MODES:
+        raise HTTPException(status_code=400, detail=f"mode must be one of {sorted(_IMPORT_MODES)}")
+    users = _validate_users_payload(payload)
+    summary = {"users": {}, "api_keys": {}}
+    for entry in users:
+        user_outcome, key_summary = _import_user(entry, mode)
+        summary["users"][user_outcome] = summary["users"].get(user_outcome, 0) + 1
+        for outcome, count in key_summary.items():
+            summary["api_keys"][outcome] = summary["api_keys"].get(outcome, 0) + count
+    _app_log.info("Users imported by '%s' mode=%s summary=%s", username, mode, summary)
+    return {"status": "ok", "mode": mode, "summary": summary}
 
 
 @router.get("/config/export")

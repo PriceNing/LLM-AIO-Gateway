@@ -7,7 +7,7 @@ from app.config import load_config
 from app.database import (
     init_db, add_admin, add_provider, add_routing_rule, add_fallback_policy,
     add_request_log, list_request_logs, clear_request_logs, add_user,
-    add_user_api_key,
+    add_user_api_key, get_user,
 )
 from app.security import create_session, hash_password
 
@@ -289,8 +289,51 @@ def test_export_import_roundtrip(temp_db):
     assert summary["routing_rules"]["skipped"] == 1
 
 
+def test_export_users_includes_api_keys(temp_db):
+    add_user({"username": "bob", "display_name": "Bob", "enabled": True})
+    key = add_user_api_key("bob", "work", ["p1/m1"])
+    r = client.get("/admin/users/export", headers=temp_db["headers"])
+    assert r.status_code == 200
+    body = r.json()
+    assert body["version"] == 1
+    user = body["users"][0]
+    assert user["username"] == "bob"
+    assert user["api_keys"][0]["key"] == key["key"]
+    assert user["api_keys"][0]["allowed_models"] == ["p1/m1"]
+
+
+def test_import_users_creates_user_and_preserves_api_key(temp_db):
+    payload = {
+        "mode": "replace",
+        "users": [{
+            "username": "alice",
+            "display_name": "Alice",
+            "enabled": True,
+            "api_keys": [{
+                "key": "sk-aio-imported",
+                "name": "imported",
+                "allowed_models": ["*"],
+                "enabled": True,
+                "stats": {"total_calls": 2, "failed_calls": 1, "total_tokens": 30},
+                "created_at": "2026-06-01",
+            }],
+        }],
+    }
+    r = client.post("/admin/users/import", json=payload, headers=temp_db["headers"])
+    assert r.status_code == 200
+    assert r.json()["summary"] == {"users": {"created": 1}, "api_keys": {"created": 1}}
+    user = get_user("alice")
+    assert user["display_name"] == "Alice"
+    assert user["api_keys"][0]["key"] == "sk-aio-imported"
+    assert user["api_keys"][0]["stats"]["total_tokens"] == 30
+
+
 def test_config_endpoints_require_auth():
     r = client.get("/admin/config/export")
     assert r.status_code == 401
     r = client.post("/admin/config/import", json={"providers": []})
+    assert r.status_code == 401
+    r = client.get("/admin/users/export")
+    assert r.status_code == 401
+    r = client.post("/admin/users/import", json={"users": []})
     assert r.status_code == 401

@@ -220,6 +220,32 @@
                             </div>
                             <div id="configImportResult" class="config-result"></div>
                         </div>
+                        <div class="config-card glass">
+                            <h3 data-i18n="config.exportUsersTitle">导出用户</h3>
+                            <p class="muted" data-i18n="config.exportUsersHint">单独导出用户管理中的用户和 API Key，方便迁移到另一台机器。</p>
+                            <div class="form-row">
+                                <button class="btn btn-primary" onclick="exportUsers()" data-i18n="config.exportUsers">下载用户 JSON</button>
+                            </div>
+                        </div>
+                        <div class="config-card glass">
+                            <h3 data-i18n="config.importUsersTitle">导入用户</h3>
+                            <p class="muted" data-i18n="config.importUsersHint">上传用户 JSON，可选择 skip / replace / merge 冲突策略。</p>
+                            <div class="form-row">
+                                <input type="file" id="usersFileInput" accept="application/json,.json">
+                            </div>
+                            <div class="form-row">
+                                <label data-i18n="config.mode">冲突策略</label>
+                                <select id="usersImportMode" class="select-input">
+                                    <option value="skip" data-i18n="config.modeSkip">skip (保留现有)</option>
+                                    <option value="replace" data-i18n="config.modeReplace">replace (覆盖)</option>
+                                    <option value="merge" data-i18n="config.modeMerge">merge (仅更新非空字段)</option>
+                                </select>
+                            </div>
+                            <div class="form-row">
+                                <button class="btn btn-primary" onclick="importUsers()" data-i18n="config.importUsers">导入用户</button>
+                            </div>
+                            <div id="usersImportResult" class="config-result"></div>
+                        </div>
                     </div>
                 </div>
             </main>
