@@ -134,6 +134,27 @@ def _target_model_for_log(target: RouteTarget, provider_id: str = "") -> str:
     return model_id.composite
 
 
+def _provider_model_for_target(target: RouteTarget) -> tuple[dict | None, dict | None]:
+    provider = resolve_provider(target.model, target.provider_id)
+    if not provider:
+        return None, None
+    model_name = parse_model_id(target.model).model_name
+    for model in provider.get("models", []) or []:
+        if model.get("id") == model_name:
+            return provider, model
+    return provider, None
+
+
+def _target_supports_native_vision(target: RouteTarget) -> bool:
+    provider, model = _provider_model_for_target(target)
+    return bool(provider and model and _model_supports_native_vision(provider, model))
+
+
+def _target_uses_preprocessor(target: RouteTarget) -> bool:
+    _provider, model = _provider_model_for_target(target)
+    return bool(model and model.get("preprocessor"))
+
+
 async def _call_nonstream_target(target: RouteTarget, internal, *, temperature, max_tokens, log_label: str, stage: str):
     provider_info = resolve_provider(target.model, target.provider_id)
     adapter_provider_id = provider_for_log(provider_info, target.provider_id)
@@ -174,6 +195,12 @@ async def _call_nonstream_target(target: RouteTarget, internal, *, temperature, 
 
 async def _internal_for_target_attempt(internal, target: RouteTarget, *, is_fallback: bool):
     if not is_fallback or not has_image_content(internal.messages):
+        return internal
+
+    if _target_supports_native_vision(target):
+        return internal
+
+    if not _target_uses_preprocessor(target):
         return internal
 
     attempt = copy.deepcopy(internal)

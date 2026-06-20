@@ -1205,7 +1205,7 @@ def test_chat_completions_stream_preprocesses_images_for_fallback_target(monkeyp
         "api_base": "https://text-fallback.example/v1",
         "api_key": "upstream-key",
         "enabled": True,
-        "models": [{"id": "text-fallback-model", "name": "Text Fallback", "enabled": True}],
+        "models": [{"id": "text-fallback-model", "name": "Text Fallback", "enabled": True, "preprocessor": "1"}],
     })
     add_fallback_policy({
         "name": "vision to text fallback", "enabled": True,
@@ -1251,6 +1251,66 @@ def test_chat_completions_stream_preprocesses_images_for_fallback_target(monkeyp
     assert "fallback saw text" in body
     assert calls == [("native-vision-fail/native-vision-model", "native-vision-fail"), ("text-fallback-model", "text-fallback-ok")]
     assert fallback_messages[-1]["content"] == "[image described by fallback preprocessor]"
+
+
+def test_chat_completions_stream_preserves_images_for_native_vision_fallback(monkeypatch, temp_db):
+    from app.database import add_fallback_policy
+    from app.core.output import InternalOutputEvent
+
+    add_provider({
+        "id": "text-primary-fail",
+        "name": "Text Primary Fail",
+        "provider_type": "openai",
+        "api_base": "https://text-primary.example/v1",
+        "api_key": "upstream-key",
+        "enabled": True,
+        "models": [{"id": "text-model", "name": "Text Model", "enabled": True}],
+    })
+    add_provider({
+        "id": "native-vision-ok",
+        "name": "Native Vision OK",
+        "provider_type": "openai",
+        "api_base": "https://native-vision-ok.example/v1",
+        "api_key": "upstream-key",
+        "enabled": True,
+        "models": [{"id": "gpt-4o-vision", "name": "GPT 4o Vision", "enabled": True}],
+    })
+    add_fallback_policy({
+        "name": "text to native vision fallback", "enabled": True,
+        "match_provider": "text-primary-fail", "match_model": "text-primary-fail/text-model",
+        "chain": [{"model": "gpt-4o-vision", "provider_id": "native-vision-ok"}],
+    })
+
+    calls = []
+    fallback_messages = []
+
+    async def fake_stream_events(**kwargs):
+        calls.append((kwargs["model"], kwargs["provider_id"]))
+        if kwargs["provider_id"] == "text-primary-fail":
+            raise RuntimeError("primary cannot accept images")
+        fallback_messages.extend(kwargs["messages"])
+        yield InternalOutputEvent(kind="message_start", role="assistant")
+        yield InternalOutputEvent(kind="text_delta", text="native vision saw image")
+        yield InternalOutputEvent(kind="message_done", finish_reason="stop")
+
+    monkeypatch.setattr("app.router.proxy.iter_openai_chat_output_events", fake_stream_events)
+
+    with client.stream("POST", "/v1/chat/completions", headers=temp_db["headers"], json={
+        "model": "text-primary-fail/text-model",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "what is this"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ]}],
+        "stream": True,
+    }) as response:
+        body = response.read().decode("utf-8")
+
+    assert response.status_code == 200
+    assert "native vision saw image" in body
+    assert calls == [("text-primary-fail/text-model", "text-primary-fail"), ("gpt-4o-vision", "native-vision-ok")]
+    content = fallback_messages[-1]["content"]
+    assert isinstance(content, list)
+    assert any(part.get("type") == "image_url" for part in content)
 
 
 def test_chat_completions_stream_fallback_matches_resolved_provider(monkeypatch, temp_db):

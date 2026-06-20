@@ -7,7 +7,7 @@ from app.config import load_config
 from app.database import (
     init_db, add_admin, add_provider, add_routing_rule, add_fallback_policy,
     add_request_log, list_request_logs, clear_request_logs, add_user,
-    add_user_api_key, get_user,
+    add_user_api_key, get_user, upsert_preprocessor, get_preprocessors,
 )
 from app.security import create_session, hash_password
 
@@ -163,6 +163,28 @@ def test_export_config_includes_secrets(temp_db):
     assert body["providers"][0]["api_key"] == "secret-key"
 
 
+def test_export_config_includes_preprocessors(temp_db):
+    upsert_preprocessor("vision-model", {
+        "api_base": "https://vision.example.com/v1",
+        "model": "gpt-4o-vision",
+        "api_key": "vision-secret",
+        "timeout": 30,
+        "max_images": 4,
+        "max_tokens": 1024,
+        "prompt": "Describe the image.",
+        "enabled": True,
+    })
+    r = client.get("/admin/config/export", headers=temp_db["headers"])
+    assert r.status_code == 200
+    body = r.json()
+    assert body["preprocessors"]["vision-model"]["model"] == "gpt-4o-vision"
+    assert body["preprocessors"]["vision-model"]["api_base"] == "https://vision.example.com/v1"
+    assert body["preprocessors"]["vision-model"]["api_key"] == ""
+
+    r = client.get("/admin/config/export", params={"include_secrets": "true"}, headers=temp_db["headers"])
+    assert r.json()["preprocessors"]["vision-model"]["api_key"] == "vision-secret"
+
+
 # -- Config import --
 
 def test_import_config_skip_mode(temp_db):
@@ -213,6 +235,31 @@ def test_import_config_replace_mode(temp_db):
     assert p1["name"] == "Updated"
     # empty api_key was filtered out, so original key preserved
     assert p1["api_key"] == "key-a"
+
+
+def test_import_config_preprocessor(temp_db):
+    payload = {
+        "mode": "replace",
+        "preprocessors": {
+            "vision-model": {
+                "api_base": "https://vision.example.com/v1",
+                "model": "gpt-4o-vision",
+                "api_key": "vision-secret",
+                "timeout": 45,
+                "max_images": 8,
+                "max_tokens": 1024,
+                "prompt": "Describe the image.",
+                "enabled": True,
+            }
+        },
+    }
+    r = client.post("/admin/config/import", json=payload, headers=temp_db["headers"])
+    assert r.status_code == 200
+    assert r.json()["summary"]["preprocessors"] == {"created": 1}
+    preprocessor = get_preprocessors()["vision-model"]
+    assert preprocessor["model"] == "gpt-4o-vision"
+    assert preprocessor["api_key"] == "vision-secret"
+    assert preprocessor["max_images"] == 8
 
 
 def test_import_config_merge_mode(temp_db):

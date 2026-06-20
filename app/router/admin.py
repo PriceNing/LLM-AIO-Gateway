@@ -727,15 +727,19 @@ _USER_EXPORT_VERSION = 1
 
 def _export_config(include_secrets: bool) -> dict:
     providers = get_providers()
+    preprocessors = get_preprocessors()
     if not include_secrets:
         for p in providers:
             p["api_key"] = ""
             p.pop("extra_headers", None)
+        for p in preprocessors.values():
+            p["api_key"] = ""
     return {
         "version": _CONFIG_VERSION,
         "exported_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "include_secrets": include_secrets,
         "providers": providers,
+        "preprocessors": preprocessors,
         "routing_rules": get_routing_rules(),
         "fallback_policies": get_fallback_policies(),
     }
@@ -857,14 +861,17 @@ async def export_config_endpoint(
     return _export_config(bool(include_secrets))
 
 
-def _validate_config_payload(payload) -> tuple[list, list, list]:
+def _validate_config_payload(payload) -> tuple[list, dict, list, list]:
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="config must be a JSON object")
     providers = payload.get("providers", [])
+    preprocessors = payload.get("preprocessors", {})
     routing = payload.get("routing_rules", [])
     fallbacks = payload.get("fallback_policies", [])
     if not isinstance(providers, list):
         raise HTTPException(status_code=400, detail="providers must be a list")
+    if not isinstance(preprocessors, dict):
+        raise HTTPException(status_code=400, detail="preprocessors must be an object")
     if not isinstance(routing, list):
         raise HTTPException(status_code=400, detail="routing_rules must be a list")
     if not isinstance(fallbacks, list):
@@ -878,7 +885,10 @@ def _validate_config_payload(payload) -> tuple[list, list, list]:
     for entry in fallbacks:
         if not isinstance(entry, dict) or not entry.get("id"):
             raise HTTPException(status_code=400, detail="each fallback_policy must be an object with id")
-    return providers, routing, fallbacks
+    for preprocessor_id, config in preprocessors.items():
+        if not str(preprocessor_id or "").strip() or not isinstance(config, dict):
+            raise HTTPException(status_code=400, detail="preprocessors must map ids to objects")
+    return providers, preprocessors, routing, fallbacks
 
 
 def _import_provider(entry: dict, mode: str) -> str:
@@ -901,6 +911,22 @@ def _import_provider(entry: dict, mode: str) -> str:
         return "updated"
     add_provider(payload)
     return "created"
+
+
+def _import_preprocessor(preprocessor_id: str, config: dict, mode: str) -> str:
+    pid = str(preprocessor_id or "").strip()
+    if not pid:
+        return "skipped"
+    existing = get_preprocessors().get(pid)
+    payload = dict(config or {})
+    if not payload.get("api_key"):
+        payload.pop("api_key", None)
+    if mode == "skip" and existing:
+        return "skipped"
+    if mode == "merge" and existing:
+        payload = {**existing, **{k: v for k, v in payload.items() if v not in (None, "", [], {})}}
+    upsert_preprocessor(pid, payload)
+    return "updated" if existing else "created"
 
 
 def _import_routing_rule(entry: dict, mode: str) -> str:
@@ -943,12 +969,15 @@ async def import_config_endpoint(payload: dict, authorization: Optional[str] = H
     mode = str(payload.get("mode") or "skip").lower()
     if mode not in _IMPORT_MODES:
         raise HTTPException(status_code=400, detail=f"mode must be one of {sorted(_IMPORT_MODES)}")
-    providers, routing, fallbacks = _validate_config_payload(payload)
+    providers, preprocessors, routing, fallbacks = _validate_config_payload(payload)
 
-    summary = {"providers": {}, "routing_rules": {}, "fallback_policies": {}}
+    summary = {"providers": {}, "preprocessors": {}, "routing_rules": {}, "fallback_policies": {}}
     for entry in providers:
         outcome = _import_provider(entry, mode)
         summary["providers"][outcome] = summary["providers"].get(outcome, 0) + 1
+    for preprocessor_id, config in preprocessors.items():
+        outcome = _import_preprocessor(preprocessor_id, config, mode)
+        summary["preprocessors"][outcome] = summary["preprocessors"].get(outcome, 0) + 1
     for entry in routing:
         outcome = _import_routing_rule(entry, mode)
         summary["routing_rules"][outcome] = summary["routing_rules"].get(outcome, 0) + 1
