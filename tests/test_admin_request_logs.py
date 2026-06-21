@@ -133,6 +133,50 @@ def test_request_logs_require_auth():
     assert r.status_code == 401
 
 
+# -- System log endpoints --
+
+def test_system_log_meta_and_list(temp_db, tmp_path):
+    log_root = tmp_path / "logs"
+    day_dir = log_root / "2026-06-06"
+    day_dir.mkdir(parents=True)
+    (day_dir / "app.log").write_text(
+        '{"ts":"2026-06-06T12:00:00.000Z","request_id":"rid1","level":"INFO","logger":"llmgw.app","msg":"hello"}\n'
+        '{"ts":"2026-06-06T12:00:01.000Z","request_id":"rid2","level":"ERROR","logger":"llmgw.app","msg":"bad thing"}\n',
+        encoding="utf-8",
+    )
+    config = load_config(str(tmp_path / "system-log-config.json"), force_reload=True)
+    config.config["logging"] = {"enabled": True, "level": "INFO", "log_dir": str(log_root), "retention_days": 30, "console": False}
+    config.save()
+
+    from app.services.logger import init_logging
+    init_logging(config.config["logging"])
+
+    r = client.get("/admin/system-logs/meta", headers=temp_db["headers"])
+    assert r.status_code == 200
+    body = r.json()
+    assert "2026-06-06" in body["dates"]
+    assert any(ch["id"] == "app" for ch in body["channels"])
+
+    r = client.get(
+        "/admin/system-logs",
+        params={"date": "2026-06-06", "channel": "app", "level": "ERROR"},
+        headers=temp_db["headers"],
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["total"] == 1
+    assert body["items"][0]["msg"] == "bad thing"
+    assert body["items"][0]["line"] == 2
+
+
+def test_system_logs_validate_inputs_and_auth(temp_db):
+    assert client.get("/admin/system-logs/meta").status_code == 401
+    r = client.get("/admin/system-logs", params={"channel": "../../bad"}, headers=temp_db["headers"])
+    assert r.status_code == 400
+    r = client.get("/admin/system-logs", params={"level": "TRACE"}, headers=temp_db["headers"])
+    assert r.status_code == 400
+
+
 # -- Config export --
 
 def test_export_config_redacts_secrets(temp_db):

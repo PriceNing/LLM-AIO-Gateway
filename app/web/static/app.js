@@ -15,7 +15,9 @@ let allModels = [];
 let users = [];
 let currentLang = localStorage.getItem(LANG_KEY) || 'zh';
 let sessionExpiredShown = false;
+let serviceVersion = '';
 window._requestLogDetails = [];
+window._systemLogMeta = null;
 
 /* ═══════════════════════════════ i18n ═══════════════════════════════ */
 
@@ -825,6 +827,8 @@ function updateAuthHint() {
 async function initAuth() {
     try {
         var status = await api('/auth/status');
+        serviceVersion = status.version || '';
+        updateServiceVersion();
         authMode = status.has_admin ? 'login' : 'setup';
         updateAuthHint();
         document.querySelector('.auth-submit').textContent = status.has_admin ? t('auth.login') : t('auth.create');
@@ -867,7 +871,14 @@ function enterApp(admin) {
     document.getElementById('authView').style.display = 'none';
     document.getElementById('appView').style.display = 'block';
     document.getElementById('currentAdmin').textContent = admin.display_name || admin.username;
+    updateServiceVersion();
     loadAll();
+}
+
+function updateServiceVersion() {
+    var el = document.getElementById('serviceVersion');
+    if (!el) return;
+    el.textContent = serviceVersion ? ('v' + serviceVersion) : '';
 }
 
 async function logout() {
@@ -938,6 +949,7 @@ function showSection(section, evt) {
     if (section === 'stats') loadStats();
     if (section === 'preprocessors') loadPreprocessors();
     if (section === 'request-logs') loadRequestLogs();
+    if (section === 'system-logs') loadSystemLogMeta();
     if (section === 'config') {/* lazy load */}
 }
 
@@ -3035,6 +3047,112 @@ async function confirmClearRequestLogs() {
     }
 }
 
+/* ════════════════════════════════ System Logs ════════════════════════════════ */
+
+var _systemLogFilterTimer = null;
+function onSystemLogFilterInput() {
+    if (_systemLogFilterTimer) clearTimeout(_systemLogFilterTimer);
+    _systemLogFilterTimer = setTimeout(loadSystemLogs, 350);
+}
+
+async function loadSystemLogMeta(force) {
+    var container = document.getElementById('systemLogsContent');
+    if (container) container.innerHTML = '<div class="loading-spinner"><span class="spinner"></span><p>' + escHtml(t('stats.loading') || 'Loading...') + '</p></div>';
+    try {
+        if (!window._systemLogMeta || force) {
+            window._systemLogMeta = await api('/admin/system-logs/meta');
+        }
+        renderSystemLogFilters(window._systemLogMeta || {});
+        await loadSystemLogs();
+    } catch (e) {
+        if (container) container.innerHTML = '<div class="empty-state"><div class="empty-icon">⚠;</div><p>' + escHtml(e.message) + '</p></div>';
+        toast((t('systemLogs.loadFail') || 'Failed to load system logs') + ': ' + e.message, 'error');
+    }
+}
+
+function renderSystemLogFilters(meta) {
+    var dateSel = document.getElementById('sysLogDateFilter');
+    var channelSel = document.getElementById('sysLogChannelFilter');
+    if (!dateSel || !channelSel) return;
+    var oldDate = dateSel.value;
+    var oldChannel = channelSel.value || 'app';
+    var dates = meta.dates || [];
+    var channels = meta.channels || [];
+    var dateHTML = '';
+    if (!dates.length) {
+        dateHTML = '<option value="">' + escHtml(t('systemLogs.noDates') || 'No log dates') + '</option>';
+    } else {
+        dates.forEach(function(date) {
+            dateHTML += '<option value="' + escHtml(date) + '">' + escHtml(date) + '</option>';
+        });
+    }
+    dateSel.innerHTML = dateHTML;
+    if (oldDate && dates.indexOf(oldDate) >= 0) dateSel.value = oldDate;
+
+    var channelHTML = '';
+    channels.forEach(function(ch) {
+        var label = t('systemLogs.channel.' + ch.id) || (ch.id + ' (' + ch.filename + ')');
+        channelHTML += '<option value="' + escHtml(ch.id) + '">' + escHtml(label) + '</option>';
+    });
+    channelSel.innerHTML = channelHTML;
+    if (oldChannel) channelSel.value = oldChannel;
+}
+
+async function loadSystemLogs() {
+    var container = document.getElementById('systemLogsContent');
+    if (!container) return;
+    var dateSel = document.getElementById('sysLogDateFilter');
+    var channelSel = document.getElementById('sysLogChannelFilter');
+    var levelSel = document.getElementById('sysLogLevelFilter');
+    var searchInput = document.getElementById('sysLogSearchFilter');
+    var date = dateSel ? dateSel.value : '';
+    var channel = channelSel ? channelSel.value : 'app';
+    var level = levelSel ? levelSel.value : '';
+    var query = searchInput ? searchInput.value.trim() : '';
+    container.innerHTML = '<div class="loading-spinner"><span class="spinner"></span><p>' + escHtml(t('stats.loading') || 'Loading...') + '</p></div>';
+    try {
+        var params = ['limit=300'];
+        if (date) params.push('date=' + encodeURIComponent(date));
+        if (channel) params.push('channel=' + encodeURIComponent(channel));
+        if (level) params.push('level=' + encodeURIComponent(level));
+        if (query) params.push('q=' + encodeURIComponent(query));
+        var data = await api('/admin/system-logs?' + params.join('&'));
+        renderSystemLogs(data);
+    } catch (e) {
+        container.innerHTML = '<div class="empty-state"><div class="empty-icon">⚠;</div><p>' + escHtml(e.message) + '</p></div>';
+        toast((t('systemLogs.loadFail') || 'Failed to load system logs') + ': ' + e.message, 'error');
+    }
+}
+
+function renderSystemLogs(data) {
+    var container = document.getElementById('systemLogsContent');
+    if (!container) return;
+    var items = (data && data.items) || [];
+    var total = (data && data.total) || 0;
+    var summary = '<div class="history-summary"><span class="history-stat"><strong>' + total + '</strong> ' + escHtml(t('systemLogs.total') || 'entries') + '</span>';
+    summary += '<span class="history-stat mono">' + escHtml((data.channel || '') + ' / ' + (data.date || '')) + '</span></div>';
+    if (!items.length) {
+        container.innerHTML = summary + '<div class="empty-state"><div class="empty-icon">☰;</div><p>' + escHtml(t('systemLogs.empty') || 'No system log entries') + '</p></div>';
+        return;
+    }
+    var html = '<div class="system-log-list">';
+    items.forEach(function(entry) {
+        var level = String(entry.level || '').toUpperCase();
+        var badgeClass = level === 'ERROR' ? 'badge-fail' : (level === 'WARNING' ? 'badge-partial' : 'badge-ok');
+        html += '<div class="system-log-row">';
+        html += '<div class="system-log-meta"><span class="badge ' + badgeClass + '">' + escHtml(level || '-') + '</span>';
+        html += '<span class="mono">' + escHtml(entry.ts || '-') + '</span>';
+        html += '<span class="mono">#' + escHtml(entry.line || '-') + '</span>';
+        if (entry.request_id) html += '<span class="mono">rid=' + escHtml(entry.request_id) + '</span>';
+        html += '<span class="mono">' + escHtml(entry.logger || '-') + '</span></div>';
+        html += '<pre class="system-log-msg">' + escHtml(entry.msg || entry.raw || '') + '</pre>';
+        if (entry.exc) html += '<pre class="system-log-exc">' + escHtml(entry.exc) + '</pre>';
+        html += '</div>';
+    });
+    html += '</div>';
+    container.innerHTML = summary + html;
+}
+
 /* ════════════════════════════════ Config import/export ════════════════════════════════ */
 
 async function exportConfig() {
@@ -3160,6 +3278,7 @@ async function importUsers() {
 
 Object.assign(I18N.zh, {
     'nav.requestLogs': '请求日志',
+    'nav.systemLogs': '系统日志',
     'nav.config': '配置导入/导出',
     'logs.title': '请求/响应日志',
     'logs.allEndpoints': '全部端点',
@@ -3191,6 +3310,18 @@ Object.assign(I18N.zh, {
     'logs.cleared': '已清空',
     'logs.clearFail': '清空失败',
     'logs.loadDetailFail': '加载详情失败',
+    'systemLogs.title': '系统日志',
+    'systemLogs.allLevels': '全部级别',
+    'systemLogs.search': '搜索日志',
+    'systemLogs.empty': '没有系统日志记录',
+    'systemLogs.noDates': '暂无日志日期',
+    'systemLogs.total': '条日志',
+    'systemLogs.loadFail': '加载系统日志失败',
+    'systemLogs.channel.access': '访问日志',
+    'systemLogs.channel.error': '错误日志',
+    'systemLogs.channel.app': '应用日志',
+    'systemLogs.channel.tool_calls': '工具调用日志',
+    'systemLogs.channel.request': '请求调试日志',
     'config.title': '配置导入/导出',
     'config.exportTitle': '导出配置',
     'config.exportHint': '生成 providers / routing rules / fallback policies 的 JSON 备份。',
@@ -3227,6 +3358,7 @@ Object.assign(I18N.zh, {
 
 Object.assign(I18N.en, {
     'nav.requestLogs': 'Request Logs',
+    'nav.systemLogs': 'System Logs',
     'nav.config': 'Config Import/Export',
     'logs.title': 'Request/Response Logs',
     'logs.allEndpoints': 'All endpoints',
@@ -3258,6 +3390,18 @@ Object.assign(I18N.en, {
     'logs.cleared': 'Cleared',
     'logs.clearFail': 'Clear failed',
     'logs.loadDetailFail': 'Failed to load detail',
+    'systemLogs.title': 'System Logs',
+    'systemLogs.allLevels': 'All levels',
+    'systemLogs.search': 'Search logs',
+    'systemLogs.empty': 'No system log entries',
+    'systemLogs.noDates': 'No log dates',
+    'systemLogs.total': 'entries',
+    'systemLogs.loadFail': 'Failed to load system logs',
+    'systemLogs.channel.access': 'Access Log',
+    'systemLogs.channel.error': 'Error Log',
+    'systemLogs.channel.app': 'Application Log',
+    'systemLogs.channel.tool_calls': 'Tool Call Log',
+    'systemLogs.channel.request': 'Request Debug Log',
     'config.title': 'Config Import/Export',
     'config.exportTitle': 'Export Config',
     'config.exportHint': 'Generate a JSON backup of providers, routing rules, and fallback policies.',

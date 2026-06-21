@@ -1,5 +1,6 @@
 import sys
 import io
+import time
 # Windows cmd.exe uses GBK by default, which can't encode emoji (e.g. OK).
 # Reconfigure stdout/stderr to UTF-8 so diagnostic prints don't crash.
 for _stream in (sys.stdout, sys.stderr):
@@ -16,7 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from app import __version__
 from app.config import load_config, get_config
-from app.services.logger import init_logging, set_request_id, generate_request_id
+from app.services.logger import get_logger, init_logging, set_request_id, generate_request_id
 from app.router import admin, auth, proxy
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -28,8 +29,30 @@ class RequestIdMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         rid = request.headers.get("X-Request-ID") or generate_request_id()
         set_request_id(rid)
-        response = await call_next(request)
+        start = time.perf_counter()
+        access_log = get_logger("access")
+        error_log = get_logger("error")
+        try:
+            response = await call_next(request)
+        except Exception as exc:
+            elapsed_ms = int((time.perf_counter() - start) * 1000)
+            error_log.exception(
+                "[http.exception] method=%s path=%s elapsed_ms=%d error=%s",
+                request.method,
+                request.url.path,
+                elapsed_ms,
+                exc,
+            )
+            raise
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
         response.headers["X-Request-ID"] = rid
+        access_log.info(
+            "[http] method=%s path=%s status=%d elapsed_ms=%d",
+            request.method,
+            request.url.path,
+            response.status_code,
+            elapsed_ms,
+        )
         return response
 
 

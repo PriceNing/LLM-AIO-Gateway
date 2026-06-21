@@ -276,6 +276,21 @@ select option {
   letter-spacing: -0.3px;
   white-space: nowrap;
 }
+.version-badge {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 8px;
+  padding: 2px 7px;
+  border: 1px solid var(--border-card);
+  border-radius: 6px;
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0;
+  vertical-align: middle;
+}
+.version-badge:empty { display: none; }
 .topbar-right {
   display: flex;
   align-items: center;
@@ -1455,4 +1470,32 @@ a.icon-btn { text-decoration: none; }
 .config-result { margin-top: 12px; }
 
 .modal-wide { max-width: 90vw; width: 720px; }
+
+.system-log-list { display: flex; flex-direction: column; gap: 8px; }
+.system-log-row {
+  padding: 12px 14px;
+  border: 1px solid var(--border-card);
+  border-radius: 8px;
+  background: var(--bg-surface);
+}
+.system-log-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+.system-log-msg,
+.system-log-exc {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, SFMono-Regular, "Cascadia Code", Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.system-log-exc {
+  margin-top: 8px;
+  color: var(--danger);
+}
 

@@ -35,7 +35,7 @@ from app.database import (
     list_request_logs, count_request_logs, get_request_log as db_get_request_log,
     delete_request_log as db_delete_request_log, clear_request_logs,
 )
-from app.services.logger import get_logger
+from app.services.logger import available_log_channels, get_logger, list_log_dates, read_log_entries
 from app.models import ProviderCreate, ProviderUpdate, StatsResponse
 
 router = APIRouter()
@@ -666,6 +666,59 @@ async def toggle_model_preprocessor(body: dict, authorization: Optional[str] = H
 # -- Request/Response detail logs --
 
 _VALID_ENDPOINTS = {"chat_completions", "completions", "messages", "responses"}
+
+
+# -- System log files --
+
+_VALID_LOG_LEVELS = {"", "DEBUG", "INFO", "WARNING", "ERROR"}
+
+
+@router.get("/system-logs/meta")
+async def system_logs_meta(authorization: Optional[str] = Header(None)):
+    await require_admin_session(authorization)
+    return {
+        "channels": [
+            {"id": channel, "filename": filename}
+            for channel, filename in available_log_channels().items()
+        ],
+        "dates": list_log_dates(),
+    }
+
+
+@router.get("/system-logs")
+async def list_system_logs_endpoint(
+    date: Optional[str] = None,
+    channel: str = "app",
+    level: str = "",
+    q: str = "",
+    limit: int = 200,
+    offset: int = 0,
+    authorization: Optional[str] = Header(None),
+):
+    await require_admin_session(authorization)
+    dates = list_log_dates()
+    selected_date = (date or (dates[0] if dates else datetime.now(timezone.utc).strftime("%Y-%m-%d"))).strip()
+    level = str(level or "").upper().strip()
+    if level not in _VALID_LOG_LEVELS:
+        raise HTTPException(status_code=400, detail="invalid log level")
+    try:
+        data = read_log_entries(
+            selected_date,
+            channel,
+            limit=max(1, min(int(limit), 1000)),
+            offset=max(0, int(offset)),
+            level=level,
+            q=q,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        **data,
+        "date": selected_date,
+        "channel": channel,
+        "level": level,
+        "q": q or "",
+    }
 
 
 @router.get("/request-logs")

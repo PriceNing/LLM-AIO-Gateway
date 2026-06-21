@@ -43,7 +43,7 @@
         <!-- Top Bar -->
         <header class="topbar glass">
             <div class="topbar-left">
-                <h1>&#9883; LLM AIO Gateway</h1>
+                <h1>&#9883; LLM AIO Gateway <span id="serviceVersion" class="version-badge"></span></h1>
             </div>
             <div class="topbar-right">
                 <span class="admin-name" id="currentAdmin"></span>
@@ -82,6 +82,9 @@
                 </button>
                 <button class="nav-btn" onclick="showSection('request-logs', event)" data-section="request-logs">
                     <span class="nav-icon">&#128203;</span><span data-i18n="nav.requestLogs">请求日志</span>
+                </button>
+                <button class="nav-btn" onclick="showSection('system-logs', event)" data-section="system-logs">
+                    <span class="nav-icon">&#128220;</span><span data-i18n="nav.systemLogs">系统日志</span>
                 </button>
                 <button class="nav-btn" onclick="showSection('config', event)" data-section="config">
                     <span class="nav-icon">&#128190;</span><span data-i18n="nav.config">配置导入/导出</span>
@@ -181,6 +184,27 @@
                         </div>
                     </div>
                     <div id="requestLogsContent"></div>
+                </div>
+
+                <!-- System Logs -->
+                <div id="system-logs-section" class="section" style="display:none;">
+                    <div class="section-header">
+                        <h2 data-i18n="systemLogs.title">系统日志</h2>
+                        <div class="section-actions">
+                            <select id="sysLogDateFilter" class="select-input" onchange="loadSystemLogs()"></select>
+                            <select id="sysLogChannelFilter" class="select-input" onchange="loadSystemLogs()"></select>
+                            <select id="sysLogLevelFilter" class="select-input" onchange="loadSystemLogs()">
+                                <option value="" data-i18n="systemLogs.allLevels">全部级别</option>
+                                <option value="DEBUG">DEBUG</option>
+                                <option value="INFO">INFO</option>
+                                <option value="WARNING">WARNING</option>
+                                <option value="ERROR">ERROR</option>
+                            </select>
+                            <input type="text" id="sysLogSearchFilter" class="text-input" data-i18n-placeholder="systemLogs.search" placeholder="搜索日志" oninput="onSystemLogFilterInput()">
+                            <button class="btn btn-secondary" onclick="loadSystemLogMeta(true)" data-i18n="logs.refresh">刷新</button>
+                        </div>
+                    </div>
+                    <div id="systemLogsContent"></div>
                 </div>
 
                 <!-- Config import/export -->

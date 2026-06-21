@@ -92,6 +92,10 @@ class LogManager:
         "request": "request.log",
     }
 
+    @classmethod
+    def channels(cls) -> dict[str, str]:
+        return dict(cls._CHANNELS)
+
     def __init__(self):
         self._lock = threading.Lock()
         self._handlers: dict[str, logging.FileHandler] = {}
@@ -264,6 +268,105 @@ def get_log_manager() -> LogManager:
 
 def get_logger(name: str) -> logging.Logger:
     return get_log_manager().get_logger(name)
+
+
+def available_log_channels() -> dict[str, str]:
+    return LogManager.channels()
+
+
+def _configured_log_dir() -> str:
+    try:
+        from app.config import get_config
+        logging_config = get_config().config.get("logging") or {}
+        return str(logging_config.get("log_dir") or get_log_manager().log_dir)
+    except Exception:
+        return get_log_manager().log_dir
+
+
+def list_log_dates() -> list[str]:
+    root = Path(_configured_log_dir())
+    if not root.exists():
+        return []
+    dates = []
+    for entry in root.iterdir():
+        if not entry.is_dir():
+            continue
+        try:
+            datetime.strptime(entry.name, "%Y-%m-%d")
+        except ValueError:
+            continue
+        dates.append(entry.name)
+    return sorted(dates, reverse=True)
+
+
+def _log_file_path(date: str, channel: str) -> Path:
+    channels = available_log_channels()
+    if channel not in channels:
+        raise ValueError("invalid log channel")
+    try:
+        datetime.strptime(date, "%Y-%m-%d")
+    except ValueError as exc:
+        raise ValueError("invalid log date") from exc
+
+    root = Path(_configured_log_dir()).resolve()
+    path = (root / date / channels[channel]).resolve()
+    if root != path and root not in path.parents:
+        raise ValueError("invalid log path")
+    return path
+
+
+def read_log_entries(
+    date: str,
+    channel: str,
+    *,
+    limit: int = 200,
+    offset: int = 0,
+    level: str = "",
+    q: str = "",
+) -> dict:
+    path = _log_file_path(date, channel)
+    limit = max(1, min(int(limit), 1000))
+    offset = max(0, int(offset))
+    level = str(level or "").upper().strip()
+    q = str(q or "").lower().strip()
+
+    if not path.exists():
+        return {"items": [], "total": 0, "limit": limit, "offset": offset, "path": str(path)}
+
+    items = []
+    with path.open("r", encoding="utf-8", errors="replace") as fh:
+        for line_no, line in enumerate(fh, start=1):
+            raw = line.rstrip("\r\n")
+            if not raw:
+                continue
+            try:
+                entry = json.loads(raw)
+                if not isinstance(entry, dict):
+                    entry = {"msg": raw}
+            except json.JSONDecodeError:
+                entry = {"msg": raw}
+            entry.setdefault("ts", "")
+            entry.setdefault("request_id", "")
+            entry.setdefault("level", "")
+            entry.setdefault("logger", "")
+            entry.setdefault("msg", raw)
+            entry["line"] = line_no
+            entry["raw"] = raw
+            if level and str(entry.get("level") or "").upper() != level:
+                continue
+            if q and q not in raw.lower():
+                continue
+            items.append(entry)
+
+    items.reverse()
+    total = len(items)
+    return {
+        "items": items[offset:offset + limit],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "path": str(path),
+    }
 
 
 def set_request_id(rid: str = "") -> None:

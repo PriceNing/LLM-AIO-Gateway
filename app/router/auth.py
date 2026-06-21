@@ -1,6 +1,7 @@
 import asyncio
 from fastapi import APIRouter, Header, HTTPException
 from typing import Optional
+from app import __version__
 from app.database import get_admins, get_admin, add_admin, update_admin_password
 from app.security import create_session, delete_session, get_session_username, hash_password, verify_password
 
@@ -29,7 +30,7 @@ async def require_admin_session(authorization: Optional[str] = Header(None)) -> 
 
 @router.get("/status")
 async def auth_status():
-    return {"has_admin": bool(get_admins())}
+    return {"has_admin": bool(get_admins()), "version": __version__}
 
 
 @router.post("/setup")
