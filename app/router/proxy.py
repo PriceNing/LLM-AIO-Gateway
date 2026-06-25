@@ -410,9 +410,24 @@ def _is_client_visible_stream_event(event) -> bool:
         return bool(event.text or event.reasoning)
     if event.kind in ("tool_call_start", "tool_call_arguments_delta", "tool_call_done"):
         return True
-    if event.kind == "message_done":
-        return True
     return False
+
+
+def _stream_event_has_payload(event: InternalOutputEvent) -> bool:
+    return bool(
+        (event.kind == "text_delta" and event.text)
+        or (event.kind == "reasoning_delta" and event.reasoning)
+        or (event.kind == "tool_call_start" and (event.tool_call_id or event.name))
+        or (event.kind == "tool_call_arguments_delta" and (event.arguments_delta or event.arguments or event.tool_call_id or event.name))
+        or (event.kind == "tool_call_done" and (event.tool_call_id or event.name))
+    )
+
+
+def _empty_stream_error(target: RouteTarget, provider_id: str) -> RuntimeError:
+    exc = RuntimeError("upstream stream ended without response output")
+    exc.attempted_model = target.model
+    exc.attempted_provider = provider_id or target.provider_id or ""
+    return exc
 
 
 async def _stream_events_with_fallbacks(internal, *, temperature, max_tokens, log_label: str, strip_thinking=True):
@@ -431,6 +446,7 @@ async def _stream_events_with_fallbacks(internal, *, temperature, max_tokens, lo
         attempt_internal.provider_id = target.provider_id
         fallback_provider_id = _fallback_provider_id_for_target(target)
         emitted = False
+        pending_events = []
         try:
             events, provider_info, adapter_provider_id = _stream_events_for_target(
                 target,
@@ -456,8 +472,18 @@ async def _stream_events_with_fallbacks(internal, *, temperature, max_tokens, lo
             })
             async for event in events:
                 if _is_client_visible_stream_event(event):
+                    if not emitted:
+                        for pending in pending_events:
+                            yield pending
+                        pending_events = []
                     emitted = True
-                yield event
+                    yield event
+                elif emitted:
+                    yield event
+                else:
+                    pending_events.append(event)
+            if not emitted and not any(_stream_event_has_payload(event) for event in pending_events):
+                raise _empty_stream_error(target, adapter_provider_id or fallback_provider_id or "")
             fallback_attempts.append(_fallback_attempt_record(
                 index=index,
                 stage=stage,

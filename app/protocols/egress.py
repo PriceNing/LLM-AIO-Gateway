@@ -145,6 +145,7 @@ async def render_responses_sse(events, *, model: str, previous_response_id: str 
     usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
     tool_states: dict[int, dict] = {}
     completion_output = []
+    saw_message_done = False
 
     _app_log.debug("[egress_responses_stream] START model=%s response_id=%s previous_response_id=%s", model, resp_id, previous_response_id or "")
 
@@ -195,7 +196,11 @@ async def render_responses_sse(events, *, model: str, previous_response_id: str 
             usage.update({k: v for k, v in event.usage.items() if k in usage})
         elif event.kind == "message_done":
             _app_log.debug("[egress_responses_stream] message_done finish_reason=%s", event.finish_reason or "")
+            saw_message_done = True
             break
+
+    if not saw_message_done and not accumulated_text and not accumulated_reasoning and not tool_states:
+        raise RuntimeError("upstream closed before sending response output")
 
     if text_item_added:
         if text_content_added:

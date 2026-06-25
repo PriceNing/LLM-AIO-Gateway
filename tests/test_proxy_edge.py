@@ -1183,6 +1183,69 @@ def test_chat_completions_stream_uses_fallback_before_output(monkeypatch, temp_d
     assert calls == [("primary-stream-model", "primary-stream-fail"), ("fallback-stream-model", "fallback-stream-ok")]
 
 
+def test_responses_stream_uses_fallback_on_empty_primary_stream(monkeypatch, temp_db):
+    from app.database import add_fallback_policy, add_routing_rule
+    from app.core.output import InternalOutputEvent
+
+    add_provider({
+        "id": "responses-empty-primary",
+        "name": "Responses Empty Primary",
+        "provider_type": "openai",
+        "api_base": "https://responses-empty.example/v1",
+        "api_key": "upstream-key",
+        "enabled": True,
+        "models": [{"id": "responses-empty-model", "name": "Primary", "enabled": True}],
+    })
+    add_provider({
+        "id": "responses-fallback-ok",
+        "name": "Responses Fallback OK",
+        "provider_type": "openai",
+        "api_base": "https://responses-fallback.example/v1",
+        "api_key": "upstream-key",
+        "enabled": True,
+        "models": [{"id": "responses-fallback-model", "name": "Fallback", "enabled": True}],
+    })
+    add_routing_rule({
+        "name": "responses-empty-rule", "enabled": True,
+        "match_model": "responses-empty-source", "target_model": "responses-empty-model", "target_provider": "responses-empty-primary",
+    })
+    add_fallback_policy({
+        "name": "responses empty stream fallback", "enabled": True,
+        "match_provider": "responses-empty-primary", "match_model": "responses-empty-model",
+        "chain": [{"model": "responses-fallback-model", "provider_id": "responses-fallback-ok"}],
+    })
+
+    calls = []
+
+    async def fake_stream_events(**kwargs):
+        calls.append((kwargs["model"], kwargs["provider_id"]))
+        if kwargs["provider_id"] == "responses-empty-primary":
+            yield InternalOutputEvent(kind="message_start", role="assistant")
+            yield InternalOutputEvent(kind="message_done", finish_reason="stop")
+            return
+        yield InternalOutputEvent(kind="message_start", role="assistant")
+        yield InternalOutputEvent(kind="text_delta", text="fallback response text")
+        yield InternalOutputEvent(kind="usage", usage={"total_tokens": 23})
+        yield InternalOutputEvent(kind="message_done", finish_reason="stop")
+
+    monkeypatch.setattr("app.router.proxy.iter_openai_chat_output_events", fake_stream_events)
+
+    with client.stream("POST", "/v1/responses", headers=temp_db["headers"], json={
+        "model": "responses-empty-source",
+        "input": [{"type": "message", "role": "user", "content": "hi"}],
+        "stream": True,
+    }) as response:
+        body = response.read().decode("utf-8")
+
+    assert response.status_code == 200
+    assert "fallback response text" in body
+    assert '"total_tokens": 23' in body
+    assert calls == [
+        ("responses-empty-model", "responses-empty-primary"),
+        ("responses-fallback-model", "responses-fallback-ok"),
+    ]
+
+
 def test_chat_completions_stream_preprocesses_images_for_fallback_target(monkeypatch, temp_db):
     from app.database import add_fallback_policy
     from app.core.output import InternalOutputEvent
