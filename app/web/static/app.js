@@ -189,6 +189,8 @@ zh: {
     'fallbacks.chain': 'Fallback 链',
     'fallbacks.addTarget': '添加目标',
     'fallbacks.timeout': '超时',
+    'fallbacks.attemptTimeout': '尝试超时（秒）',
+    'fallbacks.attemptTimeoutHint': '当前上游在出结果前最多等待多久；超时后自动切换到下一目标。默认 60 秒。',
     'fallbacks.connectionError': '连接错误',
     'fallbacks.http429': 'HTTP 429',
     'fallbacks.http5xx': 'HTTP 5xx',
@@ -209,7 +211,11 @@ zh: {
     'stats.title': '调用统计',
     'stats.loadFail': '加载统计失败',
     'stats.totalCalls': '总调用次数',
-    'stats.successRate': '成功率',
+    'stats.successRate': '硬成功率',
+    'stats.healthRate': '健康率',
+    'stats.degradedCalls': '降级次数',
+    'stats.rejectedCalls': '拒绝次数',
+    'stats.cancelledCalls': '中断次数',
     'stats.failedCalls': '失败次数',
     'stats.activeModels': '活跃模型',
     'stats.noData': '暂无调用数据',
@@ -225,6 +231,7 @@ zh: {
     'stats.key': 'Key',
     'stats.model': '实际模型',
     'stats.requestedModel': '请求模型',
+    'stats.routedModel': '路由目标',
     'stats.endpoint': '端点',
     'stats.tokens': 'Tokens',
     'stats.status': '状态',
@@ -480,6 +487,8 @@ en: {
     'fallbacks.chain': 'Fallback Chain',
     'fallbacks.addTarget': 'Add Target',
     'fallbacks.timeout': 'Timeout',
+    'fallbacks.attemptTimeout': 'Attempt timeout (sec)',
+    'fallbacks.attemptTimeoutHint': 'Max wait for the current upstream before switching to the next target. Default 60s.',
     'fallbacks.connectionError': 'Connection Error',
     'fallbacks.http429': 'HTTP 429',
     'fallbacks.http5xx': 'HTTP 5xx',
@@ -500,7 +509,11 @@ en: {
     'stats.title': 'Statistics',
     'stats.loadFail': 'Failed to load stats',
     'stats.totalCalls': 'Total Calls',
-    'stats.successRate': 'Success Rate',
+    'stats.successRate': 'Hard Success Rate',
+    'stats.healthRate': 'Health Rate',
+    'stats.degradedCalls': 'Degraded Calls',
+    'stats.rejectedCalls': 'Rejected Calls',
+    'stats.cancelledCalls': 'Cancelled Calls',
     'stats.failedCalls': 'Failed Calls',
     'stats.activeModels': 'Active Models',
     'stats.noData': 'No data yet',
@@ -516,6 +529,7 @@ en: {
     'stats.key': 'Key',
     'stats.model': 'Actual Model',
     'stats.requestedModel': 'Requested',
+    'stats.routedModel': 'Routed Target',
     'stats.endpoint': 'Endpoint',
     'stats.tokens': 'Tokens',
     'stats.status': 'Status',
@@ -612,6 +626,9 @@ Object.assign(I18N.zh, {
     'stats.statusOk': 'OK',
     'stats.statusFail': 'FAIL',
     'stats.statusPartial': 'PARTIAL',
+    'stats.statusDegraded': 'DEGRADED',
+    'stats.statusRejected': 'REJECTED',
+    'stats.statusCancelled': 'CANCELLED',
     'stats.basicInfo': '基础信息',
     'stats.routingInfo': '路由 / Fallback',
     'stats.errorInfo': '错误信息',
@@ -626,6 +643,9 @@ Object.assign(I18N.zh, {
     'stats.fallbackAttemptStarted': '尝试中',
     'stats.fallbackAttemptSuccess': '成功',
     'stats.fallbackAttemptFailed': '失败',
+    'stats.routingMatched': '命中路由',
+    'stats.routingRule': '路由规则',
+    'stats.routingReason': '路由原因',
     'stats.errorTrigger': '错误触发类型',
     'stats.errorStage': '错误阶段',
     'stats.errorMessage': '错误消息',
@@ -649,6 +669,9 @@ Object.assign(I18N.en, {
     'stats.statusOk': 'OK',
     'stats.statusFail': 'FAIL',
     'stats.statusPartial': 'PARTIAL',
+    'stats.statusDegraded': 'DEGRADED',
+    'stats.statusRejected': 'REJECTED',
+    'stats.statusCancelled': 'CANCELLED',
     'stats.basicInfo': 'Basic',
     'stats.routingInfo': 'Routing / Fallback',
     'stats.errorInfo': 'Error',
@@ -656,6 +679,9 @@ Object.assign(I18N.en, {
     'stats.provider': 'Provider',
     'stats.stream': 'Stream',
     'stats.partialOutput': 'Partial Output',
+    'stats.routingMatched': 'Routing Matched',
+    'stats.routingRule': 'Routing Rule',
+    'stats.routingReason': 'Routing Reason',
     'stats.fallbackStatus': 'Fallback Status',
     'stats.fallbackReason': 'Fallback Reason',
     'stats.fallbackAttempts': 'Fallback Chain',
@@ -1441,6 +1467,7 @@ function renderFallbackPolicies() {
                         '<span class="status-dot ' + (policy.enabled ? 'on' : 'off') + '"></span>' +
                         '<span>' + (policy.enabled ? t('fallbacks.enabled') : t('fallbacks.disabled')) + '</span>' +
                         '<span>' + escHtml(enabledTriggers.join(', ') || '-') + '</span>' +
+                        '<span>' + t('fallbacks.attemptTimeout') + ': ' + escHtml(String(policy.attempt_timeout != null ? policy.attempt_timeout : 60)) + 's</span>' +
                     '</div>' +
                 '</div>' +
                 '<div class="card-actions">' +
@@ -1481,6 +1508,10 @@ function fallbackPolicyFormHtml(title, policy) {
         '<div class="form-group"><label>' + t('fallbacks.matchModel') + '</label>' +
             '<input type="text" id="fallbackMatchModel" list="fallbackModelList" value="' + escHtml(policy.match_model || '*') + '" placeholder="*" autocomplete="off">' +
             '<datalist id="fallbackModelList"></datalist></div>' +
+        '<div class="form-group"><label>' + t('fallbacks.attemptTimeout') + '</label>' +
+            '<input type="number" id="fallbackAttemptTimeout" min="5" max="3600" step="1" value="' +
+                escHtml(String(policy.attempt_timeout != null ? policy.attempt_timeout : 60)) + '">' +
+            '<div class="form-hint muted" style="margin-top:6px;font-size:12px;">' + t('fallbacks.attemptTimeoutHint') + '</div></div>' +
         '<div class="form-group"><label>' + t('fallbacks.triggers') + '</label>' +
             '<div class="checkbox-grid">' +
                 fallbackTriggerCheckbox('timeout', t('fallbacks.timeout'), triggers.timeout) +
@@ -1545,11 +1576,17 @@ function readFallbackPolicyForm() {
         var model = row.querySelector('select[id^="fallbackModel"]').value.trim();
         if (model) chain.push({ provider_id: provider, model: model });
     });
+    var attemptTimeoutRaw = document.getElementById('fallbackAttemptTimeout').value;
+    var attemptTimeout = parseInt(attemptTimeoutRaw, 10);
+    if (!isFinite(attemptTimeout) || attemptTimeout <= 0) attemptTimeout = 60;
+    if (attemptTimeout < 5) attemptTimeout = 5;
+    if (attemptTimeout > 3600) attemptTimeout = 3600;
     return {
         name: document.getElementById('fallbackName').value.trim() || 'New Fallback Policy',
         enabled: document.getElementById('fallbackEnabled').checked,
         match_provider: document.getElementById('fallbackMatchProvider').value.trim(),
         match_model: document.getElementById('fallbackMatchModel').value.trim() || '*',
+        attempt_timeout: attemptTimeout,
         triggers: triggers,
         chain: chain
     };
@@ -2498,7 +2535,7 @@ function _buildRealtimePanel(stats) {
     var log = stats.request_log || [];
     var tableHTML = '<div class="table-card glass"><h3>' + t('stats.realtime') + '</h3>' +
         '<table class="modern-table"><thead><tr>' +
-        '<th>' + t('stats.time') + '</th><th>' + t('stats.client') + '</th><th>' + t('stats.key') + '</th><th>' + t('stats.requestedModel') + '</th><th>' + t('stats.model') + '</th><th>' + t('stats.endpoint') + '</th><th>' + t('stats.tokens') + '</th><th>' + t('stats.status') + '</th><th>' + (t('stats.details') || 'Details') + '</th>' +
+        '<th>' + t('stats.time') + '</th><th>' + t('stats.client') + '</th><th>' + t('stats.key') + '</th><th>' + t('stats.requestedModel') + '</th><th>' + t('stats.routedModel') + '</th><th>' + t('stats.model') + '</th><th>' + t('stats.endpoint') + '</th><th>' + t('stats.tokens') + '</th><th>' + t('stats.status') + '</th><th>' + (t('stats.details') || 'Details') + '</th>' +
         '</tr></thead><tbody>';
 
     var displayLog = log.slice(0, 40);
@@ -2508,13 +2545,17 @@ function _buildRealtimePanel(stats) {
         var badge = requestStatusClass(entry);
         var statusLabel = requestStatusLabel(entry);
         var reqModel = entry.requested_model || entry.model;
-        var isFallback = reqModel !== entry.model;
+        var details = entry.details || {};
+        var routedModel = entry.routed_model || details.routed_model || '';
+        var isDegraded = entry.status === 'degraded' || entry.fallback_status === 'used' || details.fallback_status === 'used';
+        var modelChanged = reqModel && entry.model && reqModel !== entry.model;
         tableHTML += '<tr>' +
             '<td>' + escHtml(entry.time) + '</td>' +
             '<td>' + escHtml(entry.username) + '</td>' +
             '<td class="mono">' + escHtml(entry.api_key) + '</td>' +
             '<td>' + escHtml(reqModel) + '</td>' +
-            '<td>' + (isFallback ? '<span style="color:var(--warning)" title="fallback">' + escHtml(entry.model) + '</span>' : escHtml(entry.model)) + '</td>' +
+            '<td>' + (routedModel ? '<span style="color:var(--warning)">' + escHtml(routedModel) + '</span>' : '-') + '</td>' +
+            '<td>' + ((isDegraded || modelChanged) ? '<span style="color:var(--warning)" title="fallback/routed">' + escHtml(entry.model) + '</span>' : escHtml(entry.model)) + '</td>' +
             '<td><span class="badge-endpoint">' + escHtml(entry.endpoint) + '</span></td>' +
             '<td>' + entry.tokens.toLocaleString() + '</td>' +
             '<td><span class="badge ' + badge + '">' + escHtml(statusLabel) + '</span></td>' +
@@ -2522,7 +2563,7 @@ function _buildRealtimePanel(stats) {
         '</tr>';
     }
     if (log.length === 0) {
-        tableHTML += '<tr><td colspan="9" style="text-align:center;color:var(--text-tertiary);padding:24px">' + t('stats.noRecords') + '</td></tr>';
+        tableHTML += '<tr><td colspan="10" style="text-align:center;color:var(--text-tertiary);padding:24px">' + t('stats.noRecords') + '</td></tr>';
     }
     tableHTML += '</tbody></table></div>';
 
@@ -2530,13 +2571,21 @@ function _buildRealtimePanel(stats) {
 }
 
 function requestStatusLabel(entry) {
+    if (entry.status === 'rejected') return t('stats.statusRejected') || 'REJECTED';
+    if (entry.status === 'cancelled') return t('stats.statusCancelled') || 'CANCELLED';
     if (entry.status === 'partial' || entry.partial_output) return t('stats.statusPartial') || 'PARTIAL';
-    return entry.success ? (t('stats.statusOk') || 'OK') : (t('stats.statusFail') || 'FAIL');
+    if (entry.status === 'degraded') return t('stats.statusDegraded') || 'DEGRADED';
+    if (entry.success === false || entry.status === 'fail') return t('stats.statusFail') || 'FAIL';
+    return t('stats.statusOk') || 'OK';
 }
 
 function requestStatusClass(entry) {
+    if (entry.status === 'rejected') return 'badge-rejected';
+    if (entry.status === 'cancelled') return 'badge-cancelled';
     if (entry.status === 'partial' || entry.partial_output) return 'badge-partial';
-    return entry.success ? 'badge-ok' : 'badge-fail';
+    if (entry.status === 'degraded') return 'badge-degraded';
+    if (entry.success === false || entry.status === 'fail') return 'badge-fail';
+    return 'badge-ok';
 }
 
 function requestDetailValue(value) {
@@ -2577,8 +2626,12 @@ function showRequestDetail(index) {
     ];
     var routeRows = [
         detailRow(t('stats.requestedModel') || 'Requested', entry.requested_model || entry.model),
+        detailRow(t('stats.routedModel') || 'Routed Target', entry.routed_model || details.routed_model),
         detailRow(t('stats.model') || 'Actual Model', entry.model),
         detailRow(t('stats.provider') || 'Provider', entry.provider),
+        detailRow(t('stats.routingMatched') || 'Routing Matched', detailPick(entry.routing_matched, details.routing_matched)),
+        detailRow(t('stats.routingRule') || 'Routing Rule', entry.routing_rule_name || details.routing_rule_name || entry.routing_rule_id || details.routing_rule_id),
+        detailRow(t('stats.routingReason') || 'Routing Reason', entry.routing_reason || details.routing_reason),
         detailRow(t('stats.attemptedModel') || 'Attempted Model', entry.attempted_model || details.attempted_model),
         detailRow(t('stats.attemptedProvider') || 'Attempted Provider', entry.attempted_provider || details.attempted_provider),
         detailRow(t('stats.stream') || 'Stream', detailPick(entry.stream, details.stream)),
@@ -2615,7 +2668,11 @@ function renderStats(stats, createCharts) {
         '</div>' +
         '<div class="summary-cards">' +
         '<div class="summary-card card-purple"><div class="card-icon">&#9636;</div><div class="card-value">' + stats.total_calls.toLocaleString() + '</div><div class="card-label">' + t('stats.totalCalls') + '</div></div>' +
+        '<div class="summary-card card-green"><div class="card-icon">&#10003;</div><div class="card-value">' + (stats.health_rate != null ? stats.health_rate : stats.success_rate) + '%</div><div class="card-label">' + t('stats.healthRate') + '</div></div>' +
         '<div class="summary-card card-green"><div class="card-icon">&#10003;</div><div class="card-value">' + stats.success_rate + '%</div><div class="card-label">' + t('stats.successRate') + '</div></div>' +
+        '<div class="summary-card card-amber"><div class="card-icon">&#9888;</div><div class="card-value">' + (stats.degraded_calls || 0).toLocaleString() + '</div><div class="card-label">' + t('stats.degradedCalls') + '</div></div>' +
+        '<div class="summary-card card-orange"><div class="card-icon">&#9940;</div><div class="card-value">' + (stats.rejected_calls || 0).toLocaleString() + '</div><div class="card-label">' + t('stats.rejectedCalls') + '</div></div>' +
+        '<div class="summary-card card-slate"><div class="card-icon">&#10006;</div><div class="card-value">' + (stats.cancelled_calls || 0).toLocaleString() + '</div><div class="card-label">' + t('stats.cancelledCalls') + '</div></div>' +
         '<div class="summary-card card-red"><div class="card-icon">&#9888;</div><div class="card-value">' + stats.failed_calls.toLocaleString() + '</div><div class="card-label">' + t('stats.failedCalls') + '</div></div>' +
         '<div class="summary-card card-blue"><div class="card-icon">&#9881;</div><div class="card-value">' + Object.keys(stats.stats_by_model || {}).length + '</div><div class="card-label">' + t('stats.activeModels') + '</div></div>' +
         '</div>';
@@ -2979,8 +3036,17 @@ function renderRequestLogs(data) {
     tableHTML += '</tr></thead><tbody>';
     items.forEach(function(entry) {
         var ts = (entry.timestamp || '').slice(11) || entry.timestamp || '';
-        var badgeClass = entry.status === 'ok' ? 'badge-ok' : (entry.status === 'partial' ? 'badge-partial' : 'badge-fail');
-        var statusLabel = entry.status || '-';
+        var badgeClass = entry.status === 'ok' ? 'badge-ok'
+            : (entry.status === 'degraded' ? 'badge-degraded'
+            : (entry.status === 'rejected' ? 'badge-rejected'
+            : (entry.status === 'cancelled' ? 'badge-cancelled'
+            : (entry.status === 'partial' ? 'badge-partial' : 'badge-fail'))));
+        var statusLabel = entry.status === 'degraded' ? (t('stats.statusDegraded') || 'DEGRADED')
+            : (entry.status === 'rejected' ? (t('stats.statusRejected') || 'REJECTED')
+            : (entry.status === 'cancelled' ? (t('stats.statusCancelled') || 'CANCELLED')
+            : (entry.status === 'partial' ? (t('stats.statusPartial') || 'PARTIAL')
+            : (entry.status === 'ok' ? (t('stats.statusOk') || 'OK')
+            : (entry.status || '-')))));
         tableHTML += '<tr>';
         tableHTML += '<td class="mono">' + escHtml(ts) + '</td>';
         tableHTML += '<td class="mono">' + escHtml(entry.endpoint || '-') + '</td>';
@@ -3004,11 +3070,18 @@ async function showRequestLogDetail(logId) {
         if (content) content.classList.add('modal-wide');
         var body = '';
         body += '<h3>' + escHtml(t('logs.detailTitle') || 'Request Detail') + ' #' + entry.id + '</h3>';
-        body += '<div class="detail-status-line"><span class="badge ' + (entry.status === 'ok' ? 'badge-ok' : (entry.status === 'partial' ? 'badge-partial' : 'badge-fail')) + '">' + escHtml(entry.status || '-') + '</span><span class="mono">' + escHtml(entry.endpoint || '-') + '</span></div>';
+        var detailBadge = entry.status === 'ok' ? 'badge-ok'
+            : (entry.status === 'degraded' ? 'badge-degraded'
+            : (entry.status === 'rejected' ? 'badge-rejected'
+            : (entry.status === 'cancelled' ? 'badge-cancelled'
+            : (entry.status === 'partial' ? 'badge-partial' : 'badge-fail'))));
+        body += '<div class="detail-status-line"><span class="badge ' + detailBadge + '">' + escHtml(entry.status || '-') + '</span><span class="mono">' + escHtml(entry.endpoint || '-') + '</span></div>';
         body += '<div class="detail-grid">';
         body += detailRow(t('logs.colTime') || 'Time', entry.timestamp);
         body += detailRow(t('logs.colUser') || 'User', entry.username);
         body += detailRow(t('logs.colEndpoint') || 'Endpoint', entry.endpoint);
+        body += detailRow(t('stats.requestedModel') || 'Requested', entry.requested_model);
+        body += detailRow(t('stats.routedModel') || 'Routed', (entry.details && entry.details.routed_model) || '');
         body += detailRow(t('logs.colModel') || 'Model', entry.model);
         body += detailRow(t('logs.colProvider') || 'Provider', entry.provider);
         body += detailRow(t('logs.colTokens') || 'Tokens', entry.tokens);

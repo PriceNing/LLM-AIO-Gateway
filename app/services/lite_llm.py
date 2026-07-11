@@ -69,6 +69,10 @@ except Exception:
 
 litellm.drop_params = False  # Allow provider-specific params like DeepSeek's 'thinking'
 litellm.add_function_to_prompt = False
+# Cap liteLLM's global request timeout. Individual provider timeouts are passed
+# per-call but liteLLM's own default (6000 s) governs the connect phase and can
+# cause multi-minute hangs when an upstream is unreachable.
+litellm.request_timeout = get_default("litellm_request_timeout", 120)
 
 OPENAI_HOSTS = ("api.openai.com", "azure.com")
 

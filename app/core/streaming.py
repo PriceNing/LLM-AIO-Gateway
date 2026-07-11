@@ -3,6 +3,13 @@ import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+import asyncio
+
+from app.core.outcome import (
+    apply_outcome_to_details,
+    is_client_disconnect_error,
+    stats_counters_for_status,
+)
 from app.core.output import InternalOutputEvent
 from app.core.text import friendly_error_msg
 from app.database import increment_global_stats, increment_user_usage
@@ -96,12 +103,17 @@ async def stream_internal_output(
     remember_response_chain_key: RememberResponseChainKey | None = None,
     remember_reasoning_content: RememberReasoningContent | None = None,
     tool_only_turns=None,
+    base_details: dict[str, Any] | None = None,
 ):
     total_tokens = 0
     final_model = model
     final_provider_id = provider_id or ""
     visible_output_started = False
     stream_details: dict[str, Any] = {"stream": True, "fallback_status": "unused"}
+    if base_details:
+        stream_details.update(base_details)
+        stream_details.setdefault("stream", True)
+        stream_details.setdefault("fallback_status", "unused")
     streamed_text_parts: list[str] = []
     streamed_reasoning_parts: list[str] = []
     streamed_tool_calls: list[dict[str, Any]] = []
@@ -139,6 +151,12 @@ async def stream_internal_output(
                     "attempted_model",
                     "attempted_provider",
                     "fallback_attempts",
+                    "routing_matched",
+                    "routing_rule_id",
+                    "routing_rule_name",
+                    "routing_reason",
+                    "routed_model",
+                    "routed_provider",
                 ):
                     if key in event.metadata:
                         stream_details[key] = event.metadata[key]
@@ -211,23 +229,29 @@ async def stream_internal_output(
                 response_id=response_id,
             ):
                 yield line
+        success_details = apply_outcome_to_details(
+            {**stream_details, "partial_output": False},
+            success=True,
+            partial_output=False,
+        )
+        counters = stats_counters_for_status(success_details.get("status", "ok"))
         log_request(
             username,
             api_key_value,
             final_model,
             final_provider_id,
             endpoint,
-            True,
+            counters.hard_success,
             total_tokens,
             requested_model,
-            details={**stream_details, "status": "ok", "partial_output": False},
+            details=success_details,
         )
         _invoke_record_request_log(
             record_request_log,
-            success=True,
-            status="ok",
+            success=counters.hard_success,
+            status=success_details.get("status", "ok"),
             tokens=total_tokens,
-            details={**stream_details, "partial_output": False},
+            details=success_details,
             streamed_text_parts=streamed_text_parts,
             streamed_reasoning_parts=streamed_reasoning_parts,
             streamed_tool_calls=streamed_tool_calls,
@@ -236,30 +260,100 @@ async def stream_internal_output(
             final_provider_id=final_provider_id,
             visible_output_started=visible_output_started,
         )
-        increment_global_stats(success=True)
+        increment_global_stats(
+            counters.hard_success,
+            degraded=counters.degraded,
+            rejected=counters.rejected,
+            cancelled=counters.cancelled,
+        )
         if username != "legacy":
-            increment_user_usage(username, api_key_value, True, total_tokens)
+            increment_user_usage(username, api_key_value, counters.hard_success, total_tokens)
         _app_log.debug(
-            "[stream_orchestrator] DONE endpoint=%s provider=%s model=%s total_tokens=%d",
+            "[stream_orchestrator] DONE endpoint=%s provider=%s model=%s total_tokens=%d status=%s",
             endpoint,
             final_provider_id,
             final_model,
             total_tokens,
+            success_details.get("status"),
         )
-    except Exception as exc:
+    except BaseException as exc:
+        if is_client_disconnect_error(exc):
+            cancel_details = apply_outcome_to_details(
+                {
+                    **stream_details,
+                    "stream": True,
+                    "client_disconnected": True,
+                    "error_message": "client disconnected",
+                    "status": "cancelled",
+                },
+                success=False,
+                partial_output=visible_output_started,
+            )
+            cancel_details["status"] = "cancelled"
+            logged_model = str(final_model or model or "-")
+            logged_provider = str(final_provider_id or provider_id or "")
+            _app_log.warning(
+                "[%s_stream.cancelled] provider=%s model=%s partial=%s tokens=%d",
+                endpoint,
+                logged_provider or "-",
+                logged_model,
+                visible_output_started,
+                total_tokens,
+            )
+            log_request(
+                username,
+                api_key_value,
+                logged_model,
+                logged_provider,
+                endpoint,
+                False,
+                total_tokens,
+                requested_model,
+                details=cancel_details,
+            )
+            _invoke_record_request_log(
+                record_request_log,
+                success=False,
+                status="cancelled",
+                tokens=total_tokens,
+                details=cancel_details,
+                streamed_text_parts=streamed_text_parts,
+                streamed_reasoning_parts=streamed_reasoning_parts,
+                streamed_tool_calls=streamed_tool_calls,
+                streamed_usage=streamed_usage,
+                final_model=logged_model,
+                final_provider_id=logged_provider,
+                visible_output_started=visible_output_started,
+                error_message="client disconnected",
+            )
+            increment_global_stats(False, cancelled=True)
+            if username != "legacy":
+                increment_user_usage(username, api_key_value, False, 0)
+            if tool_only_turns is not None and conv_key:
+                tool_only_turns.reset(conv_key)
+            if isinstance(exc, Exception) and not isinstance(exc, asyncio.CancelledError):
+                return
+            raise
+
+        if not isinstance(exc, Exception):
+            raise
+
         error_msg = friendly_error_msg(exc)
         exc_details = getattr(exc, "request_details", None)
         if not isinstance(exc_details, dict):
             exc_details = {}
         partial_output = bool(exc_details.get("partial_output", visible_output_started))
-        failure_details = {
-            **stream_details,
-            **exc_details,
-            "stream": True,
-            "status": "partial" if partial_output else "fail",
-            "partial_output": partial_output,
-            "error_message": exc_details.get("error_message") or error_msg,
-        }
+        failure_details = apply_outcome_to_details(
+            {
+                **stream_details,
+                **exc_details,
+                "stream": True,
+                "error_message": exc_details.get("error_message") or error_msg,
+            },
+            success=False,
+            partial_output=partial_output,
+        )
+        counters = stats_counters_for_status(failure_details.get("status", "fail"))
         logged_model = str(
             failure_details.get("attempted_model")
             or final_model
@@ -299,7 +393,12 @@ async def stream_internal_output(
             visible_output_started=visible_output_started,
             error_message=failure_details.get("error_message"),
         )
-        increment_global_stats(success=False)
+        increment_global_stats(
+            False,
+            degraded=counters.degraded,
+            rejected=counters.rejected,
+            cancelled=counters.cancelled,
+        )
         if username != "legacy":
             increment_user_usage(username, api_key_value, False, 0)
         if tool_only_turns is not None and conv_key:

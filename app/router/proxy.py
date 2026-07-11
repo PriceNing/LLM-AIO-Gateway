@@ -15,6 +15,11 @@ from app.database import (
     parse_model_id, add_request_record, add_request_log, trim_request_logs, get_enabled_preprocessor,
 )
 from app.core.text import friendly_error_msg, mask_key
+from app.core.outcome import (
+    apply_outcome_to_details,
+    routing_details_from_policy,
+    stats_counters_for_status,
+)
 from app.core.output import InternalOutputEvent
 
 from app.core.state import (
@@ -126,6 +131,106 @@ def _output_request_details(output) -> dict:
     return {}
 
 
+def _merge_request_details(*parts: dict | None) -> dict:
+    merged: dict = {}
+    for part in parts:
+        if isinstance(part, dict) and part:
+            merged.update(part)
+    return merged
+
+
+def _attach_output_request_details(output, **fields) -> None:
+    if getattr(output, "raw", None) is None:
+        output.raw = {}
+    if not isinstance(output.raw, dict):
+        return
+    details = output.raw.setdefault("request_details", {})
+    if not isinstance(details, dict):
+        details = {}
+        output.raw["request_details"] = details
+    details.update(fields)
+
+
+def _finalize_success_details(output=None, *, policy=None, extra: dict | None = None) -> dict:
+    details = _merge_request_details(
+        _output_request_details(output) if output is not None else {},
+        routing_details_from_policy(policy) if policy is not None else {},
+        extra,
+    )
+    return apply_outcome_to_details(details, success=True, partial_output=False)
+
+
+def _record_success_metrics(username: str, api_key_value: str, tokens: int, status: str) -> None:
+    counters = stats_counters_for_status(status)
+    increment_global_stats(
+        counters.hard_success,
+        degraded=counters.degraded,
+        rejected=counters.rejected,
+        cancelled=counters.cancelled,
+    )
+    if username != "legacy":
+        increment_user_usage(username, api_key_value, counters.hard_success, tokens)
+
+
+def _log_rejected_request(
+    *,
+    status_code: int,
+    detail: str,
+    endpoint: str = "",
+    username: str = "",
+    api_key_value: str = "",
+    requested_model: str = "",
+    model: str = "",
+    provider: str = "",
+) -> None:
+    """Persist auth/allow-list rejections so they appear in stats and request logs."""
+    req_model = requested_model or model or ""
+    final_model = model or requested_model or "-"
+    details = apply_outcome_to_details(
+        {
+            "status": "rejected",
+            "http_status": status_code,
+            "error_message": detail,
+            "reject_reason": detail,
+        },
+        success=False,
+    )
+    details["status"] = "rejected"
+    user_label = username or "anonymous"
+    try:
+        _log_request(
+            user_label,
+            api_key_value,
+            final_model,
+            provider,
+            endpoint or "unknown",
+            False,
+            0,
+            req_model,
+            details=details,
+        )
+        _record_request_log(
+            endpoint=endpoint or "unknown",
+            username=user_label,
+            api_key_value=api_key_value,
+            requested_model=req_model,
+            final_model=final_model,
+            final_provider=provider,
+            request_body=None,
+            response_body={"error": {"message": detail, "type": "rejected", "code": status_code}},
+            success=False,
+            status="rejected",
+            tokens=0,
+            details=details,
+            error_message=detail,
+        )
+        increment_global_stats(False, rejected=True)
+        if username and username != "legacy" and api_key_value:
+            increment_user_usage(username, api_key_value, False, 0)
+    except Exception as exc:
+        _app_log.warning("Failed to record rejected request: %s", exc)
+
+
 def _target_model_for_log(target: RouteTarget, provider_id: str = "") -> str:
     model_id = parse_model_id(target.model)
     resolved_provider = provider_id or target.provider_id or model_id.provider_id
@@ -213,6 +318,73 @@ def _fallback_provider_id_for_target(target: RouteTarget) -> str:
     return provider_for_log(provider_info, target.provider_id)
 
 
+def _lookup_fallback_budget(provider_id: str, model: str):
+    """Return matched fallback decision for proactive attempt timeout (ignore trigger filter)."""
+    return apply_fallback_policy(provider_id, model, trigger="")
+
+
+def _attempt_timeout_error(seconds: int, target: RouteTarget, provider_id: str) -> TimeoutError:
+    exc = TimeoutError(f"fallback attempt timeout after {int(seconds)}s")
+    exc.attempted_model = target.model
+    exc.attempted_provider = provider_id or target.provider_id or ""
+    return exc
+
+
+async def _await_with_attempt_timeout(awaitable, *, timeout_s: int | None, target: RouteTarget, provider_id: str):
+    if not timeout_s or timeout_s <= 0:
+        return await awaitable
+    try:
+        with anyio.fail_after(timeout_s):
+            return await awaitable
+    except TimeoutError as exc:
+        _app_log.warning(
+            "[fallback.attempt_timeout] target=%s provider=%s timeout_s=%d",
+            target.model,
+            provider_id or "-",
+            timeout_s,
+        )
+        raise _attempt_timeout_error(timeout_s, target, provider_id) from exc
+
+
+async def _iter_events_with_first_output_timeout(events, *, timeout_s: int | None, target: RouteTarget, provider_id: str):
+    """Yield stream events; enforce timeout only until first client-visible output."""
+    if not timeout_s or timeout_s <= 0:
+        async for event in events:
+            yield event
+        return
+
+    agen = events.__aiter__()
+    emitted = False
+    deadline = time.monotonic() + float(timeout_s)
+    while True:
+        try:
+            if not emitted:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise _attempt_timeout_error(timeout_s, target, provider_id)
+                with anyio.fail_after(remaining):
+                    event = await agen.__anext__()
+            else:
+                event = await agen.__anext__()
+        except StopAsyncIteration:
+            break
+        except TimeoutError as exc:
+            if emitted:
+                raise
+            _app_log.warning(
+                "[fallback.attempt_timeout] stage=stream_first_output target=%s provider=%s timeout_s=%d",
+                target.model,
+                provider_id or "-",
+                timeout_s,
+            )
+            if isinstance(exc, TimeoutError) and "fallback attempt timeout" in str(exc):
+                raise
+            raise _attempt_timeout_error(timeout_s, target, provider_id) from exc
+        if _is_client_visible_stream_event(event):
+            emitted = True
+        yield event
+
+
 async def _call_nonstream_with_fallbacks(policy, internal, *, temperature, max_tokens, log_label: str):
     original_model = internal.target_model
     original_provider = internal.provider_id
@@ -221,6 +393,18 @@ async def _call_nonstream_with_fallbacks(policy, internal, *, temperature, max_t
     primary = RouteTarget(model=primary.model, provider_id=_fallback_provider_id_for_target(primary))
     targets = [primary]
     fallback_attempts = []
+    budget = _lookup_fallback_budget(primary.provider_id, primary.model)
+    attempt_timeout = budget.attempt_timeout if budget.matched else None
+    if attempt_timeout:
+        _app_log.info(
+            "[%s fallback.budget] policy_id=%s policy='%s' attempt_timeout=%ds primary=%s provider=%s",
+            log_label,
+            budget.policy_id,
+            budget.policy_name,
+            attempt_timeout,
+            primary.model,
+            primary.provider_id or "-",
+        )
     _app_log.debug(
         "[%s pipeline] primary_call target=%s provider=%s",
         log_label,
@@ -232,7 +416,19 @@ async def _call_nonstream_with_fallbacks(policy, internal, *, temperature, max_t
         internal.provider_id = target.provider_id
         fallback_provider_id = _fallback_provider_id_for_target(target)
         try:
-            output, provider_info, adapter_provider_id = await _call_nonstream_target(target, internal, temperature=temperature, max_tokens=max_tokens, log_label=log_label, stage="primary")
+            output, provider_info, adapter_provider_id = await _await_with_attempt_timeout(
+                _call_nonstream_target(
+                    target,
+                    internal,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    log_label=log_label,
+                    stage="primary",
+                ),
+                timeout_s=attempt_timeout,
+                target=target,
+                provider_id=fallback_provider_id,
+            )
             fallback_attempts.append(_fallback_attempt_record(
                 index=index,
                 stage="primary",
@@ -240,6 +436,12 @@ async def _call_nonstream_with_fallbacks(policy, internal, *, temperature, max_t
                 provider_id=fallback_provider_id,
                 status="success",
             ))
+            _attach_output_request_details(
+                output,
+                fallback_status="unused",
+                attempt_index=index,
+                fallback_attempts=fallback_attempts,
+            )
             return output, provider_info, adapter_provider_id
         except Exception as exc:
             last_exc = exc
@@ -262,6 +464,10 @@ async def _call_nonstream_with_fallbacks(policy, internal, *, temperature, max_t
                 friendly_error_msg(exc),
             )
             decision = apply_fallback_policy(fallback_provider_id, target.model, trigger)
+            # Proactive attempt_timeout should still use the matched policy chain even if
+            # the "timeout" trigger checkbox is off (the budget itself implies timeout switching).
+            if not decision.matched and budget.matched and trigger == "timeout":
+                decision = budget
             if not decision.matched:
                 _attach_request_details(
                     exc,
@@ -286,7 +492,7 @@ async def _call_nonstream_with_fallbacks(policy, internal, *, temperature, max_t
                 )
                 raise
             _app_log.info(
-                "[%s fallback.decision] matched=True policy_id=%s policy='%s' source=%s provider=%s trigger=%s chain=%d",
+                "[%s fallback.decision] matched=True policy_id=%s policy='%s' source=%s provider=%s trigger=%s chain=%d attempt_timeout=%ds",
                 log_label,
                 decision.policy_id,
                 decision.policy_name,
@@ -294,8 +500,11 @@ async def _call_nonstream_with_fallbacks(policy, internal, *, temperature, max_t
                 fallback_provider_id or "-",
                 trigger,
                 len(decision.chain),
+                decision.attempt_timeout,
             )
             targets = candidate_targets(primary, decision.chain)
+            if decision.matched:
+                attempt_timeout = decision.attempt_timeout
             break
 
     for index, target in enumerate(targets[1:], 1):
@@ -311,7 +520,19 @@ async def _call_nonstream_with_fallbacks(policy, internal, *, temperature, max_t
                 target.provider_id or "-",
                 friendly_error_msg(last_exc) if last_exc else "",
             )
-            output, provider_info, adapter_provider_id = await _call_nonstream_target(target, attempt_internal, temperature=temperature, max_tokens=max_tokens, log_label=log_label, stage="fallback")
+            output, provider_info, adapter_provider_id = await _await_with_attempt_timeout(
+                _call_nonstream_target(
+                    target,
+                    attempt_internal,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    log_label=log_label,
+                    stage="fallback",
+                ),
+                timeout_s=attempt_timeout,
+                target=target,
+                provider_id=target.provider_id or "",
+            )
             fallback_attempts.append(_fallback_attempt_record(
                 index=index,
                 stage="fallback",
@@ -319,10 +540,12 @@ async def _call_nonstream_with_fallbacks(policy, internal, *, temperature, max_t
                 provider_id=target.provider_id or "",
                 status="success",
             ))
-            if getattr(output, "raw", None) is None:
-                output.raw = {}
-            if isinstance(output.raw, dict):
-                output.raw.setdefault("request_details", {})["fallback_attempts"] = fallback_attempts
+            _attach_output_request_details(
+                output,
+                fallback_status="used",
+                attempt_index=index,
+                fallback_attempts=fallback_attempts,
+            )
             internal.target_model = target.model
             internal.provider_id = target.provider_id
             return output, provider_info, adapter_provider_id
@@ -437,6 +660,18 @@ async def _stream_events_with_fallbacks(internal, *, temperature, max_tokens, lo
     last_exc = None
     index = 0
     fallback_attempts = []
+    budget = _lookup_fallback_budget(primary.provider_id, primary.model)
+    attempt_timeout = budget.attempt_timeout if budget.matched else None
+    if attempt_timeout:
+        _app_log.info(
+            "[%s fallback.budget] policy_id=%s policy='%s' attempt_timeout=%ds primary=%s provider=%s",
+            log_label,
+            budget.policy_id,
+            budget.policy_name,
+            attempt_timeout,
+            primary.model,
+            primary.provider_id or "-",
+        )
 
     while index < len(targets):
         target = targets[index]
@@ -462,6 +697,7 @@ async def _stream_events_with_fallbacks(internal, *, temperature, max_tokens, lo
                 "stream": True,
                 "attempt_index": index,
                 "fallback_status": "used" if index > 0 else "unused",
+                "attempt_timeout": attempt_timeout,
                 "fallback_attempts": fallback_attempts + [_fallback_attempt_record(
                     index=index,
                     stage=stage,
@@ -470,7 +706,13 @@ async def _stream_events_with_fallbacks(internal, *, temperature, max_tokens, lo
                     status="started",
                 )],
             })
-            async for event in events:
+            timed_events = _iter_events_with_first_output_timeout(
+                events,
+                timeout_s=attempt_timeout,
+                target=target,
+                provider_id=adapter_provider_id or fallback_provider_id or "",
+            )
+            async for event in timed_events:
                 if _is_client_visible_stream_event(event):
                     if not emitted:
                         for pending in pending_events:
@@ -554,6 +796,8 @@ async def _stream_events_with_fallbacks(internal, *, temperature, max_tokens, lo
                 raise
             if index == 0:
                 decision = apply_fallback_policy(fallback_provider_id, target.model, trigger)
+                if not decision.matched and budget.matched and trigger == "timeout":
+                    decision = budget
                 if not decision.matched:
                     _attach_request_details(
                         exc,
@@ -579,8 +823,10 @@ async def _stream_events_with_fallbacks(internal, *, temperature, max_tokens, lo
                     )
                     raise
                 targets = candidate_targets(primary, decision.chain)
+                if decision.matched:
+                    attempt_timeout = decision.attempt_timeout
                 _app_log.info(
-                    "[%s fallback.stream.decision] matched=True policy_id=%s policy='%s' source=%s provider=%s trigger=%s chain=%d",
+                    "[%s fallback.stream.decision] matched=True policy_id=%s policy='%s' source=%s provider=%s trigger=%s chain=%d attempt_timeout=%s",
                     log_label,
                     decision.policy_id,
                     decision.policy_name,
@@ -588,6 +834,7 @@ async def _stream_events_with_fallbacks(internal, *, temperature, max_tokens, lo
                     fallback_provider_id or "-",
                     trigger,
                     len(targets) - 1,
+                    attempt_timeout if attempt_timeout is not None else "-",
                 )
             index += 1
             if index < len(targets):
@@ -644,6 +891,16 @@ def _log_request(username: str, api_key: str, model: str, provider_id: str,
         "error_stage",
         "error_message",
         "attempt_index",
+        "fallback_attempts",
+        "routing_matched",
+        "routing_rule_id",
+        "routing_rule_name",
+        "routing_reason",
+        "routed_model",
+        "routed_provider",
+        "http_status",
+        "reject_reason",
+        "client_disconnected",
     ):
         if key in detail:
             entry[key] = detail[key]
@@ -848,22 +1105,38 @@ def get_timeline_model_data() -> dict:
     }
 
 
-def verify_api_key(authorization: Optional[str] = Header(None)) -> tuple[dict, dict]:
+def verify_api_key(
+    authorization: Optional[str] = Header(None),
+    *,
+    endpoint: str = "",
+    requested_model: str = "",
+) -> tuple[dict, dict]:
+    def _reject(detail: str, *, api_key_value: str = "") -> None:
+        _log_rejected_request(
+            status_code=401,
+            detail=detail,
+            endpoint=endpoint,
+            api_key_value=api_key_value,
+            requested_model=requested_model,
+        )
+        raise HTTPException(status_code=401, detail=detail)
+
     if not authorization:
-        raise HTTPException(status_code=401, detail="Missing Authorization header")
+        _reject("Missing Authorization header")
 
     if not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Invalid Authorization format")
+        _reject("Invalid Authorization format")
 
     token = authorization[7:].strip()
     if not token:
-        raise HTTPException(status_code=401, detail="Missing API key")
+        _reject("Missing API key")
 
     user_match = find_user_by_api_key(token)
     if user_match:
         return user_match
 
-    raise HTTPException(status_code=401, detail="Invalid API key")
+    _reject("Invalid API key", api_key_value=token)
+    raise HTTPException(status_code=401, detail="Invalid API key")  # unreachable, for type checkers
 
 def allowed_models_for(user: dict, api_key: dict) -> list:
     # Only key-level allowed_models matters. User is just enable/disable.
@@ -887,38 +1160,49 @@ def _model_allowed_by_list(allowed: list, model: str) -> bool:
     return False
 
 
-def ensure_model_allowed(user: dict, api_key: dict, model: str) -> None:
+def ensure_model_allowed(user: dict, api_key: dict, model: str, *, endpoint: str = "") -> None:
     allowed = allowed_models_for(user, api_key)
     if "*" in allowed:
         return
     requested = parse_model_id(model)
     if _model_allowed_by_list(allowed, model):
         return
-    if any("/" in str(allowed_model) for allowed_model in allowed) and not requested.is_composite:
+
+    def _deny(detail: str) -> None:
         _app_log.warning(
-            "[model.allow.denied] model=%s user=%s key=%s reason=not_in_allow_list allow_list=%s hint=use_provider_qualified_id",
+            "[model.allow.denied] model=%s user=%s key=%s reason=not_in_allow_list allow_list=%s",
             model,
             user.get("username", "?"),
             mask_key(api_key.get("key", "")),
             allowed,
         )
-        raise HTTPException(
+        _log_rejected_request(
             status_code=403,
-            detail=f"Model '{model}' is not allowed for this API key; use a provider-qualified model id",
+            detail=detail,
+            endpoint=endpoint,
+            username=user.get("username", ""),
+            api_key_value=api_key.get("key", ""),
+            requested_model=model,
+            model=model,
         )
-    _app_log.warning(
-        "[model.allow.denied] model=%s user=%s key=%s reason=not_in_allow_list allow_list=%s",
-        model,
-        user.get("username", "?"),
-        mask_key(api_key.get("key", "")),
-        allowed,
-    )
-    raise HTTPException(status_code=403, detail=f"Model '{model}' is not allowed for this API key")
+        raise HTTPException(status_code=403, detail=detail)
+
+    if any("/" in str(allowed_model) for allowed_model in allowed) and not requested.is_composite:
+        _deny(f"Model '{model}' is not allowed for this API key; use a provider-qualified model id")
+    _deny(f"Model '{model}' is not allowed for this API key")
 
 
-def ensure_routed_model_allowed(user: dict, api_key: dict, requested_model: str, target_model: str, target_provider: str = "") -> None:
+def ensure_routed_model_allowed(
+    user: dict,
+    api_key: dict,
+    requested_model: str,
+    target_model: str,
+    target_provider: str = "",
+    *,
+    endpoint: str = "",
+) -> None:
     if requested_model == target_model and not target_provider:
-        ensure_model_allowed(user, api_key, requested_model)
+        ensure_model_allowed(user, api_key, requested_model, endpoint=endpoint)
         return
     allowed = allowed_models_for(user, api_key)
     if "*" in allowed:
@@ -933,32 +1217,35 @@ def ensure_routed_model_allowed(user: dict, api_key: dict, requested_model: str,
         return
 
     requested = parse_model_id(requested_model)
-    if any("/" in str(allowed_model) for allowed_model in allowed) and not requested.is_composite:
+
+    def _deny(detail: str) -> None:
         _app_log.warning(
-            "[model.allow.denied] requested=%s routed_to=%s user=%s key=%s reason=not_in_allow_list allow_list=%s hint=use_provider_qualified_id",
+            "[model.allow.denied] requested=%s routed_to=%s user=%s key=%s reason=not_in_allow_list allow_list=%s",
             requested_model,
             effective_target,
             user.get("username", "?"),
             mask_key(api_key.get("key", "")),
             allowed,
         )
-        raise HTTPException(
+        _log_rejected_request(
             status_code=403,
-            detail=f"Model '{requested_model}' is not allowed for this API key; use a provider-qualified model id",
+            detail=detail,
+            endpoint=endpoint,
+            username=user.get("username", ""),
+            api_key_value=api_key.get("key", ""),
+            requested_model=requested_model,
+            model=effective_target or target_model,
+            provider=target_provider or "",
         )
-    _app_log.warning(
-        "[model.allow.denied] requested=%s routed_to=%s user=%s key=%s reason=not_in_allow_list allow_list=%s",
-        requested_model,
-        effective_target,
-        user.get("username", "?"),
-        mask_key(api_key.get("key", "")),
-        allowed,
-    )
-    raise HTTPException(status_code=403, detail=f"Model '{requested_model}' is not allowed for this API key")
+        raise HTTPException(status_code=403, detail=detail)
+
+    if any("/" in str(allowed_model) for allowed_model in allowed) and not requested.is_composite:
+        _deny(f"Model '{requested_model}' is not allowed for this API key; use a provider-qualified model id")
+    _deny(f"Model '{requested_model}' is not allowed for this API key")
 
 @router.get("/models")
 def list_models(authorization: Optional[str] = Header(None)):
-    user, api_key = verify_api_key(authorization)
+    user, api_key = verify_api_key(authorization, endpoint="models")
     allowed = allowed_models_for(user, api_key)
     models = []
 
@@ -1023,7 +1310,7 @@ def _model_should_advertise_vision(provider: dict, model: dict) -> bool:
 
 @router.post("/chat/completions")
 async def chat_completions(request: Request, authorization: Optional[str] = Header(None)):
-    user, api_key = verify_api_key(authorization)
+    user, api_key = verify_api_key(authorization, endpoint="chat_completions")
 
     body = await request.json()
     internal = chat_completions_to_internal(body)
@@ -1056,7 +1343,9 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
     )
     model = internal.target_model
     provider_id = internal.provider_id
-    ensure_routed_model_allowed(user, api_key, requested_model, model, provider_id)
+    ensure_routed_model_allowed(
+        user, api_key, requested_model, model, provider_id, endpoint="chat_completions"
+    )
     conv_key = policy.conv_key
     provider_info = None
     adapter_provider_id = provider_id or ""
@@ -1083,6 +1372,7 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
                     conv_key=conv_key,
                     remember_reasoning_content=_remember_reasoning_content,
                     tool_only_turns=_tool_only_turns,
+                    base_details=routing_details_from_policy(policy),
                 ),
                 media_type="text/event-stream"
             )
@@ -1109,18 +1399,19 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
             _tool_only_turns.reset(conv_key)
 
         rendered = render_chat_completion(output, model=model)
+        success_details = _finalize_success_details(output, policy=policy)
+        status = success_details.get("status", "ok")
+        tokens = output.usage.get("total_tokens", 0)
         _record_request_log(
             endpoint="chat_completions",
             username=username, api_key_value=api_key_value, requested_model=requested_model,
             final_model=logged_model, final_provider=adapter_provider_id or "",
             request_body=body, response_body=rendered,
-            success=True, status="ok", tokens=output.usage.get("total_tokens", 0),
-            usage=output.usage, details=_output_request_details(output),
+            success=True, status=status, tokens=tokens,
+            usage=output.usage, details=success_details,
         )
-        _log_request(username, api_key_value, logged_model, adapter_provider_id or "", "chat_completions", True, output.usage.get("total_tokens", 0), requested_model, details=_output_request_details(output))
-        increment_global_stats(success=True)
-        if username != "legacy":
-            increment_user_usage(username, api_key_value, True, output.usage.get("total_tokens", 0))
+        _log_request(username, api_key_value, logged_model, adapter_provider_id or "", "chat_completions", True, tokens, requested_model, details=success_details)
+        _record_success_metrics(username, api_key_value, tokens, status)
         return rendered
     except Exception as e:
         _error_log.error("[chat] %s", str(e))
@@ -1147,7 +1438,7 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
 
 @router.post("/completions")
 async def completions(request: Request, authorization: Optional[str] = Header(None)):
-    user, api_key = verify_api_key(authorization)
+    user, api_key = verify_api_key(authorization, endpoint="completions")
 
     body = await request.json()
     internal = completions_to_internal(body)
@@ -1177,7 +1468,9 @@ async def completions(request: Request, authorization: Optional[str] = Header(No
     )
     model = internal.target_model
     provider_id = internal.provider_id
-    ensure_routed_model_allowed(user, api_key, requested_model, model, provider_id)
+    ensure_routed_model_allowed(
+        user, api_key, requested_model, model, provider_id, endpoint="completions"
+    )
     conv_key = policy.conv_key
     provider_info = None
     adapter_provider_id = provider_id or ""
@@ -1202,6 +1495,7 @@ async def completions(request: Request, authorization: Optional[str] = Header(No
                     log_request=_log_request,
                     record_request_log=_build_stream_recorder("completions", username, api_key_value, requested_model, body),
                     conv_key=conv_key,
+                    base_details=routing_details_from_policy(policy),
                 ),
                 media_type="text/event-stream"
             )
@@ -1217,18 +1511,19 @@ async def completions(request: Request, authorization: Optional[str] = Header(No
         provider_id = internal.provider_id
         logged_model = _target_model_for_log(RouteTarget(model=model, provider_id=adapter_provider_id or provider_id or ""), adapter_provider_id or provider_id or "")
         rendered = render_completion(output, model=model)
-        _log_request(username, api_key_value, logged_model, adapter_provider_id or "", "completions", True, output.usage.get("total_tokens", 0), requested_model)
+        success_details = _finalize_success_details(output, policy=policy)
+        status = success_details.get("status", "ok")
+        tokens = output.usage.get("total_tokens", 0)
+        _log_request(username, api_key_value, logged_model, adapter_provider_id or "", "completions", True, tokens, requested_model, details=success_details)
         _record_request_log(
             endpoint="completions",
             username=username, api_key_value=api_key_value, requested_model=requested_model,
             final_model=logged_model, final_provider=adapter_provider_id or "",
             request_body=body, response_body=rendered,
-            success=True, status="ok", tokens=output.usage.get("total_tokens", 0),
-            usage=output.usage, details=_output_request_details(output),
+            success=True, status=status, tokens=tokens,
+            usage=output.usage, details=success_details,
         )
-        increment_global_stats(success=True)
-        if username != "legacy":
-            increment_user_usage(username, api_key_value, True, output.usage.get("total_tokens", 0))
+        _record_success_metrics(username, api_key_value, tokens, status)
         return rendered
     except Exception as e:
         details = _request_details_from_exception(
@@ -1255,7 +1550,7 @@ async def completions(request: Request, authorization: Optional[str] = Header(No
 
 @router.post("/messages")
 async def anthropic_messages(request: Request, authorization: Optional[str] = Header(None)):
-    user, api_key = verify_api_key(authorization)
+    user, api_key = verify_api_key(authorization, endpoint="messages")
 
     body = await request.json()
     model = body.get("model")
@@ -1290,7 +1585,9 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
     )
     model = internal.target_model
     provider_id = internal.provider_id
-    ensure_routed_model_allowed(user, api_key, requested_model, model, provider_id)
+    ensure_routed_model_allowed(
+        user, api_key, requested_model, model, provider_id, endpoint="messages"
+    )
     provider_info = resolve_provider(model, provider_id)
     adapter_provider_id = provider_for_log(provider_info, provider_id)
     previous_response_id = internal.previous_response_id
@@ -1329,6 +1626,7 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
                     record_request_log=_build_stream_recorder("messages", username, api_key_value, requested_model, body),
                     conv_key=conv_key,
                     remember_reasoning_content=_remember_reasoning_content,
+                    base_details=routing_details_from_policy(policy),
                 ),
                 media_type="text/event-stream"
             )
@@ -1349,18 +1647,19 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
                           conv_key[:60], len(output.reasoning),
                           output.usage.get("prompt_cache_hit_tokens", 0), output.usage.get("prompt_cache_miss_tokens", 0))
         rendered = render_anthropic_message(output, model=model)
-        _log_request(username, api_key_value, logged_model, adapter_provider_id, "messages", True, output.usage.get("total_tokens", 0), requested_model, details=_output_request_details(output))
+        success_details = _finalize_success_details(output, policy=policy)
+        status = success_details.get("status", "ok")
+        tokens = output.usage.get("total_tokens", 0)
+        _log_request(username, api_key_value, logged_model, adapter_provider_id, "messages", True, tokens, requested_model, details=success_details)
         _record_request_log(
             endpoint="messages",
             username=username, api_key_value=api_key_value, requested_model=requested_model,
             final_model=logged_model, final_provider=adapter_provider_id,
             request_body=body, response_body=rendered,
-            success=True, status="ok", tokens=output.usage.get("total_tokens", 0),
-            usage=output.usage, details=_output_request_details(output),
+            success=True, status=status, tokens=tokens,
+            usage=output.usage, details=success_details,
         )
-        increment_global_stats(success=True)
-        if username != "legacy":
-            increment_user_usage(username, api_key_value, True, output.usage.get("total_tokens", 0))
+        _record_success_metrics(username, api_key_value, tokens, status)
         return rendered
     except Exception as e:
         details = _request_details_from_exception(
@@ -1388,7 +1687,7 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
 
 @router.post("/responses")
 async def responses_endpoint(request: Request, authorization: Optional[str] = Header(None)):
-    user, api_key = verify_api_key(authorization)
+    user, api_key = verify_api_key(authorization, endpoint="responses")
 
     body = await request.json()
     internal = responses_to_internal(body)
@@ -1449,7 +1748,9 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
     )
     model = internal.target_model
     provider_id = internal.provider_id
-    ensure_routed_model_allowed(user, api_key, requested_model, model, provider_id)
+    ensure_routed_model_allowed(
+        user, api_key, requested_model, model, provider_id, endpoint="responses"
+    )
     conv_key = policy.conv_key
     provider_info = None
     adapter_provider_id = provider_id or ""
@@ -1483,6 +1784,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                     requested_model=requested_model,
                     log_request=_log_request,
                     record_request_log=_build_stream_recorder("responses", username, api_key_value, requested_model, body),
+                    base_details=routing_details_from_policy(policy),
                     previous_response_id=previous_response_id,
                     conv_key=conv_key,
                     remember_response_chain_key=_remember_response_chain_key,
@@ -1511,20 +1813,19 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
         resp_id = f"resp_{uuid.uuid4().hex}"
         _remember_response_chain_key(resp_id, conv_key)
         rendered = render_response(output, model=model, previous_response_id=previous_response_id, response_id=resp_id)
-        success_details = _output_request_details(output)
-        success_details["response_id"] = resp_id
-        _log_request(username, api_key_value, logged_model, adapter_provider_id, "responses", True, output.usage.get("total_tokens", 0), requested_model, details=success_details)
+        success_details = _finalize_success_details(output, policy=policy, extra={"response_id": resp_id})
+        status = success_details.get("status", "ok")
+        tokens = output.usage.get("total_tokens", 0)
+        _log_request(username, api_key_value, logged_model, adapter_provider_id, "responses", True, tokens, requested_model, details=success_details)
         _record_request_log(
             endpoint="responses",
             username=username, api_key_value=api_key_value, requested_model=requested_model,
             final_model=logged_model, final_provider=adapter_provider_id,
             request_body=body, response_body=rendered,
-            success=True, status="ok", tokens=output.usage.get("total_tokens", 0),
+            success=True, status=status, tokens=tokens,
             usage=output.usage, details=success_details,
         )
-        increment_global_stats(success=True)
-        if username != "legacy":
-            increment_user_usage(username, api_key_value, True, output.usage.get("total_tokens", 0))
+        _record_success_metrics(username, api_key_value, tokens, status)
         return rendered
     except Exception as e:
         details = _request_details_from_exception(

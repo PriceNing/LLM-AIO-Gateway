@@ -349,9 +349,14 @@ async def delete_user_api_key_endpoint(username: str, key: str, authorization: O
 async def get_stats(authorization: Optional[str] = Header(None)):
     await require_admin_session(authorization)
     stats = get_global_stats()
-    total = stats.get("total_calls", 0)
-    failed = stats.get("failed_calls", 0)
+    total = int(stats.get("total_calls", 0) or 0)
+    failed = int(stats.get("failed_calls", 0) or 0)
+    degraded = int(stats.get("degraded_calls", 0) or 0)
+    rejected = int(stats.get("rejected_calls", 0) or 0)
+    cancelled = int(stats.get("cancelled_calls", 0) or 0)
     success_rate = ((total - failed) / total * 100) if total > 0 else 100.0
+    # Health rate treats fallback-recovered calls as unhealthy for ops visibility.
+    health_rate = ((total - failed - degraded) / total * 100) if total > 0 else 100.0
 
     users_summary = []
     for u in get_users():
@@ -366,7 +371,11 @@ async def get_stats(authorization: Optional[str] = Header(None)):
     return StatsResponse(
         total_calls=total,
         failed_calls=failed,
+        degraded_calls=degraded,
+        rejected_calls=rejected,
+        cancelled_calls=cancelled,
         success_rate=round(success_rate, 2),
+        health_rate=round(health_rate, 2),
         last_reset=stats.get("last_reset", ""),
         stats_by_model=get_model_stats(),
         request_log=get_request_log(),
@@ -1005,7 +1014,7 @@ def _import_fallback_policy(entry: dict, mode: str) -> str:
         return "skipped"
     existing = get_fallback_policy(pid)
     payload = {k: entry.get(k) for k in (
-        "name", "enabled", "match_provider", "match_model", "triggers", "chain"
+        "name", "enabled", "match_provider", "match_model", "triggers", "chain", "attempt_timeout"
     ) if k in entry}
     if mode == "skip" and existing:
         return "skipped"

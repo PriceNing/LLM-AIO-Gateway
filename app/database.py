@@ -233,6 +233,7 @@ CREATE TABLE IF NOT EXISTS fallback_policies (
     match_model TEXT NOT NULL DEFAULT '*',
     triggers TEXT NOT NULL DEFAULT '{}',
     chain TEXT NOT NULL DEFAULT '[]',
+    attempt_timeout INTEGER NOT NULL DEFAULT 60,
     created_at TEXT NOT NULL DEFAULT ''
 );
 
@@ -326,20 +327,64 @@ def get_global_stats() -> dict:
         return result
 
 
-def increment_global_stats(success: bool) -> None:
+def increment_global_stats(
+    success: bool,
+    *,
+    degraded: bool = False,
+    rejected: bool = False,
+    cancelled: bool = False,
+) -> None:
+    """Increment global counters.
+
+    - total_calls always +1
+    - failed_calls +1 when success is False
+    - degraded_calls +1 when success is True and degraded is True
+    - rejected_calls +1 when auth/allow-list rejected
+    - cancelled_calls +1 when client disconnected
+    """
     with get_db() as db:
-        db.execute("INSERT OR IGNORE INTO global_stats (key, value) VALUES ('total_calls', '0')")
-        db.execute("INSERT OR IGNORE INTO global_stats (key, value) VALUES ('failed_calls', '0')")
-        db.execute("INSERT OR IGNORE INTO global_stats (key, value) VALUES ('last_reset', '')")
+        for key in (
+            "total_calls",
+            "failed_calls",
+            "degraded_calls",
+            "rejected_calls",
+            "cancelled_calls",
+            "last_reset",
+        ):
+            default = "" if key == "last_reset" else "0"
+            db.execute(
+                "INSERT OR IGNORE INTO global_stats (key, value) VALUES (?, ?)",
+                (key, default),
+            )
         db.execute("UPDATE global_stats SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = 'total_calls'")
         if not success:
             db.execute("UPDATE global_stats SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = 'failed_calls'")
+            if rejected:
+                db.execute(
+                    "UPDATE global_stats SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = 'rejected_calls'"
+                )
+            if cancelled:
+                db.execute(
+                    "UPDATE global_stats SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = 'cancelled_calls'"
+                )
+        elif degraded:
+            db.execute("UPDATE global_stats SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = 'degraded_calls'")
 
 
 def reset_global_stats() -> None:
     today = date.today().isoformat()
     with get_db() as db:
-        db.execute("UPDATE global_stats SET value = '0' WHERE key IN ('total_calls', 'failed_calls')")
+        for key in (
+            "total_calls",
+            "failed_calls",
+            "degraded_calls",
+            "rejected_calls",
+            "cancelled_calls",
+        ):
+            db.execute(
+                "INSERT OR REPLACE INTO global_stats (key, value) VALUES (?, '0')",
+                (key,),
+            )
         db.execute("INSERT OR REPLACE INTO global_stats (key, value) VALUES ('last_reset', ?)", (today,))
 
 

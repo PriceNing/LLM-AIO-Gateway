@@ -37,7 +37,11 @@ class ProviderUpdate(BaseModel):
 class StatsResponse(BaseModel):
     total_calls: int
     failed_calls: int
+    degraded_calls: int = 0
+    rejected_calls: int = 0
+    cancelled_calls: int = 0
     success_rate: float
+    health_rate: float = 100.0
     last_reset: str
     stats_by_model: dict = Field(default_factory=dict)
     request_log: list = Field(default_factory=list)

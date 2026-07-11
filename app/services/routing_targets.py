@@ -47,12 +47,22 @@ def classify_upstream_error(exc: Exception) -> str:
             return "http_4xx"
         _app_log.debug("[classify_upstream_error] category=unknown exc_type=%s status=%d", type(exc).__name__, exc.status_code)
         return "unknown"
+
+    # Prefer timeout/connection signals before generic status codes.
+    # liteLLM/OpenAI Timeout often carries status_code=408 which would otherwise
+    # be misclassified as http_4xx and hide the real timeout trigger.
     if isinstance(exc, (TimeoutError, httpx.TimeoutException)):
         _app_log.debug("[classify_upstream_error] category=timeout exc_type=%s", type(exc).__name__)
+        return "timeout"
+    text = str(exc).lower()
+    exc_name = type(exc).__name__.lower()
+    if "timeout" in text or "timed out" in text or "timeout" in exc_name:
+        _app_log.debug("[classify_upstream_error] category=timeout text_match exc_type=%s", type(exc).__name__)
         return "timeout"
     if isinstance(exc, (httpx.ConnectError, httpx.NetworkError, ConnectionError)):
         _app_log.debug("[classify_upstream_error] category=connection_error exc_type=%s", type(exc).__name__)
         return "connection_error"
+
     status_code = getattr(exc, "status_code", None)
     if status_code is not None and isinstance(status_code, int):
         if status_code == 429:
@@ -64,10 +74,6 @@ def classify_upstream_error(exc: Exception) -> str:
         if 400 <= status_code <= 499:
             _app_log.debug("[classify_upstream_error] category=http_4xx exc_type=%s status=%d", type(exc).__name__, status_code)
             return "http_4xx"
-    text = str(exc).lower()
-    if "timeout" in text or "timed out" in text:
-        _app_log.debug("[classify_upstream_error] category=timeout text_match exc_type=%s", type(exc).__name__)
-        return "timeout"
     if "429" in text or "rate limit" in text:
         _app_log.debug("[classify_upstream_error] category=http_429 text_match exc_type=%s", type(exc).__name__)
         return "http_429"

@@ -214,6 +214,8 @@ class FallbackDecision:
     policy_name: str = ""
     reason: str = "no fallback policy matched"
     chain: list[RouteTarget] = field(default_factory=list)
+    # Seconds to wait on current attempt before proactive timeout→fallback.
+    attempt_timeout: int = 60
 
 
 @dataclass(slots=True)
@@ -293,6 +295,11 @@ def apply_fallback_policy(provider_id: str, model: str, trigger: str = "") -> Fa
             )
             continue
         chain = _route_targets(policy.get("chain"))
+        try:
+            attempt_timeout = int(policy.get("attempt_timeout") or 60)
+        except (TypeError, ValueError):
+            attempt_timeout = 60
+        attempt_timeout = max(5, min(3600, attempt_timeout))
         decision = FallbackDecision(
             target=target,
             trigger=trigger,
@@ -301,9 +308,10 @@ def apply_fallback_policy(provider_id: str, model: str, trigger: str = "") -> Fa
             policy_name=policy.get("name", ""),
             reason=f"matched fallback policy '{policy.get('name', '') or policy.get('id', '')}' for target '{_target_label(provider_id, model)}'",
             chain=chain,
+            attempt_timeout=attempt_timeout,
         )
         _app_log.info(
-            "[fallback] matched=%s policy_id=%s policy='%s' target=%s provider=%s trigger=%s chain=%d reason=%s",
+            "[fallback] matched=%s policy_id=%s policy='%s' target=%s provider=%s trigger=%s chain=%d attempt_timeout=%ds reason=%s",
             decision.matched,
             decision.policy_id,
             decision.policy_name,
@@ -311,6 +319,7 @@ def apply_fallback_policy(provider_id: str, model: str, trigger: str = "") -> Fa
             provider_id or "-",
             trigger or "-",
             len(chain),
+            decision.attempt_timeout,
             decision.reason,
         )
         return decision

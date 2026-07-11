@@ -1011,7 +1011,7 @@ a.icon-btn { text-decoration: none; }
 
 .summary-cards {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(3, 1fr);
   gap: 16px;
 }
 .summary-card {
@@ -1036,6 +1036,9 @@ a.icon-btn { text-decoration: none; }
 
 .card-purple { background: linear-gradient(135deg, #818cf8, #6366f1); }
 .card-green  { background: linear-gradient(135deg, #34d399, #059669); }
+.card-amber  { background: linear-gradient(135deg, #fbbf24, #d97706); }
+.card-orange { background: linear-gradient(135deg, #fb923c, #ea580c); }
+.card-slate  { background: linear-gradient(135deg, #94a3b8, #64748b); }
 .card-red    { background: linear-gradient(135deg, #f87171, #dc2626); }
 .card-blue   { background: linear-gradient(135deg, #38bdf8, #0284c7); }
 
@@ -1090,6 +1093,9 @@ a.icon-btn { text-decoration: none; }
 .badge-ok { background: var(--success-bg); color: var(--success); }
 .badge-fail { background: var(--danger-bg); color: var(--danger); }
 .badge-partial { background: var(--warning-bg); color: var(--warning); }
+.badge-degraded { background: var(--warning-bg); color: var(--warning); }
+.badge-rejected { background: rgba(249, 115, 22, 0.15); color: #ea580c; }
+.badge-cancelled { background: rgba(100, 116, 139, 0.18); color: #64748b; }
 .badge-endpoint {
   background: var(--accent-glow);
   color: var(--accent);
@@ -1447,6 +1453,9 @@ a.icon-btn { text-decoration: none; }
 .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; }
 .badge-ok { background: rgba(46, 160, 67, 0.15); color: #2ea043; }
 .badge-partial { background: rgba(255, 184, 0, 0.15); color: #b58900; }
+.badge-degraded { background: rgba(255, 184, 0, 0.18); color: #b58900; }
+.badge-rejected { background: rgba(249, 115, 22, 0.15); color: #c2410c; }
+.badge-cancelled { background: rgba(100, 116, 139, 0.18); color: #475569; }
 .badge-fail { background: rgba(217, 45, 32, 0.15); color: #d12920; }
 .mono { font-family: ui-monospace, SFMono-Regular, "Cascadia Code", Consolas, monospace; font-size: 12px; }
 

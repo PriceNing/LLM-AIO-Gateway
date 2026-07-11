@@ -35,9 +35,15 @@ def test_increment_and_get_stats():
     increment_global_stats(success=True)
     increment_global_stats(success=True)
     increment_global_stats(success=False)
+    increment_global_stats(success=True, degraded=True)
+    increment_global_stats(success=False, rejected=True)
+    increment_global_stats(success=False, cancelled=True)
     stats = get_global_stats()
-    assert stats["total_calls"] == 3
-    assert stats["failed_calls"] == 1
+    assert stats["total_calls"] == 6
+    assert stats["failed_calls"] == 3
+    assert stats["degraded_calls"] == 1
+    assert stats["rejected_calls"] == 1
+    assert stats["cancelled_calls"] == 1
 
 
 def test_stats_initial_values():
@@ -46,15 +52,22 @@ def test_stats_initial_values():
     stats = get_global_stats()
     assert stats["total_calls"] == 1  # one call seeded
     assert stats["failed_calls"] == 0
+    assert int(stats.get("degraded_calls", 0) or 0) == 0
 
 
 def test_reset_global_stats():
     increment_global_stats(success=True)
     increment_global_stats(success=False)
+    increment_global_stats(success=True, degraded=True)
+    increment_global_stats(success=False, rejected=True)
+    increment_global_stats(success=False, cancelled=True)
     reset_global_stats()
     stats = get_global_stats()
     assert stats["total_calls"] == 0
     assert stats["failed_calls"] == 0
+    assert stats["degraded_calls"] == 0
+    assert stats["rejected_calls"] == 0
+    assert stats["cancelled_calls"] == 0
     assert stats["last_reset"] != ""
 
 
@@ -264,12 +277,14 @@ def test_add_update_delete_fallback_policy():
         "match_model": "gpt-5.5",
         "triggers": {"http_5xx": True, "http_4xx": False},
         "chain": [{"model": "gpt-5.5", "provider_id": "NewAPI"}],
+        "attempt_timeout": 45,
     })
     assert policy["name"] == "Pixel fallback"
     assert policy["enabled"] is True
     assert policy["triggers"]["http_5xx"] is True
     assert policy["triggers"]["http_4xx"] is False
     assert policy["chain"][0]["provider_id"] == "NewAPI"
+    assert policy["attempt_timeout"] == 45
 
     policies = get_fallback_policies()
     assert len(policies) == 1
@@ -277,11 +292,28 @@ def test_add_update_delete_fallback_policy():
     updated = update_fallback_policy(policy["id"], {
         "enabled": False,
         "chain": [{"model": "deepseek-v4-flash", "provider_id": "deepseek"}],
+        "attempt_timeout": 90,
     })
     assert updated["enabled"] is False
     assert updated["chain"][0]["model"] == "deepseek-v4-flash"
+    assert updated["attempt_timeout"] == 90
     assert delete_fallback_policy(policy["id"]) is True
     assert delete_fallback_policy(policy["id"]) is False
+
+
+def test_fallback_attempt_timeout_defaults_and_clamps():
+    policy = add_fallback_policy({
+        "name": "default timeout",
+        "match_model": "*",
+        "chain": [{"model": "m", "provider_id": "p"}],
+    })
+    assert policy["attempt_timeout"] == 60
+
+    too_low = update_fallback_policy(policy["id"], {"attempt_timeout": 1})
+    assert too_low["attempt_timeout"] == 5
+
+    too_high = update_fallback_policy(policy["id"], {"attempt_timeout": 99999})
+    assert too_high["attempt_timeout"] == 3600
 
 
 def test_delete_routing_rule():

@@ -299,6 +299,116 @@ async def test_stream_internal_output_logs_partial_failure_after_visible_output(
 
 
 @pytest.mark.asyncio
+async def test_stream_internal_output_marks_fallback_success_as_degraded(monkeypatch):
+    """Successful completion after fallback should log status=degraded and increment degraded stats."""
+    logged = {}
+    counters = {"ok": 0, "degraded": 0, "failed": 0, "cancelled": 0}
+
+    def fake_log(user, key, model, provider, endpoint, success, tokens, requested, **kwargs):
+        logged["success"] = success
+        logged["model"] = model
+        logged["details"] = kwargs.get("details") or {}
+
+    def fake_increment(success, *, degraded=False, rejected=False, cancelled=False):
+        if success and degraded:
+            counters["degraded"] += 1
+        elif success:
+            counters["ok"] += 1
+        elif cancelled:
+            counters["cancelled"] += 1
+        else:
+            counters["failed"] += 1
+
+    monkeypatch.setattr("app.core.streaming.increment_global_stats", fake_increment)
+    monkeypatch.setattr("app.core.streaming.increment_user_usage", lambda *a, **k: None)
+
+    async def _events():
+        yield InternalOutputEvent(
+            kind="metadata",
+            metadata={
+                "model": "qianye/gpt-5.5",
+                "provider_id": "qianye",
+                "fallback_status": "used",
+                "attempt_index": 1,
+                "fallback_attempts": [
+                    {"index": 0, "stage": "primary", "status": "failed", "provider": "PixelAPI"},
+                    {"index": 1, "stage": "fallback", "status": "success", "provider": "qianye"},
+                ],
+            },
+        )
+        yield InternalOutputEvent(kind="text_delta", text="recovered")
+        yield InternalOutputEvent(kind="message_done", finish_reason="stop")
+
+    async for _ in stream_internal_output(
+        events=_events(),
+        endpoint="chat_completions",
+        model="PixelAPI/gpt-5.5",
+        username="u",
+        api_key_value="k",
+        provider_id="PixelAPI",
+        requested_model="qianye/gpt-5.5",
+        log_request=fake_log,
+        conv_key="conv-degraded",
+        base_details={"routing_matched": True, "routed_model": "PixelAPI/gpt-5.5"},
+    ):
+        pass
+
+    assert logged["success"] is True
+    assert logged["details"]["status"] == "degraded"
+    assert logged["details"]["fallback_status"] == "used"
+    assert logged["details"]["routed_model"] == "PixelAPI/gpt-5.5"
+    assert logged["model"] == "qianye/gpt-5.5"
+    assert counters["degraded"] == 1
+    assert counters["failed"] == 0
+
+
+@pytest.mark.asyncio
+async def test_stream_internal_output_marks_client_disconnect_as_cancelled(monkeypatch):
+    logged = {}
+    counters = {"cancelled": 0, "failed": 0}
+
+    def fake_log(user, key, model, provider, endpoint, success, tokens, requested, **kwargs):
+        logged["success"] = success
+        logged["details"] = kwargs.get("details") or {}
+
+    def fake_increment(success, *, degraded=False, rejected=False, cancelled=False):
+        if cancelled:
+            counters["cancelled"] += 1
+        elif not success:
+            counters["failed"] += 1
+
+    monkeypatch.setattr("app.core.streaming.increment_global_stats", fake_increment)
+    monkeypatch.setattr("app.core.streaming.increment_user_usage", lambda *a, **k: None)
+
+    class ClientDisconnect(Exception):
+        pass
+
+    async def _events():
+        yield InternalOutputEvent(kind="text_delta", text="partial")
+        raise ClientDisconnect("client disconnected")
+
+    result = []
+    async for line in stream_internal_output(
+        events=_events(),
+        endpoint="chat_completions",
+        model="m",
+        username="u",
+        api_key_value="k",
+        provider_id="p",
+        requested_model="m",
+        log_request=fake_log,
+        conv_key="conv-cancel",
+    ):
+        result.append(line)
+
+    assert logged["success"] is False
+    assert logged["details"]["status"] == "cancelled"
+    assert logged["details"]["client_disconnected"] is True
+    assert counters["cancelled"] == 1
+    assert counters["failed"] == 0
+
+
+@pytest.mark.asyncio
 async def test_stream_internal_output_records_tool_arguments_for_request_log():
     recorded = {}
 

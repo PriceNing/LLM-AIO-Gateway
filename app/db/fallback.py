@@ -13,6 +13,13 @@ DEFAULT_TRIGGERS = {
     "http_4xx": False,
 }
 
+# Max seconds to wait on the current upstream attempt before treating it as a
+# timeout and switching to the next fallback target. Independent of provider
+# request_timeout; used so a hung primary cannot block fallback for many minutes.
+DEFAULT_ATTEMPT_TIMEOUT = 60
+MIN_ATTEMPT_TIMEOUT = 5
+MAX_ATTEMPT_TIMEOUT = 3600
+
 
 def json_loads(value: str, fallback):
     if not value:
@@ -42,6 +49,14 @@ def to_bool(value) -> bool:
     return False
 
 
+def clamp_attempt_timeout(value, default: int = DEFAULT_ATTEMPT_TIMEOUT) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(MIN_ATTEMPT_TIMEOUT, min(MAX_ATTEMPT_TIMEOUT, parsed))
+
+
 def migrate(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
@@ -53,10 +68,19 @@ def migrate(conn: sqlite3.Connection) -> None:
             match_model TEXT NOT NULL DEFAULT '*',
             triggers TEXT NOT NULL DEFAULT '{}',
             chain TEXT NOT NULL DEFAULT '[]',
+            attempt_timeout INTEGER NOT NULL DEFAULT 60,
             created_at TEXT NOT NULL DEFAULT ''
         )
         """
     )
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(fallback_policies)").fetchall()}
+    if "attempt_timeout" not in columns:
+        try:
+            conn.execute(
+                "ALTER TABLE fallback_policies ADD COLUMN attempt_timeout INTEGER NOT NULL DEFAULT 60"
+            )
+        except sqlite3.OperationalError:
+            pass
 
 
 def normalize_policy(row: sqlite3.Row | None) -> Optional[dict]:
@@ -71,6 +95,9 @@ def normalize_policy(row: sqlite3.Row | None) -> Optional[dict]:
     data["triggers"] = triggers
     chain = json_loads(data.get("chain", "[]"), [])
     data["chain"] = chain if isinstance(chain, list) else []
+    data["attempt_timeout"] = clamp_attempt_timeout(
+        data.get("attempt_timeout"), DEFAULT_ATTEMPT_TIMEOUT
+    )
     return data
 
 
@@ -91,12 +118,15 @@ def add_fallback_policy(get_db, get_policy, policy: dict) -> dict:
     triggers = dict(DEFAULT_TRIGGERS)
     if isinstance(policy.get("triggers"), dict):
         triggers.update({key: bool(value) for key, value in policy["triggers"].items()})
+    attempt_timeout = clamp_attempt_timeout(
+        policy.get("attempt_timeout"), DEFAULT_ATTEMPT_TIMEOUT
+    )
     with get_db() as db:
         db.execute(
             """
             INSERT INTO fallback_policies
-                (id, name, enabled, match_provider, match_model, triggers, chain, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (id, name, enabled, match_provider, match_model, triggers, chain, attempt_timeout, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 entry_id,
@@ -106,6 +136,7 @@ def add_fallback_policy(get_db, get_policy, policy: dict) -> dict:
                 policy.get("match_model", "*"),
                 json_dumps(triggers, DEFAULT_TRIGGERS),
                 json_dumps(policy.get("chain", []), []),
+                attempt_timeout,
                 policy.get("created_at") or date.today().isoformat(),
             ),
         )
@@ -118,7 +149,15 @@ def update_fallback_policy(get_db, get_policy, policy_id: str, updates: dict) ->
         if not existing:
             return None
         current = normalize_policy(existing) or {}
-        for key in ("name", "enabled", "match_provider", "match_model", "triggers", "chain"):
+        for key in (
+            "name",
+            "enabled",
+            "match_provider",
+            "match_model",
+            "triggers",
+            "chain",
+            "attempt_timeout",
+        ):
             if key not in updates:
                 continue
             value = updates[key]
@@ -133,9 +172,10 @@ def update_fallback_policy(get_db, get_policy, policy_id: str, updates: dict) ->
                 value = json_dumps(triggers, DEFAULT_TRIGGERS)
             elif key == "chain":
                 value = json_dumps(value, [])
+            elif key == "attempt_timeout":
+                value = clamp_attempt_timeout(value, current.get("attempt_timeout", DEFAULT_ATTEMPT_TIMEOUT))
             db.execute(f"UPDATE fallback_policies SET {key} = ? WHERE id = ?", (value, policy_id))
     return get_policy(policy_id)
-
 
 def delete_fallback_policy(get_db, policy_id: str) -> bool:
     with get_db() as db:

@@ -122,6 +122,25 @@ def test_classify_text_timeout():
     assert classify_upstream_error(RuntimeError("Request timed out")) == "timeout"
 
 
+def test_classify_timeout_preferred_over_status_code_408():
+    """liteLLM Timeout often sets status_code=408; still classify as timeout."""
+
+    class FakeTimeout(Exception):
+        status_code = 408
+
+        def __str__(self):
+            return "APITimeoutError - Request timed out."
+
+    assert classify_upstream_error(FakeTimeout()) == "timeout"
+
+
+def test_classify_timeout_by_exception_name():
+    class APITimeoutError(Exception):
+        status_code = 408
+
+    assert classify_upstream_error(APITimeoutError("boom")) == "timeout"
+
+
 def test_classify_text_timed_out():
     assert classify_upstream_error(RuntimeError("connection timed out")) == "timeout"
 
