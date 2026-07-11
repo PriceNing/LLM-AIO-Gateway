@@ -895,10 +895,24 @@ def ensure_model_allowed(user: dict, api_key: dict, model: str) -> None:
     if _model_allowed_by_list(allowed, model):
         return
     if any("/" in str(allowed_model) for allowed_model in allowed) and not requested.is_composite:
+        _app_log.warning(
+            "[model.allow.denied] model=%s user=%s key=%s reason=not_in_allow_list allow_list=%s hint=use_provider_qualified_id",
+            model,
+            user.get("username", "?"),
+            mask_key(api_key.get("key", "")),
+            allowed,
+        )
         raise HTTPException(
             status_code=403,
             detail=f"Model '{model}' is not allowed for this API key; use a provider-qualified model id",
         )
+    _app_log.warning(
+        "[model.allow.denied] model=%s user=%s key=%s reason=not_in_allow_list allow_list=%s",
+        model,
+        user.get("username", "?"),
+        mask_key(api_key.get("key", "")),
+        allowed,
+    )
     raise HTTPException(status_code=403, detail=f"Model '{model}' is not allowed for this API key")
 
 
@@ -920,10 +934,26 @@ def ensure_routed_model_allowed(user: dict, api_key: dict, requested_model: str,
 
     requested = parse_model_id(requested_model)
     if any("/" in str(allowed_model) for allowed_model in allowed) and not requested.is_composite:
+        _app_log.warning(
+            "[model.allow.denied] requested=%s routed_to=%s user=%s key=%s reason=not_in_allow_list allow_list=%s hint=use_provider_qualified_id",
+            requested_model,
+            effective_target,
+            user.get("username", "?"),
+            mask_key(api_key.get("key", "")),
+            allowed,
+        )
         raise HTTPException(
             status_code=403,
             detail=f"Model '{requested_model}' is not allowed for this API key; use a provider-qualified model id",
         )
+    _app_log.warning(
+        "[model.allow.denied] requested=%s routed_to=%s user=%s key=%s reason=not_in_allow_list allow_list=%s",
+        requested_model,
+        effective_target,
+        user.get("username", "?"),
+        mask_key(api_key.get("key", "")),
+        allowed,
+    )
     raise HTTPException(status_code=403, detail=f"Model '{requested_model}' is not allowed for this API key")
 
 @router.get("/models")
