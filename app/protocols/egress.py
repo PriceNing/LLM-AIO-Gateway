@@ -4,6 +4,7 @@ import uuid
 
 from app.adapters.output import tool_arguments_to_input
 from app.core.output import InternalOutputEvent, InternalOutputMessage
+from app.protocols.ingress import custom_tool_input_from_arguments
 from app.services.logger import get_logger
 
 
@@ -118,7 +119,80 @@ def _responses_tool_ids(event: InternalOutputEvent) -> tuple[str, str]:
     return tool_id, call_id
 
 
-async def render_responses_sse(events, *, model: str, previous_response_id: str | None = None, response_id: str | None = None):
+def _responses_custom_tools(extra: dict | None) -> dict[str, dict[str, str]]:
+    custom_tools = (extra or {}).get("responses_custom_tools")
+    return custom_tools if isinstance(custom_tools, dict) else {}
+
+
+def _responses_namespace_tools(extra: dict | None) -> dict[str, dict[str, str]]:
+    namespace_tools = (extra or {}).get("responses_namespace_tools")
+    return namespace_tools if isinstance(namespace_tools, dict) else {}
+
+
+def _responses_tool_name(raw_name: str, namespace_tools: dict[str, dict[str, str]]) -> tuple[str | None, str]:
+    mapped = namespace_tools.get(raw_name)
+    if isinstance(mapped, dict):
+        return mapped.get("namespace") or None, mapped.get("name") or raw_name
+    if "." in raw_name:
+        namespace, name = raw_name.split(".", 1)
+        if namespace and name:
+            return namespace, name
+    if raw_name.startswith("mcp__"):
+        rest = raw_name[len("mcp__"):]
+        marker = rest.find("__")
+        if marker >= 0:
+            split_at = len("mcp__") + marker + len("__")
+            if split_at < len(raw_name):
+                return raw_name[:split_at], raw_name[split_at:]
+    return None, raw_name
+
+
+def _responses_tool_item_from_state(state: dict, *, status: str, extra: dict | None = None) -> dict:
+    name = state.get("name") or ""
+    custom_tools = _responses_custom_tools(extra)
+    custom_tool = custom_tools.get(name)
+    item_id = state.get("item_id") or state.get("id") or f"fc_{int(time.time())}"
+    call_id = state.get("call_id") or state.get("id") or f"call_{int(time.time())}"
+    if custom_tool:
+        argument_field = custom_tool.get("argument_field") or ("patch" if name == "apply_patch" else "input")
+        input_text = custom_tool_input_from_arguments(state.get("arguments") or "", argument_field)
+        return {
+            "type": "custom_tool_call",
+            "id": item_id if str(item_id).startswith("ctc_") else f"ctc_{item_id}",
+            "call_id": call_id,
+            "name": custom_tool.get("name") or name,
+            "input": "" if status == "in_progress" else input_text,
+            "status": status,
+        }
+
+    namespace, response_name = _responses_tool_name(name, _responses_namespace_tools(extra))
+    item = {
+        "type": "function_call",
+        "id": item_id,
+        "call_id": call_id,
+        "name": response_name,
+        "arguments": "" if status == "in_progress" else (state.get("arguments") or ""),
+        "status": status,
+    }
+    if namespace:
+        item["namespace"] = namespace
+    return item
+
+
+def _custom_tool_state_delta(state: dict, argument_field: str) -> str:
+    input_text = custom_tool_input_from_arguments(state.get("arguments") or "", argument_field)
+    previous = state.get("custom_input_sent") or ""
+    if input_text == previous:
+        return ""
+    if input_text.startswith(previous):
+        delta = input_text[len(previous):]
+    else:
+        delta = input_text
+    state["custom_input_sent"] = input_text
+    return delta
+
+
+async def render_responses_sse(events, *, model: str, previous_response_id: str | None = None, response_id: str | None = None, extra: dict | None = None):
     resp_id = response_id or f"resp_{uuid.uuid4().hex}"
     msg_id = f"msg_{uuid.uuid4().hex}"
     created_at = int(time.time())
@@ -175,7 +249,7 @@ async def render_responses_sse(events, *, model: str, previous_response_id: str 
             })
             output_index_counter += 1
             _tool_log.debug("[egress_responses_stream] tool_start index=%d id=%s call_id=%s name=%s output_index=%d", event.tool_index, state["id"], state["call_id"], state["name"], state["output_index"])
-            yield f"data: {json.dumps({'type': 'response.output_item.added', 'output_index': state['output_index'], 'item': {'type': 'function_call', 'id': state['id'], 'call_id': state['call_id'], 'name': state['name'], 'arguments': '', 'status': 'in_progress'}})}\n\n"
+            yield f"data: {json.dumps({'type': 'response.output_item.added', 'output_index': state['output_index'], 'item': _responses_tool_item_from_state(state, status='in_progress', extra=extra)})}\n\n"
         elif event.kind == "tool_call_arguments_delta":
             tool_id, call_id = _responses_tool_ids(event)
             state = tool_states.setdefault(event.tool_index, {
@@ -189,9 +263,16 @@ async def render_responses_sse(events, *, model: str, previous_response_id: str 
             if not state.get("item_added"):
                 output_index_counter = max(output_index_counter, state["output_index"] + 1)
                 state["item_added"] = True
-                yield f"data: {json.dumps({'type': 'response.output_item.added', 'output_index': state['output_index'], 'item': {'type': 'function_call', 'id': state['id'], 'call_id': state['call_id'], 'name': state['name'], 'arguments': '', 'status': 'in_progress'}})}\n\n"
+                yield f"data: {json.dumps({'type': 'response.output_item.added', 'output_index': state['output_index'], 'item': _responses_tool_item_from_state(state, status='in_progress', extra=extra)})}\n\n"
             state["arguments"] = event.arguments or (state["arguments"] + event.arguments_delta)
-            yield f"data: {json.dumps({'type': 'response.function_call_arguments.delta', 'output_index': state['output_index'], 'call_id': state['call_id'], 'delta': event.arguments_delta})}\n\n"
+            custom_tool = _responses_custom_tools(extra).get(state.get("name") or "")
+            if custom_tool:
+                argument_field = custom_tool.get("argument_field") or ("patch" if state.get("name") == "apply_patch" else "input")
+                delta = _custom_tool_state_delta(state, argument_field)
+                if delta:
+                    yield f"data: {json.dumps({'type': 'response.custom_tool_call_input.delta', 'output_index': state['output_index'], 'call_id': state['call_id'], 'delta': delta})}\n\n"
+            else:
+                yield f"data: {json.dumps({'type': 'response.function_call_arguments.delta', 'output_index': state['output_index'], 'call_id': state['call_id'], 'delta': event.arguments_delta})}\n\n"
         elif event.kind == "usage":
             usage.update({k: v for k, v in event.usage.items() if k in usage})
         elif event.kind == "message_done":
@@ -216,8 +297,16 @@ async def render_responses_sse(events, *, model: str, previous_response_id: str 
 
     for idx in sorted(tool_states):
         state = tool_states[idx]
-        yield f"data: {json.dumps({'type': 'response.function_call_arguments.done', 'output_index': state['output_index'], 'call_id': state['call_id'], 'arguments': state['arguments']})}\n\n"
-        item = {"type": "function_call", "id": state["id"], "call_id": state["call_id"], "name": state["name"], "arguments": state["arguments"], "status": "completed"}
+        custom_tool = _responses_custom_tools(extra).get(state.get("name") or "")
+        if custom_tool:
+            argument_field = custom_tool.get("argument_field") or ("patch" if state.get("name") == "apply_patch" else "input")
+            delta = _custom_tool_state_delta(state, argument_field)
+            if delta:
+                yield f"data: {json.dumps({'type': 'response.custom_tool_call_input.delta', 'output_index': state['output_index'], 'call_id': state['call_id'], 'delta': delta})}\n\n"
+            yield f"data: {json.dumps({'type': 'response.custom_tool_call_input.done', 'output_index': state['output_index'], 'call_id': state['call_id'], 'input': custom_tool_input_from_arguments(state['arguments'], argument_field)})}\n\n"
+        else:
+            yield f"data: {json.dumps({'type': 'response.function_call_arguments.done', 'output_index': state['output_index'], 'call_id': state['call_id'], 'arguments': state['arguments']})}\n\n"
+        item = _responses_tool_item_from_state(state, status="completed", extra=extra)
         yield f"data: {json.dumps({'type': 'response.output_item.done', 'output_index': state['output_index'], 'item': item})}\n\n"
         completion_output.append(item)
 
@@ -447,7 +536,7 @@ def render_anthropic_message(output: InternalOutputMessage, *, model: str) -> di
     }
 
 
-def render_response(output: InternalOutputMessage, *, model: str, previous_response_id: str | None = None, response_id: str | None = None) -> dict:
+def render_response(output: InternalOutputMessage, *, model: str, previous_response_id: str | None = None, response_id: str | None = None, extra: dict | None = None) -> dict:
     resp_id = response_id or f"resp_{uuid.uuid4().hex}"
     msg_id = f"msg_{uuid.uuid4().hex}"
     rendered_output = []
@@ -474,14 +563,12 @@ def render_response(output: InternalOutputMessage, *, model: str, previous_respo
             msg_out["reasoning_content"] = output.reasoning
         rendered_output.append(msg_out)
     for tool in output.tool_calls:
-        rendered_output.append({
-            "type": "function_call",
+        rendered_output.append(_responses_tool_item_from_state({
             "id": tool.id or f"fc_{int(time.time())}",
             "call_id": tool.call_id or tool.id or f"call_{int(time.time())}",
             "name": tool.name,
             "arguments": tool.arguments,
-            "status": "completed",
-        })
+        }, status="completed", extra=extra))
     return {
         "id": resp_id,
         "object": "response",

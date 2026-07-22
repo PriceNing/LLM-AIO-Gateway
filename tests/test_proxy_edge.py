@@ -186,10 +186,30 @@ def test_responses_tools_project_to_openai_chat_tools():
     tools = [
         {"type": "function", "name": "search", "description": "Search", "parameters": {"type": "object"}},
         {"type": "web_search", "name": "web"},
+        {"type": "custom", "name": "exec", "description": "Run JS"},
     ]
     converted = responses_tools_to_chat_tools(tools)
-    assert len(converted) == 1  # web_search filtered out
+    assert len(converted) == 2  # web_search filtered out
     assert converted[0]["function"]["name"] == "search"
+    assert converted[1]["function"]["name"] == "exec"
+    assert converted[1]["function"]["parameters"]["required"] == ["input"]
+
+
+def test_responses_to_internal_preserves_additional_tools_for_upstream_request():
+    from app.protocols.ingress import responses_to_internal
+
+    req = responses_to_internal({
+        "model": "gpt-test",
+        "input": [
+            {"type": "additional_tools", "role": "developer", "tools": [
+                {"type": "custom", "name": "exec", "description": "Run JavaScript"},
+            ]},
+            {"type": "message", "role": "user", "content": "hi"},
+        ],
+    })
+
+    assert req.extra["responses_custom_tools"]["exec"]["argument_field"] == "input"
+    assert req.tools[0].name == "exec"
 
 
 # -- Routing rules --
@@ -601,6 +621,84 @@ async def test_responses_sse_adds_tool_item_when_arguments_arrive_first():
     delta_pos = joined.index('"type": "response.function_call_arguments.delta"')
     assert added_pos < delta_pos
     assert '"type": "function_call"' in joined
+
+
+@pytest.mark.asyncio
+async def test_responses_sse_emits_custom_tool_call_for_custom_tools():
+    from app.core.output import InternalOutputEvent
+    from app.protocols.egress import render_responses_sse
+
+    async def events():
+        yield InternalOutputEvent(kind="tool_call_start", tool_index=0, tool_call_id="call_patch", call_id="call_patch", name="apply_patch")
+        yield InternalOutputEvent(
+            kind="tool_call_arguments_delta",
+            tool_index=0,
+            tool_call_id="call_patch",
+            call_id="call_patch",
+            name="apply_patch",
+            arguments_delta='{"patch":"*** Begin Patch"}',
+            arguments='{"patch":"*** Begin Patch"}',
+        )
+        yield InternalOutputEvent(kind="message_done", finish_reason="tool_calls")
+
+    chunks = []
+    async for line in render_responses_sse(
+        events(),
+        model="gpt-test",
+        extra={"responses_custom_tools": {"apply_patch": {"name": "apply_patch", "argument_field": "patch"}}},
+    ):
+        chunks.append(line)
+
+    joined = "".join(chunks)
+    assert '"type": "custom_tool_call"' in joined
+    assert 'response.custom_tool_call_input.delta' in joined
+    assert '*** Begin Patch' in joined
+
+
+@pytest.mark.asyncio
+async def test_responses_sse_custom_tool_delta_handles_split_json_arguments():
+    from app.core.output import InternalOutputEvent
+    from app.protocols.egress import render_responses_sse
+
+    async def events():
+        yield InternalOutputEvent(kind="tool_call_start", tool_index=0, tool_call_id="call_exec", call_id="call_exec", name="exec")
+        yield InternalOutputEvent(
+            kind="tool_call_arguments_delta",
+            tool_index=0,
+            tool_call_id="call_exec",
+            call_id="call_exec",
+            name="exec",
+            arguments_delta='{"input":"hello ',
+            arguments='{"input":"hello ',
+        )
+        yield InternalOutputEvent(
+            kind="tool_call_arguments_delta",
+            tool_index=0,
+            tool_call_id="call_exec",
+            call_id="call_exec",
+            name="exec",
+            arguments_delta='world"}',
+            arguments='{"input":"hello world"}',
+        )
+        yield InternalOutputEvent(kind="message_done", finish_reason="tool_calls")
+
+    chunks = []
+    async for line in render_responses_sse(
+        events(),
+        model="gpt-test",
+        extra={"responses_custom_tools": {"exec": {"name": "exec", "argument_field": "input"}}},
+    ):
+        chunks.append(line)
+
+    deltas = []
+    for chunk in chunks:
+        if 'response.custom_tool_call_input.delta' not in chunk:
+            continue
+        payload = json.loads(chunk.removeprefix("data: ").strip())
+        deltas.append(payload["delta"])
+
+    assert "".join(deltas) == "hello world"
+    assert all(not delta.startswith('{"input"') for delta in deltas)
 
 
 @pytest.mark.asyncio

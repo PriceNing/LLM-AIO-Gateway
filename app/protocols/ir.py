@@ -361,7 +361,22 @@ def anthropic_messages_to_ir(messages: list[dict[str, Any]], system: Any = "") -
     return result
 
 
-def responses_input_to_ir(input_data: Any, instructions: str = "") -> list[InternalMessage]:
+def _custom_argument_field(name: str) -> str:
+    return "patch" if name == "apply_patch" else "input"
+
+
+def _custom_tool_arguments(item: dict[str, Any], custom_tools: dict[str, dict[str, str]]) -> str:
+    name = str(item.get("name") or "")
+    argument_field = custom_tools.get(name, {}).get("argument_field") or _custom_argument_field(name)
+    return json.dumps({argument_field: item.get("input") or ""}, ensure_ascii=False)
+
+
+def responses_input_to_ir(
+    input_data: Any,
+    instructions: str = "",
+    custom_tools: dict[str, dict[str, str]] | None = None,
+) -> list[InternalMessage]:
+    custom_tools = custom_tools or {}
     if isinstance(input_data, str):
         messages = []
         if instructions:
@@ -383,6 +398,10 @@ def responses_input_to_ir(input_data: Any, instructions: str = "") -> list[Inter
             i += 1
             continue
         item_type = item.get("type", "")
+
+        if item_type == "additional_tools":
+            i += 1
+            continue
 
         if item_type == "message" or (not item_type and "role" in item):
             role = item.get("role", "user")
@@ -406,17 +425,19 @@ def responses_input_to_ir(input_data: Any, instructions: str = "") -> list[Inter
             messages.append(InternalMessage(role=role, parts=_parts_from_responses_content(item.get("content", "")), raw=dict(item)))
             i += 1
 
-        elif item_type == "function_call":
+        elif item_type in ("function_call", "custom_tool_call"):
             tool_parts = []
             fc_items = []
-            while i < len(input_data) and isinstance(input_data[i], dict) and input_data[i].get("type") == "function_call":
+            while i < len(input_data) and isinstance(input_data[i], dict) and input_data[i].get("type") in ("function_call", "custom_tool_call"):
                 fc = input_data[i]
                 fc_items.append(fc)
+                fc_type = fc.get("type")
+                raw_arguments = _custom_tool_arguments(fc, custom_tools) if fc_type == "custom_tool_call" else fc.get("arguments", "")
                 tool_parts.append(tool_call_part(
                     fc.get("call_id", ""),
                     fc.get("name", ""),
-                    _parse_arguments(fc.get("arguments", "")),
-                    raw_arguments=fc.get("arguments", ""),
+                    _parse_arguments(raw_arguments),
+                    raw_arguments=raw_arguments,
                     raw=dict(fc),
                 ))
                 i += 1
@@ -442,7 +463,7 @@ def responses_input_to_ir(input_data: Any, instructions: str = "") -> list[Inter
                 if part.tool_call_id:
                     tool_call_assistant_idx[str(part.tool_call_id)] = last_tool_assistant_idx
 
-        elif item_type == "function_call_output":
+        elif item_type in ("function_call_output", "custom_tool_call_output"):
             call_id = str(item.get("call_id", ""))
             rc = item.get("reasoning_content")
             assistant_idx = tool_call_assistant_idx.get(call_id, last_tool_assistant_idx)

@@ -201,11 +201,14 @@ def test_openai_adapter_requires_and_uses_ir():
         chat_messages_from_internal(req)
 
 
-def test_responses_to_internal_converts_function_items_and_tools():
+def test_responses_to_internal_converts_function_items_tools_and_additional_tools():
     req = responses_to_internal({
         "model": "gpt-test",
         "instructions": "sys",
         "input": [
+            {"type": "additional_tools", "role": "developer", "tools": [
+                {"type": "custom", "name": "exec", "description": "Run JS"}
+            ]},
             {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
             {"type": "function_call", "call_id": "call_1", "name": "run", "arguments": "{}"},
         ],
@@ -218,11 +221,15 @@ def test_responses_to_internal_converts_function_items_and_tools():
     assert projected[0] == {"role": "system", "content": "sys"}
     assert projected[1] == {"role": "user", "content": "hi"}
     assert projected[2]["tool_calls"][0]["id"] == "call_1"
+    assert req.messages[1].parts[0].kind == "text"
     assert req.messages[2].parts[0].kind == "tool_call"
     assert req.messages[2].parts[0].tool_call_id == "call_1"
     assert req.tools[0].name == "run"
     assert "strict" not in req.extra["tools"][0]["function"]
     assert req.tool_choice is None
+    assert req.extra["responses_custom_tools"]["exec"]["argument_field"] == "input"
+    assert req.tools[1].name == "exec"
+    assert req.chat_tools()[1]["function"]["parameters"]["required"] == ["input"]
 
 
 def test_responses_tool_choice_projects_to_openai_chat_shape():
@@ -235,6 +242,35 @@ def test_responses_tool_choice_projects_to_openai_chat_shape():
 
     kwargs = chat_kwargs_from_internal(req)
     assert kwargs["tool_choice"] == {"type": "function", "function": {"name": "run"}}
+
+
+def test_responses_to_internal_ignores_non_additional_tools_blocks():
+    req = responses_to_internal({
+        "model": "gpt-test",
+        "input": [
+            {"type": "message", "role": "user", "content": "hi"},
+            {"type": "tool_result", "tool_use_id": "call_1", "content": "ok"},
+        ],
+    })
+
+    assert "responses_custom_tools" not in req.extra
+
+
+def test_responses_to_internal_replays_custom_tool_call_as_chat_tool_message():
+    req = responses_to_internal({
+        "model": "gpt-test",
+        "input": [
+            {"type": "custom_tool_call", "call_id": "call_patch", "name": "apply_patch", "input": "*** Begin Patch"},
+            {"type": "custom_tool_call_output", "call_id": "call_patch", "output": "Done"},
+        ],
+        "tools": [{"type": "custom", "name": "apply_patch", "description": "Apply patch"}],
+    })
+
+    projected = chat_messages_from_internal(req)
+    assert projected[0]["role"] == "assistant"
+    assert projected[0]["tool_calls"][0]["function"]["name"] == "apply_patch"
+    assert projected[0]["tool_calls"][0]["function"]["arguments"] == '{"patch": "*** Begin Patch"}'
+    assert projected[1] == {"role": "tool", "tool_call_id": "call_patch", "content": "Done"}
 
 
 def test_ir_preserves_responses_images_and_reasoning_content():

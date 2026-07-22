@@ -1790,6 +1790,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                     remember_response_chain_key=_remember_response_chain_key,
                     remember_reasoning_content=_remember_reasoning_content,
                     tool_only_turns=_tool_only_turns,
+                    render_extra=internal.extra,
                 ),
                 media_type="text/event-stream"
             )
@@ -1812,7 +1813,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
 
         resp_id = f"resp_{uuid.uuid4().hex}"
         _remember_response_chain_key(resp_id, conv_key)
-        rendered = render_response(output, model=model, previous_response_id=previous_response_id, response_id=resp_id)
+        rendered = render_response(output, model=model, previous_response_id=previous_response_id, response_id=resp_id, extra=internal.extra)
         success_details = _finalize_success_details(output, policy=policy, extra={"response_id": resp_id})
         status = success_details.get("status", "ok")
         tokens = output.usage.get("total_tokens", 0)

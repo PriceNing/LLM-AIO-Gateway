@@ -104,6 +104,7 @@ async def stream_internal_output(
     remember_reasoning_content: RememberReasoningContent | None = None,
     tool_only_turns=None,
     base_details: dict[str, Any] | None = None,
+    render_extra: dict[str, Any] | None = None,
 ):
     total_tokens = 0
     final_model = model
@@ -227,6 +228,7 @@ async def stream_internal_output(
                 model=model,
                 previous_response_id=previous_response_id,
                 response_id=response_id,
+                extra=render_extra,
             ):
                 yield line
         success_details = apply_outcome_to_details(

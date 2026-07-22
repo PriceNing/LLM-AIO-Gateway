@@ -700,8 +700,10 @@ def test_responses_tools_filter_non_function_tools():
         {"type": "custom", "name": "custom"},
         {"type": "function", "name": "my_func", "parameters": {}},
     ])
-    assert len(result) == 1
-    assert result[0]["function"]["name"] == "my_func"
+    assert len(result) == 2
+    assert result[0]["function"]["name"] == "custom"
+    assert result[0]["function"]["parameters"]["required"] == ["input"]
+    assert result[1]["function"]["name"] == "my_func"
 
 
 def test_responses_tools_skip_non_dict_items():

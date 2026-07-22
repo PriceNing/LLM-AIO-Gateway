@@ -116,17 +116,21 @@ class InternalRequest:
     def chat_tools(self) -> list[dict[str, Any]] | None:
         if not self.tools:
             return None
-        return [
-            {
+        result = []
+        for tool in self.tools:
+            raw = tool.raw if isinstance(tool.raw, dict) else {}
+            if raw.get("type") == "function" and isinstance(raw.get("function"), dict):
+                result.append(dict(raw))
+                continue
+            result.append({
                 "type": "function",
                 "function": {
                     "name": tool.name,
                     "description": tool.description,
                     "parameters": tool.parameters,
                 },
-            }
-            for tool in self.tools
-        ]
+            })
+        return result
 
     def anthropic_tools(self) -> list[dict[str, Any]] | None:
         if not self.tools:
@@ -141,20 +145,35 @@ class InternalRequest:
         ]
 
 
+def _tool_name(tool: dict[str, Any]) -> str:
+    function = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+    return str(function.get("name") or "")
+
+
+def _tool_description(tool: dict[str, Any]) -> str:
+    function = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+    return str(function.get("description") or "")
+
+
+def _tool_parameters(tool: dict[str, Any]) -> dict[str, Any]:
+    function = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+    params = function.get("parameters") or function.get("input_schema")
+    return params if isinstance(params, dict) else {"type": "object", "properties": {}}
+
+
 def tools_from_chat(tools: list[Any] | None) -> list[InternalTool]:
     normalized = []
     for tool in tools or []:
         if not isinstance(tool, dict):
             continue
-        fn = tool.get("function") if isinstance(tool.get("function"), dict) else tool
-        name = fn.get("name")
+        name = _tool_name(tool)
         if not name:
             continue
         normalized.append(
             InternalTool(
                 name=name,
-                description=fn.get("description", ""),
-                parameters=fn.get("parameters") or fn.get("input_schema") or {"type": "object", "properties": {}},
+                description=_tool_description(tool),
+                parameters=_tool_parameters(tool),
                 raw=dict(tool),
             )
         )

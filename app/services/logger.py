@@ -211,7 +211,7 @@ class LogManager:
                 continue
             try:
                 dir_date = datetime.strptime(entry.name, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-                if dir_date < cutoff:
+                if dir_date < cutoff and not any(entry.iterdir()):
                     import shutil
                     shutil.rmtree(entry, ignore_errors=True)
             except ValueError:
@@ -275,12 +275,15 @@ def available_log_channels() -> dict[str, str]:
 
 
 def _configured_log_dir() -> str:
+    manager_dir = get_log_manager().log_dir
+    if manager_dir:
+        return str(manager_dir)
     try:
         from app.config import get_config
         logging_config = get_config().config.get("logging") or {}
-        return str(logging_config.get("log_dir") or get_log_manager().log_dir)
+        return str(logging_config.get("log_dir") or manager_dir)
     except Exception:
-        return get_log_manager().log_dir
+        return manager_dir
 
 
 def list_log_dates() -> list[str]:
