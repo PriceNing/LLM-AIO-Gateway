@@ -168,6 +168,34 @@ def clean_params(params: dict[str, Any]) -> dict[str, Any]:
     return cleaned
 
 
+def _local_litellm_model_name(model: str) -> str:
+    text = str(model or "")
+    if text.startswith("openai/"):
+        return text.split("/", 1)[1]
+    return text
+
+
+def _gpt5_temperature_supported(model: str, kwargs: dict[str, Any]) -> bool:
+    local_model = _local_litellm_model_name(model).lower()
+    if not local_model.startswith("gpt-5"):
+        return True
+    reasoning_effort = kwargs.get("reasoning_effort")
+    return local_model.startswith("gpt-5.1") and reasoning_effort in (None, "none")
+
+
+def _normalize_gpt5_temperature(model: str, kwargs: dict[str, Any]) -> None:
+    """Avoid liteLLM rejecting GPT-5-family requests before they reach upstream."""
+    if "temperature" not in kwargs or _gpt5_temperature_supported(model, kwargs):
+        return
+    if kwargs.get("temperature") != 1:
+        get_logger("app").debug(
+            "Coercing unsupported temperature=%s to 1 for model=%s",
+            kwargs.get("temperature"),
+            model,
+        )
+        kwargs["temperature"] = 1
+
+
 def _disable_thinking_when_tools_forced(kwargs: dict[str, Any]) -> None:
     """DeepSeek rejects forced tool_choice while thinking mode is enabled."""
     if not kwargs.get("tools"):
@@ -188,6 +216,7 @@ def create_chat_completion(
 ) -> dict:
     litellm_model, extra_params = build_completion_args(model, provider_id)
     kwargs.update(extra_params)
+    _normalize_gpt5_temperature(litellm_model, kwargs)
     _disable_thinking_when_tools_forced(kwargs)
     normalize_image_content(messages)
     if has_image_content(messages):
@@ -204,6 +233,7 @@ def create_chat_completion_stream(
 ):
     litellm_model, extra_params = build_completion_args(model, provider_id)
     kwargs.update(extra_params)
+    _normalize_gpt5_temperature(litellm_model, kwargs)
     _disable_thinking_when_tools_forced(kwargs)
     kwargs["stream"] = True
     if "stream_options" not in kwargs:

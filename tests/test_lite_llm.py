@@ -3,7 +3,11 @@ Unit tests for liteLLM OpenAI-compatible routing and image normalization helpers
 """
 import pytest
 from app.core.images import extract_image_data_uris, has_image_content, normalize_image_content
-from app.services.lite_llm import _disable_thinking_when_tools_forced, get_litellm_model_name
+from app.services.lite_llm import (
+    _disable_thinking_when_tools_forced,
+    _normalize_gpt5_temperature,
+    get_litellm_model_name,
+)
 
 # -- Model name routing --
 
@@ -45,6 +49,39 @@ def test_disable_thinking_when_tools_forced_only_with_tools():
     kwargs["tools"] = [{"type": "function", "function": {"name": "run"}}]
     _disable_thinking_when_tools_forced(kwargs)
     assert kwargs["extra_body"]["thinking"] == {"type": "disabled"}
+
+
+@pytest.mark.parametrize("model", ["gpt-5", "gpt-5-codex", "openai/gpt-5.6"])
+def test_normalize_gpt5_temperature_coerces_unsupported_values(model):
+    kwargs = {"temperature": 0}
+
+    _normalize_gpt5_temperature(model, kwargs)
+
+    assert kwargs["temperature"] == 1
+
+
+def test_normalize_gpt51_temperature_allows_default_reasoning_effort():
+    kwargs = {"temperature": 0}
+
+    _normalize_gpt5_temperature("gpt-5.1", kwargs)
+
+    assert kwargs["temperature"] == 0
+
+
+def test_normalize_gpt51_temperature_coerces_with_reasoning_enabled():
+    kwargs = {"temperature": 0.7, "reasoning_effort": "medium"}
+
+    _normalize_gpt5_temperature("gpt-5.1", kwargs)
+
+    assert kwargs["temperature"] == 1
+
+
+def test_normalize_gpt5_temperature_leaves_other_models_alone():
+    kwargs = {"temperature": 0}
+
+    _normalize_gpt5_temperature("gpt-4.1", kwargs)
+
+    assert kwargs["temperature"] == 0
 
 
 # -- Image data URI extraction --
