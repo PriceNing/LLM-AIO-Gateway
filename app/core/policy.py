@@ -397,6 +397,8 @@ async def prepare_request_policy(
     tool_only_turns=None,
     tool_only_limit: int | None = None,
     normalize: bool = True,
+    preprocess: bool = True,
+    apply_ir_transforms: bool = True,
     log_label: str = "request",
 ) -> RequestPolicyResult:
     """Apply request-side policy while keeping endpoint-specific output unchanged."""
@@ -414,12 +416,14 @@ async def prepare_request_policy(
 
     conv_key = conversation_cache_key(api_key_value, request.messages, request.previous_response_id)
 
-    modified = await preprocess_request(
-        request,
-        requested_model,
-        parse_model_id(requested_model).provider_id,
-        requested_model,
-    )
+    modified = False
+    if preprocess:
+        modified = await preprocess_request(
+            request,
+            requested_model,
+            parse_model_id(requested_model).provider_id,
+            requested_model,
+        )
     _app_log.info(
         "[%s preprocess.result] requested=%s modified=%s messages=%d",
         log_label,
@@ -452,14 +456,15 @@ async def prepare_request_policy(
         routing.reason,
     )
     injected = 0
-    if reasoning_context is not None:
+    if apply_ir_transforms and reasoning_context is not None:
         cached_rc, tool_map = reasoning_context(conv_key, request.messages)
         injected = inject_reasoning_content(request.messages, cached_rc, tool_map)
 
-    fix_tool_args(request)
+    if apply_ir_transforms:
+        fix_tool_args(request)
 
     limited = False
-    if tool_only_turns is not None and tool_only_limit is not None:
+    if apply_ir_transforms and tool_only_turns is not None and tool_only_limit is not None:
         if request_has_tools(request) and tool_only_turns.get(conv_key, 0) >= tool_only_limit:
             strip_tools(request)
             limited = True

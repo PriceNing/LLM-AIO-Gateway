@@ -63,7 +63,12 @@ def classify_upstream_error(exc: Exception) -> str:
         _app_log.debug("[classify_upstream_error] category=connection_error exc_type=%s", type(exc).__name__)
         return "connection_error"
 
+    # httpx.HTTPStatusError keeps the real status on ``response`` rather than
+    # on the exception itself.  Read it before falling back to text matching so
+    # a 502 is not misleadingly reported as a connection failure.
     status_code = getattr(exc, "status_code", None)
+    if status_code is None:
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
     if status_code is not None and isinstance(status_code, int):
         if status_code == 429:
             _app_log.debug("[classify_upstream_error] category=http_429 exc_type=%s status=%d", type(exc).__name__, status_code)

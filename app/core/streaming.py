@@ -400,6 +400,7 @@ async def stream_internal_output(
             degraded=counters.degraded,
             rejected=counters.rejected,
             cancelled=counters.cancelled,
+            stateful_fallback_blocked=bool(failure_details.get("stateful_fallback_blocked")),
         )
         if username != "legacy":
             increment_user_usage(username, api_key_value, False, 0)

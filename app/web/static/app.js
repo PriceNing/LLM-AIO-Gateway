@@ -643,6 +643,11 @@ Object.assign(I18N.zh, {
     'stats.fallbackAttemptStarted': '尝试中',
     'stats.fallbackAttemptSuccess': '成功',
     'stats.fallbackAttemptFailed': '失败',
+    'stats.responsesStateful': 'Responses 状态会话',
+    'stats.responsesStateMarkers': '状态标记',
+    'stats.fallbackSafetyDecision': 'Fallback 安全决策',
+    'stats.statefulFallbackBlocked': '已阻止跨提供商 Fallback',
+    'stats.statefulFallbackBlockedCalls': '状态会话 Fallback 阻止次数',
     'stats.routingMatched': '命中路由',
     'stats.routingRule': '路由规则',
     'stats.routingReason': '路由原因',
@@ -689,6 +694,11 @@ Object.assign(I18N.en, {
     'stats.fallbackAttemptStarted': 'Started',
     'stats.fallbackAttemptSuccess': 'Success',
     'stats.fallbackAttemptFailed': 'Failed',
+    'stats.responsesStateful': 'Stateful Responses Session',
+    'stats.responsesStateMarkers': 'State Markers',
+    'stats.fallbackSafetyDecision': 'Fallback Safety Decision',
+    'stats.statefulFallbackBlocked': 'Cross-provider fallback blocked',
+    'stats.statefulFallbackBlockedCalls': 'Stateful fallback blocks',
     'stats.errorTrigger': 'Error Trigger',
     'stats.errorStage': 'Error Stage',
     'stats.errorMessage': 'Error Message',
@@ -2638,6 +2648,10 @@ function showRequestDetail(index) {
         detailRow(t('stats.partialOutput') || 'Partial Output', detailPick(entry.partial_output, details.partial_output)),
         detailRow(t('stats.fallbackStatus') || 'Fallback Status', entry.fallback_status || details.fallback_status),
         detailRow(t('stats.fallbackReason') || 'Fallback Reason', entry.fallback_reason || details.fallback_reason),
+        detailRow(t('stats.responsesStateful') || 'Stateful Responses Session', detailPick(entry.responses_stateful, details.responses_stateful)),
+        detailRow(t('stats.responsesStateMarkers') || 'State Markers', (entry.responses_state_markers || details.responses_state_markers || []).join ? (entry.responses_state_markers || details.responses_state_markers || []).join(', ') : ''),
+        detailRow(t('stats.fallbackSafetyDecision') || 'Fallback Safety Decision', entry.fallback_safety_decision || details.fallback_safety_decision),
+        detailRow(t('stats.statefulFallbackBlocked') || 'Cross-provider fallback blocked', detailPick(entry.stateful_fallback_blocked, details.stateful_fallback_blocked)),
         detailRow(t('stats.errorTrigger') || 'Error Trigger', entry.error_trigger || details.error_trigger),
         detailRow(t('stats.errorStage') || 'Error Stage', entry.error_stage || details.error_stage)
     ];
@@ -2673,6 +2687,7 @@ function renderStats(stats, createCharts) {
         '<div class="summary-card card-amber"><div class="card-icon">&#9888;</div><div class="card-value">' + (stats.degraded_calls || 0).toLocaleString() + '</div><div class="card-label">' + t('stats.degradedCalls') + '</div></div>' +
         '<div class="summary-card card-orange"><div class="card-icon">&#9940;</div><div class="card-value">' + (stats.rejected_calls || 0).toLocaleString() + '</div><div class="card-label">' + t('stats.rejectedCalls') + '</div></div>' +
         '<div class="summary-card card-slate"><div class="card-icon">&#10006;</div><div class="card-value">' + (stats.cancelled_calls || 0).toLocaleString() + '</div><div class="card-label">' + t('stats.cancelledCalls') + '</div></div>' +
+        '<div class="summary-card card-orange"><div class="card-icon">&#9888;</div><div class="card-value">' + (stats.stateful_fallback_blocked_calls || 0).toLocaleString() + '</div><div class="card-label">' + t('stats.statefulFallbackBlockedCalls') + '</div></div>' +
         '<div class="summary-card card-red"><div class="card-icon">&#9888;</div><div class="card-value">' + stats.failed_calls.toLocaleString() + '</div><div class="card-label">' + t('stats.failedCalls') + '</div></div>' +
         '<div class="summary-card card-blue"><div class="card-icon">&#9881;</div><div class="card-value">' + Object.keys(stats.stats_by_model || {}).length + '</div><div class="card-label">' + t('stats.activeModels') + '</div></div>' +
         '</div>';
@@ -3523,6 +3538,7 @@ document.addEventListener('DOMContentLoaded', function() {
 function fallbackAttemptRow(att) {
     var statusLabel = att.status === 'success' ? (t('stats.fallbackAttemptSuccess') || 'Success')
         : att.status === 'failed' ? (t('stats.fallbackAttemptFailed') || 'Failed')
+        : att.status === 'skipped' ? (att.reason || 'Skipped')
         : (t('stats.fallbackAttemptStarted') || 'Started');
     var modelLabel = att.model || '-';
     var providerLabel = att.provider || '';

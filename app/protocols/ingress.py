@@ -295,10 +295,10 @@ def responses_to_internal(body: dict[str, Any]) -> InternalRequest:
     namespace_tools, custom_tools = responses_tool_maps(request_tools)
     messages = responses_input_to_ir(input_data, instructions, custom_tools=custom_tools)
 
-    extra_keys = {"top_p", "presence_penalty", "frequency_penalty", "stop", "response_format", "user"}
+    # Only Chat-compatible fields go in extra. The full cleaned body is retained
+    # separately for a native Responses upstream and must never leak into Chat.
+    extra_keys = {"top_p", "presence_penalty", "frequency_penalty", "stop", "response_format", "user", "parallel_tool_calls"}
     extra = {key: body[key] for key in extra_keys if key in body}
-    if body.get("previous_response_id"):
-        extra["previous_response_id"] = body.get("previous_response_id")
 
     if namespace_tools:
         extra["responses_namespace_tools"] = namespace_tools
@@ -331,5 +331,5 @@ def responses_to_internal(body: dict[str, Any]) -> InternalRequest:
         previous_response_id=body.get("previous_response_id") or "",
         extra=extra,
         raw_body=body,
-        metadata={"input_is_list": isinstance(input_data, list), "instructions": instructions},
+        metadata={"input_is_list": isinstance(input_data, list), "instructions": instructions, "responses_native": {"request_body": copy.deepcopy(body)}},
     )

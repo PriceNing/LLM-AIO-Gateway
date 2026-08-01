@@ -13,12 +13,14 @@ from app.database import (
     get_providers, find_user_by_api_key,
     increment_global_stats, increment_user_usage, get_db,
     parse_model_id, add_request_record, add_request_log, trim_request_logs, get_enabled_preprocessor,
+    update_provider_responses_tool_types,
 )
 from app.core.text import friendly_error_msg, mask_key
 from app.core.outcome import (
     apply_outcome_to_details,
     routing_details_from_policy,
     stats_counters_for_status,
+    is_client_disconnect_error,
 )
 from app.core.output import InternalOutputEvent
 
@@ -48,6 +50,7 @@ from app.adapters.openai import chat_kwargs_from_internal, chat_messages_from_in
 from app.adapters.output import response_to_internal_output
 from app.adapters.anthropic_streaming import iter_anthropic_output_events
 from app.adapters.openai_streaming import iter_openai_chat_output_events
+from app.adapters.responses import iter_sse_frames, post_native_response, split_sse_frame, sse_payload, stream_native_response
 from app.protocols.egress import (
     render_anthropic_message,
     render_chat_completion,
@@ -57,6 +60,7 @@ from app.protocols.egress import (
 from app.services.lite_llm import create_chat_completion
 from app.services.preprocessing import has_image_content, preprocess_messages
 from app.services.routing_targets import candidate_targets, classify_upstream_error, provider_for_log, resolve_provider
+from app.services.discovery import probe_responses_capability
 from app.services.logger import get_logger
 from app.config import get_default
 
@@ -71,6 +75,275 @@ router = APIRouter()
 # Rolling log of recent requests for the admin stats dashboard
 _request_log = deque(maxlen=get_default("request_log_max", 200))
 _request_log_lock = threading.Lock()
+
+
+def _responses_requires_native(body: dict) -> list[str]:
+    """Return request features that cannot be faithfully represented by Chat."""
+    required = []
+    chat_safe_fields = {
+        "model", "input", "instructions", "tools", "tool_choice", "stream",
+        "temperature", "top_p", "presence_penalty", "frequency_penalty", "stop",
+        "user", "previous_response_id", "provider_id", "parallel_tool_calls",
+    }
+    for field, value in body.items():
+        if field not in chat_safe_fields and value not in (None, False, "", [], {}):
+            required.append(field)
+    chat_tool_types = {"function", "custom", "namespace"}
+    for tool in body.get("tools") or []:
+        if isinstance(tool, dict) and tool.get("type") not in chat_tool_types:
+            required.append(f"tool:{tool.get('type') or 'unknown'}")
+    return required
+
+
+def _responses_required_tool_types(body: dict) -> set[str]:
+    return {str(tool.get("type") or "") for tool in body.get("tools") or [] if isinstance(tool, dict) and tool.get("type")}
+
+
+def _responses_stateful_tool_markers(body: dict) -> list[str]:
+    """Identify prior Responses tool/agent state that cannot cross providers safely."""
+    input_data = body.get("input")
+    found = []
+    if body.get("previous_response_id"):
+        found.append("previous_response_id")
+    if not isinstance(input_data, list):
+        return found
+    marker_types = {
+        "additional_tools",
+        "custom_tool_call",
+        "custom_tool_call_output",
+        "function_call",
+        "function_call_output",
+        "computer_call",
+        "computer_call_output",
+    }
+    for item in input_data:
+        if not isinstance(item, dict):
+            continue
+        item_type = str(item.get("type") or "")
+        if item_type in marker_types and item_type not in found:
+            found.append(item_type)
+    return found
+
+
+def _observed_response_tool_types(response: dict) -> set[str]:
+    observed = set()
+    for item in response.get("output") or []:
+        if not isinstance(item, dict):
+            continue
+        item_type = str(item.get("type") or "")
+        if item_type == "custom_tool_call":
+            observed.add("custom")
+        elif item_type == "function_call":
+            observed.add("namespace" if item.get("namespace") else "function")
+        elif item_type.endswith("_call"):
+            observed.add(item_type[:-5])
+    return observed
+
+
+async def _native_responses_stream_with_accounting(events, *, username, api_key_value, model, provider_id, requested_model, policy, request_body, fallback_attempts=None, required_tool_types=None, remember_response_chain_key=None, conv_key=""):
+    """Forward raw Responses SSE while recording the terminal response lifecycle."""
+    buffer = b""
+    response_body = None
+    failed = False
+    try:
+        async for frame in iter_sse_frames(events):
+            payload = sse_payload(frame)
+            if payload and payload.get("type") in {"response.completed", "response.failed", "response.incomplete"}:
+                response_body = payload.get("response")
+                terminal_error = payload.get("error") or (response_body or {}).get("error")
+                failed = payload.get("type") != "response.completed"
+            if payload and payload.get("type") == "response.output_item.done":
+                observed = _observed_response_tool_types({"output": [payload.get("item") or {}]})
+                if observed:
+                    provider = resolve_provider(model, provider_id) or {}
+                    update_provider_responses_tool_types(provider_id, list(set(provider.get("responses_tool_types") or []) | observed))
+            yield frame
+    except BaseException as exc:
+        failed = True
+        client_disconnected = is_client_disconnect_error(exc)
+        raise
+    finally:
+        usage = (response_body or {}).get("usage") or {}
+        tokens = usage.get("total_tokens") or 0
+        success = bool(response_body) and not failed
+        response_id = (response_body or {}).get("id")
+        if success and response_id and remember_response_chain_key and conv_key:
+            remember_response_chain_key(response_id, conv_key)
+        client_disconnected = locals().get("client_disconnected", False)
+        details = {**routing_details_from_policy(policy), "responses_mode": "native", "stream": True, "fallback_attempts": fallback_attempts or []}
+        if len(fallback_attempts or []) > 1:
+            details.update({"fallback_status": "used", "attempt_index": len(fallback_attempts) - 1})
+        if client_disconnected:
+            details.update({"status": "cancelled", "client_disconnected": True})
+        elif failed and response_body:
+            details.update({"status": "partial", "partial_output": True})
+        details = apply_outcome_to_details(details, success=success, partial_output=bool(response_body) and failed)
+        _log_request(username, api_key_value, model, provider_id, "responses", success, tokens, requested_model, details=details)
+        status = details.get("status", "ok" if success else "fail")
+        error_text = str(locals().get("terminal_error") or "native Responses stream did not complete") if not success else ""
+        _record_request_log(endpoint="responses", username=username, api_key_value=api_key_value, requested_model=requested_model, final_model=model, final_provider=provider_id, request_body=request_body, response_body=response_body, success=success, status=status, tokens=tokens, usage=usage, details=details, error_message=error_text)
+        _record_success_metrics(username, api_key_value, tokens, status)
+
+
+def _native_response_target_supported(target: RouteTarget, *, stream: bool, required_tool_types: set[str], is_primary: bool) -> tuple[dict | None, str]:
+    provider = resolve_provider(target.model, target.provider_id)
+    if not provider or provider.get("responses_status") != "supported":
+        return None, ""
+    if stream and provider.get("responses_streaming_status") != "supported":
+        return None, ""
+    # ``responses_tool_types`` is learned from successful response output.  It is
+    # therefore positive evidence, not an exhaustive declaration of what an
+    # upstream can do.  Treating an absent entry as unsupported prevented a newly
+    # discovered native fallback from ever handling Codex tools (the generic
+    # capability probe deliberately does not execute tools).
+    #
+    # Keep accepting ``required_tool_types`` here so callers document why they
+    # selected native dispatch; explicit negative capability data can be added
+    # later without changing this boundary.
+    del required_tool_types, is_primary
+    return provider, provider_for_log(provider, target.provider_id)
+
+
+async def _wait_for_native_response_event(events) -> bytes:
+    """Buffer initial SSE keepalives until an actual Responses lifecycle event."""
+    buffered = b""
+    while True:
+        chunk = await events.__anext__()
+        buffered += chunk
+        while (split := split_sse_frame(buffered)) is not None:
+            frame, _rest = split
+            for line in frame.splitlines():
+                if not line.startswith(b"data:"):
+                    continue
+                try:
+                    payload = json.loads(line[5:].lstrip().decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                if str(payload.get("type") or "").startswith("response."):
+                    return buffered
+            buffered = _rest
+
+
+async def _native_response_with_fallbacks(internal, *, stream: bool, required_tool_types: set[str], stateful_markers: list[str] | None = None):
+    """Retry only native-capable fallback targets before any client output."""
+    primary = RouteTarget(model=internal.target_model, provider_id=internal.provider_id)
+    primary = RouteTarget(model=primary.model, provider_id=_fallback_provider_id_for_target(primary))
+    targets = [primary]
+    stateful_markers = list(stateful_markers or [])
+    # Capability mismatch is local routing information, rather than an upstream
+    # failure.  Still consult the configured fallback chain: otherwise an
+    # advanced Responses request is rejected before it can reach a compatible
+    # fallback provider.  An empty trigger intentionally ignores error-trigger
+    # gates because no upstream request has been made yet.
+    primary_provider, _primary_provider_id = _native_response_target_supported(
+        primary, stream=stream, required_tool_types=required_tool_types, is_primary=True,
+    )
+    if stateful_markers and primary_provider is None:
+        capability_fallback = apply_fallback_policy(
+            _fallback_provider_id_for_target(primary), primary.model, trigger=""
+        )
+        blocked_targets = candidate_targets(primary, capability_fallback.chain)[1:] if capability_fallback.matched else []
+        attempts = [{
+            "index": 0, "stage": "primary", "target": primary.model,
+            "provider_id": primary.provider_id, "status": "skipped", "reason": "capability_mismatch",
+        }]
+        attempts.extend({
+            "index": idx, "stage": "fallback", "target": target.model,
+            "provider_id": target.provider_id, "status": "skipped", "reason": "stateful_codex_tools",
+        } for idx, target in enumerate(blocked_targets, start=1))
+        error = RuntimeError("Native Responses fallback blocked for stateful tool session")
+        _attach_request_details(
+            error, fallback_attempts=attempts, fallback_status="skipped",
+            fallback_reason="stateful_codex_tools", fallback_safety_decision="blocked_cross_provider",
+            responses_stateful=True, responses_state_markers=stateful_markers,
+            stateful_fallback_blocked=True, error_stage="primary",
+        )
+        raise error
+    if primary_provider is None:
+        capability_fallback = apply_fallback_policy(
+            _fallback_provider_id_for_target(primary), primary.model, trigger=""
+        )
+        if capability_fallback.matched:
+            targets = candidate_targets(primary, capability_fallback.chain)
+    last_exc = None
+    index = 0
+    attempts = []
+    while index < len(targets):
+        target = targets[index]
+        # A fallback has no effect if it is merely waiting for an administrator
+        # to click refresh.  Probe an *unknown fallback* once, synchronously for
+        # this request, then cache the result.  We never infer negative tool
+        # support from a runtime 4xx: providers can hotfix capabilities at any
+        # time, so later requests remain eligible to try them again.
+        candidate_info = resolve_provider(target.model, target.provider_id)
+        if index > 0 and candidate_info and candidate_info.get("responses_status") == "unknown":
+            try:
+                await probe_responses_capability(candidate_info["id"])
+            except Exception as probe_error:
+                _app_log.info(
+                    "[responses native fallback.probe] target=%s provider=%s result=error error=%s",
+                    target.model, candidate_info.get("id"), friendly_error_msg(probe_error),
+                )
+        provider, provider_id = _native_response_target_supported(target, stream=stream, required_tool_types=required_tool_types, is_primary=index == 0)
+        if provider is None:
+            attempts.append({"index": index, "stage": "primary" if index == 0 else "fallback", "target": target.model, "provider_id": target.provider_id, "status": "skipped", "reason": "capability_mismatch"})
+            index += 1
+            continue
+        attempt = copy.deepcopy(internal)
+        attempt.target_model, attempt.provider_id = target.model, provider_id
+        try:
+            if stream:
+                # Do not yield until the first chunk: this preserves the existing
+                # stream fallback invariant.
+                events = stream_native_response(provider, attempt)
+                first = await _wait_for_native_response_event(events)
+                async def prefixed():
+                    yield first
+                    async for chunk in events:
+                        yield chunk
+                attempts.append({"index": index, "stage": "primary" if index == 0 else "fallback", "target": target.model, "provider_id": provider_id, "status": "success"})
+                return prefixed(), target, provider_id, attempts
+            response = await post_native_response(provider, attempt)
+            attempts.append({"index": index, "stage": "primary" if index == 0 else "fallback", "target": target.model, "provider_id": provider_id, "status": "success"})
+            return response, target, provider_id, attempts
+        except Exception as exc:
+            last_exc = exc
+            attempts.append({"index": index, "stage": "primary" if index == 0 else "fallback", "target": target.model, "provider_id": provider_id, "status": "failed", "trigger": classify_upstream_error(exc), "error": friendly_error_msg(exc)})
+            if index == 0:
+                decision = apply_fallback_policy(provider_id, target.model, classify_upstream_error(exc))
+                if decision.matched:
+                    if stateful_markers:
+                        blocked_targets = candidate_targets(primary, decision.chain)[1:]
+                        attempts.extend({
+                            "index": blocked_index,
+                            "stage": "fallback",
+                            "target": blocked.model,
+                            "provider_id": blocked.provider_id,
+                            "status": "skipped",
+                            "reason": "stateful_codex_tools",
+                        } for blocked_index, blocked in enumerate(blocked_targets, start=1))
+                        _attach_request_details(
+                            exc,
+                            fallback_attempts=attempts,
+                            fallback_status="skipped",
+                            fallback_reason="stateful_codex_tools",
+                            fallback_safety_decision="blocked_cross_provider",
+                            responses_stateful=True,
+                            responses_state_markers=stateful_markers,
+                            stateful_fallback_blocked=True,
+                            error_trigger=classify_upstream_error(exc),
+                            error_stage="primary",
+                        )
+                        raise
+                    targets = candidate_targets(primary, decision.chain)
+            index += 1
+    error = last_exc or RuntimeError("No native Responses fallback target available")
+    if last_exc is None:
+        error.native_capability_unavailable = True
+        error.required_tool_types = sorted(required_tool_types)
+    _attach_request_details(error, fallback_attempts=attempts, fallback_status="exhausted", responses_stateful=bool(stateful_markers), responses_state_markers=stateful_markers)
+    raise error
+
 
 
 def _attach_request_details(exc: Exception, **details) -> Exception:
@@ -901,6 +1174,10 @@ def _log_request(username: str, api_key: str, model: str, provider_id: str,
         "http_status",
         "reject_reason",
         "client_disconnected",
+        "responses_stateful",
+        "responses_state_markers",
+        "fallback_safety_decision",
+        "stateful_fallback_blocked",
     ):
         if key in detail:
             entry[key] = detail[key]
@@ -1413,6 +1690,8 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
         _log_request(username, api_key_value, logged_model, adapter_provider_id or "", "chat_completions", True, tokens, requested_model, details=success_details)
         _record_success_metrics(username, api_key_value, tokens, status)
         return rendered
+    except HTTPException:
+        raise
     except Exception as e:
         _error_log.error("[chat] %s", str(e))
         details = _request_details_from_exception(
@@ -1743,7 +2022,10 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
         api_key_value=api_key_value,
         preprocess_request=_policy_preprocess_request,
         conversation_cache_key=_conversation_cache_key,
-        reasoning_context=_reasoning_context if isinstance(input_data, list) else None,
+        reasoning_context=None,
+        normalize=False,
+        preprocess=False,
+        apply_ir_transforms=False,
         log_label="responses",
     )
     model = internal.target_model
@@ -1766,6 +2048,76 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
         )
 
     try:
+        provider_info = resolve_provider(model, provider_id)
+        adapter_provider_id = provider_for_log(provider_info, provider_id)
+        native_required = _responses_requires_native(body)
+        required_tool_types = _responses_required_tool_types(body)
+        stateful_markers = _responses_stateful_tool_markers(body)
+        native_supported = bool(provider_info and provider_info.get("responses_status") == "supported")
+        if stream and native_supported and provider_info.get("responses_streaming_status") != "supported":
+            native_supported = False
+        # A native-only feature may still be served by a configured native
+        # fallback even when the routed primary lacks Responses support.  Basic
+        # requests, on the other hand, remain eligible for the Chat/Anthropic
+        # compatibility path when no native stream is available.
+        if native_supported or native_required:
+            _app_log.info("[responses native] provider=%s model=%s stream=%s", adapter_provider_id or "-", model, stream)
+            try:
+                if stream:
+                    native_events, used_target, used_provider_id, native_attempts = await _native_response_with_fallbacks(internal, stream=True, required_tool_types=required_tool_types, stateful_markers=stateful_markers)
+                    final_model = _target_model_for_log(used_target, used_provider_id)
+                    return StreamingResponse(
+                        _native_responses_stream_with_accounting(
+                        native_events, username=username, api_key_value=api_key_value,
+                        model=final_model, provider_id=used_provider_id, requested_model=requested_model, policy=policy, request_body=body,
+                        fallback_attempts=native_attempts,
+                        required_tool_types=required_tool_types,
+                            remember_response_chain_key=_remember_response_chain_key, conv_key=conv_key,
+                        ),
+                        media_type="text/event-stream",
+                        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+                    )
+                rendered, used_target, adapter_provider_id, native_attempts = await _native_response_with_fallbacks(internal, stream=False, required_tool_types=required_tool_types, stateful_markers=stateful_markers)
+                model = _target_model_for_log(used_target, adapter_provider_id)
+                usage = rendered.get("usage") or {}
+                tokens = usage.get("total_tokens") or (usage.get("input_tokens", 0) + usage.get("output_tokens", 0))
+                if rendered.get("id"):
+                    _remember_response_chain_key(rendered["id"], conv_key)
+                observed = _observed_response_tool_types(rendered)
+                if observed:
+                    provider = resolve_provider(model, adapter_provider_id) or {}
+                    update_provider_responses_tool_types(adapter_provider_id, list(set(provider.get("responses_tool_types") or []) | observed))
+                native_details = apply_outcome_to_details({**routing_details_from_policy(policy), "responses_mode": "native", "fallback_attempts": native_attempts}, success=True)
+                status = native_details.get("status", "ok")
+                _log_request(username, api_key_value, model, adapter_provider_id, "responses", True, tokens, requested_model, details=native_details)
+                _record_request_log(endpoint="responses", username=username, api_key_value=api_key_value, requested_model=requested_model, final_model=model, final_provider=adapter_provider_id, request_body=body, response_body=rendered, success=True, status=status, tokens=tokens, usage=usage, details=native_details)
+                _record_success_metrics(username, api_key_value, tokens, status)
+                return rendered
+            except Exception as native_error:
+                if stateful_markers:
+                    raise
+                if native_required:
+                    if getattr(native_error, "native_capability_unavailable", False):
+                        raise HTTPException(status_code=422, detail=(
+                            "No configured provider supports native Responses required by this request: "
+                            + ", ".join(native_required)
+                        )) from native_error
+                    raise
+                _app_log.warning("[responses native fallback] no native target succeeded; downgrading basic request: %s", native_error)
+
+        # The initial minimal policy deliberately leaves a native payload untouched.
+        # Once native dispatch is ruled out, run the full IR policy required by the
+        # Chat/Anthropic compatibility adapters.
+        policy = await prepare_request_policy(
+            internal, username=username, api_key_value=api_key_value,
+            preprocess_request=_policy_preprocess_request, conversation_cache_key=_conversation_cache_key,
+            reasoning_context=_reasoning_context if isinstance(input_data, list) else None,
+            log_label="responses",
+        )
+        model = internal.target_model
+        provider_id = internal.provider_id
+        provider_info = resolve_provider(model, provider_id)
+        adapter_provider_id = provider_for_log(provider_info, provider_id)
         if stream:
             events = _stream_events_with_fallbacks(
                 internal,
@@ -1828,6 +2180,8 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
         )
         _record_success_metrics(username, api_key_value, tokens, status)
         return rendered
+    except HTTPException:
+        raise
     except Exception as e:
         details = _request_details_from_exception(
             e,
@@ -1845,7 +2199,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
             success=False, status=details.get("status", "fail"),
             tokens=0, details=details, error_message=friendly_error_msg(e),
         )
-        increment_global_stats(success=False)
+        increment_global_stats(success=False, stateful_fallback_blocked=bool(details.get("stateful_fallback_blocked")))
         if username != "legacy":
             increment_user_usage(username, api_key_value, False, 0)
         _error_log.error("FAILED: %s", str(e))

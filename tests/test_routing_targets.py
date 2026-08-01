@@ -114,6 +114,12 @@ def test_classify_httpx_network_error():
     assert classify_upstream_error(httpx.NetworkError("unreachable")) == "connection_error"
 
 
+def test_classify_httpx_status_error_uses_response_status():
+    request = httpx.Request("POST", "https://example.test/v1/responses")
+    response = httpx.Response(502, request=request)
+    assert classify_upstream_error(httpx.HTTPStatusError("bad gateway", request=request, response=response)) == "http_5xx"
+
+
 def test_classify_builtin_connection_error():
     assert classify_upstream_error(ConnectionError("reset")) == "connection_error"
 

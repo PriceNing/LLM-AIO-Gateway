@@ -2,6 +2,7 @@ import time
 import json
 
 import anyio
+from fastapi import BackgroundTasks
 import httpx
 from fastapi import APIRouter, HTTPException, Header
 from typing import Optional
@@ -24,7 +25,7 @@ from app.adapters.output import response_to_internal_output
 from app.core.text import mask_key
 from app.core.types import InternalMessage, InternalRequest, text_part
 from app.router.auth import require_admin_session
-from app.services.discovery import refresh_provider_models, refresh_all_providers, check_provider_health, check_all_provider_health
+from app.services.discovery import refresh_provider_models, refresh_all_providers, check_provider_health, check_all_provider_health, probe_responses_capability
 from app.services.lite_llm import create_chat_completion, get_available_models
 from app.services.routing_targets import provider_for_log, resolve_provider
 from app.router.proxy import (
@@ -49,12 +50,15 @@ async def list_providers(authorization: Optional[str] = Header(None)):
 
 
 @router.post("/providers")
-async def create_provider(provider: ProviderCreate, authorization: Optional[str] = Header(None)):
+async def create_provider(provider: ProviderCreate, background_tasks: BackgroundTasks, authorization: Optional[str] = Header(None)):
     await require_admin_session(authorization)
     existing = get_provider(provider.id)
     if existing:
         raise HTTPException(status_code=400, detail="Provider with this ID already exists")
-    return add_provider(provider.model_dump())
+    created = add_provider(provider.model_dump())
+    background_tasks.add_task(probe_responses_capability, provider.id)
+    created["responses_capability"] = {"status": "unknown", "pending": True}
+    return created
 
 
 @router.put("/providers/{provider_id}")
@@ -354,6 +358,7 @@ async def get_stats(authorization: Optional[str] = Header(None)):
     degraded = int(stats.get("degraded_calls", 0) or 0)
     rejected = int(stats.get("rejected_calls", 0) or 0)
     cancelled = int(stats.get("cancelled_calls", 0) or 0)
+    stateful_fallback_blocked = int(stats.get("stateful_fallback_blocked_calls", 0) or 0)
     success_rate = ((total - failed) / total * 100) if total > 0 else 100.0
     # Health rate treats fallback-recovered calls as unhealthy for ops visibility.
     health_rate = ((total - failed - degraded) / total * 100) if total > 0 else 100.0
@@ -374,6 +379,7 @@ async def get_stats(authorization: Optional[str] = Header(None)):
         degraded_calls=degraded,
         rejected_calls=rejected,
         cancelled_calls=cancelled,
+        stateful_fallback_blocked_calls=stateful_fallback_blocked,
         success_rate=round(success_rate, 2),
         health_rate=round(health_rate, 2),
         last_reset=stats.get("last_reset", ""),
