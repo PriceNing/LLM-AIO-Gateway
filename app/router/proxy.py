@@ -84,6 +84,7 @@ def _responses_requires_native(body: dict) -> list[str]:
         "model", "input", "instructions", "tools", "tool_choice", "stream",
         "temperature", "top_p", "presence_penalty", "frequency_penalty", "stop",
         "user", "previous_response_id", "provider_id", "parallel_tool_calls",
+        "max_output_tokens", "max_completion_tokens",
     }
     for field, value in body.items():
         if field not in chat_safe_fields and value not in (None, False, "", [], {}):
@@ -108,12 +109,8 @@ def _responses_stateful_tool_markers(body: dict) -> list[str]:
     if not isinstance(input_data, list):
         return found
     marker_types = {
-        "additional_tools",
-        "custom_tool_call",
         "custom_tool_call_output",
-        "function_call",
         "function_call_output",
-        "computer_call",
         "computer_call_output",
     }
     for item in input_data:
@@ -2094,8 +2091,6 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                 _record_success_metrics(username, api_key_value, tokens, status)
                 return rendered
             except Exception as native_error:
-                if stateful_markers:
-                    raise
                 if native_required:
                     if getattr(native_error, "native_capability_unavailable", False):
                         raise HTTPException(status_code=422, detail=(

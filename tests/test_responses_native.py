@@ -283,3 +283,9 @@ async def test_stateful_request_blocks_fallback_when_primary_capability_unknown(
         await _native_response_with_fallbacks(internal, stream=False, required_tool_types=set(), stateful_markers=["previous_response_id", "function_call_output"])
     assert raised.value.request_details["fallback_reason"] == "stateful_codex_tools"
     assert raised.value.request_details["stateful_fallback_blocked"] is True
+
+
+def test_stateful_markers_include_previous_response_id_and_not_plain_tools():
+    from app.router.proxy import _responses_stateful_tool_markers
+    assert _responses_stateful_tool_markers({"input": "hello", "tools": [{"type": "function"}]}) == []
+    assert _responses_stateful_tool_markers({"previous_response_id": "resp_1", "input": "hello"}) == ["previous_response_id"]
