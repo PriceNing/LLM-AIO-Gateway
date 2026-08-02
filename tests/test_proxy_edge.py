@@ -254,6 +254,38 @@ def test_routing_rules_match_wildcard_and_provider(temp_db):
     assert decision.rule_name == "wild-provider"
 
 
+def test_routing_rules_unqualified_scope_does_not_match_provider_qualified_model(temp_db):
+    from app.database import add_routing_rule
+    add_routing_rule({
+        "name": "bare Codex alias", "enabled": True,
+        "match_model": "gpt-5.6-luna", "match_scope": "unqualified",
+        "target_model": "gpt-5.6-luna", "target_provider": "PixelAPI",
+    })
+
+    bare = _apply_routing_rules("alice", "user-key", "gpt-5.6-luna", "gpt-5.6-luna")
+    qualified = _apply_routing_rules(
+        "alice", "user-key", "PixelAPI/gpt-5.6-luna", "PixelAPI/gpt-5.6-luna"
+    )
+
+    assert bare.matched is True
+    assert bare.target_provider == "PixelAPI"
+    assert qualified.matched is False
+
+
+def test_routing_rules_qualified_scope_does_not_match_bare_model(temp_db):
+    from app.database import add_routing_rule
+    add_routing_rule({
+        "name": "qualified only", "enabled": True,
+        "match_model": "PixelAPI/gpt-*", "match_scope": "qualified",
+        "target_model": "other-model", "target_provider": "other-provider",
+    })
+
+    assert _apply_routing_rules("alice", "user-key", "gpt-5.6-luna", "gpt-5.6-luna").matched is False
+    assert _apply_routing_rules(
+        "alice", "user-key", "PixelAPI/gpt-5.6-luna", "PixelAPI/gpt-5.6-luna"
+    ).matched is True
+
+
 def test_routing_rules_can_set_provider_only(temp_db):
     from app.database import add_routing_rule
     add_routing_rule({

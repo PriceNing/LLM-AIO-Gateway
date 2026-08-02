@@ -384,6 +384,44 @@ async def test_stream_internal_output_marks_fallback_success_as_degraded(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_stream_internal_output_preserves_native_downgrade_metadata():
+    logged = {}
+
+    def fake_log(*args, **kwargs):
+        logged["details"] = kwargs.get("details") or {}
+
+    async def _events():
+        yield InternalOutputEvent(
+            kind="metadata",
+            metadata={
+                "upstream_endpoint": "chat_completions",
+                "model": "PixelAPI/gpt-5.6-luna",
+                "provider_id": "PixelAPI",
+            },
+        )
+        yield InternalOutputEvent(kind="message_done", finish_reason="stop")
+
+    async for _ in stream_internal_output(
+        events=_events(), endpoint="responses", model="PixelAPI/gpt-5.6-luna",
+        username="u", api_key_value="k", provider_id="PixelAPI",
+        requested_model="PixelAPI/gpt-5.6-luna", log_request=fake_log,
+        base_details={
+            "responses_mode": "compatibility_downgrade",
+            "native_attempted": True,
+            "native_failure_endpoint": "responses",
+            "native_failure_status": 502,
+            "native_failure_reason": "http_5xx",
+        },
+    ):
+        pass
+
+    assert logged["details"]["upstream_endpoint"] == "chat_completions"
+    assert logged["details"]["responses_mode"] == "compatibility_downgrade"
+    assert logged["details"]["native_attempted"] is True
+    assert logged["details"]["native_failure_status"] == 502
+
+
+@pytest.mark.asyncio
 async def test_stream_internal_output_marks_client_disconnect_as_cancelled(monkeypatch):
     logged = {}
     counters = {"cancelled": 0, "failed": 0}

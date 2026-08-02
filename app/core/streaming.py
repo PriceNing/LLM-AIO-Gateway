@@ -159,6 +159,13 @@ async def stream_internal_output(
                     "routed_model",
                     "routed_provider",
                     "upstream_endpoint",
+                    "responses_mode",
+                    "native_attempted",
+                    "native_failure_endpoint",
+                    "native_failure_status",
+                    "native_failure_reason",
+                    "native_failure_message",
+                    "native_attempts",
                 ):
                     if key in event.metadata:
                         stream_details[key] = event.metadata[key]

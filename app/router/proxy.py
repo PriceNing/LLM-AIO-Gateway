@@ -237,6 +237,24 @@ def _native_error_is_explicitly_unsupported(exc: Exception) -> bool:
     return mentions_responses and rejects_protocol
 
 
+def _native_downgrade_details(exc: Exception, attempts: list[dict] | None = None) -> dict:
+    """Describe a failed native attempt that was completed through compatibility."""
+    response = getattr(exc, "response", None)
+    status = getattr(exc, "status_code", None) or getattr(response, "status_code", None)
+    details = {
+        "responses_mode": "compatibility_downgrade",
+        "native_attempted": True,
+        "native_failure_endpoint": "responses",
+        "native_failure_reason": classify_upstream_error(exc),
+        "native_failure_message": friendly_error_msg(exc),
+    }
+    if status is not None:
+        details["native_failure_status"] = status
+    if attempts:
+        details["native_attempts"] = attempts
+    return details
+
+
 def _native_response_target_supported(target: RouteTarget, *, stream: bool, required_tool_types: set[str], is_primary: bool) -> tuple[dict | None, str]:
     provider = resolve_provider(target.model, target.provider_id)
     if not provider or provider.get("provider_type") != "openai":
@@ -1226,6 +1244,13 @@ def _log_request(username: str, api_key: str, model: str, provider_id: str,
         "fallback_safety_decision",
         "stateful_fallback_blocked",
         "upstream_endpoint",
+        "responses_mode",
+        "native_attempted",
+        "native_failure_endpoint",
+        "native_failure_status",
+        "native_failure_reason",
+        "native_failure_message",
+        "native_attempts",
     ):
         if key in detail:
             entry[key] = detail[key]
@@ -2144,6 +2169,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                 _record_success_metrics(username, api_key_value, tokens, status)
                 return rendered
             except Exception as native_error:
+                native_attempts = list(getattr(native_error, "request_details", {}).get("fallback_attempts", []) or [])
                 if native_required:
                     # A model can explicitly reject the Responses protocol
                     # (for example DeepSeek Pro) while a sibling supports it.
@@ -2165,6 +2191,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                             )) from native_error
                         raise
                 _app_log.warning("[responses native fallback] no native target succeeded; downgrading basic request: %s", native_error)
+                native_downgrade_details = _native_downgrade_details(native_error, native_attempts)
 
         # The initial minimal policy deliberately leaves a native payload untouched.
         # Once native dispatch is ruled out, run the full IR policy required by the
@@ -2197,7 +2224,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                     requested_model=requested_model,
                     log_request=_log_request,
                     record_request_log=_build_stream_recorder("responses", username, api_key_value, requested_model, body),
-                    base_details=routing_details_from_policy(policy),
+                    base_details={**routing_details_from_policy(policy), **native_downgrade_details},
                     previous_response_id=previous_response_id,
                     conv_key=conv_key,
                     remember_response_chain_key=_remember_response_chain_key,
@@ -2227,7 +2254,10 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
         resp_id = f"resp_{uuid.uuid4().hex}"
         _remember_response_chain_key(resp_id, conv_key)
         rendered = render_response(output, model=model, previous_response_id=previous_response_id, response_id=resp_id, extra=internal.extra)
-        success_details = _finalize_success_details(output, policy=policy, extra={"response_id": resp_id})
+        success_details = _finalize_success_details(
+            output, policy=policy,
+            extra={"response_id": resp_id, **native_downgrade_details},
+        )
         status = success_details.get("status", "ok")
         tokens = output.usage.get("total_tokens", 0)
         _log_request(username, api_key_value, logged_model, adapter_provider_id, "responses", True, tokens, requested_model, details=success_details)

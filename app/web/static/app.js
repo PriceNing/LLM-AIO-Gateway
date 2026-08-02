@@ -149,6 +149,10 @@ zh: {
     'routing.keyPattern': '匹配 Key（空=全部）',
     'routing.matchModel': '匹配请求模型',
     'routing.matchModelHint': '支持 * 通配符，如 deepseek-*',
+    'routing.matchScope': '匹配范围',
+    'routing.scopeAny': '全部（兼容旧行为）',
+    'routing.scopeUnqualified': '仅裸模型',
+    'routing.scopeQualified': '仅限定模型',
     'routing.targetModel': '目标模型',
     'routing.targetProvider': '目标提供商（空=自动）',
     'routing.save': '保存',
@@ -447,6 +451,10 @@ en: {
     'routing.keyPattern': 'Match Key (empty=all)',
     'routing.matchModel': 'Match Request Model',
     'routing.matchModelHint': 'Supports * wildcard, e.g. deepseek-*',
+    'routing.matchScope': 'Match Scope',
+    'routing.scopeAny': 'Any (legacy compatible)',
+    'routing.scopeUnqualified': 'Unqualified models only',
+    'routing.scopeQualified': 'Provider-qualified models only',
     'routing.targetModel': 'Target Model',
     'routing.targetProvider': 'Target Provider (empty=auto)',
     'routing.save': 'Save',
@@ -651,6 +659,12 @@ Object.assign(I18N.zh, {
     'stats.routingMatched': '命中路由',
     'stats.routingRule': '路由规则',
     'stats.routingReason': '路由原因',
+    'stats.responsesMode': 'Responses 模式',
+    'stats.nativeAttempted': '已尝试原生 Responses',
+    'stats.nativeFailureEndpoint': '原生失败端点',
+    'stats.nativeFailureStatus': '原生失败状态码',
+    'stats.nativeFailureReason': '原生失败原因',
+    'stats.nativeFailureMessage': '原生失败消息',
     'stats.errorTrigger': '错误触发类型',
     'stats.errorStage': '错误阶段',
     'stats.errorMessage': '错误消息',
@@ -687,6 +701,12 @@ Object.assign(I18N.en, {
     'stats.routingMatched': 'Routing Matched',
     'stats.routingRule': 'Routing Rule',
     'stats.routingReason': 'Routing Reason',
+    'stats.responsesMode': 'Responses Mode',
+    'stats.nativeAttempted': 'Native Responses Attempted',
+    'stats.nativeFailureEndpoint': 'Native Failure Endpoint',
+    'stats.nativeFailureStatus': 'Native Failure Status',
+    'stats.nativeFailureReason': 'Native Failure Reason',
+    'stats.nativeFailureMessage': 'Native Failure Message',
     'stats.fallbackStatus': 'Fallback Status',
     'stats.fallbackReason': 'Fallback Reason',
     'stats.fallbackAttempts': 'Fallback Chain',
@@ -1210,6 +1230,7 @@ function renderRoutingRules() {
                     '<div class="routing-from">' +
                         '<span class="label">' + t('routing.matchModel') + ':</span>' +
                         '<code>' + escHtml(rule.match_model || '*') + '</code>' +
+                        '<span class="label" style="margin-left:8px">' + t('routing.matchScope') + ':</span><code>' + escHtml(routingScopeLabel(rule.match_scope)) + '</code>' +
                         (rule.username ? '<span class="label" style="margin-left:8px">User:</span><code>' + escHtml(rule.username) + '</code>' : '') +
                     '</div>' +
                     '<span class="arrow">→</span>' +
@@ -1222,6 +1243,10 @@ function renderRoutingRules() {
             '</div>' +
         '</div>';
     }).join('');
+}
+
+function routingScopeLabel(scope) {
+    return t(scope === 'unqualified' ? 'routing.scopeUnqualified' : scope === 'qualified' ? 'routing.scopeQualified' : 'routing.scopeAny');
 }
 
 function modelsForProvider(providerId) {
@@ -1375,6 +1400,12 @@ function routingFormHtml(title, rule) {
         '<div class="form-group"><label>' + t('routing.matchModel') + ' (' + t('routing.matchModelHint') + ')</label>' +
             '<input type="text" id="ruleMatchModel" list="matchModelList" value="' + escHtml(rule.match_model || '') + '" placeholder="*" autocomplete="off">' +
             '<datalist id="matchModelList"></datalist></div>' +
+        '<div class="form-group"><label>' + t('routing.matchScope') + '</label>' +
+            '<select id="ruleMatchScope" style="width:100%">' +
+                '<option value="any"' + ((rule.match_scope || 'any') === 'any' ? ' selected' : '') + '>' + t('routing.scopeAny') + '</option>' +
+                '<option value="unqualified"' + (rule.match_scope === 'unqualified' ? ' selected' : '') + '>' + t('routing.scopeUnqualified') + '</option>' +
+                '<option value="qualified"' + (rule.match_scope === 'qualified' ? ' selected' : '') + '>' + t('routing.scopeQualified') + '</option>' +
+            '</select></div>' +
         '<div class="form-group"><label>' + t('routing.targetProvider') + '</label>' +
             providerSelectHtml('ruleTargetProvider', rule.target_provider || '', "refreshModelSelectForProvider('ruleTargetModel','ruleTargetProvider')") + '</div>' +
         '<div class="form-group"><label>' + t('routing.targetModel') + '</label>' +
@@ -1391,6 +1422,7 @@ function readRoutingForm() {
         username: document.getElementById('ruleUsername').value.trim(),
         api_key_pattern: document.getElementById('ruleKeyPattern').value.trim(),
         match_model: document.getElementById('ruleMatchModel').value.trim(),
+        match_scope: document.getElementById('ruleMatchScope').value,
         target_model: document.getElementById('ruleTargetModel').value.trim(),
         target_provider: document.getElementById('ruleTargetProvider').value.trim()
     };
@@ -2633,6 +2665,7 @@ function showRequestDetail(index) {
         detailRow(t('stats.key') || 'Key', entry.api_key),
         detailRow(t('stats.endpoint') || 'Client Endpoint', entry.endpoint),
         detailRow(t('stats.upstreamEndpoint') || 'Upstream Endpoint', entry.upstream_endpoint || details.upstream_endpoint),
+        detailRow(t('stats.responsesMode') || 'Responses Mode', entry.responses_mode || details.responses_mode),
         detailRow(t('stats.tokens') || 'Tokens', entry.tokens)
     ];
     var routeRows = [
@@ -2649,6 +2682,11 @@ function showRequestDetail(index) {
         detailRow(t('stats.partialOutput') || 'Partial Output', detailPick(entry.partial_output, details.partial_output)),
         detailRow(t('stats.fallbackStatus') || 'Fallback Status', entry.fallback_status || details.fallback_status),
         detailRow(t('stats.fallbackReason') || 'Fallback Reason', entry.fallback_reason || details.fallback_reason),
+        detailRow(t('stats.nativeAttempted') || 'Native Responses Attempted', detailPick(entry.native_attempted, details.native_attempted)),
+        detailRow(t('stats.nativeFailureEndpoint') || 'Native Failure Endpoint', entry.native_failure_endpoint || details.native_failure_endpoint),
+        detailRow(t('stats.nativeFailureStatus') || 'Native Failure Status', entry.native_failure_status || details.native_failure_status),
+        detailRow(t('stats.nativeFailureReason') || 'Native Failure Reason', entry.native_failure_reason || details.native_failure_reason),
+        detailRow(t('stats.nativeFailureMessage') || 'Native Failure Message', entry.native_failure_message || details.native_failure_message),
         detailRow(t('stats.responsesStateful') || 'Stateful Responses Session', detailPick(entry.responses_stateful, details.responses_stateful)),
         detailRow(t('stats.responsesStateMarkers') || 'State Markers', (entry.responses_state_markers || details.responses_state_markers || []).join ? (entry.responses_state_markers || details.responses_state_markers || []).join(', ') : ''),
         detailRow(t('stats.fallbackSafetyDecision') || 'Fallback Safety Decision', entry.fallback_safety_decision || details.fallback_safety_decision),

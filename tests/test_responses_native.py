@@ -12,6 +12,7 @@ from app.router.proxy import (
     _responses_requires_native,
     _responses_required_tool_types,
     _native_response_target_supported,
+    _native_downgrade_details,
 )
 from app.core.policy import RouteTarget
 from app.config import load_config
@@ -142,6 +143,24 @@ def test_actual_upstream_endpoint_labels_native_openai_and_anthropic_paths():
     assert _upstream_endpoint_for_provider({"provider_type": "openai"}) == "chat_completions"
     assert _upstream_endpoint_for_provider({"provider_type": "anthropic"}) == "messages"
     assert _upstream_endpoint_for_provider({"provider_type": "openai"}, native_responses=True) == "responses"
+
+
+def test_native_downgrade_details_preserve_the_failed_responses_attempt():
+    request = httpx.Request("POST", "https://pixel.invalid/v1/responses")
+    error = httpx.HTTPStatusError(
+        "bad gateway", request=request, response=httpx.Response(502, request=request),
+    )
+    details = _native_downgrade_details(error, [{"index": 0, "status": "failed"}])
+
+    assert details == {
+        "responses_mode": "compatibility_downgrade",
+        "native_attempted": True,
+        "native_failure_endpoint": "responses",
+        "native_failure_status": 502,
+        "native_failure_reason": "http_5xx",
+        "native_failure_message": "bad gateway",
+        "native_attempts": [{"index": 0, "status": "failed"}],
+    }
 
 
 @pytest.mark.asyncio

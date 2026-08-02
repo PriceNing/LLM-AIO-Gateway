@@ -168,6 +168,43 @@ def test_legacy_provider_responses_columns_are_physically_removed(tmp_path):
     assert "responses_status" not in get_provider("legacy")
 
 
+def test_routing_rule_match_scope_migrates_existing_database(tmp_path):
+    import app.database as db_mod
+
+    legacy_path = tmp_path / "legacy-routing.db"
+    with sqlite3.connect(legacy_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE routing_rules (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL DEFAULT 'New Rule',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                username TEXT NOT NULL DEFAULT '',
+                api_key_pattern TEXT NOT NULL DEFAULT '',
+                match_model TEXT NOT NULL DEFAULT '',
+                target_model TEXT NOT NULL DEFAULT '',
+                target_provider TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO routing_rules (id, name, match_model) VALUES (?, ?, ?)",
+            ("legacy-rule", "Legacy Rule", "gpt-5.6-luna"),
+        )
+
+    db_mod._initialized = False
+    init_db(str(legacy_path))
+
+    with sqlite3.connect(legacy_path) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(routing_rules)")}
+        scope = conn.execute(
+            "SELECT match_scope FROM routing_rules WHERE id = ?", ("legacy-rule",)
+        ).fetchone()[0]
+
+    assert "match_scope" in columns
+    assert scope == "any"
+
+
 def test_add_and_get_provider():
     add_provider({
         "id": "test-p", "name": "Test P",

@@ -263,6 +263,7 @@ CREATE TABLE IF NOT EXISTS routing_rules (
     username TEXT NOT NULL DEFAULT '',
     api_key_pattern TEXT NOT NULL DEFAULT '',
     match_model TEXT NOT NULL DEFAULT '',
+    match_scope TEXT NOT NULL DEFAULT 'any',
     target_model TEXT NOT NULL DEFAULT '',
     target_provider TEXT NOT NULL DEFAULT ''
 );

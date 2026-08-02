@@ -1001,7 +1001,7 @@ def _import_routing_rule(entry: dict, mode: str) -> str:
         return "skipped"
     existing = get_routing_rule(rid)
     payload = {k: entry.get(k) for k in (
-        "name", "enabled", "username", "api_key_pattern", "match_model", "target_model", "target_provider"
+        "name", "enabled", "username", "api_key_pattern", "match_model", "match_scope", "target_model", "target_provider"
     ) if k in entry}
     if mode == "skip" and existing:
         return "skipped"

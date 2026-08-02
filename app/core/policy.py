@@ -348,8 +348,18 @@ def apply_routing_rules(username: str, api_key_value: str, requested_model: str,
         if not match_model:
             continue
         mid = parse_model_id(requested_model)
-        if not (wildcard_match(match_model, requested_model) or
-                (mid.is_composite and wildcard_match(match_model, mid.model_name))):
+        match_scope = str(rule.get("match_scope") or "any").lower()
+        if match_scope == "unqualified":
+            model_matches = not mid.is_composite and wildcard_match(match_model, requested_model)
+        elif match_scope == "qualified":
+            model_matches = mid.is_composite and wildcard_match(match_model, requested_model)
+        else:
+            # Legacy/default behaviour: a simple model alias also matches the
+            # model component of a provider-qualified request.
+            model_matches = wildcard_match(match_model, requested_model) or (
+                mid.is_composite and wildcard_match(match_model, mid.model_name)
+            )
+        if not model_matches:
             continue
         target = rule.get("target_model", resolved_model)
         provider = rule.get("target_provider", "")
