@@ -158,6 +158,7 @@ async def stream_internal_output(
                     "routing_reason",
                     "routed_model",
                     "routed_provider",
+                    "upstream_endpoint",
                 ):
                     if key in event.metadata:
                         stream_details[key] = event.metadata[key]

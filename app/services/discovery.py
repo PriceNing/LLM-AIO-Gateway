@@ -2,7 +2,7 @@ import asyncio
 import time
 
 import httpx
-from app.database import get_provider, update_provider, get_providers, get_db, set_provider_responses_capability, parse_model_id
+from app.database import get_provider, update_provider, get_providers, get_db
 from app.adapters.responses import iter_sse_frames, responses_headers, responses_url, sse_payload
 
 
@@ -137,7 +137,6 @@ async def refresh_provider_models(provider_id: str) -> dict:
                     )
                     added += 1
 
-    capability = await probe_responses_capability(provider_id)
     return {
         "provider_id": provider_id,
         "discovered": discovered,
@@ -145,51 +144,7 @@ async def refresh_provider_models(provider_id: str) -> dict:
         "added": added,
         "updated": updated,
         "removed": removed,
-        "responses_capability": capability,
     }
-
-
-async def probe_responses_capability(provider_id: str) -> dict:
-    """Probe the minimal native Responses contract once and cache its result."""
-    provider = get_provider(provider_id)
-    if not provider or provider.get("provider_type") != "openai":
-        status, error = "unsupported", "provider is not OpenAI-compatible"
-        if provider:
-            set_provider_responses_capability(provider_id, status=status, error=error)
-        return {"status": status, "streaming": False, "error": error}
-    models = [m for m in provider.get("models", []) if m.get("enabled")]
-    if not models:
-        return {"status": "unknown", "streaming": False, "error": "no enabled model available for probe"}
-    payload = {"model": parse_model_id(models[0]["id"]).model_name, "input": "Reply with OK.", "max_output_tokens": 8}
-    try:
-        async with httpx.AsyncClient(timeout=min(15, int(provider.get("request_timeout") or 120))) as client:
-            response = await client.post(responses_url(provider.get("api_base", "")), headers=responses_headers(provider), json=payload)
-        data = response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
-        if response.is_success and isinstance(data, dict) and data.get("object") == "response" and isinstance(data.get("output"), list):
-            status, error = "supported", ""
-        else:
-            status, error = "unsupported", (str(data) or response.text)[:500]
-    except Exception as exc:
-        status, error = "unsupported", str(exc)[:500]
-    streaming_status = "unknown"
-    streaming = False
-    if status == "supported":
-        try:
-            stream_payload = {**payload, "stream": True}
-            async with httpx.AsyncClient(timeout=min(8, int(provider.get("request_timeout") or 120))) as client:
-                async with client.stream("POST", responses_url(provider.get("api_base", "")), headers=responses_headers(provider), json=stream_payload) as stream_response:
-                    stream_response.raise_for_status()
-                    async for frame in iter_sse_frames(stream_response.aiter_raw()):
-                        event = sse_payload(frame)
-                        if event and str(event.get("type") or "").startswith("response."):
-                            streaming = True
-                            break
-            streaming_status = "supported" if streaming else "unsupported"
-        except Exception as exc:
-            streaming_status = "unsupported"
-            error = error or f"stream probe: {str(exc)[:400]}"
-    set_provider_responses_capability(provider_id, status=status, streaming=streaming, streaming_status=streaming_status, error=error)
-    return {"status": status, "streaming": streaming, "streaming_status": streaming_status, "error": error}
 
 
 async def refresh_all_providers() -> list[dict]:

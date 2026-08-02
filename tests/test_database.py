@@ -4,6 +4,7 @@ Unit tests for app.database - stats, provider lookup, routing rules, TTLDict.
 import time
 from datetime import timedelta, timezone
 import pytest
+import sqlite3
 from app.database import (
     init_db, get_db,
     increment_global_stats, get_global_stats, reset_global_stats,
@@ -14,6 +15,7 @@ from app.database import (
     add_fallback_policy, get_fallback_policies, update_fallback_policy, delete_fallback_policy,
     delete_preprocessor, get_enabled_preprocessor, get_preprocessors,
     upsert_preprocessor,
+    get_model_responses_capability, set_model_responses_capability,
 )
 
 
@@ -90,6 +92,81 @@ def test_history_stats_queries_local_day_against_utc_records(monkeypatch):
 
 
 # -- Provider CRUD --
+
+
+def test_legacy_provider_responses_columns_are_physically_removed(tmp_path):
+    """Existing provider-level capability fields migrate to model-level fields only."""
+    import app.database as db_mod
+
+    legacy_path = tmp_path / "legacy-responses.db"
+    with sqlite3.connect(legacy_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE providers (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                provider_type TEXT NOT NULL DEFAULT 'openai',
+                api_base TEXT NOT NULL DEFAULT '',
+                api_key TEXT NOT NULL DEFAULT '',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                extra_headers TEXT NOT NULL DEFAULT '{}',
+                request_timeout INTEGER NOT NULL DEFAULT 120,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                retry_backoff REAL NOT NULL DEFAULT 0.5,
+                responses_status TEXT NOT NULL DEFAULT 'unknown',
+                responses_checked_at TEXT NOT NULL DEFAULT '',
+                responses_streaming INTEGER NOT NULL DEFAULT 0,
+                responses_streaming_status TEXT NOT NULL DEFAULT 'unknown',
+                responses_tool_types TEXT NOT NULL DEFAULT '[]',
+                responses_error TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE provider_models (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider_id TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                model_name TEXT NOT NULL DEFAULT '',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL DEFAULT '',
+                preprocessor TEXT NOT NULL DEFAULT '',
+                FOREIGN KEY (provider_id) REFERENCES providers(id) ON DELETE CASCADE,
+                UNIQUE(provider_id, model_id)
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO providers (id, name, responses_status) VALUES (?, ?, ?)",
+            ("legacy", "Legacy provider", "supported"),
+        )
+        conn.execute(
+            "INSERT INTO provider_models (provider_id, model_id, model_name) VALUES (?, ?, ?)",
+            ("legacy", "legacy-model", "Legacy model"),
+        )
+
+    db_mod._initialized = False
+    init_db(str(legacy_path))
+
+    with sqlite3.connect(legacy_path) as conn:
+        provider_columns = {row[1] for row in conn.execute("PRAGMA table_info(providers)")}
+        model_columns = {row[1] for row in conn.execute("PRAGMA table_info(provider_models)")}
+        provider_row = conn.execute("SELECT id, name FROM providers WHERE id = ?", ("legacy",)).fetchone()
+
+    legacy_columns = {
+        "responses_status", "responses_checked_at", "responses_streaming",
+        "responses_streaming_status", "responses_tool_types", "responses_error",
+    }
+    assert provider_columns.isdisjoint(legacy_columns)
+    assert provider_row == ("legacy", "Legacy provider")
+    assert {
+        "responses_status", "responses_checked_at", "responses_expires_at",
+        "responses_streaming", "responses_streaming_status",
+        "responses_tool_types", "responses_error",
+    }.issubset(model_columns)
+
+    set_model_responses_capability("legacy", "legacy-model", status="supported")
+    capability = get_model_responses_capability("legacy", "legacy-model")
+    assert capability["responses_status"] == "supported"
+    assert "responses_status" not in get_provider("legacy")
+
 
 def test_add_and_get_provider():
     add_provider({

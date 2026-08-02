@@ -39,7 +39,8 @@ def init_db(path: Optional[str] = None) -> None:
             # Migration: add extra_headers to providers if missing
             _migrate_providers_extra_headers(conn)
             _migrate_provider_request_options(conn)
-            _migrate_provider_responses_capability(conn)
+            _remove_legacy_provider_responses_capability(conn)
+            _migrate_model_responses_capability(conn)
             _migrate_preprocessors(conn)
             # Routing and fallback policy migrations.
             routing_db.migrate(conn)
@@ -94,20 +95,37 @@ def _migrate_provider_request_options(conn: sqlite3.Connection) -> None:
                 pass
 
 
-def _migrate_provider_responses_capability(conn: sqlite3.Connection) -> None:
-    """Add cached native Responses capability fields to existing databases."""
+def _remove_legacy_provider_responses_capability(conn: sqlite3.Connection) -> None:
+    """Drop obsolete provider-level Responses cache columns from existing databases."""
+    legacy_columns = (
+        "responses_status",
+        "responses_checked_at",
+        "responses_streaming",
+        "responses_streaming_status",
+        "responses_tool_types",
+        "responses_error",
+    )
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(providers)").fetchall()}
+    for column in legacy_columns:
+        if column in existing:
+            conn.execute(f"ALTER TABLE providers DROP COLUMN {column}")
+
+
+def _migrate_model_responses_capability(conn: sqlite3.Connection) -> None:
+    """Store native Responses capability per provider/model, never per provider."""
     columns = {
         "responses_status": "TEXT NOT NULL DEFAULT 'unknown'",
         "responses_checked_at": "TEXT NOT NULL DEFAULT ''",
+        "responses_expires_at": "TEXT NOT NULL DEFAULT ''",
         "responses_streaming": "INTEGER NOT NULL DEFAULT 0",
         "responses_streaming_status": "TEXT NOT NULL DEFAULT 'unknown'",
         "responses_tool_types": "TEXT NOT NULL DEFAULT '[]'",
         "responses_error": "TEXT NOT NULL DEFAULT ''",
     }
-    existing = {row[1] for row in conn.execute("PRAGMA table_info(providers)").fetchall()}
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(provider_models)").fetchall()}
     for col, ddl in columns.items():
         if col not in existing:
-            conn.execute(f"ALTER TABLE providers ADD COLUMN {col} {ddl}")
+            conn.execute(f"ALTER TABLE provider_models ADD COLUMN {col} {ddl}")
 
 
 def _migrate_preprocessors(conn: sqlite3.Connection) -> None:
@@ -200,13 +218,7 @@ CREATE TABLE IF NOT EXISTS providers (
     extra_headers TEXT NOT NULL DEFAULT '{}',
     request_timeout INTEGER NOT NULL DEFAULT 120,
     retry_count INTEGER NOT NULL DEFAULT 0,
-    retry_backoff REAL NOT NULL DEFAULT 0.5,
-    responses_status TEXT NOT NULL DEFAULT 'unknown',
-    responses_checked_at TEXT NOT NULL DEFAULT '',
-    responses_streaming INTEGER NOT NULL DEFAULT 0,
-    responses_streaming_status TEXT NOT NULL DEFAULT 'unknown',
-    responses_tool_types TEXT NOT NULL DEFAULT '[]',
-    responses_error TEXT NOT NULL DEFAULT ''
+    retry_backoff REAL NOT NULL DEFAULT 0.5
 );
 
 CREATE TABLE IF NOT EXISTS provider_models (
@@ -217,6 +229,13 @@ CREATE TABLE IF NOT EXISTS provider_models (
     enabled INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL DEFAULT '',
     preprocessor TEXT NOT NULL DEFAULT '',
+    responses_status TEXT NOT NULL DEFAULT 'unknown',
+    responses_checked_at TEXT NOT NULL DEFAULT '',
+    responses_expires_at TEXT NOT NULL DEFAULT '',
+    responses_streaming INTEGER NOT NULL DEFAULT 0,
+    responses_streaming_status TEXT NOT NULL DEFAULT 'unknown',
+    responses_tool_types TEXT NOT NULL DEFAULT '[]',
+    responses_error TEXT NOT NULL DEFAULT '',
     FOREIGN KEY (provider_id) REFERENCES providers(id) ON DELETE CASCADE,
     UNIQUE(provider_id, model_id)
 );
@@ -955,10 +974,23 @@ def _provider_from_row(row: sqlite3.Row) -> dict:
     p = _row_to_dict(row)
     p["enabled"] = _to_bool(p["enabled"])
     p["extra_headers"] = _json_loads(p.get("extra_headers", "{}")) or {}
-    p["responses_streaming"] = _to_bool(p.get("responses_streaming", 0))
-    p["responses_tool_types"] = _json_loads(p.get("responses_tool_types", "[]")) or []
     p.update(_normalize_provider_request_options(p))
     return p
+
+
+def _model_from_row(row: sqlite3.Row) -> dict:
+    model = {
+        "id": row["model_id"], "name": row["model_name"],
+        "enabled": _to_bool(row["enabled"]), "preprocessor": row["preprocessor"] or "",
+        "responses_status": row["responses_status"] or "unknown",
+        "responses_checked_at": row["responses_checked_at"] or "",
+        "responses_expires_at": row["responses_expires_at"] or "",
+        "responses_streaming": _to_bool(row["responses_streaming"]),
+        "responses_streaming_status": row["responses_streaming_status"] or "unknown",
+        "responses_tool_types": _json_loads(row["responses_tool_types"] or "[]") or [],
+        "responses_error": row["responses_error"] or "",
+    }
+    return model
 
 def get_providers() -> list:
     with get_db() as db:
@@ -967,7 +999,7 @@ def get_providers() -> list:
         for r in rows:
             p = _provider_from_row(r)
             models_rows = db.execute("SELECT * FROM provider_models WHERE provider_id = ? ORDER BY model_id", (p["id"],)).fetchall()
-            p["models"] = [{"id": m["model_id"], "name": m["model_name"], "enabled": _to_bool(m["enabled"]), "preprocessor": m["preprocessor"] or ""} for m in models_rows]
+            p["models"] = [_model_from_row(m) for m in models_rows]
             result.append(p)
         return result
 
@@ -979,29 +1011,72 @@ def get_provider(provider_id: str) -> Optional[dict]:
             return None
         p = _provider_from_row(row)
         models_rows = db.execute("SELECT * FROM provider_models WHERE provider_id = ? ORDER BY model_id", (provider_id,)).fetchall()
-        p["models"] = [{"id": m["model_id"], "name": m["model_name"], "enabled": _to_bool(m["enabled"]), "preprocessor": m["preprocessor"] or ""} for m in models_rows]
+        p["models"] = [_model_from_row(m) for m in models_rows]
         return p
 
 
-def set_provider_responses_capability(provider_id: str, *, status: str, streaming: bool = False, streaming_status: str = "unknown", tool_types: list | None = None, error: str = "") -> None:
+def get_model_responses_capability(provider_id: str, model: str) -> dict | None:
+    model_name = parse_model_id(model).model_name
+    with get_db() as db:
+        row = db.execute(
+            "SELECT * FROM provider_models WHERE provider_id = ? AND (model_id IN (?, ?) OR model_name = ?) LIMIT 1",
+            (provider_id, model, model_name, model_name),
+        ).fetchone()
+        return _model_from_row(row) if row else None
+
+
+def set_model_responses_capability(provider_id: str, model: str, *, status: str, streaming: bool = False,
+                                   streaming_status: str = "unknown", tool_types: list | None = None,
+                                   error: str = "", expires_at: str = "") -> None:
     if status not in {"unknown", "supported", "unsupported", "degraded"}:
         raise ValueError("invalid Responses capability status")
     with get_db() as db:
         db.execute(
-            "UPDATE providers SET responses_status = ?, responses_checked_at = ?, responses_streaming = ?, responses_streaming_status = ?, responses_tool_types = ?, responses_error = ? WHERE id = ?",
-            (status, datetime.now(timezone.utc).isoformat(), 1 if streaming else 0, streaming_status, json.dumps(tool_types or [], ensure_ascii=False), str(error)[:500], provider_id),
+            "UPDATE provider_models SET responses_status = ?, responses_checked_at = ?, responses_expires_at = ?, responses_streaming = ?, responses_streaming_status = ?, responses_tool_types = ?, responses_error = ? WHERE provider_id = ? AND (model_id IN (?, ?) OR model_name = ?)",
+            (status, datetime.now(timezone.utc).isoformat(), expires_at, 1 if streaming else 0, streaming_status, json.dumps(tool_types or [], ensure_ascii=False), str(error)[:500], provider_id, model, parse_model_id(model).model_name, parse_model_id(model).model_name),
         )
 
 
-def invalidate_provider_responses_capability(provider_id: str) -> None:
+def update_model_responses_capability(provider_id: str, model: str, **updates) -> None:
+    """Update only observed model-level capability fields without erasing evidence."""
+    allowed = {
+        "responses_status": "status",
+        "responses_expires_at": "expires_at",
+        "responses_streaming": "streaming",
+        "responses_streaming_status": "streaming_status",
+        "responses_tool_types": "tool_types",
+        "responses_error": "error",
+    }
+    fields = []
+    values = []
+    for column, key in allowed.items():
+        if key not in updates:
+            continue
+        value = updates[key]
+        if key == "streaming":
+            value = 1 if value else 0
+        elif key == "tool_types":
+            value = json.dumps(value or [], ensure_ascii=False)
+        elif key == "error":
+            value = str(value)[:500]
+        fields.append(f"{column} = ?")
+        values.append(value)
+    if not fields:
+        return
+    fields.append("responses_checked_at = ?")
+    values.append(datetime.now(timezone.utc).isoformat())
+    model_name = parse_model_id(model).model_name
     with get_db() as db:
-        db.execute("UPDATE providers SET responses_status = 'unknown', responses_checked_at = '', responses_streaming = 0, responses_streaming_status = 'unknown', responses_tool_types = '[]', responses_error = '' WHERE id = ?", (provider_id,))
+        db.execute(
+            f"UPDATE provider_models SET {', '.join(fields)} WHERE provider_id = ? AND (model_id IN (?, ?) OR model_name = ?)",
+            (*values, provider_id, model, model_name, model_name),
+        )
 
 
-def update_provider_responses_tool_types(provider_id: str, tool_types: list[str]) -> None:
+def update_model_responses_tool_types(provider_id: str, model: str, tool_types: list[str]) -> None:
     normalized = sorted({str(item) for item in tool_types if item})
     with get_db() as db:
-        db.execute("UPDATE providers SET responses_tool_types = ? WHERE id = ?", (json.dumps(normalized, ensure_ascii=False), provider_id))
+        db.execute("UPDATE provider_models SET responses_tool_types = ? WHERE provider_id = ? AND (model_id IN (?, ?) OR model_name = ?)", (json.dumps(normalized, ensure_ascii=False), provider_id, model, parse_model_id(model).model_name, parse_model_id(model).model_name))
 
 
 def add_provider(provider: dict) -> dict:
@@ -1088,14 +1163,14 @@ def update_provider(provider_id: str, updates: dict) -> Optional[dict]:
                         (provider_id, m["id"], m.get("name", m["id"]), 1 if m.get("enabled", True) else 0, m.get("preprocessor", ""))
                     )
         if any(key in updates for key in {"api_base", "api_key", "provider_type", "models"}):
-            db.execute("UPDATE providers SET responses_status = 'unknown', responses_checked_at = '', responses_streaming = 0, responses_streaming_status = 'unknown', responses_tool_types = '[]', responses_error = '' WHERE id = ?", (provider_id,))
+            db.execute("UPDATE provider_models SET responses_status = 'unknown', responses_checked_at = '', responses_expires_at = '', responses_streaming = 0, responses_streaming_status = 'unknown', responses_tool_types = '[]', responses_error = '' WHERE provider_id = ?", (provider_id,))
         # Fetch updated state within same transaction
         row = db.execute("SELECT * FROM providers WHERE id = ?", (provider_id,)).fetchone()
         if not row:
             return None
         p = _provider_from_row(row)
         models_rows = db.execute("SELECT * FROM provider_models WHERE provider_id = ? ORDER BY model_id", (provider_id,)).fetchall()
-        p["models"] = [{"id": m["model_id"], "name": m["model_name"], "enabled": _to_bool(m["enabled"]), "preprocessor": m["preprocessor"] or ""} for m in models_rows]
+        p["models"] = [_model_from_row(m) for m in models_rows]
         return p
 
 

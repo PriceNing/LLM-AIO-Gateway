@@ -25,7 +25,7 @@ from app.adapters.output import response_to_internal_output
 from app.core.text import mask_key
 from app.core.types import InternalMessage, InternalRequest, text_part
 from app.router.auth import require_admin_session
-from app.services.discovery import refresh_provider_models, refresh_all_providers, check_provider_health, check_all_provider_health, probe_responses_capability
+from app.services.discovery import refresh_provider_models, refresh_all_providers, check_provider_health, check_all_provider_health
 from app.services.lite_llm import create_chat_completion, get_available_models
 from app.services.routing_targets import provider_for_log, resolve_provider
 from app.router.proxy import (
@@ -56,8 +56,6 @@ async def create_provider(provider: ProviderCreate, background_tasks: Background
     if existing:
         raise HTTPException(status_code=400, detail="Provider with this ID already exists")
     created = add_provider(provider.model_dump())
-    background_tasks.add_task(probe_responses_capability, provider.id)
-    created["responses_capability"] = {"status": "unknown", "pending": True}
     return created
 
 

@@ -2631,7 +2631,8 @@ function showRequestDetail(index) {
         detailRow(t('stats.fullTime') || 'Full Time', entry.full_time),
         detailRow(t('stats.client') || 'Client', entry.username),
         detailRow(t('stats.key') || 'Key', entry.api_key),
-        detailRow(t('stats.endpoint') || 'Endpoint', entry.endpoint),
+        detailRow(t('stats.endpoint') || 'Client Endpoint', entry.endpoint),
+        detailRow(t('stats.upstreamEndpoint') || 'Upstream Endpoint', entry.upstream_endpoint || details.upstream_endpoint),
         detailRow(t('stats.tokens') || 'Tokens', entry.tokens)
     ];
     var routeRows = [
@@ -3398,6 +3399,7 @@ Object.assign(I18N.zh, {
     'logs.cleared': '已清空',
     'logs.clearFail': '清空失败',
     'logs.loadDetailFail': '加载详情失败',
+    'stats.upstreamEndpoint': '提供商端点',
     'systemLogs.title': '系统日志',
     'systemLogs.allLevels': '全部级别',
     'systemLogs.search': '搜索日志',
@@ -3478,6 +3480,7 @@ Object.assign(I18N.en, {
     'logs.cleared': 'Cleared',
     'logs.clearFail': 'Clear failed',
     'logs.loadDetailFail': 'Failed to load detail',
+    'stats.upstreamEndpoint': 'Upstream Endpoint',
     'systemLogs.title': 'System Logs',
     'systemLogs.allLevels': 'All levels',
     'systemLogs.search': 'Search logs',

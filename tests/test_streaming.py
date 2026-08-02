@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 from app.core.output import InternalOutputEvent
 from app.core.streaming import record_streaming_events, stream_internal_output
+from app.adapters.streaming import iter_stream_async
 
 
 async def _collect_events(events):
@@ -19,6 +20,26 @@ async def _make_events(*kinds_and_data):
     """Helper: yield InternalOutputEvent from (kind, field, value) triples."""
     for kind, field, value in kinds_and_data:
         yield InternalOutputEvent(kind=kind, **{field: value})
+
+
+@pytest.mark.asyncio
+async def test_iter_stream_async_accepts_litellm_style_iterable_without_close(monkeypatch):
+    """A stream wrapper may be iterable without exposing generator.close()."""
+    import app.adapters.streaming as streaming_adapter
+
+    warnings = []
+    monkeypatch.setattr(streaming_adapter._app_log, "warning", lambda *args: warnings.append(args))
+
+    class StreamWrapper:
+        def __iter__(self):
+            return iter(["one", "two"])
+
+    received = []
+    async for chunk in iter_stream_async(StreamWrapper):
+        received.append(chunk)
+
+    assert received == ["one", "two"]
+    assert warnings == []
 
 
 # --- record_streaming_events ---

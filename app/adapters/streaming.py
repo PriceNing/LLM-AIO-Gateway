@@ -44,8 +44,10 @@ async def iter_stream_async(stream_func):
             error = e
         finally:
             if stream_gen is not None:
+                close = getattr(stream_gen, "close", None)
                 try:
-                    stream_gen.close()
+                    if callable(close):
+                        close()
                 except Exception as close_err:
                     _app_log.warning("[iter_stream_async] error closing generator: %s", close_err)
             chunk_queue.put(_STREAM_SENTINEL)

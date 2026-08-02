@@ -27,7 +27,10 @@ def default_config() -> dict:
             "reasoning_cache_max_size": 1000,
             "tool_only_turns_ttl": 600,
             "tool_only_turns_max_size": 2000,
-            "image_cache_max_size": 500
+            "image_cache_max_size": 500,
+            "responses_capability_supported_ttl": 604800,
+            "responses_capability_unsupported_ttl": 21600,
+            "responses_capability_transient_ttl": 300,
         }
     }
 

@@ -94,13 +94,13 @@ def test_list_request_logs_filters(temp_db):
 
 
 def test_request_log_detail(temp_db):
-    lid = _add_log()
+    lid = _add_log(details={"fallback_status": "unused", "upstream_endpoint": "messages"})
     r = client.get(f"/admin/request-logs/{lid}", headers=temp_db["headers"])
     assert r.status_code == 200
     body = r.json()
     assert body["id"] == lid
     assert body["request_body"] == {"messages": [{"role": "user", "content": "hi"}]}
-    assert body["details"] == {"fallback_status": "unused"}
+    assert body["details"] == {"fallback_status": "unused", "upstream_endpoint": "messages"}
 
 
 def test_request_log_detail_404(temp_db):

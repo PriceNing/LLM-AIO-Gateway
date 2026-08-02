@@ -117,6 +117,25 @@ def test_get_stats(temp_db):
     assert "success_rate" in data
 
 
+def test_stats_request_detail_exposes_actual_upstream_endpoint(temp_db):
+    import app.router.proxy as proxy
+
+    proxy.clear_request_log()
+    try:
+        proxy._log_request(
+            "alice", "sk-test", "minimax/MiniMax-M3", "minimax",
+            "responses", True, 12,
+            details={"upstream_endpoint": "messages"},
+        )
+        response = client.get("/admin/stats", headers=temp_db["headers"])
+        assert response.status_code == 200
+        entry = response.json()["request_log"][0]
+        assert entry["endpoint"] == "responses"
+        assert entry["upstream_endpoint"] == "messages"
+    finally:
+        proxy.clear_request_log()
+
+
 def test_realtime_stats_timeline_skips_large_idle_gaps(temp_db):
     import app.router.proxy as proxy
 

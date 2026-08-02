@@ -1,10 +1,12 @@
 import pytest
 import httpx
+from datetime import datetime, timedelta, timezone
 
 from app.adapters.responses import iter_sse_frames, native_responses_body, responses_url, sse_payload
 from app.core.types import InternalRequest
 from app.protocols.ingress import responses_to_internal
 from app.router.proxy import (
+    _native_responses_stream_with_accounting,
     _native_response_with_fallbacks,
     _observed_response_tool_types,
     _responses_requires_native,
@@ -17,7 +19,7 @@ from app.database import (
     add_fallback_policy,
     add_provider,
     init_db,
-    set_provider_responses_capability,
+    set_model_responses_capability, get_model_responses_capability,
 )
 from main import app
 
@@ -84,6 +86,133 @@ def test_observed_tool_types_require_an_actual_output_item():
     assert _observed_response_tool_types({"output": [{"type": "function_call", "namespace": "mcp"}]}) == {"namespace"}
 
 
+def test_capability_is_scoped_to_provider_and_model_and_expired_negative_is_retryable():
+    add_provider({
+        "id": "deepseek", "name": "DeepSeek", "provider_type": "openai",
+        "api_base": "https://deepseek.invalid/v1", "api_key": "key",
+        "models": [{"id": "deepseek-v4-flash"}, {"id": "deepseek-v4-pro"}],
+    })
+    set_model_responses_capability("deepseek", "deepseek-v4-flash", status="supported")
+    set_model_responses_capability("deepseek", "deepseek-v4-pro", status="unsupported", expires_at=(datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat())
+
+    flash = get_model_responses_capability("deepseek", "deepseek-v4-flash")
+    pro = get_model_responses_capability("deepseek", "deepseek-v4-pro")
+    assert flash["responses_status"] == "supported"
+    assert pro["responses_status"] == "unsupported"
+    assert _native_response_target_supported(RouteTarget(model="deepseek-v4-flash", provider_id="deepseek"), stream=True, required_tool_types=set(), is_primary=True)[0]
+    # The next real request, rather than a timer or refresh operation, probes
+    # an expired negative entry.
+    assert _native_response_target_supported(RouteTarget(model="deepseek-v4-pro", provider_id="deepseek"), stream=True, required_tool_types=set(), is_primary=True)[0]
+
+
+def test_anthropic_provider_never_uses_openai_native_responses_probe_path():
+    add_provider({
+        "id": "minimax", "name": "MiniMax", "provider_type": "anthropic",
+        "api_base": "https://minimax.invalid/anthropic", "api_key": "key",
+        "models": [{"id": "MiniMax-M3"}],
+    })
+    assert _native_response_target_supported(
+        RouteTarget(model="MiniMax-M3", provider_id="minimax"),
+        stream=True, required_tool_types=set(), is_primary=True,
+    ) == (None, "")
+
+
+@pytest.mark.asyncio
+async def test_real_native_request_promotes_unknown_model_without_background_probe(monkeypatch):
+    add_provider({
+        "id": "pixel", "name": "Pixel", "provider_type": "openai",
+        "api_base": "https://pixel.invalid/v1", "api_key": "key",
+        "models": [{"id": "gpt-5.6-luna"}],
+    })
+    async def fake_post(provider, internal):
+        return {"object": "response", "id": "resp_pixel", "output": []}
+    monkeypatch.setattr("app.router.proxy.post_native_response", fake_post)
+    internal = responses_to_internal({"model": "gpt-5.6-luna", "input": "hello"})
+    internal.provider_id = "pixel"
+    await _native_response_with_fallbacks(internal, stream=False, required_tool_types=set())
+    capability = get_model_responses_capability("pixel", "gpt-5.6-luna")
+    assert capability["responses_status"] == "supported"
+    assert capability["responses_expires_at"]
+
+
+
+def test_actual_upstream_endpoint_labels_native_openai_and_anthropic_paths():
+    from app.router.proxy import _upstream_endpoint_for_provider
+
+    assert _upstream_endpoint_for_provider({"provider_type": "openai"}) == "chat_completions"
+    assert _upstream_endpoint_for_provider({"provider_type": "anthropic"}) == "messages"
+    assert _upstream_endpoint_for_provider({"provider_type": "openai"}, native_responses=True) == "responses"
+
+
+@pytest.mark.asyncio
+async def test_explicit_protocol_rejection_is_short_lived_model_negative_cache(monkeypatch):
+    add_provider({
+        "id": "deepseek", "name": "DeepSeek", "provider_type": "openai",
+        "api_base": "https://deepseek.invalid/v1", "api_key": "key",
+        "models": [{"id": "deepseek-v4-pro"}],
+    })
+    request = httpx.Request("POST", "https://deepseek.invalid/v1/responses")
+    async def fake_post(provider, internal):
+        raise httpx.HTTPStatusError(
+            "Responses endpoint not supported", request=request,
+            response=httpx.Response(404, text='{"error":{"message":"Responses endpoint not supported"}}', request=request),
+        )
+    monkeypatch.setattr("app.router.proxy.post_native_response", fake_post)
+    internal = responses_to_internal({"model": "deepseek-v4-pro", "input": "hello"})
+    internal.provider_id = "deepseek"
+    with pytest.raises(httpx.HTTPStatusError):
+        await _native_response_with_fallbacks(internal, stream=False, required_tool_types=set())
+    capability = get_model_responses_capability("deepseek", "deepseek-v4-pro")
+    assert capability["responses_status"] == "unsupported"
+    assert capability["responses_expires_at"]
+
+
+@pytest.mark.asyncio
+async def test_model_not_found_404_does_not_create_negative_capability_cache(monkeypatch):
+    add_provider({
+        "id": "provider", "name": "Provider", "provider_type": "openai",
+        "api_base": "https://provider.invalid/v1", "api_key": "key",
+        "models": [{"id": "model"}],
+    })
+    request = httpx.Request("POST", "https://provider.invalid/v1/responses")
+
+    async def fake_post(provider, internal):
+        raise httpx.HTTPStatusError(
+            "model not found", request=request,
+            response=httpx.Response(404, text='{"error":{"message":"model does not exist"}}', request=request),
+        )
+
+    monkeypatch.setattr("app.router.proxy.post_native_response", fake_post)
+    internal = responses_to_internal({"model": "model", "input": "hello"})
+    internal.provider_id = "provider"
+    with pytest.raises(httpx.HTTPStatusError):
+        await _native_response_with_fallbacks(internal, stream=False, required_tool_types=set())
+    assert get_model_responses_capability("provider", "model")["responses_status"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_arbitrary_validation_error_does_not_create_negative_capability_cache(monkeypatch):
+    add_provider({
+        "id": "provider", "name": "Provider", "provider_type": "openai",
+        "api_base": "https://provider.invalid/v1", "api_key": "key",
+        "models": [{"id": "model"}],
+    })
+    request = httpx.Request("POST", "https://provider.invalid/v1/responses")
+
+    async def fake_post(provider, internal):
+        raise httpx.HTTPStatusError(
+            "invalid input item", request=request,
+            response=httpx.Response(422, text='{"detail":"invalid input"}', request=request),
+        )
+
+    monkeypatch.setattr("app.router.proxy.post_native_response", fake_post)
+    internal = responses_to_internal({"model": "model", "input": "hello"})
+    internal.provider_id = "provider"
+    with pytest.raises(httpx.HTTPStatusError):
+        await _native_response_with_fallbacks(internal, stream=False, required_tool_types=set())
+    assert get_model_responses_capability("provider", "model")["responses_status"] == "unknown"
+
+
 @pytest.mark.asyncio
 async def test_sse_frame_parser_ignores_keepalive_and_preserves_frame_bytes():
     async def chunks():
@@ -107,6 +236,59 @@ async def test_sse_frame_parser_preserves_crlf_framing():
 
 
 @pytest.mark.asyncio
+async def test_stream_created_then_failed_does_not_mark_model_responses_supported(monkeypatch):
+    add_provider({
+        "id": "pixel", "name": "Pixel", "provider_type": "openai",
+        "api_base": "https://pixel.invalid/v1", "api_key": "key",
+        "models": [{"id": "gpt-5.6-luna"}],
+    })
+    internal = responses_to_internal({"model": "gpt-5.6-luna", "input": "hello", "stream": True})
+
+    async def events():
+        yield b'data: {"type":"response.created","response":{"id":"resp_1"}}\n\n'
+        yield b'data: {"type":"response.failed","response":{"id":"resp_1"}}\n\n'
+
+    async def no_op(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr("app.router.proxy._log_request", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("app.router.proxy._record_request_log", lambda **_kwargs: None)
+    monkeypatch.setattr("app.router.proxy._record_success_metrics", lambda *_args, **_kwargs: None)
+    frames = [frame async for frame in _native_responses_stream_with_accounting(
+        events(), username="u", api_key_value="k", model="pixel/gpt-5.6-luna",
+        provider_id="pixel", requested_model="pixel/gpt-5.6-luna", policy=None,
+        request_body=internal.raw_body,
+    )]
+    assert len(frames) == 2
+    assert get_model_responses_capability("pixel", "gpt-5.6-luna")["responses_status"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_completed_native_stream_marks_model_responses_supported(monkeypatch):
+    add_provider({
+        "id": "pixel", "name": "Pixel", "provider_type": "openai",
+        "api_base": "https://pixel.invalid/v1", "api_key": "key",
+        "models": [{"id": "gpt-5.6-luna"}],
+    })
+
+    async def events():
+        yield b'data: {"type":"response.completed","response":{"id":"resp_1","usage":{"total_tokens":1}}}\n\n'
+
+    monkeypatch.setattr("app.router.proxy._log_request", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("app.router.proxy._record_request_log", lambda **_kwargs: None)
+    monkeypatch.setattr("app.router.proxy._record_success_metrics", lambda *_args, **_kwargs: None)
+    async for _frame in _native_responses_stream_with_accounting(
+        events(), username="u", api_key_value="k", model="pixel/gpt-5.6-luna",
+        provider_id="pixel", requested_model="pixel/gpt-5.6-luna", policy=None,
+        request_body={},
+    ):
+        pass
+    capability = get_model_responses_capability("pixel", "gpt-5.6-luna")
+    assert capability["responses_status"] == "supported"
+    assert capability["responses_streaming"] is True
+
+
+@pytest.mark.asyncio
 async def test_native_fallback_is_used_when_primary_lacks_responses_capability(monkeypatch):
     add_provider({
         "id": "native-primary-off", "name": "Primary", "provider_type": "openai",
@@ -118,8 +300,8 @@ async def test_native_fallback_is_used_when_primary_lacks_responses_capability(m
         "api_base": "https://fallback.invalid/v1", "api_key": "key",
         "models": [{"id": "fallback-model"}],
     })
-    set_provider_responses_capability("native-primary-off", status="unsupported")
-    set_provider_responses_capability("native-fallback-on", status="supported")
+    set_model_responses_capability("native-primary-off", "primary-model", status="unsupported", expires_at="2999-01-01T00:00:00+00:00")
+    set_model_responses_capability("native-fallback-on", "fallback-model", status="supported")
     add_fallback_policy({
         "name": "native capability fallback",
         "match_provider": "native-primary-off", "match_model": "primary-model",
@@ -158,7 +340,7 @@ async def test_native_only_request_reports_no_compatible_fallback():
         "api_base": "https://none.invalid/v1", "api_key": "key",
         "models": [{"id": "none-model"}],
     })
-    set_provider_responses_capability("native-none", status="unsupported")
+    set_model_responses_capability("native-none", "none-model", status="unsupported", expires_at="2999-01-01T00:00:00+00:00")
     internal = responses_to_internal({"model": "none-model", "input": "x", "tools": [{"type": "computer"}]})
     internal.provider_id = "native-none"
 
@@ -180,7 +362,7 @@ async def test_unknown_same_model_native_fallback_is_probed_then_used(monkeypatc
         "api_base": "https://fallback.invalid/v1", "api_key": "key",
         "models": [{"id": "shared-model"}],
     })
-    set_provider_responses_capability("native-primary-fail", status="supported")
+    set_model_responses_capability("native-primary-fail", "shared-model", status="supported")
     add_fallback_policy({
         "name": "probe unknown fallback", "match_provider": "native-primary-fail",
         "match_model": "shared-model", "chain": [{"model": "shared-model", "provider_id": "native-fallback-unknown"}],
@@ -191,13 +373,7 @@ async def test_unknown_same_model_native_fallback_is_probed_then_used(monkeypatc
             raise httpx.HTTPStatusError("bad gateway", request=httpx.Request("POST", "https://primary.invalid"), response=httpx.Response(502, request=httpx.Request("POST", "https://primary.invalid")))
         return {"object": "response", "id": "resp_probed", "output": []}
 
-    async def fake_probe(provider_id):
-        assert provider_id == "native-fallback-unknown"
-        set_provider_responses_capability(provider_id, status="supported")
-        return {"status": "supported", "streaming": False}
-
     monkeypatch.setattr("app.router.proxy.post_native_response", fake_post)
-    monkeypatch.setattr("app.router.proxy.probe_responses_capability", fake_probe)
     internal = responses_to_internal({"model": "shared-model", "input": "hello"})
     internal.provider_id = "native-primary-fail"
 
@@ -225,8 +401,8 @@ async def test_native_fallback_keeps_administrator_chain_order(monkeypatch):
         "api_base": "https://second.invalid/v1", "api_key": "key",
         "models": [{"id": "primary-model"}],
     })
-    for provider_id in ("order-primary", "order-first", "order-second"):
-        set_provider_responses_capability(provider_id, status="supported")
+    for provider_id, model_id in (("order-primary", "primary-model"), ("order-first", "other-model"), ("order-second", "primary-model")):
+        set_model_responses_capability(provider_id, model_id, status="supported")
     add_fallback_policy({
         "name": "preserve native order", "match_provider": "order-primary",
         "match_model": "primary-model",
@@ -257,7 +433,7 @@ async def test_native_fallback_keeps_administrator_chain_order(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_stateful_request_can_fallback_when_primary_capability_unknown():
+async def test_stateful_request_attempts_unknown_primary_before_any_cross_provider_fallback():
     add_provider({
         "id": "stateful-unknown-primary", "name": "Primary", "provider_type": "openai",
         "api_base": "https://primary.invalid/v1", "api_key": "key",
@@ -268,7 +444,7 @@ async def test_stateful_request_can_fallback_when_primary_capability_unknown():
         "api_base": "https://fallback.invalid/v1", "api_key": "key",
         "models": [{"id": "fallback-model"}],
     })
-    set_provider_responses_capability("stateful-fallback", status="supported")
+    set_model_responses_capability("stateful-fallback", "fallback-model", status="supported")
     add_fallback_policy({
         "name": "stateful block", "match_provider": "stateful-unknown-primary",
         "match_model": "stateful-model",
@@ -281,24 +457,25 @@ async def test_stateful_request_can_fallback_when_primary_capability_unknown():
     internal.provider_id = "stateful-unknown-primary"
     async def fake_post(provider, internal):
         return {"object": "response", "id": "resp_stateful_compat", "output": []}
-    # Capability fallback is safe here because no native primary session was
-    # created; the downstream compatibility path owns the reconstructed turn.
+    # Unknown is intentionally request-driven: the real user request first
+    # verifies the selected target rather than preemptively moving a stateful
+    # turn to another provider.
     from unittest.mock import patch
     with patch("app.router.proxy.post_native_response", side_effect=fake_post):
         response, _target, provider_id, attempts = await _native_response_with_fallbacks(
             internal, stream=False, required_tool_types=set(), stateful_markers=["previous_response_id", "function_call_output"]
         )
     assert response["id"] == "resp_stateful_compat"
-    assert provider_id == "stateful-fallback"
-    assert attempts[-1]["status"] == "success"
+    assert provider_id == "stateful-unknown-primary"
+    assert attempts == [{"index": 0, "stage": "primary", "target": "stateful-model", "provider_id": "stateful-unknown-primary", "status": "success"}]
 
 
 @pytest.mark.asyncio
 async def test_stateful_request_blocks_only_after_primary_native_request_fails(monkeypatch):
     add_provider({"id": "stateful-primary-fails", "name": "Primary", "provider_type": "openai", "api_base": "https://primary.invalid/v1", "api_key": "key", "models": [{"id": "stateful-model"}]})
     add_provider({"id": "stateful-other", "name": "Other", "provider_type": "openai", "api_base": "https://other.invalid/v1", "api_key": "key", "models": [{"id": "other-model"}]})
-    set_provider_responses_capability("stateful-primary-fails", status="supported")
-    set_provider_responses_capability("stateful-other", status="supported")
+    set_model_responses_capability("stateful-primary-fails", "stateful-model", status="supported")
+    set_model_responses_capability("stateful-other", "other-model", status="supported")
     add_fallback_policy({"name": "stateful failure block", "match_provider": "stateful-primary-fails", "match_model": "stateful-model", "chain": [{"model": "other-model", "provider_id": "stateful-other"}]})
     async def fake_post(provider, internal):
         raise httpx.HTTPStatusError("bad gateway", request=httpx.Request("POST", "https://primary.invalid"), response=httpx.Response(502))

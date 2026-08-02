@@ -4,6 +4,7 @@ import threading
 import time
 import uuid
 from collections import deque
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import anyio
@@ -13,7 +14,7 @@ from app.database import (
     get_providers, find_user_by_api_key,
     increment_global_stats, increment_user_usage, get_db,
     parse_model_id, add_request_record, add_request_log, trim_request_logs, get_enabled_preprocessor,
-    update_provider_responses_tool_types,
+    get_model_responses_capability, set_model_responses_capability, update_model_responses_capability, update_model_responses_tool_types,
 )
 from app.core.text import friendly_error_msg, mask_key
 from app.core.outcome import (
@@ -60,7 +61,6 @@ from app.protocols.egress import (
 from app.services.lite_llm import create_chat_completion
 from app.services.preprocessing import has_image_content, preprocess_messages
 from app.services.routing_targets import candidate_targets, classify_upstream_error, provider_for_log, resolve_provider
-from app.services.discovery import probe_responses_capability
 from app.services.logger import get_logger
 from app.config import get_default
 
@@ -153,6 +153,7 @@ async def _native_responses_stream_with_accounting(events, *, username, api_key_
     buffer = b""
     response_body = None
     failed = False
+    upstream_endpoint = "responses"
     try:
         async for frame in iter_sse_frames(events):
             payload = sse_payload(frame)
@@ -160,11 +161,22 @@ async def _native_responses_stream_with_accounting(events, *, username, api_key_
                 response_body = payload.get("response")
                 terminal_error = payload.get("error") or (response_body or {}).get("error")
                 failed = payload.get("type") != "response.completed"
+                if not failed:
+                    capability = get_model_responses_capability(provider_id, model) or {}
+                    update_model_responses_capability(
+                        provider_id,
+                        model,
+                        status="supported",
+                        streaming=True,
+                        streaming_status="supported",
+                        tool_types=capability.get("responses_tool_types") or [],
+                        expires_at=_responses_capability_expiry("supported"),
+                    )
             if payload and payload.get("type") == "response.output_item.done":
                 observed = _observed_response_tool_types({"output": [payload.get("item") or {}]})
                 if observed:
-                    provider = resolve_provider(model, provider_id) or {}
-                    update_provider_responses_tool_types(provider_id, list(set(provider.get("responses_tool_types") or []) | observed))
+                    capability = get_model_responses_capability(provider_id, model) or {}
+                    update_model_responses_tool_types(provider_id, model, list(set(capability.get("responses_tool_types") or []) | observed))
             yield frame
     except BaseException as exc:
         failed = True
@@ -178,7 +190,7 @@ async def _native_responses_stream_with_accounting(events, *, username, api_key_
         if success and response_id and remember_response_chain_key and conv_key:
             remember_response_chain_key(response_id, conv_key)
         client_disconnected = locals().get("client_disconnected", False)
-        details = {**routing_details_from_policy(policy), "responses_mode": "native", "stream": True, "fallback_attempts": fallback_attempts or []}
+        details = {**routing_details_from_policy(policy), "responses_mode": "native", "upstream_endpoint": upstream_endpoint, "stream": True, "fallback_attempts": fallback_attempts or []}
         if len(fallback_attempts or []) > 1:
             details.update({"fallback_status": "used", "attempt_index": len(fallback_attempts) - 1})
         if client_disconnected:
@@ -193,11 +205,47 @@ async def _native_responses_stream_with_accounting(events, *, username, api_key_
         _record_success_metrics(username, api_key_value, tokens, status)
 
 
+def _responses_capability_is_fresh(capability: dict | None) -> bool:
+    if not capability or not capability.get("responses_expires_at"):
+        return False
+    try:
+        return datetime.fromisoformat(capability["responses_expires_at"]) > datetime.now(timezone.utc)
+    except (TypeError, ValueError):
+        return False
+
+
+def _responses_capability_expiry(status: str) -> str:
+    ttl_key = {
+        "supported": "responses_capability_supported_ttl",
+        "unsupported": "responses_capability_unsupported_ttl",
+    }.get(status, "responses_capability_transient_ttl")
+    fallback = 604800 if status == "supported" else 21600 if status == "unsupported" else 300
+    return (datetime.now(timezone.utc) + timedelta(seconds=max(0, int(get_default(ttl_key, fallback))))).isoformat()
+
+
+def _native_error_is_explicitly_unsupported(exc: Exception) -> bool:
+    response = getattr(exc, "response", None)
+    status = getattr(exc, "status_code", None) or getattr(response, "status_code", None)
+    if status not in {400, 404, 405, 422, 501}:
+        return False
+    try:
+        detail = response.text.lower()
+    except Exception:
+        detail = str(exc).lower()
+    mentions_responses = any(marker in detail for marker in ("/responses", "responses api", "response api", "responses endpoint", "native responses"))
+    rejects_protocol = any(marker in detail for marker in ("not supported", "unsupported", "not implemented", "unknown endpoint", "method not allowed"))
+    return mentions_responses and rejects_protocol
+
+
 def _native_response_target_supported(target: RouteTarget, *, stream: bool, required_tool_types: set[str], is_primary: bool) -> tuple[dict | None, str]:
     provider = resolve_provider(target.model, target.provider_id)
-    if not provider or provider.get("responses_status") != "supported":
+    if not provider or provider.get("provider_type") != "openai":
         return None, ""
-    if stream and provider.get("responses_streaming_status") != "supported":
+    capability = get_model_responses_capability(provider.get("id") or target.provider_id, target.model)
+    # Only a fresh explicit negative result prevents a real user request from
+    # attempting native Responses. Unknown, expired, and transient results are
+    # deliberately request-driven rechecks.
+    if _responses_capability_is_fresh(capability) and capability.get("responses_status") == "unsupported":
         return None, ""
     # ``responses_tool_types`` is learned from successful response output.  It is
     # therefore positive evidence, not an exhaustive declaration of what an
@@ -208,7 +256,7 @@ def _native_response_target_supported(target: RouteTarget, *, stream: bool, requ
     # Keep accepting ``required_tool_types`` here so callers document why they
     # selected native dispatch; explicit negative capability data can be added
     # later without changing this boundary.
-    del required_tool_types, is_primary
+    del stream, required_tool_types, is_primary
     return provider, provider_for_log(provider, target.provider_id)
 
 
@@ -257,20 +305,6 @@ async def _native_response_with_fallbacks(internal, *, stream: bool, required_to
     attempts = []
     while index < len(targets):
         target = targets[index]
-        # A fallback has no effect if it is merely waiting for an administrator
-        # to click refresh.  Probe an *unknown fallback* once, synchronously for
-        # this request, then cache the result.  We never infer negative tool
-        # support from a runtime 4xx: providers can hotfix capabilities at any
-        # time, so later requests remain eligible to try them again.
-        candidate_info = resolve_provider(target.model, target.provider_id)
-        if index > 0 and candidate_info and candidate_info.get("responses_status") == "unknown":
-            try:
-                await probe_responses_capability(candidate_info["id"])
-            except Exception as probe_error:
-                _app_log.info(
-                    "[responses native fallback.probe] target=%s provider=%s result=error error=%s",
-                    target.model, candidate_info.get("id"), friendly_error_msg(probe_error),
-                )
         provider, provider_id = _native_response_target_supported(target, stream=stream, required_tool_types=required_tool_types, is_primary=index == 0)
         if provider is None:
             attempts.append({"index": index, "stage": "primary" if index == 0 else "fallback", "target": target.model, "provider_id": target.provider_id, "status": "skipped", "reason": "capability_mismatch"})
@@ -292,9 +326,12 @@ async def _native_response_with_fallbacks(internal, *, stream: bool, required_to
                 return prefixed(), target, provider_id, attempts
             response = await post_native_response(provider, attempt)
             attempts.append({"index": index, "stage": "primary" if index == 0 else "fallback", "target": target.model, "provider_id": provider_id, "status": "success"})
+            set_model_responses_capability(provider_id, target.model, status="supported", streaming=False, streaming_status="unknown", expires_at=_responses_capability_expiry("supported"))
             return response, target, provider_id, attempts
         except Exception as exc:
             last_exc = exc
+            if _native_error_is_explicitly_unsupported(exc):
+                set_model_responses_capability(provider_id, target.model, status="unsupported", expires_at=_responses_capability_expiry("unsupported"), error=friendly_error_msg(exc))
             attempts.append({"index": index, "stage": "primary" if index == 0 else "fallback", "target": target.model, "provider_id": provider_id, "status": "failed", "trigger": classify_upstream_error(exc), "error": friendly_error_msg(exc)})
             if index == 0:
                 decision = apply_fallback_policy(provider_id, target.model, classify_upstream_error(exc))
@@ -526,6 +563,15 @@ def _target_uses_preprocessor(target: RouteTarget) -> bool:
     return bool(model and model.get("preprocessor"))
 
 
+def _upstream_endpoint_for_provider(provider_info: dict | None, *, native_responses: bool = False) -> str:
+    """Name the actual protocol endpoint used for one upstream attempt."""
+    if native_responses:
+        return "responses"
+    if provider_info and provider_info.get("provider_type") == "anthropic":
+        return "messages"
+    return "chat_completions"
+
+
 async def _call_nonstream_target(target: RouteTarget, internal, *, temperature, max_tokens, log_label: str, stage: str):
     provider_info = resolve_provider(target.model, target.provider_id)
     adapter_provider_id = provider_for_log(provider_info, target.provider_id)
@@ -551,6 +597,10 @@ async def _call_nonstream_target(target: RouteTarget, internal, *, temperature, 
             )
         )
         output = response_to_internal_output(response)
+    _attach_output_request_details(
+        output,
+        upstream_endpoint=_upstream_endpoint_for_provider(provider_info),
+    )
     _app_log.info(
         "[%s upstream.%s.success] target=%s provider=%s tokens=%s text_len=%d tool_calls=%d",
         log_label,
@@ -707,6 +757,7 @@ async def _call_nonstream_with_fallbacks(policy, internal, *, temperature, max_t
                 fallback_status="unused",
                 attempt_index=index,
                 fallback_attempts=fallback_attempts,
+                upstream_endpoint=_upstream_endpoint_for_provider(provider_info),
             )
             return output, provider_info, adapter_provider_id
         except Exception as exc:
@@ -811,6 +862,7 @@ async def _call_nonstream_with_fallbacks(policy, internal, *, temperature, max_t
                 fallback_status="used",
                 attempt_index=index,
                 fallback_attempts=fallback_attempts,
+                upstream_endpoint=_upstream_endpoint_for_provider(provider_info),
             )
             internal.target_model = target.model
             internal.provider_id = target.provider_id
@@ -971,6 +1023,7 @@ async def _stream_events_with_fallbacks(internal, *, temperature, max_tokens, lo
                     provider_id=adapter_provider_id or "",
                     status="started",
                 )],
+                "upstream_endpoint": _upstream_endpoint_for_provider(provider_info),
             })
             timed_events = _iter_events_with_first_output_timeout(
                 events,
@@ -1006,6 +1059,7 @@ async def _stream_events_with_fallbacks(internal, *, temperature, max_tokens, lo
                 "attempt_index": index,
                 "fallback_status": "used" if index > 0 else "unused",
                 "fallback_attempts": fallback_attempts,
+                "upstream_endpoint": _upstream_endpoint_for_provider(provider_info),
             })
             _app_log.info(
                 "[%s upstream.stream.success] stage=%s target=%s provider=%s",
@@ -1171,6 +1225,7 @@ def _log_request(username: str, api_key: str, model: str, provider_id: str,
         "responses_state_markers",
         "fallback_safety_decision",
         "stateful_fallback_blocked",
+        "upstream_endpoint",
     ):
         if key in detail:
             entry[key] = detail[key]
@@ -2046,9 +2101,11 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
         native_required = _responses_requires_native(body)
         required_tool_types = _responses_required_tool_types(body)
         stateful_markers = _responses_stateful_tool_markers(body)
-        native_supported = bool(provider_info and provider_info.get("responses_status") == "supported")
-        if stream and native_supported and provider_info.get("responses_streaming_status") != "supported":
-            native_supported = False
+        capability = get_model_responses_capability(adapter_provider_id, model) if provider_info else None
+        native_supported = bool(provider_info and provider_info.get("provider_type") == "openai" and not (
+            _responses_capability_is_fresh(capability)
+            and capability.get("responses_status") == "unsupported"
+        ))
         # A native-only feature may still be served by a configured native
         # fallback even when the routed primary lacks Responses support.  Basic
         # requests, on the other hand, remain eligible for the Chat/Anthropic
@@ -2078,9 +2135,9 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                     _remember_response_chain_key(rendered["id"], conv_key)
                 observed = _observed_response_tool_types(rendered)
                 if observed:
-                    provider = resolve_provider(model, adapter_provider_id) or {}
-                    update_provider_responses_tool_types(adapter_provider_id, list(set(provider.get("responses_tool_types") or []) | observed))
-                native_details = apply_outcome_to_details({**routing_details_from_policy(policy), "responses_mode": "native", "fallback_attempts": native_attempts}, success=True)
+                    capability = get_model_responses_capability(adapter_provider_id, model) or {}
+                    update_model_responses_tool_types(adapter_provider_id, model, list(set(capability.get("responses_tool_types") or []) | observed))
+                native_details = apply_outcome_to_details({**routing_details_from_policy(policy), "responses_mode": "native", "upstream_endpoint": "responses", "fallback_attempts": native_attempts}, success=True)
                 status = native_details.get("status", "ok")
                 _log_request(username, api_key_value, model, adapter_provider_id, "responses", True, tokens, requested_model, details=native_details)
                 _record_request_log(endpoint="responses", username=username, api_key_value=api_key_value, requested_model=requested_model, final_model=model, final_provider=adapter_provider_id, request_body=body, response_body=rendered, success=True, status=status, tokens=tokens, usage=usage, details=native_details)
@@ -2088,12 +2145,12 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                 return rendered
             except Exception as native_error:
                 if native_required:
-                    # A provider-wide probe can be positive while the routed
-                    # model (for example DeepSeek Pro) does not implement
-                    # Responses.  A stateless HTTP 4xx is therefore eligible
-                    # for the existing Chat/Messages compatibility path; do
-                    # not turn a model-level incompatibility into a 422.
-                    if classify_upstream_error(native_error) == "http_4xx":
+                    # A model can explicitly reject the Responses protocol
+                    # (for example DeepSeek Pro) while a sibling supports it.
+                    # Only that clear signal may downgrade a native-only turn;
+                    # arbitrary 4xx responses can be malformed user input or
+                    # an upstream defect and must remain visible.
+                    if _native_error_is_explicitly_unsupported(native_error):
                         _app_log.warning(
                             "[responses native] model-level Responses incompatibility; "
                             "downgrading to compatibility path (stateful=%s): %s",
