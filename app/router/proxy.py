@@ -85,11 +85,22 @@ def _responses_requires_native(body: dict) -> list[str]:
         "temperature", "top_p", "presence_penalty", "frequency_penalty", "stop",
         "user", "previous_response_id", "provider_id", "parallel_tool_calls",
         "max_output_tokens", "max_completion_tokens",
+        # Responses metadata/options that have a reasonable IR/Chat
+        # compatibility equivalent (or can safely be ignored by the adapter).
+        # These must not force an unsupported provider down the native-only
+        # path; Codex commonly sends them on every request.
+        "reasoning", "text", "store", "metadata", "truncation", "include",
+        "background", "service_tier", "safety_identifier", "prompt_cache_key",
+        "prompt_cache_retention", "max_tool_calls", "top_logprobs", "logprobs",
+        "client_metadata",
     }
     for field, value in body.items():
         if field not in chat_safe_fields and value not in (None, False, "", [], {}):
             required.append(field)
-    chat_tool_types = {"function", "custom", "namespace"}
+    # Hosted Responses tools are intentionally filtered by ingress when a
+    # provider uses the compatibility path.  They must not turn an otherwise
+    # compatible Codex request into a native-only request.
+    chat_tool_types = {"function", "custom", "namespace", "web_search"}
     for tool in body.get("tools") or []:
         if isinstance(tool, dict) and tool.get("type") not in chat_tool_types:
             required.append(f"tool:{tool.get('type') or 'unknown'}")
@@ -235,27 +246,6 @@ async def _native_response_with_fallbacks(internal, *, stream: bool, required_to
     primary_provider, _primary_provider_id = _native_response_target_supported(
         primary, stream=stream, required_tool_types=required_tool_types, is_primary=True,
     )
-    if stateful_markers and primary_provider is None:
-        capability_fallback = apply_fallback_policy(
-            _fallback_provider_id_for_target(primary), primary.model, trigger=""
-        )
-        blocked_targets = candidate_targets(primary, capability_fallback.chain)[1:] if capability_fallback.matched else []
-        attempts = [{
-            "index": 0, "stage": "primary", "target": primary.model,
-            "provider_id": primary.provider_id, "status": "skipped", "reason": "capability_mismatch",
-        }]
-        attempts.extend({
-            "index": idx, "stage": "fallback", "target": target.model,
-            "provider_id": target.provider_id, "status": "skipped", "reason": "stateful_codex_tools",
-        } for idx, target in enumerate(blocked_targets, start=1))
-        error = RuntimeError("Native Responses fallback blocked for stateful tool session")
-        _attach_request_details(
-            error, fallback_attempts=attempts, fallback_status="skipped",
-            fallback_reason="stateful_codex_tools", fallback_safety_decision="blocked_cross_provider",
-            responses_stateful=True, responses_state_markers=stateful_markers,
-            stateful_fallback_blocked=True, error_stage="primary",
-        )
-        raise error
     if primary_provider is None:
         capability_fallback = apply_fallback_policy(
             _fallback_provider_id_for_target(primary), primary.model, trigger=""
@@ -309,6 +299,12 @@ async def _native_response_with_fallbacks(internal, *, stream: bool, required_to
             if index == 0:
                 decision = apply_fallback_policy(provider_id, target.model, classify_upstream_error(exc))
                 if decision.matched:
+                    # A failed primary native request may have created provider-
+                    # side response/tool state.  Do not migrate a stateful
+                    # Responses turn to another provider.  This guard is
+                    # intentionally inside the exception path: capability
+                    # mismatch (where no upstream request was sent) remains
+                    # eligible for the configured fallback chain.
                     if stateful_markers:
                         blocked_targets = candidate_targets(primary, decision.chain)[1:]
                         attempts.extend({
@@ -2092,12 +2088,25 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                 return rendered
             except Exception as native_error:
                 if native_required:
-                    if getattr(native_error, "native_capability_unavailable", False):
-                        raise HTTPException(status_code=422, detail=(
-                            "No configured provider supports native Responses required by this request: "
-                            + ", ".join(native_required)
-                        )) from native_error
-                    raise
+                    # A provider-wide probe can be positive while the routed
+                    # model (for example DeepSeek Pro) does not implement
+                    # Responses.  A stateless HTTP 4xx is therefore eligible
+                    # for the existing Chat/Messages compatibility path; do
+                    # not turn a model-level incompatibility into a 422.
+                    if classify_upstream_error(native_error) == "http_4xx":
+                        _app_log.warning(
+                            "[responses native] model-level Responses incompatibility; "
+                            "downgrading to compatibility path (stateful=%s): %s",
+                            bool(stateful_markers), native_error,
+                        )
+                        native_required = []
+                    else:
+                        if getattr(native_error, "native_capability_unavailable", False):
+                            raise HTTPException(status_code=422, detail=(
+                                "No configured provider supports native Responses required by this request: "
+                                + ", ".join(native_required)
+                            )) from native_error
+                        raise
                 _app_log.warning("[responses native fallback] no native target succeeded; downgrading basic request: %s", native_error)
 
         # The initial minimal policy deliberately leaves a native payload untouched.

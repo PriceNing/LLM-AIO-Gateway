@@ -257,7 +257,7 @@ async def test_native_fallback_keeps_administrator_chain_order(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_stateful_request_blocks_fallback_when_primary_capability_unknown():
+async def test_stateful_request_can_fallback_when_primary_capability_unknown():
     add_provider({
         "id": "stateful-unknown-primary", "name": "Primary", "provider_type": "openai",
         "api_base": "https://primary.invalid/v1", "api_key": "key",
@@ -279,7 +279,33 @@ async def test_stateful_request_blocks_fallback_when_primary_capability_unknown(
         "input": [{"type": "function_call_output", "call_id": "call_old", "output": "ok"}],
     })
     internal.provider_id = "stateful-unknown-primary"
-    with pytest.raises(RuntimeError, match="fallback blocked") as raised:
+    async def fake_post(provider, internal):
+        return {"object": "response", "id": "resp_stateful_compat", "output": []}
+    # Capability fallback is safe here because no native primary session was
+    # created; the downstream compatibility path owns the reconstructed turn.
+    from unittest.mock import patch
+    with patch("app.router.proxy.post_native_response", side_effect=fake_post):
+        response, _target, provider_id, attempts = await _native_response_with_fallbacks(
+            internal, stream=False, required_tool_types=set(), stateful_markers=["previous_response_id", "function_call_output"]
+        )
+    assert response["id"] == "resp_stateful_compat"
+    assert provider_id == "stateful-fallback"
+    assert attempts[-1]["status"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_stateful_request_blocks_only_after_primary_native_request_fails(monkeypatch):
+    add_provider({"id": "stateful-primary-fails", "name": "Primary", "provider_type": "openai", "api_base": "https://primary.invalid/v1", "api_key": "key", "models": [{"id": "stateful-model"}]})
+    add_provider({"id": "stateful-other", "name": "Other", "provider_type": "openai", "api_base": "https://other.invalid/v1", "api_key": "key", "models": [{"id": "other-model"}]})
+    set_provider_responses_capability("stateful-primary-fails", status="supported")
+    set_provider_responses_capability("stateful-other", status="supported")
+    add_fallback_policy({"name": "stateful failure block", "match_provider": "stateful-primary-fails", "match_model": "stateful-model", "chain": [{"model": "other-model", "provider_id": "stateful-other"}]})
+    async def fake_post(provider, internal):
+        raise httpx.HTTPStatusError("bad gateway", request=httpx.Request("POST", "https://primary.invalid"), response=httpx.Response(502))
+    monkeypatch.setattr("app.router.proxy.post_native_response", fake_post)
+    internal = responses_to_internal({"model": "stateful-model", "previous_response_id": "resp_old", "input": [{"type": "function_call_output", "call_id": "call_old", "output": "ok"}]})
+    internal.provider_id = "stateful-primary-fails"
+    with pytest.raises(httpx.HTTPStatusError) as raised:
         await _native_response_with_fallbacks(internal, stream=False, required_tool_types=set(), stateful_markers=["previous_response_id", "function_call_output"])
     assert raised.value.request_details["fallback_reason"] == "stateful_codex_tools"
     assert raised.value.request_details["stateful_fallback_blocked"] is True
@@ -289,3 +315,21 @@ def test_stateful_markers_include_previous_response_id_and_not_plain_tools():
     from app.router.proxy import _responses_stateful_tool_markers
     assert _responses_stateful_tool_markers({"input": "hello", "tools": [{"type": "function"}]}) == []
     assert _responses_stateful_tool_markers({"previous_response_id": "resp_1", "input": "hello"}) == ["previous_response_id"]
+
+
+def test_responses_native_required_fields_do_not_include_common_codex_options():
+    from app.router.proxy import _responses_requires_native
+    assert _responses_requires_native({"model": "x", "input": "hello", "max_output_tokens": 32, "tools": [{"type": "function", "name": "f"}]}) == []
+
+
+def test_responses_native_required_fields_do_not_include_codex_custom_tools():
+    from app.router.proxy import _responses_requires_native
+    assert _responses_requires_native({"model": "x", "input": "hello", "tools": [{"type": "custom", "name": "exec_command"}]}) == []
+
+
+def test_responses_compatibility_accepts_client_metadata_and_hosted_tools():
+    from app.router.proxy import _responses_requires_native
+    assert _responses_requires_native({
+        "model": "x", "input": "hello", "client_metadata": {"client": "codex"},
+        "tools": [{"type": "web_search"}],
+    }) == []
