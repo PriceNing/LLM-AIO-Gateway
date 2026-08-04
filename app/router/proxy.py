@@ -5,25 +5,39 @@ import time
 import uuid
 from collections import deque
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Any, Optional
 
 import anyio
 from fastapi import APIRouter, HTTPException, Header, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from app.database import (
     get_providers, find_user_by_api_key,
-    increment_global_stats, increment_user_usage, get_db,
+    increment_global_stats, increment_image_generation_stats, increment_user_usage, get_db,
     parse_model_id, add_request_record, add_request_log, trim_request_logs, get_enabled_preprocessor,
+    get_enabled_image_generator, get_model_image_generation,
     get_model_responses_capability, set_model_responses_capability, update_model_responses_capability, update_model_responses_tool_types,
 )
 from app.core.text import friendly_error_msg, mask_key
+from app.core.image_intent import latest_user_text
+from app.core.image_bridge import (
+    GATEWAY_IMAGE_DISPLAY_CALL_PREFIX,
+    IMAGE_BRIDGE_TOOL_NAME,
+    configure_internal_image_bridge,
+    has_codex_generated_image_exec_tool,
+    has_codex_image_function_tool,
+    image_call_arguments,
+    image_call_arguments_from_exec,
+    inject_hosted_image_capability,
+    is_gateway_image_display_followup,
+)
+from app.core.image_results import find_image_result, image_preview_data_uri, store_image_results
 from app.core.outcome import (
     apply_outcome_to_details,
     routing_details_from_policy,
     stats_counters_for_status,
     is_client_disconnect_error,
 )
-from app.core.output import InternalOutputEvent
+from app.core.output import InternalOutputEvent, InternalOutputMessage, InternalToolCallOutput
 
 from app.core.state import (
     TOOL_ONLY_LIMIT,
@@ -52,11 +66,13 @@ from app.adapters.output import response_to_internal_output
 from app.adapters.anthropic_streaming import iter_anthropic_output_events
 from app.adapters.openai_streaming import iter_openai_chat_output_events
 from app.adapters.responses import iter_sse_frames, post_native_response, split_sse_frame, sse_payload, stream_native_response
+from app.adapters.imagegen import generate_images, image_results_bytes
 from app.protocols.egress import (
     render_anthropic_message,
     render_chat_completion,
     render_completion,
-    render_response,
+    render_response, render_responses_image_generation, render_responses_image_generation_sse,
+    render_responses_sse,
 )
 from app.services.lite_llm import create_chat_completion
 from app.services.preprocessing import has_image_content, preprocess_messages
@@ -105,6 +121,195 @@ def _responses_requires_native(body: dict) -> list[str]:
         if isinstance(tool, dict) and tool.get("type") not in chat_tool_types:
             required.append(f"tool:{tool.get('type') or 'unknown'}")
     return required
+
+
+def _responses_image_generation_tool(body: dict) -> dict | None:
+    for tool in body.get("tools") or []:
+        if isinstance(tool, dict) and tool.get("type") == "image_generation":
+            return tool
+    for item in body.get("input") or []:
+        if not isinstance(item, dict) or item.get("type") != "additional_tools":
+            continue
+        for tool in item.get("tools") or []:
+            if isinstance(tool, dict) and tool.get("type") == "image_generation":
+                return tool
+    choice = body.get("tool_choice")
+    if isinstance(choice, dict) and choice.get("type") == "image_generation":
+        return choice
+    return None
+
+
+def _responses_image_prompt(input_data: Any, instructions: Any = "") -> str:
+    """Extract the current user request without forwarding conversation history."""
+    prompt = latest_user_text(input_data).strip()
+    if prompt:
+        return prompt
+    return str(instructions or "").strip()
+
+
+def _resolved_image_generator(config: dict) -> dict:
+    """Resolve a configured provider/model reference without changing chat routing."""
+    resolved = dict(config or {})
+    provider_model = str(resolved.get("provider_model") or "").strip()
+    if provider_model:
+        image_mid = parse_model_id(provider_model)
+        image_provider = resolve_provider(image_mid.model_name, image_mid.provider_id)
+        if image_provider:
+            if not resolved.get("api_base"):
+                resolved["api_base"] = image_provider.get("api_base") or ""
+            if not resolved.get("api_key"):
+                resolved["api_key"] = image_provider.get("api_key") or ""
+            if not resolved.get("extra_headers"):
+                resolved["extra_headers"] = image_provider.get("extra_headers") or {}
+            resolved["model"] = image_mid.model_name
+            resolved["provider_id"] = image_provider.get("id") or image_mid.provider_id
+    return resolved
+
+
+async def _generate_with_configured_backend(prompt: str, options: dict | None = None):
+    configured = get_enabled_image_generator()
+    if not configured:
+        raise HTTPException(status_code=503, detail="No image-generation backend is enabled")
+    generator = _resolved_image_generator(configured)
+    opts = options or {}
+    prompt = str(prompt or "").strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="image generation prompt is required")
+    if len(prompt) > 8000:
+        _app_log.warning("[responses image_generation] truncating image prompt from %d to 8000 chars", len(prompt))
+        prompt = prompt[:8000]
+    _app_log.info(
+        "[responses image_generation] backend=%s model=%s params=%s",
+        generator.get("provider_id") or "-",
+        generator.get("model") or "-",
+        sorted(key for key in ("n", "size", "quality", "background", "output_format") if opts.get(key) not in (None, "")),
+    )
+    try:
+        results = await generate_images(
+            generator,
+            prompt=prompt,
+            model=generator.get("model") or None,
+            n=int(opts.get("n") or 1),
+            size=opts.get("size"),
+            quality=opts.get("quality"),
+            background=opts.get("background"),
+            output_format=opts.get("output_format"),
+        )
+    except HTTPException as exc:
+        _attach_request_details(
+            exc,
+            request_kind="image_generation",
+            responses_mode="image_generation",
+            upstream_endpoint="images/generations",
+            image_model=generator.get("model") or generator.get("provider_model") or "",
+            image_count=0,
+            image_bytes=0,
+            attempted_provider=generator.get("provider_id") or "",
+        )
+        raise
+    except Exception as exc:
+        _error_log.exception("[responses image_generation] failed: %s", exc)
+        error = HTTPException(status_code=502, detail=friendly_error_msg(exc))
+        _attach_request_details(
+            error,
+            request_kind="image_generation",
+            responses_mode="image_generation",
+            upstream_endpoint="images/generations",
+            image_model=generator.get("model") or generator.get("provider_model") or "",
+            image_count=0,
+            image_bytes=0,
+            attempted_provider=generator.get("provider_id") or "",
+        )
+        raise error from exc
+    return results, generator
+
+
+async def _nonstream_output_events(output: InternalOutputMessage):
+    """Replay a buffered planner response through the normal Responses renderer."""
+    yield InternalOutputEvent(kind="message_start", role=output.role)
+    if output.reasoning:
+        yield InternalOutputEvent(kind="reasoning_delta", reasoning=output.reasoning)
+    if output.text:
+        yield InternalOutputEvent(kind="text_delta", text=output.text)
+    for index, tool in enumerate(output.tool_calls):
+        yield InternalOutputEvent(
+            kind="tool_call_start", tool_index=index, tool_call_id=tool.id,
+            call_id=tool.call_id, name=tool.name,
+        )
+        yield InternalOutputEvent(
+            kind="tool_call_arguments_delta", tool_index=index,
+            tool_call_id=tool.id, call_id=tool.call_id, name=tool.name,
+            arguments_delta=tool.arguments, arguments=tool.arguments,
+        )
+        yield InternalOutputEvent(
+            kind="tool_call_done", tool_index=index, tool_call_id=tool.id,
+            call_id=tool.call_id, name=tool.name, arguments=tool.arguments,
+        )
+    if output.usage:
+        yield InternalOutputEvent(kind="usage", usage=output.usage)
+    yield InternalOutputEvent(kind="message_done", finish_reason=output.finish_reason)
+
+
+def _image_result_url(request: Request, token: str) -> str:
+    prefix = "v1/" if request.url.path.startswith("/v1/") else ""
+    return f"{str(request.base_url).rstrip('/')}/{prefix}image-results/{token}"
+
+
+def _generated_image_markdown_output(
+    request: Request, image_results, usage: dict | None = None
+) -> tuple[InternalOutputMessage, list]:
+    """Publish inline data images with HTTP download links as a fallback.
+
+    Older Codex-compatible clients do not advertise the generatedImage helper.
+    Their Markdown renderer recognizes image syntax but may refuse remote HTTP
+    image loads, leaving a blank thumbnail. A data URI keeps rendering local to
+    the client while the stored artifact URL remains available for opening or
+    downloading the original image.
+    """
+    stored = store_image_results(image_results)
+    blocks = []
+    for index, (result, item) in enumerate(zip(image_results, stored), start=1):
+        url = _image_result_url(request, item.token)
+        label = "Generated image" if len(stored) == 1 else f"Generated image {index}"
+        blocks.append(
+            f"![{label}]({image_preview_data_uri(result)})\n\n[Open {label.lower()}]({url})"
+        )
+    return InternalOutputMessage(
+        text="\n\n".join(blocks), finish_reason="stop", usage=dict(usage or {})
+    ), stored
+
+
+def _generated_image_exec_output(image_results, usage: dict | None = None) -> InternalOutputMessage:
+    """Ask Codex's client-owned exec runtime to publish native image results."""
+    source = "\n".join(
+        "generatedImage({ image_url: %s, output_hint: %s });" % (
+            json.dumps(str(result.data_uri or ""), ensure_ascii=False),
+            json.dumps("The generated image has already been displayed to the user.", ensure_ascii=False),
+        )
+        for result in image_results
+    )
+    suffix = uuid.uuid4().hex
+    return InternalOutputMessage(
+        tool_calls=[InternalToolCallOutput(
+            id=f"ctc_gateway_image_display_{suffix}",
+            call_id=f"{GATEWAY_IMAGE_DISPLAY_CALL_PREFIX}{suffix}",
+            name="exec",
+            arguments=json.dumps({"input": source}, ensure_ascii=False),
+        )],
+        finish_reason="tool_calls",
+        usage=dict(usage or {}),
+    )
+
+
+def _generated_image_client_output(
+    request: Request, body: dict, image_results, usage: dict | None = None
+) -> tuple[InternalOutputMessage, list, str]:
+    """Select Codex-native display when advertised, with Markdown as fallback."""
+    if has_codex_generated_image_exec_tool(body):
+        stored = store_image_results(image_results)
+        return _generated_image_exec_output(image_results, usage), stored, "codex_exec_generated_image"
+    output, stored = _generated_image_markdown_output(request, image_results, usage)
+    return output, stored, "assistant_message"
 
 
 def _responses_required_tool_types(body: dict) -> set[str]:
@@ -1199,10 +1404,61 @@ async def _stream_events_with_fallbacks(internal, *, temperature, max_tokens, lo
     raise last_exc or RuntimeError("No routing target available")
 
 
+def _normalized_request_details(endpoint: str, details: dict | None) -> dict:
+    """Promote image-generation requests to a stable logging dimension."""
+    normalized = dict(details or {})
+    mode = str(normalized.get("responses_mode") or "")
+    if (
+        normalized.get("request_kind") == "image_generation"
+        or endpoint == "images_generations"
+        or normalized.get("upstream_endpoint") == "images/generations"
+        or "image_generation" in mode
+    ):
+        normalized["request_kind"] = "image_generation"
+        for key in ("image_count", "image_bytes", "image_artifact_count"):
+            try:
+                normalized[key] = max(0, int(normalized.get(key) or 0))
+            except (TypeError, ValueError):
+                normalized[key] = 0
+        normalized["image_model"] = str(normalized.get("image_model") or "")
+    else:
+        normalized.setdefault("request_kind", "text_generation")
+    return normalized
+
+
+def _record_image_generation_failure(
+    *, username: str, api_key_value: str, requested_model: str, model: str,
+    provider_id: str, endpoint: str, request_body: dict, exc: Exception,
+) -> None:
+    details = _normalized_request_details(
+        endpoint,
+        {
+            **_request_details_from_exception(exc),
+            "request_kind": "image_generation",
+            "responses_mode": "image_generation",
+            "upstream_endpoint": "images/generations",
+            "error_message": friendly_error_msg(exc),
+        },
+    )
+    final_provider = str(details.get("attempted_provider") or provider_id or "")
+    _log_request(
+        username, api_key_value, model or requested_model, final_provider,
+        endpoint, False, 0, requested_model, details=details,
+    )
+    _record_request_log(
+        endpoint=endpoint, username=username, api_key_value=api_key_value,
+        requested_model=requested_model, final_model=model or requested_model,
+        final_provider=final_provider, request_body=request_body,
+        success=False, status="fail", tokens=0, details=details,
+        error_message=friendly_error_msg(exc),
+    )
+    _record_success_metrics(username, api_key_value, 0, "fail")
+
+
 def _log_request(username: str, api_key: str, model: str, provider_id: str,
                  endpoint: str, success: bool, tokens: int,
                  requested_model: str = "", *, details: dict | None = None) -> None:
-    detail = dict(details or {})
+    detail = _normalized_request_details(endpoint, details)
     status = str(detail.get("status") or ("ok" if success else "fail"))
     entry = {
         "time": time.strftime("%H:%M:%S"),
@@ -1245,6 +1501,11 @@ def _log_request(username: str, api_key: str, model: str, provider_id: str,
         "stateful_fallback_blocked",
         "upstream_endpoint",
         "responses_mode",
+        "request_kind",
+        "image_model",
+        "image_count",
+        "image_bytes",
+        "image_artifact_count",
         "native_attempted",
         "native_failure_endpoint",
         "native_failure_status",
@@ -1265,7 +1526,22 @@ def _log_request(username: str, api_key: str, model: str, provider_id: str,
                            endpoint, username, model, provider_id or "-")
     # Write to persistent history for stats
     try:
-        add_request_record(model=requested_model or model, username=username, success=success, tokens=tokens)
+        if detail.get("request_kind") == "image_generation":
+            increment_image_generation_stats(
+                success,
+                image_count=detail.get("image_count", 0),
+                image_bytes=detail.get("image_bytes", 0),
+            )
+        add_request_record(
+            model=requested_model or model,
+            username=username,
+            success=success,
+            tokens=tokens,
+            request_kind=detail.get("request_kind", ""),
+            image_model=detail.get("image_model", ""),
+            image_count=detail.get("image_count", 0),
+            image_bytes=detail.get("image_bytes", 0),
+        )
     except Exception as e:
         _app_log.warning("Failed to log request: %s", e)
 
@@ -2106,9 +2382,116 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
     ensure_routed_model_allowed(
         user, api_key, requested_model, model, provider_id, endpoint="responses"
     )
+    provider_info = resolve_provider(model, provider_id)
+    adapter_provider_id = provider_for_log(provider_info, provider_id)
+    image_tool = _responses_image_generation_tool(body)
+    explicit_image_choice = isinstance(body.get("tool_choice"), dict) and body["tool_choice"].get("type") == "image_generation"
+    image_enabled = bool(provider_info and get_model_image_generation(adapter_provider_id, model))
+    if is_gateway_image_display_followup(input_data):
+        output = InternalOutputMessage(finish_reason="stop")
+        details = {**routing_details_from_policy(policy), "responses_mode": "image_display_followup"}
+        if stream:
+            _log_request(username, api_key_value, model, adapter_provider_id, "responses", True, 0, requested_model, details=details)
+            _record_request_log(
+                endpoint="responses", username=username, api_key_value=api_key_value,
+                requested_model=requested_model, final_model=model,
+                final_provider=adapter_provider_id, request_body=body,
+                response_body={"status": "completed", "output_count": 0},
+                success=True, status="ok", tokens=0, usage={}, details=details, stream=True,
+            )
+            _record_success_metrics(username, api_key_value, 0, "ok")
+            return StreamingResponse(
+                render_responses_sse(
+                    _nonstream_output_events(output), model=model,
+                    previous_response_id=previous_response_id, extra=internal.extra,
+                ),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+        rendered = render_response(
+            output, model=model, previous_response_id=previous_response_id, extra=internal.extra
+        )
+        _log_request(username, api_key_value, model, adapter_provider_id, "responses", True, 0, requested_model, details=details)
+        _record_request_log(
+            endpoint="responses", username=username, api_key_value=api_key_value,
+            requested_model=requested_model, final_model=model,
+            final_provider=adapter_provider_id, request_body=body,
+            response_body=rendered, success=True, status="ok", tokens=0,
+            usage={}, details=details,
+        )
+        _record_success_metrics(username, api_key_value, 0, "ok")
+        return rendered
+    # Sub2API leaves Codex's client-owned image_gen namespace intact.  The
+    # first Responses turn must therefore return a namespaced function_call;
+    # Codex will then call /images/generations itself.  Do not replace this
+    # protocol with the gateway's synthetic image_generation_call response.
+    codex_image_tool = has_codex_image_function_tool(body)
+    image_bridge = False
+
+    # A forced hosted-tool choice is an explicit invocation and can execute
+    # directly. A declaration with tool_choice=auto is only a capability: the
+    # model must choose it through the bridge below.
+    if image_tool and explicit_image_choice:
+        if isinstance(input_data, list) and any(isinstance(item, dict) and item.get("type") == "input_image" for item in input_data):
+            raise HTTPException(status_code=400, detail="Image editing is not supported by the configured image-generation backend")
+        if body.get("previous_response_id"):
+            raise HTTPException(status_code=400, detail="Image generation cannot use previous_response_id")
+        if not image_enabled:
+            raise HTTPException(status_code=403, detail="Image generation is not enabled for the requested model")
+        prompt = _responses_image_prompt(input_data, instructions)
+        image_results, generator = await _generate_with_configured_backend(prompt, {
+            "n": image_tool.get("n") or body.get("n"),
+            "size": image_tool.get("size") or body.get("size"),
+            "quality": image_tool.get("quality") or body.get("quality"),
+            "background": image_tool.get("background") or body.get("background"),
+            "output_format": image_tool.get("output_format") or body.get("output_format"),
+        })
+        image_model = generator.get("model") or generator.get("provider_model") or ""
+        details = {**routing_details_from_policy(policy), "request_kind": "image_generation", "responses_mode": "image_generation", "upstream_endpoint": "images/generations", "image_model": image_model, "image_count": len(image_results), "image_bytes": image_results_bytes(image_results)}
+        if stream:
+            # Streaming requests return before the body iterator runs. Record
+            # the completed backend operation here so the admin statistics do
+            # not lose successful image requests.
+            _log_request(username, api_key_value, model, adapter_provider_id, "responses", True, 0, requested_model, details=details)
+            _record_request_log(endpoint="responses", username=username, api_key_value=api_key_value, requested_model=requested_model, final_model=model, final_provider=adapter_provider_id, request_body=body, response_body={"status": "completed", "output_count": len(image_results)}, success=True, status="ok", tokens=0, usage={}, details={**details, "stream": True}, stream=True)
+            _record_success_metrics(username, api_key_value, 0, "ok")
+            _app_log.info(
+                "[responses image_generation.bridge_wire] stream=true output_items=%d image_bytes=%d "
+                "partial=false done=true completed_output=true",
+                len(image_results),
+                image_results_bytes(image_results),
+            )
+            return StreamingResponse(
+                render_responses_image_generation_sse(image_results, model=model, previous_response_id=previous_response_id,
+                                                      tool={"type": "image_generation", "output_format": "png"}),
+                media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+        rendered = render_responses_image_generation(image_results, model=model, previous_response_id=previous_response_id,
+                                                     tool={"type": "image_generation", "output_format": "png"})
+        _log_request(username, api_key_value, model, adapter_provider_id, "responses", True, 0, requested_model, details=details)
+        _record_request_log(
+            endpoint="responses", username=username, api_key_value=api_key_value,
+            requested_model=requested_model, final_model=model,
+            final_provider=adapter_provider_id, request_body=body,
+            response_body={"status": "completed", "output_count": len(image_results)},
+            success=True, status="ok", tokens=0, usage={}, details=details,
+        )
+        _record_success_metrics(username, api_key_value, 0, "ok")
+        return rendered
+
+    # Match sub2api's public transform, but project the hosted tool to an
+    # internal function because this gateway's configured image backend is
+    # separate from the chat provider. Client-owned image_gen.imagegen tools
+    # remain untouched and execute in Codex itself.
+    if image_enabled and not has_codex_image_function_tool(body):
+        inject_hosted_image_capability(body)
+        configure_internal_image_bridge(internal, body)
+        image_bridge = True
+        _app_log.info(
+            "[responses image_generation.bridge_injected] model=%s provider=%s tool_choice=%s",
+            model, adapter_provider_id or "-", body.get("tool_choice"),
+        )
     conv_key = policy.conv_key
-    provider_info = None
-    adapter_provider_id = provider_id or ""
 
     if isinstance(input_data, list):
         _app_log.debug(
@@ -2123,10 +2506,140 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
     try:
         provider_info = resolve_provider(model, provider_id)
         adapter_provider_id = provider_for_log(provider_info, provider_id)
+
+        if image_bridge:
+            # Run the model first. The proxy tool call is consumed by the
+            # gateway; ordinary text and client-owned tools are replayed through
+            # the normal Responses renderer.
+            policy = await prepare_request_policy(
+                internal, username=username, api_key_value=api_key_value,
+                preprocess_request=_policy_preprocess_request,
+                conversation_cache_key=_conversation_cache_key,
+                reasoning_context=_reasoning_context if isinstance(input_data, list) else None,
+                log_label="responses.image_bridge",
+            )
+            configure_internal_image_bridge(internal, body)
+            output, provider_info, adapter_provider_id = await _call_nonstream_with_fallbacks(
+                policy, internal, temperature=temperature, max_tokens=max_tokens,
+                log_label="responses.image_bridge",
+            )
+            image_calls = [call for call in output.tool_calls if call.name == IMAGE_BRIDGE_TOOL_NAME]
+            exec_image_args = next(
+                (image_call_arguments_from_exec(call.arguments) for call in output.tool_calls if call.name == "exec"),
+                {},
+            )
+            if image_calls or exec_image_args:
+                args = image_call_arguments(image_calls[0].arguments) if image_calls else exec_image_args
+                prompt = str(args.get("prompt") or latest_user_text(input_data) or "")
+                image_results, generator = await _generate_with_configured_backend(prompt, args)
+                image_model = generator.get("model") or generator.get("provider_model") or ""
+                tokens = output.usage.get("total_tokens", 0)
+                details = {
+                    **routing_details_from_policy(policy),
+                    "request_kind": "image_generation",
+                    "responses_mode": "model_driven_image_generation",
+                    "upstream_endpoint": "images/generations",
+                    "image_model": image_model,
+                    "image_count": len(image_results),
+                    "image_bytes": image_results_bytes(image_results),
+                    "planner_tokens": tokens,
+                }
+                _app_log.info(
+                    "[responses image_generation.model_invoked] prompt_chars=%d image_model=%s",
+                    len(prompt), image_model,
+                )
+                # API-key Codex does not register the account-authenticated
+                # image_gen extension, and its ordinary Responses stream drops
+                # server-synthesized image_generation_call items. Return an
+                # assistant message so the completed result is not discarded.
+                image_output, stored_images, display_mode = _generated_image_client_output(
+                    request, body, image_results, output.usage
+                )
+                details = {
+                    **details,
+                    "responses_mode": f"model_driven_image_generation_{display_mode}",
+                    "image_artifact_count": len(stored_images),
+                }
+                _app_log.info(
+                    "[responses image_generation.assistant_message] images=%d artifact_bytes=%d",
+                    len(stored_images),
+                    sum(item.path.stat().st_size for item in stored_images),
+                )
+                if stream:
+                    _log_request(username, api_key_value, model, adapter_provider_id, "responses", True, tokens, requested_model, details=details)
+                    _record_request_log(
+                        endpoint="responses", username=username, api_key_value=api_key_value,
+                        requested_model=requested_model, final_model=model,
+                        final_provider=adapter_provider_id, request_body=body,
+                        response_body={"status": "completed", "output_count": len(image_results)},
+                        success=True, status="ok", tokens=tokens, usage=output.usage,
+                        details=details, stream=True,
+                    )
+                    _record_success_metrics(username, api_key_value, tokens, "ok")
+                    return StreamingResponse(
+                        render_responses_sse(
+                            _nonstream_output_events(image_output), model=model,
+                            previous_response_id=previous_response_id,
+                            extra=internal.extra,
+                        ),
+                        media_type="text/event-stream",
+                        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+                    )
+                rendered = render_response(
+                    image_output, model=model, previous_response_id=previous_response_id,
+                    extra=internal.extra,
+                )
+                _log_request(username, api_key_value, model, adapter_provider_id, "responses", True, tokens, requested_model, details=details)
+                _record_request_log(
+                    endpoint="responses", username=username, api_key_value=api_key_value,
+                    requested_model=requested_model, final_model=model,
+                    final_provider=adapter_provider_id, request_body=body,
+                    response_body=rendered, success=True, status="ok", tokens=tokens,
+                    usage=output.usage, details=details,
+                )
+                _record_success_metrics(username, api_key_value, tokens, "ok")
+                return rendered
+
+            # The model chose not to generate an image. Never expose the
+            # gateway's private proxy function in the client-visible response.
+            output.tool_calls = [call for call in output.tool_calls if call.name != IMAGE_BRIDGE_TOOL_NAME]
+            if stream:
+                return StreamingResponse(
+                    _stream_internal_output(
+                        events=_nonstream_output_events(output), endpoint="responses",
+                        model=model, username=username, api_key_value=api_key_value,
+                        provider_id=adapter_provider_id, requested_model=requested_model,
+                        log_request=_log_request,
+                        record_request_log=_build_stream_recorder("responses", username, api_key_value, requested_model, body),
+                        base_details={**routing_details_from_policy(policy), "responses_mode": "image_bridge_model_passthrough"},
+                        previous_response_id=previous_response_id, conv_key=conv_key,
+                        remember_response_chain_key=_remember_response_chain_key,
+                        remember_reasoning_content=_remember_reasoning_content,
+                        tool_only_turns=_tool_only_turns, render_extra=internal.extra,
+                    ),
+                    media_type="text/event-stream",
+                )
+            resp_id = f"resp_{uuid.uuid4().hex}"
+            _remember_response_chain_key(resp_id, conv_key)
+            rendered = render_response(output, model=model, previous_response_id=previous_response_id, response_id=resp_id, extra=internal.extra)
+            tokens = output.usage.get("total_tokens", 0)
+            details = {**routing_details_from_policy(policy), "responses_mode": "image_bridge_model_passthrough", "response_id": resp_id}
+            _log_request(username, api_key_value, model, adapter_provider_id, "responses", True, tokens, requested_model, details=details)
+            _record_request_log(
+                endpoint="responses", username=username, api_key_value=api_key_value,
+                requested_model=requested_model, final_model=model,
+                final_provider=adapter_provider_id, request_body=body,
+                response_body=rendered, success=True, status="ok", tokens=tokens,
+                usage=output.usage, details=details,
+            )
+            _record_success_metrics(username, api_key_value, tokens, "ok")
+            return rendered
+
         native_required = _responses_requires_native(body)
         required_tool_types = _responses_required_tool_types(body)
         stateful_markers = _responses_stateful_tool_markers(body)
         capability = get_model_responses_capability(adapter_provider_id, model) if provider_info else None
+        native_downgrade_details = {}
         native_supported = bool(provider_info and provider_info.get("provider_type") == "openai" and not (
             _responses_capability_is_fresh(capability)
             and capability.get("responses_status") == "unsupported"
@@ -2135,7 +2648,12 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
         # fallback even when the routed primary lacks Responses support.  Basic
         # requests, on the other hand, remain eligible for the Chat/Anthropic
         # compatibility path when no native stream is available.
-        if native_supported or native_required:
+        # Native Responses forwarding is not suitable for client-owned
+        # Codex namespaces on ordinary provider API endpoints.  The
+        # compatibility adapter already maps image_gen-imagegen to a function
+        # tool and egress restores namespace=image_gen, matching Sub2API's
+        # client-owned tool loop.
+        if (native_supported and not codex_image_tool) or native_required:
             _app_log.info("[responses native] provider=%s model=%s stream=%s", adapter_provider_id or "-", model, stream)
             try:
                 if stream:
@@ -2271,7 +2789,14 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
         )
         _record_success_metrics(username, api_key_value, tokens, status)
         return rendered
-    except HTTPException:
+    except HTTPException as e:
+        if _request_details_from_exception(e).get("request_kind") == "image_generation":
+            _record_image_generation_failure(
+                username=username, api_key_value=api_key_value,
+                requested_model=requested_model, model=model,
+                provider_id=adapter_provider_id, endpoint="responses",
+                request_body=body, exc=e,
+            )
         raise
     except Exception as e:
         details = _request_details_from_exception(
@@ -2295,6 +2820,81 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
             increment_user_usage(username, api_key_value, False, 0)
         _error_log.error("FAILED: %s", str(e))
         raise HTTPException(status_code=500, detail=friendly_error_msg(e))
+
+
+async def _images_generation_request(request: Request, authorization: Optional[str]):
+    user, api_key = verify_api_key(authorization, endpoint="images_generations")
+    body = await request.json()
+    requested_model = str(body.get("model") or "")
+    prompt = str(body.get("prompt") or "").strip()
+    if not requested_model or not prompt:
+        raise HTTPException(status_code=400, detail="model and prompt are required")
+    internal_model = parse_model_id(requested_model)
+    provider_info = resolve_provider(internal_model.model_name, internal_model.provider_id)
+    provider_id = provider_for_log(provider_info, internal_model.provider_id)
+    # The model in an Images request is an image-backend hint, not the chat
+    # model selected by the user.  In particular, Codex's image_gen extension
+    # always sends "gpt-image-2" even when this gateway routes the operation to
+    # a configured Grok or external backend.  Endpoint authorization has
+    # already been enforced above; applying the chat-model allow-list here
+    # would incorrectly reject the client-owned image generation step.
+    configured_generator = get_enabled_image_generator()
+    if not configured_generator:
+        raise HTTPException(status_code=503, detail="No image-generation backend is enabled")
+    generator = _resolved_image_generator(configured_generator)
+    image_provider_id = str(generator.get("provider_id") or provider_id or "")
+    image_model = str(generator.get("model") or generator.get("provider_model") or "")
+    try:
+        results = await generate_images(generator, prompt=prompt, model=generator.get("model") or None, n=body.get("n", 1), size=body.get("size"), quality=body.get("quality"), background=body.get("background"), output_format=body.get("output_format"), extra={k: v for k, v in body.items() if k not in {"model", "prompt", "n", "size", "quality", "background", "output_format"}})
+    except Exception as exc:
+        username = user.get("username", "legacy")
+        api_key_value = api_key.get("key", "")
+        details = {
+            "request_kind": "image_generation", "responses_mode": "image_generation",
+            "upstream_endpoint": "images/generations", "image_model": image_model,
+            "image_count": 0, "image_bytes": 0, "error_message": friendly_error_msg(exc),
+        }
+        _log_request(username, api_key_value, requested_model, image_provider_id, "images_generations", False, 0, requested_model, details=details)
+        _record_request_log(
+            endpoint="images_generations", username=username, api_key_value=api_key_value,
+            requested_model=requested_model, final_model=requested_model,
+            final_provider=image_provider_id, request_body=body, success=False,
+            status="fail", tokens=0, details=details, error_message=friendly_error_msg(exc),
+        )
+        _record_success_metrics(username, api_key_value, 0, "fail")
+        raise HTTPException(status_code=502, detail=friendly_error_msg(exc)) from exc
+    data = [{"b64_json": item.data_uri.split(",", 1)[1], "mime_type": item.mime_type} for item in results]
+    details = {"request_kind": "image_generation", "responses_mode": "image_generation", "upstream_endpoint": "images/generations", "image_model": image_model, "image_count": len(results), "image_bytes": image_results_bytes(results)}
+    username = user.get("username", "legacy")
+    api_key_value = api_key.get("key", "")
+    _log_request(username, api_key_value, requested_model, image_provider_id, "images_generations", True, 0, requested_model, details=details)
+    _record_request_log(
+        endpoint="images_generations", username=username, api_key_value=api_key_value,
+        requested_model=requested_model, final_model=requested_model,
+        final_provider=image_provider_id, request_body=body,
+        response_body={"created": True, "image_count": len(results)},
+        success=True, status="ok", tokens=0, details=details,
+    )
+    _record_success_metrics(username, api_key_value, 0, "ok")
+    return {"created": int(time.time()), "data": data}
+
+
+@router.post("/images/generations")
+async def images_generations_endpoint(request: Request, authorization: Optional[str] = Header(None)):
+    return await _images_generation_request(request, authorization)
+
+
+@router.get("/image-results/{token}")
+async def image_result_endpoint(token: str):
+    """Serve a generated image through its unguessable capability token."""
+    result = find_image_result(token)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Generated image not found or expired")
+    return FileResponse(
+        result.path,
+        media_type=result.mime_type,
+        headers={"Cache-Control": "private, max-age=3600", "X-Content-Type-Options": "nosniff"},
+    )
 
 
 # -- Request/Response detail log recorder --
@@ -2374,6 +2974,7 @@ def _record_request_log(
     streamed_text=None,
     streamed_reasoning=None,
     streamed_tool_calls=None,
+    stream=None,
     usage=None,
     success,
     status,
@@ -2382,7 +2983,7 @@ def _record_request_log(
     partial_output=False,
     error_message=None,
 ):
-    payload_details = dict(details or {})
+    payload_details = _normalized_request_details(endpoint, details)
     if usage and 'usage' not in payload_details:
         payload_details['usage'] = usage
     if streamed_text is not None:
@@ -2427,7 +3028,7 @@ def _record_request_log(
             model=final_model or '',
             provider=final_provider or '',
             status=status,
-            stream=response_body is None and (streamed_text is not None or streamed_reasoning is not None or streamed_tool_calls is not None),
+            stream=(stream if stream is not None else response_body is None and (streamed_text is not None or streamed_reasoning is not None or streamed_tool_calls is not None)),
             tokens=int(tokens or 0),
             request_body=_truncate_payload(request_body),
             response_body=_truncate_payload(final_response_body),

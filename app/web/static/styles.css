@@ -1094,6 +1094,7 @@ a.icon-btn { text-decoration: none; }
 .badge-fail { background: var(--danger-bg); color: var(--danger); }
 .badge-partial { background: var(--warning-bg); color: var(--warning); }
 .badge-degraded { background: var(--warning-bg); color: var(--warning); }
+.badge-image { background: rgba(139, 92, 246, 0.16); color: #8b5cf6; }
 .badge-rejected { background: rgba(249, 115, 22, 0.15); color: #ea580c; }
 .badge-cancelled { background: rgba(100, 116, 139, 0.18); color: #64748b; }
 .badge-endpoint {

@@ -177,4 +177,19 @@ def _decode_request_log(entry):
     entry["request_body"] = _loads_json(entry.get("request_body"))
     entry["response_body"] = _loads_json(entry.get("response_body"))
     entry["details"] = _loads_json(entry.get("details")) or {}
+    details = entry["details"]
+    mode = str(details.get("responses_mode") or "")
+    is_image = (
+        details.get("request_kind") == "image_generation"
+        or entry.get("endpoint") == "images_generations"
+        or details.get("upstream_endpoint") == "images/generations"
+        or "image_generation" in mode
+    )
+    entry["request_kind"] = "image_generation" if is_image else str(details.get("request_kind") or "text_generation")
+    for key in (
+        "image_model", "image_count", "image_bytes", "image_artifact_count",
+        "responses_mode", "upstream_endpoint",
+    ):
+        if key in details:
+            entry[key] = details[key]
     return entry

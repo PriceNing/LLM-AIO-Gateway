@@ -41,6 +41,7 @@ zh: {
     'nav.fallbacks': 'Fallback 策略',
     'nav.stats': '统计',
     'nav.preprocessors': '视觉模型注入',
+    'nav.imageGeneration': '图像生成',
     'nav.logout': '退出',
     'nav.github': 'GitHub 项目地址',
     'nav.switchLang': '切换语言',
@@ -311,6 +312,27 @@ zh: {
     'preprocessors.test': '测试',
     'preprocessors.testRunning': '测试中...',
     'preprocessors.testFail': '视觉模型测试失败',
+    'imageGeneration.title': '图像生成',
+    'imageGeneration.config': '全局生图后端',
+    'imageGeneration.models': '模型开关',
+    'imageGeneration.save': '保存配置',
+    'imageGeneration.test': '测试连接',
+    'imageGeneration.backendType': '后端类型',
+    'imageGeneration.existingModel': '已有提供商模型',
+    'imageGeneration.externalModel': '外部模型',
+    'imageGeneration.notAvailable': '暂不可用',
+    'imageGeneration.providerModel': '提供商模型',
+    'imageGeneration.selectModel': '请选择提供商模型',
+    'imageGeneration.apiBase': 'API Base URL',
+    'imageGeneration.apiKey': 'API Key',
+    'imageGeneration.model': '模型名称',
+    'imageGeneration.timeout': '超时时间（秒）',
+    'imageGeneration.enabled': '启用',
+    'imageGeneration.on': '开',
+    'imageGeneration.off': '关',
+    'imageGeneration.loadFail': '加载图像生成配置失败',
+    'imageGeneration.saveFail': '保存图像生成配置失败',
+    'imageGeneration.toggleFail': '切换图像生成开关失败',
 
     'common.save': '保存',
     'common.cancel': '取消',
@@ -343,6 +365,7 @@ en: {
     'nav.fallbacks': 'Fallback Policies',
     'nav.stats': 'Stats',
     'nav.preprocessors': 'Vision Model Injection',
+    'nav.imageGeneration': 'Image Generation',
     'nav.logout': 'Logout',
     'nav.github': 'GitHub Project',
     'nav.switchLang': 'Switch Language',
@@ -614,6 +637,27 @@ en: {
     'preprocessors.test': 'Test',
     'preprocessors.testRunning': 'Testing...',
     'preprocessors.testFail': 'Vision model test failed',
+    'imageGeneration.title': 'Image Generation',
+    'imageGeneration.config': 'Global Image Backend',
+    'imageGeneration.models': 'Model Toggles',
+    'imageGeneration.save': 'Save Configuration',
+    'imageGeneration.test': 'Test Connection',
+    'imageGeneration.backendType': 'Backend Type',
+    'imageGeneration.existingModel': 'Existing Provider Model',
+    'imageGeneration.externalModel': 'External Model',
+    'imageGeneration.notAvailable': 'Not available',
+    'imageGeneration.providerModel': 'Provider Model',
+    'imageGeneration.selectModel': 'Select a provider model',
+    'imageGeneration.apiBase': 'API Base URL',
+    'imageGeneration.apiKey': 'API Key',
+    'imageGeneration.model': 'Model Name',
+    'imageGeneration.timeout': 'Timeout (seconds)',
+    'imageGeneration.enabled': 'Enabled',
+    'imageGeneration.on': 'ON',
+    'imageGeneration.off': 'OFF',
+    'imageGeneration.loadFail': 'Failed to load image generation settings',
+    'imageGeneration.saveFail': 'Failed to save image generation settings',
+    'imageGeneration.toggleFail': 'Failed to toggle image generation',
 
     'common.save': 'Save',
     'common.cancel': 'Cancel',
@@ -1004,6 +1048,7 @@ function showSection(section, evt) {
     if (section === 'fallbacks') { loadFallbackPolicies(); loadModels(); loadProviders(); }
     if (section === 'stats') loadStats();
     if (section === 'preprocessors') loadPreprocessors();
+    if (section === 'image-generation') loadImageGeneration();
     if (section === 'request-logs') loadRequestLogs();
     if (section === 'system-logs') loadSystemLogMeta();
     if (section === 'config') {/* lazy load */}
@@ -1925,6 +1970,84 @@ async function testModel(modelId, btn) {
 
 var preprocessorsData = { preprocessors: {}, models: [] };
 
+var imageGenerationData = { generators: {}, models: [], providers: [] };
+
+async function loadImageGeneration() {
+    try {
+        var data = await api('/admin/image-generation');
+        imageGenerationData = { generators: data.generators || {}, models: data.models || [], providers: data.providers || [] };
+        renderImageGeneration();
+    } catch (e) { toast(t('imageGeneration.loadFail') + ': ' + e.message, 'error'); }
+}
+
+function renderImageGeneration() {
+    var container = document.getElementById('imageGenerationContent');
+    var ids = Object.keys(imageGenerationData.generators);
+    var active = ids.length ? imageGenerationData.generators[ids[0]] : {};
+    var html = '<div class="preprocessors-layout">';
+    var providerOptions = '<option value="">' + t('imageGeneration.selectModel') + '</option>';
+    (imageGenerationData.providers || []).forEach(function(provider) {
+        providerOptions += '<optgroup label="' + escHtml(provider.name || provider.id) + '">';
+        (provider.models || []).forEach(function(model) {
+            providerOptions += '<option value="' + escHtml(model.provider_model) + '">' + escHtml(model.model_name) + '</option>';
+        });
+        providerOptions += '</optgroup>';
+    });
+    html += '<div class="preprocessor-config-col"><div class="section-sub-header"><h3>' + t('imageGeneration.config') + '</h3></div>';
+    html += '<div class="preprocessor-card glass"><div class="preprocessor-card-body">' +
+        '<div class="form-group"><label>' + t('imageGeneration.backendType') + '</label><select id="imageBackendType" onchange="updateImageBackendFields()"><option value="existing_model">' + t('imageGeneration.existingModel') + '</option><option value="external_model">' + t('imageGeneration.externalModel') + '</option><option value="comfyui" disabled>ComfyUI (' + t('imageGeneration.notAvailable') + ')</option></select></div>' +
+        '<div class="form-group"><label>' + t('imageGeneration.providerModel') + '</label><select id="imageProviderModel">' + providerOptions + '</select></div>' +
+        '<div id="imageExternalFields" style="display:none">' +
+        '<div class="form-group"><label>' + t('imageGeneration.apiBase') + '</label><input id="imageApiBase"></div>' +
+        '<div class="form-group"><label>' + t('imageGeneration.apiKey') + '</label><input type="password" id="imageApiKey"></div>' +
+        '<div class="form-group"><label>' + t('imageGeneration.model') + '</label><input id="imageModel"></div></div>' +
+        '<div class="form-group"><label>' + t('imageGeneration.timeout') + '</label><input type="number" id="imageTimeout" value="' + (active.timeout || 180) + '" min="1" max="3600"></div>' +
+        '<div class="form-group"><label><input type="checkbox" id="imageEnabled"' + (active.enabled === false ? '' : ' checked') + '> ' + t('imageGeneration.enabled') + '</label></div>' +
+        '<div class="form-actions"><button class="btn btn-secondary" onclick="testImageGeneration()">' + t('imageGeneration.test') + '</button><button class="btn btn-primary" onclick="saveImageGeneration()">' + t('imageGeneration.save') + '</button></div>' +
+        '</div></div></div>';
+    html += '<div class="preprocessor-models-col"><div class="section-sub-header"><h3>' + t('imageGeneration.models') + '</h3></div>';
+    if (!imageGenerationData.models.length) html += '<div class="empty-state"><p>' + t('preprocessors.modelsEmpty') + '</p></div>';
+    imageGenerationData.models.forEach(function(m) {
+        html += '<div class="model-toggle-item"><div class="model-toggle-info"><span class="model-toggle-name">' + escHtml(m.provider_name + '/' + m.model_id) + '</span><span class="model-toggle-status ' + (m.image_generation ? 'on' : 'off') + '">' + (m.image_generation ? t('imageGeneration.on') : t('imageGeneration.off')) + '</span></div><label class="toggle-switch"><input type="checkbox" ' + (m.image_generation ? 'checked' : '') + ' onchange="toggleModelImageGeneration(\'' + jsEsc(m.provider_model) + '\', this.checked)"><span class="toggle-slider"></span></label></div>';
+    });
+    html += '</div></div>';
+    container.innerHTML = html;
+    if (active.backend_type) document.getElementById('imageBackendType').value = active.backend_type === 'openai_images' ? 'existing_model' : active.backend_type;
+    if (active.provider_model) document.getElementById('imageProviderModel').value = active.provider_model;
+    document.getElementById('imageApiBase').value = active.api_base || '';
+    document.getElementById('imageApiKey').value = '';
+    document.getElementById('imageApiKey').placeholder = active.has_api_key ? '********' : '';
+    document.getElementById('imageModel').value = active.model || '';
+    updateImageBackendFields();
+}
+
+function updateImageBackendFields() {
+    var type = document.getElementById('imageBackendType').value;
+    document.getElementById('imageProviderModel').closest('.form-group').style.display = type === 'existing_model' ? '' : 'none';
+    document.getElementById('imageExternalFields').style.display = type === 'external_model' || type === 'comfyui' ? '' : 'none';
+}
+
+async function saveImageGeneration() {
+    var id = Object.keys(imageGenerationData.generators)[0] || 'default';
+    try {
+        var type = document.getElementById('imageBackendType').value;
+        await api('/admin/image-generation/' + encodeURIComponent(id), { method: 'PUT', body: JSON.stringify({ backend_type: type, provider_model: type === 'existing_model' ? document.getElementById('imageProviderModel').value : '', api_base: type !== 'existing_model' ? document.getElementById('imageApiBase').value.trim() : '', api_key: type !== 'existing_model' ? document.getElementById('imageApiKey').value.trim() : '', model: type !== 'existing_model' ? document.getElementById('imageModel').value.trim() : '', timeout: parseInt(document.getElementById('imageTimeout').value) || 180, enabled: document.getElementById('imageEnabled').checked }) });
+        toast(t('common.saved') || t('imageGeneration.save'), 'success'); loadImageGeneration();
+    } catch (e) { toast(t('imageGeneration.saveFail') + ': ' + e.message, 'error'); }
+}
+
+async function testImageGeneration() {
+    var id = Object.keys(imageGenerationData.generators)[0] || '';
+    if (!id) { toast(t('imageGeneration.saveFail'), 'error'); return; }
+    try { var result = await api('/admin/image-generation/test', { method: 'POST', body: JSON.stringify({ generator_id: id }) }); showTestResult(t('imageGeneration.title'), result); }
+    catch (e) { toast(t('imageGeneration.loadFail') + ': ' + e.message, 'error'); }
+}
+
+async function toggleModelImageGeneration(providerModel, enabled) {
+    try { await api('/admin/models/image-generation', { method: 'PUT', body: JSON.stringify({ model_id: providerModel, enabled: enabled }) }); loadImageGeneration(); }
+    catch (e) { toast(t('imageGeneration.toggleFail') + ': ' + e.message, 'error'); }
+}
+
 async function loadPreprocessors() {
     try {
         var data = await api('/admin/preprocessors');
@@ -2495,6 +2618,8 @@ function renderHistoryStats(data) {
         '<span class="history-stat success"><strong>' + successRate + '%</strong> ' + t('stats.periodSuccessRate') + '</span>' +
         '<span class="history-stat danger"><strong>' + failed.toLocaleString() + '</strong> ' + t('stats.failedCalls') + '</span>' +
         '<span class="history-stat"><strong>' + tokens.toLocaleString() + '</strong> ' + t('stats.periodTokens') + '</span>' +
+        '<span class="history-stat"><strong>' + (overall.image_generation_calls || 0).toLocaleString() + '</strong> ' + t('stats.imageGenerationCalls') + '</span>' +
+        '<span class="history-stat"><strong>' + (overall.image_generation_images || 0).toLocaleString() + '</strong> ' + t('stats.generatedImages') + '</span>' +
         '</div>';
 
     var container = document.getElementById('historyContent');
@@ -2577,7 +2702,7 @@ function _buildRealtimePanel(stats) {
     var log = stats.request_log || [];
     var tableHTML = '<div class="table-card glass"><h3>' + t('stats.realtime') + '</h3>' +
         '<table class="modern-table"><thead><tr>' +
-        '<th>' + t('stats.time') + '</th><th>' + t('stats.client') + '</th><th>' + t('stats.key') + '</th><th>' + t('stats.requestedModel') + '</th><th>' + t('stats.routedModel') + '</th><th>' + t('stats.model') + '</th><th>' + t('stats.endpoint') + '</th><th>' + t('stats.tokens') + '</th><th>' + t('stats.status') + '</th><th>' + (t('stats.details') || 'Details') + '</th>' +
+        '<th>' + t('stats.time') + '</th><th>' + t('stats.requestType') + '</th><th>' + t('stats.client') + '</th><th>' + t('stats.key') + '</th><th>' + t('stats.requestedModel') + '</th><th>' + t('stats.routedModel') + '</th><th>' + t('stats.model') + '</th><th>' + t('stats.endpoint') + '</th><th>' + t('stats.tokens') + '</th><th>' + t('stats.status') + '</th><th>' + (t('stats.details') || 'Details') + '</th>' +
         '</tr></thead><tbody>';
 
     var displayLog = log.slice(0, 40);
@@ -2593,6 +2718,7 @@ function _buildRealtimePanel(stats) {
         var modelChanged = reqModel && entry.model && reqModel !== entry.model;
         tableHTML += '<tr>' +
             '<td>' + escHtml(entry.time) + '</td>' +
+            '<td><span class="badge ' + requestKindClass(entry) + '">' + escHtml(requestKindLabel(entry)) + '</span></td>' +
             '<td>' + escHtml(entry.username) + '</td>' +
             '<td class="mono">' + escHtml(entry.api_key) + '</td>' +
             '<td>' + escHtml(reqModel) + '</td>' +
@@ -2605,7 +2731,7 @@ function _buildRealtimePanel(stats) {
         '</tr>';
     }
     if (log.length === 0) {
-        tableHTML += '<tr><td colspan="10" style="text-align:center;color:var(--text-tertiary);padding:24px">' + t('stats.noRecords') + '</td></tr>';
+        tableHTML += '<tr><td colspan="11" style="text-align:center;color:var(--text-tertiary);padding:24px">' + t('stats.noRecords') + '</td></tr>';
     }
     tableHTML += '</tbody></table></div>';
 
@@ -2619,6 +2745,16 @@ function requestStatusLabel(entry) {
     if (entry.status === 'degraded') return t('stats.statusDegraded') || 'DEGRADED';
     if (entry.success === false || entry.status === 'fail') return t('stats.statusFail') || 'FAIL';
     return t('stats.statusOk') || 'OK';
+}
+
+function requestKindLabel(entry) {
+    return entry && entry.request_kind === 'image_generation'
+        ? (t('stats.imageGeneration') || 'Image Generation')
+        : (t('stats.textGeneration') || 'Text Generation');
+}
+
+function requestKindClass(entry) {
+    return entry && entry.request_kind === 'image_generation' ? 'badge-image' : 'badge-endpoint';
 }
 
 function requestStatusClass(entry) {
@@ -2664,6 +2800,7 @@ function showRequestDetail(index) {
         detailRow(t('stats.client') || 'Client', entry.username),
         detailRow(t('stats.key') || 'Key', entry.api_key),
         detailRow(t('stats.endpoint') || 'Client Endpoint', entry.endpoint),
+        detailRow(t('stats.requestType') || 'Type', requestKindLabel(entry)),
         detailRow(t('stats.upstreamEndpoint') || 'Upstream Endpoint', entry.upstream_endpoint || details.upstream_endpoint),
         detailRow(t('stats.responsesMode') || 'Responses Mode', entry.responses_mode || details.responses_mode),
         detailRow(t('stats.tokens') || 'Tokens', entry.tokens)
@@ -2704,10 +2841,20 @@ function showRequestDetail(index) {
     var errorRows = [
         detailRow(t('stats.errorMessage') || 'Error Message', entry.error_message || details.error_message)
     ];
+    var imageRows = [];
+    if (entry.request_kind === 'image_generation' || details.request_kind === 'image_generation') {
+        imageRows = [
+            detailRow(t('stats.imageModel') || 'Image Model', entry.image_model || details.image_model),
+            detailRow(t('stats.imageCount') || 'Image Count', detailPick(entry.image_count, details.image_count)),
+            detailRow(t('stats.imageBytes') || 'Image Bytes', detailPick(entry.image_bytes, details.image_bytes)),
+            detailRow(t('stats.imageArtifactCount') || 'Stored Artifacts', detailPick(entry.image_artifact_count, details.image_artifact_count))
+        ];
+    }
 
     document.getElementById('modalContent').innerHTML = '<h3>' + escHtml(t('stats.requestDetails') || 'Request Details') + '</h3><div class="request-detail-view">' +
         '<div class="detail-status-line"><span class="badge ' + requestStatusClass(entry) + '">' + escHtml(requestStatusLabel(entry)) + '</span><span class="mono">' + escHtml(entry.endpoint || '') + '</span></div>' +
         detailSection(t('stats.basicInfo') || 'Basic', basicRows) +
+        (imageRows.length ? detailSection(t('stats.imageInfo') || 'Image Generation', imageRows) : '') +
         detailSection(t('stats.routingInfo') || 'Routing / Fallback', routeRows) +
         detailSection(t('stats.errorInfo') || 'Error', errorRows) +
         '</div>';
@@ -2728,6 +2875,8 @@ function renderStats(stats, createCharts) {
         '<div class="summary-card card-slate"><div class="card-icon">&#10006;</div><div class="card-value">' + (stats.cancelled_calls || 0).toLocaleString() + '</div><div class="card-label">' + t('stats.cancelledCalls') + '</div></div>' +
         '<div class="summary-card card-orange"><div class="card-icon">&#9888;</div><div class="card-value">' + (stats.stateful_fallback_blocked_calls || 0).toLocaleString() + '</div><div class="card-label">' + t('stats.statefulFallbackBlockedCalls') + '</div></div>' +
         '<div class="summary-card card-red"><div class="card-icon">&#9888;</div><div class="card-value">' + stats.failed_calls.toLocaleString() + '</div><div class="card-label">' + t('stats.failedCalls') + '</div></div>' +
+        '<div class="summary-card card-purple"><div class="card-icon">&#127912;</div><div class="card-value">' + (stats.image_generation_calls || 0).toLocaleString() + '</div><div class="card-label">' + t('stats.imageGenerationCalls') + '</div></div>' +
+        '<div class="summary-card card-blue"><div class="card-icon">&#128444;</div><div class="card-value">' + (stats.image_generation_images || 0).toLocaleString() + '</div><div class="card-label">' + t('stats.generatedImages') + '</div></div>' +
         '<div class="summary-card card-blue"><div class="card-icon">&#9881;</div><div class="card-value">' + Object.keys(stats.stats_by_model || {}).length + '</div><div class="card-label">' + t('stats.activeModels') + '</div></div>' +
         '</div>';
 
@@ -3081,6 +3230,7 @@ function renderRequestLogs(data) {
     }
     var tableHTML = '<div class="table-wrap"><table class="data-table"><thead><tr>';
     tableHTML += '<th>' + escHtml(t('logs.colTime') || 'Time') + '</th>';
+    tableHTML += '<th>' + escHtml(t('stats.requestType') || 'Type') + '</th>';
     tableHTML += '<th>' + escHtml(t('logs.colEndpoint') || 'Endpoint') + '</th>';
     tableHTML += '<th>' + escHtml(t('logs.colUser') || 'User') + '</th>';
     tableHTML += '<th>' + escHtml(t('logs.colModel') || 'Model') + '</th>';
@@ -3103,6 +3253,7 @@ function renderRequestLogs(data) {
             : (entry.status || '-')))));
         tableHTML += '<tr>';
         tableHTML += '<td class="mono">' + escHtml(ts) + '</td>';
+        tableHTML += '<td><span class="badge ' + requestKindClass(entry) + '">' + escHtml(requestKindLabel(entry)) + '</span></td>';
         tableHTML += '<td class="mono">' + escHtml(entry.endpoint || '-') + '</td>';
         tableHTML += '<td>' + escHtml(entry.username || '-') + '</td>';
         tableHTML += '<td class="mono">' + escHtml(entry.model || '-') + '</td>';
@@ -3134,6 +3285,7 @@ async function showRequestLogDetail(logId) {
         body += detailRow(t('logs.colTime') || 'Time', entry.timestamp);
         body += detailRow(t('logs.colUser') || 'User', entry.username);
         body += detailRow(t('logs.colEndpoint') || 'Endpoint', entry.endpoint);
+        body += detailRow(t('stats.requestType') || 'Type', requestKindLabel(entry));
         body += detailRow(t('stats.requestedModel') || 'Requested', entry.requested_model);
         body += detailRow(t('stats.routedModel') || 'Routed', (entry.details && entry.details.routed_model) || '');
         body += detailRow(t('logs.colModel') || 'Model', entry.model);
@@ -3142,6 +3294,16 @@ async function showRequestLogDetail(logId) {
         body += detailRow(t('logs.colStatus') || 'Status', entry.status);
         body += detailRow(t('logs.colError') || 'Error', entry.error || '-');
         body += '</div>';
+        if (entry.request_kind === 'image_generation') {
+            body += '<div class="detail-section"><h3>' + escHtml(t('stats.imageInfo') || 'Image Generation') + '</h3><div class="detail-grid">';
+            body += detailRow(t('stats.imageModel') || 'Image Model', entry.image_model || '');
+            body += detailRow(t('stats.imageCount') || 'Image Count', entry.image_count || 0);
+            body += detailRow(t('stats.imageBytes') || 'Image Bytes', entry.image_bytes || 0);
+            body += detailRow(t('stats.imageArtifactCount') || 'Stored Artifacts', entry.image_artifact_count || 0);
+            body += detailRow(t('stats.upstreamEndpoint') || 'Upstream Endpoint', entry.upstream_endpoint || '');
+            body += detailRow(t('stats.responsesMode') || 'Responses Mode', entry.responses_mode || '');
+            body += '</div></div>';
+        }
         body += '<div class="detail-section"><h3>' + escHtml(t('logs.requestBody') || 'Request Body') + '</h3><pre class="json-block">' + escHtml(JSON.stringify(entry.request_body, null, 2)) + '</pre></div>';
         body += '<div class="detail-section"><h3>' + escHtml(t('logs.responseBody') || 'Response Body') + '</h3><pre class="json-block">' + escHtml(JSON.stringify(entry.response_body, null, 2)) + '</pre></div>';
         body += '<div class="detail-section"><h3>' + escHtml(t('logs.details') || 'Routing / Details') + '</h3><pre class="json-block">' + escHtml(JSON.stringify(entry.details, null, 2)) + '</pre></div>';
@@ -3438,6 +3600,16 @@ Object.assign(I18N.zh, {
     'logs.clearFail': '清空失败',
     'logs.loadDetailFail': '加载详情失败',
     'stats.upstreamEndpoint': '提供商端点',
+    'stats.requestType': '类型',
+    'stats.textGeneration': '文本生成',
+    'stats.imageGeneration': '图像生成',
+    'stats.imageGenerationCalls': '生图调用',
+    'stats.generatedImages': '生成图像数',
+    'stats.imageInfo': '图像生成',
+    'stats.imageModel': '生图模型',
+    'stats.imageCount': '图像数量',
+    'stats.imageBytes': '图像字节数',
+    'stats.imageArtifactCount': '已存储图像',
     'systemLogs.title': '系统日志',
     'systemLogs.allLevels': '全部级别',
     'systemLogs.search': '搜索日志',
@@ -3519,6 +3691,16 @@ Object.assign(I18N.en, {
     'logs.clearFail': 'Clear failed',
     'logs.loadDetailFail': 'Failed to load detail',
     'stats.upstreamEndpoint': 'Upstream Endpoint',
+    'stats.requestType': 'Type',
+    'stats.textGeneration': 'Text Generation',
+    'stats.imageGeneration': 'Image Generation',
+    'stats.imageGenerationCalls': 'Image Calls',
+    'stats.generatedImages': 'Generated Images',
+    'stats.imageInfo': 'Image Generation',
+    'stats.imageModel': 'Image Model',
+    'stats.imageCount': 'Image Count',
+    'stats.imageBytes': 'Image Bytes',
+    'stats.imageArtifactCount': 'Stored Images',
     'systemLogs.title': 'System Logs',
     'systemLogs.allLevels': 'All levels',
     'systemLogs.search': 'Search logs',

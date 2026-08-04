@@ -42,6 +42,9 @@ def init_db(path: Optional[str] = None) -> None:
             _remove_legacy_provider_responses_capability(conn)
             _migrate_model_responses_capability(conn)
             _migrate_preprocessors(conn)
+            _migrate_image_generation(conn)
+            _migrate_request_records_image_generation(conn)
+            _migrate_image_generation_stats(conn)
             # Routing and fallback policy migrations.
             routing_db.migrate(conn)
             fallback_db.migrate(conn)
@@ -151,6 +154,95 @@ def _migrate_preprocessors(conn: sqlite3.Connection) -> None:
                 pass
 
 
+def _migrate_image_generation(conn: sqlite3.Connection) -> None:
+    """Add independent image-generation settings and per-model capability flags."""
+    existing_models = {row[1] for row in conn.execute("PRAGMA table_info(provider_models)").fetchall()}
+    if "image_generation" not in existing_models:
+        try:
+            conn.execute("ALTER TABLE provider_models ADD COLUMN image_generation TEXT NOT NULL DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS image_generators (
+            id TEXT PRIMARY KEY,
+            backend_type TEXT NOT NULL DEFAULT 'existing_model',
+            provider_model TEXT NOT NULL DEFAULT '',
+            api_base TEXT NOT NULL DEFAULT '',
+            model TEXT NOT NULL DEFAULT '',
+            api_key TEXT NOT NULL DEFAULT '',
+            timeout INTEGER NOT NULL DEFAULT 180,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        )
+    """)
+
+
+def _migrate_request_records_image_generation(conn: sqlite3.Connection) -> None:
+    """Add image-generation dimensions to historical request statistics."""
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(request_records)").fetchall()}
+    columns = {
+        "request_kind": "TEXT NOT NULL DEFAULT ''",
+        "image_model": "TEXT NOT NULL DEFAULT ''",
+        "image_count": "INTEGER NOT NULL DEFAULT 0",
+        "image_bytes": "INTEGER NOT NULL DEFAULT 0",
+    }
+    for column, ddl in columns.items():
+        if column not in existing:
+            conn.execute(f"ALTER TABLE request_records ADD COLUMN {column} {ddl}")
+
+
+def _migrate_image_generation_stats(conn: sqlite3.Connection) -> None:
+    """Initialize durable image counters from retained request logs once."""
+    keys = {
+        "image_generation_calls",
+        "image_generation_failed_calls",
+        "image_generation_images",
+        "image_generation_bytes",
+    }
+    existing = {
+        row[0] for row in conn.execute(
+            "SELECT key FROM global_stats WHERE key IN (?, ?, ?, ?)", tuple(sorted(keys))
+        ).fetchall()
+    }
+    if not keys.issubset(existing):
+        calls = failures = images = image_bytes = 0
+        for row in conn.execute("SELECT status, details FROM request_logs").fetchall():
+            try:
+                details = json.loads(row[1] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                details = {}
+            mode = str(details.get("responses_mode") or "")
+            is_image = (
+                details.get("request_kind") == "image_generation"
+                or details.get("upstream_endpoint") == "images/generations"
+                or "image_generation" in mode
+            )
+            if not is_image:
+                continue
+            calls += 1
+            failures += 0 if row[0] in {"ok", "degraded"} else 1
+            try:
+                images += max(0, int(details.get("image_count") or 0))
+                image_bytes += max(0, int(details.get("image_bytes") or 0))
+            except (TypeError, ValueError):
+                pass
+        initial = {
+            "image_generation_calls": calls,
+            "image_generation_failed_calls": failures,
+            "image_generation_images": images,
+            "image_generation_bytes": image_bytes,
+        }
+    else:
+        initial = {}
+    for key in sorted(keys):
+        if key in initial:
+            conn.execute(
+                "INSERT OR IGNORE INTO global_stats (key, value) VALUES (?, ?)",
+                (key, str(initial[key])),
+            )
+
+
 def _ensure_init() -> None:
     if not _initialized:
         init_db()
@@ -229,6 +321,7 @@ CREATE TABLE IF NOT EXISTS provider_models (
     enabled INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL DEFAULT '',
     preprocessor TEXT NOT NULL DEFAULT '',
+    image_generation TEXT NOT NULL DEFAULT '',
     responses_status TEXT NOT NULL DEFAULT 'unknown',
     responses_checked_at TEXT NOT NULL DEFAULT '',
     responses_expires_at TEXT NOT NULL DEFAULT '',
@@ -252,6 +345,19 @@ CREATE TABLE IF NOT EXISTS preprocessors (
     prompt TEXT NOT NULL DEFAULT '',
     enabled INTEGER NOT NULL DEFAULT 1,
     max_tokens INTEGER NOT NULL DEFAULT 2048,
+    created_at TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS image_generators (
+    id TEXT PRIMARY KEY,
+    backend_type TEXT NOT NULL DEFAULT 'existing_model',
+    provider_model TEXT NOT NULL DEFAULT '',
+    api_base TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    api_key TEXT NOT NULL DEFAULT '',
+    timeout INTEGER NOT NULL DEFAULT 180,
+    enabled INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL DEFAULT ''
 );
@@ -291,7 +397,11 @@ CREATE TABLE IF NOT EXISTS request_records (
     model TEXT NOT NULL,
     username TEXT NOT NULL DEFAULT '',
     success INTEGER NOT NULL DEFAULT 1,
-    tokens INTEGER NOT NULL DEFAULT 0
+    tokens INTEGER NOT NULL DEFAULT 0,
+    request_kind TEXT NOT NULL DEFAULT '',
+    image_model TEXT NOT NULL DEFAULT '',
+    image_count INTEGER NOT NULL DEFAULT 0,
+    image_bytes INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_req_ts ON request_records(timestamp);
 CREATE TABLE IF NOT EXISTS request_logs (
@@ -418,6 +528,27 @@ def increment_global_stats(
             db.execute("UPDATE global_stats SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = 'stateful_fallback_blocked_calls'")
 
 
+def increment_image_generation_stats(success: bool, image_count: int = 0, image_bytes: int = 0) -> None:
+    """Increment image-generation counters once per completed gateway request."""
+    increments = {
+        "image_generation_calls": 1,
+        "image_generation_failed_calls": 0 if success else 1,
+        "image_generation_images": max(0, int(image_count or 0)),
+        "image_generation_bytes": max(0, int(image_bytes or 0)),
+    }
+    with get_db() as db:
+        for key, amount in increments.items():
+            db.execute(
+                "INSERT OR IGNORE INTO global_stats (key, value) VALUES (?, '0')",
+                (key,),
+            )
+            if amount:
+                db.execute(
+                    "UPDATE global_stats SET value = CAST(CAST(value AS INTEGER) + ? AS TEXT) WHERE key = ?",
+                    (amount, key),
+                )
+
+
 def reset_global_stats() -> None:
     today = date.today().isoformat()
     with get_db() as db:
@@ -428,6 +559,10 @@ def reset_global_stats() -> None:
             "rejected_calls",
             "cancelled_calls",
             "stateful_fallback_blocked_calls",
+            "image_generation_calls",
+            "image_generation_failed_calls",
+            "image_generation_images",
+            "image_generation_bytes",
         ):
             db.execute(
                 "INSERT OR REPLACE INTO global_stats (key, value) VALUES (?, '0')",
@@ -625,13 +760,30 @@ def find_user_by_api_key(key: str) -> Optional[tuple[dict, dict]]:
 
 # -- Request history records --
 
-def add_request_record(model: str, username: str, success: bool, tokens: int = 0) -> None:
+def add_request_record(
+    model: str,
+    username: str,
+    success: bool,
+    tokens: int = 0,
+    *,
+    request_kind: str = "",
+    image_model: str = "",
+    image_count: int = 0,
+    image_bytes: int = 0,
+) -> None:
     """Insert a request record for historical stats. Called from _log_request."""
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     with get_db() as db:
         db.execute(
-            "INSERT INTO request_records (timestamp, model, username, success, tokens) VALUES (?, ?, ?, ?, ?)",
-            (now, model, username, 1 if success else 0, tokens)
+            """INSERT INTO request_records (
+                   timestamp, model, username, success, tokens,
+                   request_kind, image_model, image_count, image_bytes
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                now, model, username, 1 if success else 0, tokens,
+                request_kind or "", image_model or "",
+                max(0, int(image_count or 0)), max(0, int(image_bytes or 0)),
+            ),
         )
 
 
@@ -704,7 +856,6 @@ def _zero_pad_timeline(rows, from_ts, to_ts, granularity, model_bucket_rows):
         else:
             cur += delta
 
-    zero_row = {"total": 0, "failed": 0, "tokens": 0}
     padded_rows = []
     padded_model_rows = []
     for b in all_buckets:
@@ -712,7 +863,10 @@ def _zero_pad_timeline(rows, from_ts, to_ts, granularity, model_bucket_rows):
         if existing:
             padded_rows.append(existing)
         else:
-            padded_rows.append({"bucket": b, "total": 0, "failed": 0, "tokens": 0})
+            padded_rows.append({
+                "bucket": b, "total": 0, "failed": 0, "tokens": 0,
+                "image_calls": 0, "image_failed": 0, "images": 0, "image_bytes": 0,
+            })
         for mr in model_map.get(b, []):
             padded_model_rows.append(mr)
         # Missing bucket -> no model rows needed (all zeros)
@@ -729,7 +883,11 @@ def get_history_stats(from_ts: str, to_ts: str, granularity: str = "day") -> dic
             SELECT timestamp,
                    COUNT(*) AS total,
                    SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) AS failed,
-                   SUM(tokens) AS tokens
+                   SUM(tokens) AS tokens,
+                   SUM(CASE WHEN request_kind = 'image_generation' THEN 1 ELSE 0 END) AS image_calls,
+                   SUM(CASE WHEN request_kind = 'image_generation' AND success = 0 THEN 1 ELSE 0 END) AS image_failed,
+                   SUM(image_count) AS images,
+                   SUM(image_bytes) AS image_bytes
             FROM request_records
             WHERE timestamp >= ? AND timestamp <= ?
             GROUP BY timestamp
@@ -772,10 +930,17 @@ def get_history_stats(from_ts: str, to_ts: str, granularity: str = "day") -> dic
     bucket_rows = {}
     for row in rows:
         bucket = _bucket_for_timestamp(row["timestamp"], granularity)
-        current = bucket_rows.setdefault(bucket, {"bucket": bucket, "total": 0, "failed": 0, "tokens": 0})
+        current = bucket_rows.setdefault(bucket, {
+            "bucket": bucket, "total": 0, "failed": 0, "tokens": 0,
+            "image_calls": 0, "image_failed": 0, "images": 0, "image_bytes": 0,
+        })
         current["total"] += row["total"] or 0
         current["failed"] += row["failed"] or 0
         current["tokens"] += row["tokens"] or 0
+        current["image_calls"] += row["image_calls"] or 0
+        current["image_failed"] += row["image_failed"] or 0
+        current["images"] += row["images"] or 0
+        current["image_bytes"] += row["image_bytes"] or 0
 
     bucket_model_rows = {}
     for row in model_bucket_rows:
@@ -796,6 +961,10 @@ def get_history_stats(from_ts: str, to_ts: str, granularity: str = "day") -> dic
         "total":  [r["total"] for r in rows],
         "failed": [r["failed"] for r in rows],
         "tokens": [r["tokens"] for r in rows],
+        "image_calls": [r["image_calls"] for r in rows],
+        "image_failed": [r["image_failed"] for r in rows],
+        "images": [r["images"] for r in rows],
+        "image_bytes": [r["image_bytes"] for r in rows],
     }
 
     # Build per-model timeline matrix for stacked bar chart
@@ -822,6 +991,10 @@ def get_history_stats(from_ts: str, to_ts: str, granularity: str = "day") -> dic
         "total_calls": sum(r["total"] for r in rows),
         "failed_calls": sum(r["failed"] for r in rows),
         "total_tokens": sum(r["tokens"] for r in rows),
+        "image_generation_calls": sum(r["image_calls"] for r in rows),
+        "image_generation_failed_calls": sum(r["image_failed"] for r in rows),
+        "image_generation_images": sum(r["images"] for r in rows),
+        "image_generation_bytes": sum(r["image_bytes"] for r in rows),
     }
     return {"timeline": timeline, "timeline_models": timeline_models, "models": models, "users": users, "overall": overall}
 
@@ -980,9 +1153,11 @@ def _provider_from_row(row: sqlite3.Row) -> dict:
 
 
 def _model_from_row(row: sqlite3.Row) -> dict:
+    image_generation = row["image_generation"] if "image_generation" in row.keys() else ""
     model = {
         "id": row["model_id"], "name": row["model_name"],
         "enabled": _to_bool(row["enabled"]), "preprocessor": row["preprocessor"] or "",
+        "image_generation": bool(image_generation),
         "responses_status": row["responses_status"] or "unknown",
         "responses_checked_at": row["responses_checked_at"] or "",
         "responses_expires_at": row["responses_expires_at"] or "",
@@ -992,6 +1167,102 @@ def _model_from_row(row: sqlite3.Row) -> dict:
         "responses_error": row["responses_error"] or "",
     }
     return model
+
+
+IMAGE_GENERATOR_DEFAULTS = {
+    "backend_type": "existing_model", "provider_model": "", "api_base": "",
+    "model": "", "api_key": "", "timeout": 180, "enabled": True,
+}
+
+
+def _image_generator_from_row(row: sqlite3.Row) -> dict:
+    data = _row_to_dict(row)
+    data["enabled"] = _to_bool(data.get("enabled"))
+    try:
+        data["timeout"] = int(data.get("timeout") or 180)
+    except (TypeError, ValueError):
+        data["timeout"] = 180
+    return data
+
+
+def get_image_generators() -> dict:
+    with get_db() as db:
+        rows = db.execute("SELECT * FROM image_generators ORDER BY id").fetchall()
+        return {row["id"]: {k: v for k, v in _image_generator_from_row(row).items() if k != "id"} for row in rows}
+
+
+def get_enabled_image_generator() -> Optional[dict]:
+    with get_db() as db:
+        row = db.execute("SELECT * FROM image_generators WHERE enabled = 1 ORDER BY updated_at DESC, id LIMIT 1").fetchone()
+        return _image_generator_from_row(row) if row else None
+
+
+def upsert_image_generator(generator_id: str, config: dict) -> dict:
+    generator_id = str(generator_id or "").strip()
+    if not generator_id:
+        raise ValueError("image generator id is required")
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    with get_db() as db:
+        row = db.execute("SELECT * FROM image_generators WHERE id = ?", (generator_id,)).fetchone()
+        merged = dict(IMAGE_GENERATOR_DEFAULTS)
+        if row:
+            merged.update(_image_generator_from_row(row))
+        merged.update(config or {})
+        merged["backend_type"] = str(merged.get("backend_type") or "existing_model")
+        for key in ("provider_model", "api_base", "model", "api_key"):
+            merged[key] = str(merged.get(key) or "")
+        try:
+            merged["timeout"] = max(1, min(3600, int(merged.get("timeout") or 180)))
+        except (TypeError, ValueError):
+            merged["timeout"] = 180
+        merged["enabled"] = _to_bool(merged.get("enabled", True))
+        if merged["enabled"]:
+            db.execute("UPDATE image_generators SET enabled = 0 WHERE id <> ?", (generator_id,))
+        values = (merged["backend_type"], merged["provider_model"], merged["api_base"], merged["model"], merged["api_key"], merged["timeout"], 1 if merged["enabled"] else 0, now)
+        if row:
+            db.execute("UPDATE image_generators SET backend_type=?, provider_model=?, api_base=?, model=?, api_key=?, timeout=?, enabled=?, updated_at=? WHERE id=?", values + (generator_id,))
+        else:
+            db.execute("INSERT INTO image_generators (id, backend_type, provider_model, api_base, model, api_key, timeout, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (generator_id,) + values[:7] + (now, now))
+        return _image_generator_from_row(db.execute("SELECT * FROM image_generators WHERE id = ?", (generator_id,)).fetchone())
+
+
+def delete_image_generator(generator_id: str) -> bool:
+    with get_db() as db:
+        return db.execute("DELETE FROM image_generators WHERE id = ?", (generator_id,)).rowcount > 0
+
+
+def set_model_image_generation(model_id: str, enabled: bool) -> bool:
+    mid = parse_model_id(model_id)
+    with get_db() as db:
+        if mid.is_composite:
+            cur = db.execute("UPDATE provider_models SET image_generation = ? WHERE provider_id = ? AND model_id = ?", ("1" if enabled else "", mid.provider_id, mid.model_name))
+            # Older admin pages could prepend the provider to an already
+            # composite model value. Accept that stale form once so a cached
+            # browser can still turn the switch off after this fix ships.
+            repeated_prefix = f"{mid.provider_id}/"
+            if cur.rowcount == 0 and mid.model_name.startswith(repeated_prefix):
+                cur = db.execute(
+                    "UPDATE provider_models SET image_generation = ? WHERE provider_id = ? AND model_id = ?",
+                    ("1" if enabled else "", mid.provider_id, mid.model_name[len(repeated_prefix):]),
+                )
+            if cur.rowcount == 0:
+                # Some legacy provider refreshes stored the provider prefix in
+                # model_id itself. Keep accepting the canonical admin value
+                # until those rows are naturally refreshed.
+                cur = db.execute(
+                    "UPDATE provider_models SET image_generation = ? WHERE provider_id = ? AND model_id = ?",
+                    ("1" if enabled else "", mid.provider_id, f"{mid.provider_id}/{mid.model_name}"),
+                )
+        else:
+            cur = db.execute("UPDATE provider_models SET image_generation = ? WHERE model_id = ?", ("1" if enabled else "", mid.model_name))
+        return cur.rowcount > 0
+
+
+def get_model_image_generation(provider_id: str, model: str) -> bool:
+    model_name = parse_model_id(model).model_name
+    with get_db() as db:
+        row = db.execute("SELECT image_generation FROM provider_models WHERE provider_id = ? AND (model_id IN (?, ?) OR model_name = ?) LIMIT 1", (provider_id, model, model_name, model_name)).fetchone()
+        return bool(row and row["image_generation"])
 
 def get_providers() -> list:
     with get_db() as db:
@@ -1100,13 +1371,14 @@ def add_provider(provider: dict) -> dict:
             raise ValueError(f"Provider '{provider['id']}' already exists")
         for m in provider.get("models", []):
             db.execute(
-                "INSERT OR IGNORE INTO provider_models (provider_id, model_id, model_name, enabled, preprocessor) VALUES (?, ?, ?, ?, ?)",
+                "INSERT OR IGNORE INTO provider_models (provider_id, model_id, model_name, enabled, preprocessor, image_generation) VALUES (?, ?, ?, ?, ?, ?)",
                 (
                     provider["id"],
                     m["id"],
                     m.get("name", m["id"]),
                     1 if m.get("enabled", True) else 0,
                     m.get("preprocessor", ""),
+                    "1" if m.get("image_generation") else "",
                 )
             )
     options = _normalize_provider_request_options(provider)
@@ -1125,6 +1397,7 @@ def add_provider(provider: dict) -> dict:
                 "name": m.get("name", m["id"]),
                 "enabled": m.get("enabled", True),
                 "preprocessor": m.get("preprocessor", ""),
+                "image_generation": bool(m.get("image_generation")),
             }
             for m in provider.get("models", [])
         ]
@@ -1154,14 +1427,20 @@ def update_provider(provider_id: str, updates: dict) -> Optional[dict]:
             existing_ids = {m["model_id"] for m in db.execute("SELECT model_id FROM provider_models WHERE provider_id = ?", (provider_id,)).fetchall()}
             for m in updates["models"]:
                 if m["id"] in existing_ids:
-                    db.execute(
-                        "UPDATE provider_models SET model_name = ?, enabled = ?, preprocessor = ? WHERE provider_id = ? AND model_id = ?",
-                        (m.get("name", m["id"]), 1 if m.get("enabled", True) else 0, m.get("preprocessor", ""), provider_id, m["id"])
-                    )
+                    if "image_generation" in m:
+                        db.execute(
+                            "UPDATE provider_models SET model_name = ?, enabled = ?, preprocessor = ?, image_generation = ? WHERE provider_id = ? AND model_id = ?",
+                            (m.get("name", m["id"]), 1 if m.get("enabled", True) else 0, m.get("preprocessor", ""), "1" if m.get("image_generation") else "", provider_id, m["id"])
+                        )
+                    else:
+                        db.execute(
+                            "UPDATE provider_models SET model_name = ?, enabled = ?, preprocessor = ? WHERE provider_id = ? AND model_id = ?",
+                            (m.get("name", m["id"]), 1 if m.get("enabled", True) else 0, m.get("preprocessor", ""), provider_id, m["id"])
+                        )
                 else:
                     db.execute(
-                        "INSERT OR IGNORE INTO provider_models (provider_id, model_id, model_name, enabled, preprocessor) VALUES (?, ?, ?, ?, ?)",
-                        (provider_id, m["id"], m.get("name", m["id"]), 1 if m.get("enabled", True) else 0, m.get("preprocessor", ""))
+                        "INSERT OR IGNORE INTO provider_models (provider_id, model_id, model_name, enabled, preprocessor, image_generation) VALUES (?, ?, ?, ?, ?, ?)",
+                        (provider_id, m["id"], m.get("name", m["id"]), 1 if m.get("enabled", True) else 0, m.get("preprocessor", ""), "1" if m.get("image_generation") else "")
                     )
         if any(key in updates for key in {"api_base", "api_key", "provider_type", "models"}):
             db.execute("UPDATE provider_models SET responses_status = 'unknown', responses_checked_at = '', responses_expires_at = '', responses_streaming = 0, responses_streaming_status = 'unknown', responses_tool_types = '[]', responses_error = '' WHERE provider_id = ?", (provider_id,))

@@ -5,3 +5,4 @@ litellm==1.83.14
 python-multipart>=0.0.6
 httpx>=0.26.0
 anyio>=4.0.0
+Pillow>=10.0.0

@@ -103,6 +103,27 @@ def test_request_log_detail(temp_db):
     assert body["details"] == {"fallback_status": "unused", "upstream_endpoint": "messages"}
 
 
+def test_request_log_promotes_image_generation_details(temp_db):
+    lid = _add_log(
+        endpoint="responses",
+        details={
+            "responses_mode": "model_driven_image_generation_markdown",
+            "upstream_endpoint": "images/generations",
+            "image_model": "grok-imagine-image",
+            "image_count": 1,
+            "image_bytes": 2048,
+            "image_artifact_count": 1,
+        },
+    )
+    body = client.get(f"/admin/request-logs/{lid}", headers=temp_db["headers"]).json()
+    assert body["request_kind"] == "image_generation"
+    assert body["image_model"] == "grok-imagine-image"
+    assert body["image_count"] == 1
+    assert body["image_bytes"] == 2048
+    assert body["image_artifact_count"] == 1
+    assert body["upstream_endpoint"] == "images/generations"
+
+
 def test_request_log_detail_404(temp_db):
     r = client.get("/admin/request-logs/9999", headers=temp_db["headers"])
     assert r.status_code == 404

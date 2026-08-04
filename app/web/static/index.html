@@ -77,6 +77,9 @@
                 <button class="nav-btn" onclick="showSection('preprocessors', event)" data-section="preprocessors">
                     <span class="nav-icon">&#127918;</span><span data-i18n="nav.preprocessors">视觉模型注入</span>
                 </button>
+                <button class="nav-btn" onclick="showSection('image-generation', event)" data-section="image-generation">
+                    <span class="nav-icon">&#127912;</span><span data-i18n="nav.imageGeneration">图像生成</span>
+                </button>
                 <button class="nav-btn" onclick="showSection('stats', event)" data-section="stats">
                     <span class="nav-icon">&#128200;</span><span data-i18n="nav.stats">统计</span>
                 </button>
@@ -184,6 +187,11 @@
                         </div>
                     </div>
                     <div id="requestLogsContent"></div>
+                </div>
+
+                <div id="image-generation-section" class="section" style="display:none;">
+                    <div class="section-header"><h2 data-i18n="imageGeneration.title">图像生成</h2></div>
+                    <div id="imageGenerationContent" class="preprocessors-grid"></div>
                 </div>
 
                 <!-- System Logs -->

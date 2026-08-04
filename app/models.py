@@ -41,6 +41,10 @@ class StatsResponse(BaseModel):
     rejected_calls: int = 0
     cancelled_calls: int = 0
     stateful_fallback_blocked_calls: int = 0
+    image_generation_calls: int = 0
+    image_generation_failed_calls: int = 0
+    image_generation_images: int = 0
+    image_generation_bytes: int = 0
     success_rate: float
     health_rate: float = 100.0
     last_reset: str

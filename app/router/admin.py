@@ -17,6 +17,8 @@ from app.database import (
     get_history_stats,
     find_provider_by_model, parse_model_id,
     get_preprocessors, upsert_preprocessor, delete_preprocessor as delete_preprocessor_config,
+    get_image_generators, upsert_image_generator, delete_image_generator as delete_image_generator_config,
+    set_model_image_generation,
 )
 from app.core.policy import apply_fallback_policy, apply_routing_rules
 from app.adapters.anthropic import anthropic_messages_completion_for_internal
@@ -357,6 +359,10 @@ async def get_stats(authorization: Optional[str] = Header(None)):
     rejected = int(stats.get("rejected_calls", 0) or 0)
     cancelled = int(stats.get("cancelled_calls", 0) or 0)
     stateful_fallback_blocked = int(stats.get("stateful_fallback_blocked_calls", 0) or 0)
+    image_generation_calls = int(stats.get("image_generation_calls", 0) or 0)
+    image_generation_failed_calls = int(stats.get("image_generation_failed_calls", 0) or 0)
+    image_generation_images = int(stats.get("image_generation_images", 0) or 0)
+    image_generation_bytes = int(stats.get("image_generation_bytes", 0) or 0)
     success_rate = ((total - failed) / total * 100) if total > 0 else 100.0
     # Health rate treats fallback-recovered calls as unhealthy for ops visibility.
     health_rate = ((total - failed - degraded) / total * 100) if total > 0 else 100.0
@@ -378,6 +384,10 @@ async def get_stats(authorization: Optional[str] = Header(None)):
         rejected_calls=rejected,
         cancelled_calls=cancelled,
         stateful_fallback_blocked_calls=stateful_fallback_blocked,
+        image_generation_calls=image_generation_calls,
+        image_generation_failed_calls=image_generation_failed_calls,
+        image_generation_images=image_generation_images,
+        image_generation_bytes=image_generation_bytes,
         success_rate=round(success_rate, 2),
         health_rate=round(health_rate, 2),
         last_reset=stats.get("last_reset", ""),
@@ -675,6 +685,119 @@ async def toggle_model_preprocessor(body: dict, authorization: Optional[str] = H
     return {"model_id": model_id, "preprocessor": enabled}
 
 
+@router.get("/image-generation")
+async def list_image_generation(authorization: Optional[str] = Header(None)):
+    await require_admin_session(authorization)
+    from app.database import get_db
+    with get_db() as db:
+        rows = db.execute("SELECT m.provider_id, m.model_id, m.image_generation, p.name AS provider_name FROM provider_models m JOIN providers p ON p.id = m.provider_id WHERE m.enabled = 1 ORDER BY m.provider_id, m.model_id").fetchall()
+    models = [{
+        "model_id": (
+            r["model_id"][len(r["provider_id"]) + 1:]
+            if r["model_id"].startswith(f"{r['provider_id']}/")
+            else r["model_id"]
+        ),
+        "provider_model": (
+            r["model_id"]
+            if r["model_id"].startswith(f"{r['provider_id']}/")
+            else f"{r['provider_id']}/{r['model_id']}"
+        ),
+        "provider_id": r["provider_id"],
+        "provider_name": r["provider_name"],
+        "model_name": (
+            r["model_id"][len(r["provider_id"]) + 1:]
+            if r["model_id"].startswith(f"{r['provider_id']}/")
+            else r["model_id"]
+        ),
+        "image_generation": bool(r["image_generation"]),
+    } for r in rows]
+    providers = {}
+    for model in models:
+        providers.setdefault(model["provider_id"], {"id": model["provider_id"], "name": model["provider_name"], "models": []})["models"].append(model)
+    generators = get_image_generators()
+    for generator in generators.values():
+        generator["has_api_key"] = bool(generator.get("api_key"))
+        generator["api_key"] = ""
+    return {"generators": generators, "models": models, "providers": list(providers.values())}
+
+
+@router.post("/image-generation/test")
+async def test_image_generation(body: dict, authorization: Optional[str] = Header(None)):
+    await require_admin_session(authorization)
+    from app.adapters.imagegen import generate_images
+    from app.router.proxy import _resolved_image_generator
+    generator_id = str(body.get("generator_id") or "").strip()
+    generator = get_image_generators().get(generator_id) if generator_id else None
+    if not generator:
+        raise HTTPException(status_code=404, detail="Image generator not found")
+    prompt = str(body.get("prompt") or "A simple red apple on a white background").strip()
+    started = time.perf_counter()
+    try:
+        resolved = _resolved_image_generator({"id": generator_id, **generator})
+        results = await generate_images(resolved, prompt=prompt, n=1)
+        return {"status": "ok", "generator_id": generator_id, "model": resolved.get("model") or resolved.get("provider_model") or "", "image_count": len(results), "latency_ms": int((time.perf_counter() - started) * 1000)}
+    except Exception as exc:
+        return {"status": "error", "generator_id": generator_id, "error": str(exc), "latency_ms": int((time.perf_counter() - started) * 1000)}
+
+
+@router.put("/image-generation/{generator_id}")
+async def update_image_generation(generator_id: str, config: dict, authorization: Optional[str] = Header(None)):
+    await require_admin_session(authorization)
+    config = dict(config or {})
+    backend_type = str(config.get("backend_type") or "existing_model")
+    if backend_type != "existing_model" and not str(config.get("api_key") or "").strip():
+        # The admin read endpoint never returns stored secrets. An empty
+        # password field therefore means "keep the current key", matching
+        # provider and preprocessor configuration behavior.
+        config.pop("api_key", None)
+    provider_model = str(config.get("provider_model") or "").strip()
+    if backend_type == "existing_model" and provider_model:
+        mid = parse_model_id(provider_model)
+        provider = get_provider(mid.provider_id) if mid.provider_id else find_provider_by_model(mid.model_name)
+        valid_ids = {
+            m.get("id") for m in (provider or {}).get("models", [])
+            if m.get("enabled", True)
+        }
+        if not provider or not ({mid.model_name, f"{mid.provider_id}/{mid.model_name}"} & valid_ids):
+            raise HTTPException(status_code=400, detail="provider_model must reference an enabled provider model")
+    if backend_type == "existing_model" and not provider_model:
+        raise HTTPException(status_code=400, detail="an existing provider model is required")
+    if backend_type == "external_model" and (not config.get("api_base") or not config.get("model")):
+        raise HTTPException(status_code=400, detail="external model requires api_base and model")
+    if backend_type == "comfyui" and config.get("enabled", True):
+        raise HTTPException(status_code=400, detail="ComfyUI image generation is not implemented yet")
+    if backend_type not in {"existing_model", "external_model", "comfyui"}:
+        raise HTTPException(status_code=400, detail="unsupported image-generation backend type")
+    try:
+        current = upsert_image_generator(generator_id, config)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    current.pop("id", None)
+    return {"id": generator_id, "config": current}
+
+
+@router.delete("/image-generation/{generator_id}")
+async def delete_image_generation(generator_id: str, authorization: Optional[str] = Header(None)):
+    await require_admin_session(authorization)
+    if delete_image_generator_config(generator_id):
+        return {"status": "deleted"}
+    raise HTTPException(status_code=404, detail="Image generator not found")
+
+
+@router.put("/models/image-generation")
+async def toggle_model_image_generation(body: dict, authorization: Optional[str] = Header(None)):
+    await require_admin_session(authorization)
+    model_id = body.get("model_id", "")
+    enabled = body.get("enabled", False)
+    if not model_id:
+        raise HTTPException(status_code=400, detail="model_id is required")
+    if not isinstance(enabled, bool):
+        raise HTTPException(status_code=400, detail="enabled must be a boolean")
+    if not set_model_image_generation(model_id, enabled):
+        raise HTTPException(status_code=404, detail="Model not found")
+    return {"model_id": model_id, "image_generation": enabled}
+
+
 
 # -- Request/Response detail logs --
 
@@ -794,18 +917,22 @@ _USER_EXPORT_VERSION = 1
 def _export_config(include_secrets: bool) -> dict:
     providers = get_providers()
     preprocessors = get_preprocessors()
+    image_generators = get_image_generators()
     if not include_secrets:
         for p in providers:
             p["api_key"] = ""
             p.pop("extra_headers", None)
         for p in preprocessors.values():
             p["api_key"] = ""
+        for generator in image_generators.values():
+            generator["api_key"] = ""
     return {
         "version": _CONFIG_VERSION,
         "exported_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "include_secrets": include_secrets,
         "providers": providers,
         "preprocessors": preprocessors,
+        "image_generators": image_generators,
         "routing_rules": get_routing_rules(),
         "fallback_policies": get_fallback_policies(),
     }
@@ -927,17 +1054,20 @@ async def export_config_endpoint(
     return _export_config(bool(include_secrets))
 
 
-def _validate_config_payload(payload) -> tuple[list, dict, list, list]:
+def _validate_config_payload(payload) -> tuple[list, dict, dict, list, list]:
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="config must be a JSON object")
     providers = payload.get("providers", [])
     preprocessors = payload.get("preprocessors", {})
+    image_generators = payload.get("image_generators", {})
     routing = payload.get("routing_rules", [])
     fallbacks = payload.get("fallback_policies", [])
     if not isinstance(providers, list):
         raise HTTPException(status_code=400, detail="providers must be a list")
     if not isinstance(preprocessors, dict):
         raise HTTPException(status_code=400, detail="preprocessors must be an object")
+    if not isinstance(image_generators, dict):
+        raise HTTPException(status_code=400, detail="image_generators must be an object")
     if not isinstance(routing, list):
         raise HTTPException(status_code=400, detail="routing_rules must be a list")
     if not isinstance(fallbacks, list):
@@ -954,7 +1084,10 @@ def _validate_config_payload(payload) -> tuple[list, dict, list, list]:
     for preprocessor_id, config in preprocessors.items():
         if not str(preprocessor_id or "").strip() or not isinstance(config, dict):
             raise HTTPException(status_code=400, detail="preprocessors must map ids to objects")
-    return providers, preprocessors, routing, fallbacks
+    for generator_id, config in image_generators.items():
+        if not str(generator_id or "").strip() or not isinstance(config, dict):
+            raise HTTPException(status_code=400, detail="image_generators must map ids to objects")
+    return providers, preprocessors, image_generators, routing, fallbacks
 
 
 def _import_provider(entry: dict, mode: str) -> str:
@@ -992,6 +1125,22 @@ def _import_preprocessor(preprocessor_id: str, config: dict, mode: str) -> str:
     if mode == "merge" and existing:
         payload = {**existing, **{k: v for k, v in payload.items() if v not in (None, "", [], {})}}
     upsert_preprocessor(pid, payload)
+    return "updated" if existing else "created"
+
+
+def _import_image_generator(generator_id: str, config: dict, mode: str) -> str:
+    gid = str(generator_id or "").strip()
+    if not gid:
+        return "skipped"
+    existing = get_image_generators().get(gid)
+    payload = dict(config or {})
+    if not payload.get("api_key"):
+        payload.pop("api_key", None)
+    if mode == "skip" and existing:
+        return "skipped"
+    if mode == "merge" and existing:
+        payload = {**existing, **{k: v for k, v in payload.items() if v not in (None, "", [], {})}}
+    upsert_image_generator(gid, payload)
     return "updated" if existing else "created"
 
 
@@ -1035,15 +1184,18 @@ async def import_config_endpoint(payload: dict, authorization: Optional[str] = H
     mode = str(payload.get("mode") or "skip").lower()
     if mode not in _IMPORT_MODES:
         raise HTTPException(status_code=400, detail=f"mode must be one of {sorted(_IMPORT_MODES)}")
-    providers, preprocessors, routing, fallbacks = _validate_config_payload(payload)
+    providers, preprocessors, image_generators, routing, fallbacks = _validate_config_payload(payload)
 
-    summary = {"providers": {}, "preprocessors": {}, "routing_rules": {}, "fallback_policies": {}}
+    summary = {"providers": {}, "preprocessors": {}, "image_generators": {}, "routing_rules": {}, "fallback_policies": {}}
     for entry in providers:
         outcome = _import_provider(entry, mode)
         summary["providers"][outcome] = summary["providers"].get(outcome, 0) + 1
     for preprocessor_id, config in preprocessors.items():
         outcome = _import_preprocessor(preprocessor_id, config, mode)
         summary["preprocessors"][outcome] = summary["preprocessors"].get(outcome, 0) + 1
+    for generator_id, config in image_generators.items():
+        outcome = _import_image_generator(generator_id, config, mode)
+        summary["image_generators"][outcome] = summary["image_generators"].get(outcome, 0) + 1
     for entry in routing:
         outcome = _import_routing_rule(entry, mode)
         summary["routing_rules"][outcome] = summary["routing_rules"].get(outcome, 0) + 1

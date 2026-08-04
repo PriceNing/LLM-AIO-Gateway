@@ -6,10 +6,86 @@ from app.adapters.output import tool_arguments_to_input
 from app.core.output import InternalOutputEvent, InternalOutputMessage
 from app.protocols.ingress import custom_tool_input_from_arguments
 from app.services.logger import get_logger
+from app.adapters.imagegen import ImageGenerationResult
 
 
 _app_log = get_logger("app")
 _tool_log = get_logger("tool_calls")
+
+
+def render_responses_image_generation(results: list[ImageGenerationResult], *, model: str,
+                                      previous_response_id: str | None = None,
+                                      tool: dict | None = None) -> dict:
+    def result_base64(result: ImageGenerationResult) -> str:
+        """Return the Responses API image result without a data-URI prefix.
+
+        Responses' image_generation_call.result is documented as base64 data.
+        The images endpoint can still expose a data URI, but forwarding that
+        wrapper through a Responses stream makes strict Codex clients abort.
+        """
+        value = result.data_uri or ""
+        if value.startswith("data:") and "," in value:
+            return value.split(",", 1)[1]
+        return value
+
+    output = []
+    for result in results:
+        item = {"type": "image_generation_call", "id": f"ig_{uuid.uuid4().hex}",
+                "status": "completed", "result": result_base64(result),
+                "output_format": result.output_format or result.mime_type.removeprefix("image/"),}
+        if result.revised_prompt:
+            item["revised_prompt"] = result.revised_prompt
+        if result.size:
+            item["size"] = result.size
+        output.append(item)
+    now = int(time.time())
+    # Keep the bridge response shaped like a normal Responses response.  Codex
+    # reads the lifecycle metadata as well as output_item.done; a minimal
+    # response is accepted by the OpenAI SDK but can be discarded by stricter
+    # Codex clients before it reaches the conversation renderer.
+    return {
+        "id": f"resp_{uuid.uuid4().hex}", "object": "response", "created_at": now,
+        "completed_at": now, "status": "completed", "background": False,
+        "error": None, "incomplete_details": None, "model": model,
+        "previous_response_id": previous_response_id or None, "output": output,
+        "parallel_tool_calls": True, "tool_choice": "auto",
+        "tools": [tool] if isinstance(tool, dict) else [],
+        "text": {"format": {"type": "text"}, "verbosity": "medium"},
+        "store": False,
+        "tool_usage": {"image_gen": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}},
+        "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+    }
+
+
+async def render_responses_image_generation_sse(results: list[ImageGenerationResult], *, model: str,
+                                                previous_response_id: str | None = None,
+                                                tool: dict | None = None):
+    response = render_responses_image_generation(results, model=model,
+                                                 previous_response_id=previous_response_id,
+                                                 tool=tool)
+    initial = {**response, "status": "in_progress", "output": []}
+    def frame(payload: dict) -> str:
+        # Sub2API forwards data-only Responses SSE frames. Keep the event
+        # discriminator in the JSON payload and do not add gateway-specific
+        # SSE fields.
+        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    # The image upstream contract used by Sub2API does not require synthetic
+    # lifecycle frames before the completed output item. Keep these standard
+    # response lifecycle frames only; the image-specific result is emitted by
+    # output_item.done below.
+    yield frame({'type': 'response.created', 'response': initial})
+    yield frame({'type': 'response.in_progress', 'response': initial})
+    for index, item in enumerate(response["output"]):
+        # This is the authoritative image event consumed by Sub2API and
+        # Codex-compatible clients.
+        yield frame({'type': 'response.output_item.done', 'output_index': index, 'item': item})
+    # Sub2API's Codex Responses bridge preserves the completed image item in
+    # both output_item.done and the terminal response snapshot. Its dedicated
+    # /images adapter accepts an empty terminal output, but that is a different
+    # protocol boundary; using that shape here makes Codex discard the turn.
+    yield frame({'type': 'response.completed', 'response': response})
+    yield "data: [DONE]\n\n"
 
 
 def _anthropic_stop_reason(finish_reason: str) -> str:

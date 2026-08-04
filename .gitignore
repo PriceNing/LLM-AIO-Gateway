@@ -25,6 +25,7 @@ tools/live_eval/live-eval.config.local.json
 svn-update-docker.sh
 *.log
 data/
+generated_images/
 
 # Project-local notes (not for distribution)
 AGENTS.md

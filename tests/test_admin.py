@@ -136,6 +136,38 @@ def test_stats_request_detail_exposes_actual_upstream_endpoint(temp_db):
         proxy.clear_request_log()
 
 
+def test_stats_distinguishes_image_generation(temp_db):
+    import app.router.proxy as proxy
+
+    proxy.clear_request_log()
+    try:
+        proxy._log_request(
+            "alice", "sk-test", "chat-model", "chat",
+            "responses", True, 7, "chat/chat-model",
+            details={
+                "responses_mode": "model_driven_image_generation_markdown",
+                "upstream_endpoint": "images/generations",
+                "image_model": "grok-imagine-image",
+                "image_count": 2,
+                "image_bytes": 4096,
+                "image_artifact_count": 2,
+            },
+        )
+        response = client.get("/admin/stats", headers=temp_db["headers"])
+        assert response.status_code == 200
+        data = response.json()
+        assert data["image_generation_calls"] == 1
+        assert data["image_generation_images"] == 2
+        assert data["image_generation_bytes"] == 4096
+        entry = data["request_log"][0]
+        assert entry["request_kind"] == "image_generation"
+        assert entry["image_model"] == "grok-imagine-image"
+        assert entry["image_count"] == 2
+        assert entry["image_artifact_count"] == 2
+    finally:
+        proxy.clear_request_log()
+
+
 def test_realtime_stats_timeline_skips_large_idle_gaps(temp_db):
     import app.router.proxy as proxy
 

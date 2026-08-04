@@ -2,13 +2,13 @@
 Unit tests for app.database - stats, provider lookup, routing rules, TTLDict.
 """
 import time
-from datetime import timedelta, timezone
+from datetime import datetime, timedelta, timezone
 import pytest
 import sqlite3
 from app.database import (
     init_db, get_db,
-    increment_global_stats, get_global_stats, reset_global_stats,
-    get_history_stats,
+    increment_global_stats, increment_image_generation_stats, get_global_stats, reset_global_stats,
+    add_request_record, get_history_stats,
     find_provider_by_model, parse_model_id,
     add_provider, get_provider, get_providers, update_provider, delete_provider,
     add_routing_rule, get_routing_rules, update_routing_rule, delete_routing_rule,
@@ -73,6 +73,36 @@ def test_reset_global_stats():
     assert stats["last_reset"] != ""
 
 
+def test_image_generation_stats_and_history():
+    increment_image_generation_stats(True, image_count=2, image_bytes=4096)
+    increment_image_generation_stats(False)
+    add_request_record(
+        "chat-model", "alice", True, 7,
+        request_kind="image_generation", image_model="grok-imagine-image",
+        image_count=2, image_bytes=4096,
+    )
+
+    stats = get_global_stats()
+    assert stats["image_generation_calls"] == 2
+    assert stats["image_generation_failed_calls"] == 1
+    assert stats["image_generation_images"] == 2
+    assert stats["image_generation_bytes"] == 4096
+
+    today = datetime.now().astimezone().date().isoformat()
+    history = get_history_stats(today, today, "day")
+    assert history["overall"]["image_generation_calls"] == 1
+    assert history["overall"]["image_generation_failed_calls"] == 0
+    assert history["overall"]["image_generation_images"] == 2
+    assert history["overall"]["image_generation_bytes"] == 4096
+
+    reset_global_stats()
+    reset = get_global_stats()
+    assert reset["image_generation_calls"] == 0
+    assert reset["image_generation_failed_calls"] == 0
+    assert reset["image_generation_images"] == 0
+    assert reset["image_generation_bytes"] == 0
+
+
 def test_history_stats_queries_local_day_against_utc_records(monkeypatch):
     import app.database as db_mod
 
@@ -85,7 +115,11 @@ def test_history_stats_queries_local_day_against_utc_records(monkeypatch):
 
     stats = get_history_stats("2026-05-29", "2026-05-29", "hour")
 
-    assert stats["overall"] == {"total_calls": 1, "failed_calls": 0, "total_tokens": 123}
+    assert stats["overall"] == {
+        "total_calls": 1, "failed_calls": 0, "total_tokens": 123,
+        "image_generation_calls": 0, "image_generation_failed_calls": 0,
+        "image_generation_images": 0, "image_generation_bytes": 0,
+    }
     assert stats["timeline"]["labels"][16] == "2026-05-29 16:00"
     assert stats["timeline"]["total"][16] == 1
     assert stats["timeline"]["tokens"][16] == 123

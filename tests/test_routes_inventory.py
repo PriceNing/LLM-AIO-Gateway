@@ -73,16 +73,23 @@ def test_expected_http_routes_are_registered():
         ("DELETE", "/admin/preprocessors/{preprocessor_id}"),
         ("GET", "/admin/preprocessors/fetch-models"),
         ("PUT", "/admin/models/preprocessor"),
+        ("GET", "/admin/image-generation"),
+        ("POST", "/admin/image-generation/test"),
+        ("PUT", "/admin/image-generation/{generator_id}"),
+        ("DELETE", "/admin/image-generation/{generator_id}"),
+        ("PUT", "/admin/models/image-generation"),
         ("GET", "/v1/models"),
         ("POST", "/v1/chat/completions"),
         ("POST", "/v1/completions"),
         ("POST", "/v1/messages"),
         ("POST", "/v1/responses"),
+        ("POST", "/v1/images/generations"),
         ("GET", "/models"),
         ("POST", "/chat/completions"),
         ("POST", "/completions"),
         ("POST", "/messages"),
         ("POST", "/responses"),
+        ("POST", "/images/generations"),
     }
 
     assert expected <= _registered_routes()
