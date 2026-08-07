@@ -1491,10 +1491,16 @@ def test_image_generation_admin_menu_api(image_app_db):
     admin = {"Authorization": f"Bearer {create_session('admin')}"}
     response = TestClient(app).get("/admin/image-generation", headers=admin)
     assert response.status_code == 200
-    model = response.json()["models"][0]
+    payload = response.json()
+    model = payload["models"][0]
     assert model["image_generation"] is True
     assert model["model_id"] == "chat-model"
     assert model["provider_model"] == "chat/chat-model"
+    assert payload["providers"] == [{
+        "id": "chat",
+        "name": "Chat",
+        "models": [model],
+    }]
 
 
 def test_image_generation_admin_menu_masks_external_api_key(image_app_db):
@@ -1508,6 +1514,27 @@ def test_image_generation_admin_menu_masks_external_api_key(image_app_db):
     payload = TestClient(app).get("/admin/image-generation", headers=admin).json()
     assert payload["generators"]["default"]["api_key"] == ""
     assert payload["generators"]["default"]["has_api_key"] is True
+
+
+def test_image_generation_admin_connection_test(image_app_db, monkeypatch):
+    async def fake_generate(config, **kwargs):
+        assert config["model"] == "image-model"
+        assert kwargs["prompt"]
+        return [ImageGenerationResult("data:image/png;base64,AAAA")]
+
+    monkeypatch.setattr("app.adapters.imagegen.generate_images", fake_generate)
+    admin = {"Authorization": f"Bearer {create_session('admin')}"}
+    response = TestClient(app).post(
+        "/admin/image-generation/test",
+        headers=admin,
+        json={"generator_id": "default"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "ok"
+    assert response.json()["generator_id"] == "default"
+    assert response.json()["model"] == "image-model"
+    assert response.json()["image_count"] == 1
 
 
 def test_image_generation_toggle_accepts_stale_duplicate_provider_prefix(image_app_db):

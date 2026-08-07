@@ -317,6 +317,10 @@ zh: {
     'imageGeneration.models': '模型开关',
     'imageGeneration.save': '保存配置',
     'imageGeneration.test': '测试连接',
+    'imageGeneration.testRunning': '测试中...',
+    'imageGeneration.testStarted': '正在测试生图连接，部分模型可能需要几分钟',
+    'imageGeneration.testFail': '图像生成连接测试失败',
+    'imageGeneration.noGenerator': '请先保存生图后端配置',
     'imageGeneration.backendType': '后端类型',
     'imageGeneration.existingModel': '已有提供商模型',
     'imageGeneration.externalModel': '外部模型',
@@ -642,6 +646,10 @@ en: {
     'imageGeneration.models': 'Model Toggles',
     'imageGeneration.save': 'Save Configuration',
     'imageGeneration.test': 'Test Connection',
+    'imageGeneration.testRunning': 'Testing...',
+    'imageGeneration.testStarted': 'Testing the image backend; some models may take several minutes',
+    'imageGeneration.testFail': 'Image generation connection test failed',
+    'imageGeneration.noGenerator': 'Save the image backend configuration first',
     'imageGeneration.backendType': 'Backend Type',
     'imageGeneration.existingModel': 'Existing Provider Model',
     'imageGeneration.externalModel': 'External Model',
@@ -2004,13 +2012,47 @@ function renderImageGeneration() {
         '<div class="form-group"><label>' + t('imageGeneration.model') + '</label><input id="imageModel"></div></div>' +
         '<div class="form-group"><label>' + t('imageGeneration.timeout') + '</label><input type="number" id="imageTimeout" value="' + (active.timeout || 180) + '" min="1" max="3600"></div>' +
         '<div class="form-group"><label><input type="checkbox" id="imageEnabled"' + (active.enabled === false ? '' : ' checked') + '> ' + t('imageGeneration.enabled') + '</label></div>' +
-        '<div class="form-actions"><button class="btn btn-secondary" onclick="testImageGeneration()">' + t('imageGeneration.test') + '</button><button class="btn btn-primary" onclick="saveImageGeneration()">' + t('imageGeneration.save') + '</button></div>' +
+        '<div class="form-actions"><button class="btn btn-secondary" id="imageGenerationTestBtn" onclick="testImageGeneration(this)">' + t('imageGeneration.test') + '</button><button class="btn btn-primary" onclick="saveImageGeneration()">' + t('imageGeneration.save') + '</button></div>' +
         '</div></div></div>';
     html += '<div class="preprocessor-models-col"><div class="section-sub-header"><h3>' + t('imageGeneration.models') + '</h3></div>';
-    if (!imageGenerationData.models.length) html += '<div class="empty-state"><p>' + t('preprocessors.modelsEmpty') + '</p></div>';
-    imageGenerationData.models.forEach(function(m) {
-        html += '<div class="model-toggle-item"><div class="model-toggle-info"><span class="model-toggle-name">' + escHtml(m.provider_name + '/' + m.model_id) + '</span><span class="model-toggle-status ' + (m.image_generation ? 'on' : 'off') + '">' + (m.image_generation ? t('imageGeneration.on') : t('imageGeneration.off')) + '</span></div><label class="toggle-switch"><input type="checkbox" ' + (m.image_generation ? 'checked' : '') + ' onchange="toggleModelImageGeneration(\'' + jsEsc(m.provider_model) + '\', this.checked)"><span class="toggle-slider"></span></label></div>';
-    });
+    if (!imageGenerationData.models.length) {
+        html += '<div class="empty-state"><div class="empty-icon">&#128269;</div><p>' + t('preprocessors.modelsEmpty') + '</p></div>';
+    } else {
+        var groupedModels = {};
+        imageGenerationData.models.forEach(function(model) {
+            var providerKey = model.provider_id || model.provider_name || '-';
+            if (!groupedModels[providerKey]) {
+                groupedModels[providerKey] = {
+                    name: model.provider_name || model.provider_id || '-',
+                    models: []
+                };
+            }
+            groupedModels[providerKey].models.push(model);
+        });
+        Object.keys(groupedModels).sort(function(left, right) {
+            return groupedModels[left].name.localeCompare(groupedModels[right].name);
+        }).forEach(function(providerKey) {
+            var group = groupedModels[providerKey];
+            html += '<div class="model-group glass">' +
+                '<div class="model-group-header">' +
+                    '<span class="model-group-title">' + escHtml(group.name) + '</span>' +
+                    '<span class="model-group-count">' + group.models.length + ' ' + t('models.count') + '</span>' +
+                '</div><div class="model-group-list">';
+            group.models.forEach(function(model) {
+                html += '<div class="model-toggle-item">' +
+                    '<div class="model-toggle-info">' +
+                        '<span class="model-toggle-name">' + escHtml(model.model_id) + '</span>' +
+                        '<span class="model-toggle-status ' + (model.image_generation ? 'on' : 'off') + '">' +
+                            (model.image_generation ? t('imageGeneration.on') : t('imageGeneration.off')) +
+                        '</span>' +
+                    '</div><label class="toggle-switch">' +
+                        '<input type="checkbox" ' + (model.image_generation ? 'checked' : '') +
+                            ' onchange="toggleModelImageGeneration(\'' + jsEsc(model.provider_model) + '\', this.checked)">' +
+                        '<span class="toggle-slider"></span></label></div>';
+            });
+            html += '</div></div>';
+        });
+    }
     html += '</div></div>';
     container.innerHTML = html;
     if (active.backend_type) document.getElementById('imageBackendType').value = active.backend_type === 'openai_images' ? 'existing_model' : active.backend_type;
@@ -2037,11 +2079,23 @@ async function saveImageGeneration() {
     } catch (e) { toast(t('imageGeneration.saveFail') + ': ' + e.message, 'error'); }
 }
 
-async function testImageGeneration() {
+async function testImageGeneration(btn) {
     var id = Object.keys(imageGenerationData.generators)[0] || '';
-    if (!id) { toast(t('imageGeneration.saveFail'), 'error'); return; }
-    try { var result = await api('/admin/image-generation/test', { method: 'POST', body: JSON.stringify({ generator_id: id }) }); showTestResult(t('imageGeneration.title'), result); }
-    catch (e) { toast(t('imageGeneration.loadFail') + ': ' + e.message, 'error'); }
+    if (!id) { toast(t('imageGeneration.noGenerator'), 'error'); return; }
+    var oldText = btn ? btn.textContent : '';
+    if (btn) { btn.disabled = true; btn.textContent = t('imageGeneration.testRunning'); }
+    toast(t('imageGeneration.testStarted'), 'info');
+    try {
+        var result = await api('/admin/image-generation/test', {
+            method: 'POST',
+            body: JSON.stringify({ generator_id: id })
+        });
+        showTestResult(t('testResult.title') + ' - ' + t('imageGeneration.title'), result);
+    } catch (e) {
+        toast(t('imageGeneration.testFail') + ': ' + e.message, 'error');
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = oldText || t('imageGeneration.test'); }
+    }
 }
 
 async function toggleModelImageGeneration(providerModel, enabled) {

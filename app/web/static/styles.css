@@ -427,6 +427,12 @@ a.icon-btn { text-decoration: none; }
   letter-spacing: 0.2px;
 }
 .btn:active { transform: scale(0.97); }
+.btn:disabled {
+  opacity: 0.6;
+  cursor: wait;
+  pointer-events: none;
+  transform: none;
+}
 
 .btn-primary {
   background: var(--accent);
