@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 from app.core.output import InternalOutputEvent
 from app.core.streaming import record_streaming_events, stream_internal_output
 from app.adapters.streaming import iter_stream_async
+from app.services.logger import get_request_id, set_request_id
 
 
 async def _collect_events(events):
@@ -40,6 +41,20 @@ async def test_iter_stream_async_accepts_litellm_style_iterable_without_close(mo
 
     assert received == ["one", "two"]
     assert warnings == []
+
+
+@pytest.mark.asyncio
+async def test_iter_stream_async_propagates_request_id_to_worker_thread():
+    set_request_id("stream-request-123")
+    seen = []
+
+    def stream():
+        seen.append(get_request_id())
+        yield "ok"
+
+    received = [chunk async for chunk in iter_stream_async(stream)]
+    assert received == ["ok"]
+    assert seen == ["stream-request-123"]
 
 
 # --- record_streaming_events ---

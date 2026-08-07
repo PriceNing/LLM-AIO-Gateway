@@ -2,9 +2,14 @@
 
 import base64
 import binascii
+import asyncio
+import email.utils
+import ipaddress
 import math
 import mimetypes
 import re
+import socket
+import time
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlparse
@@ -12,6 +17,35 @@ from urllib.parse import urlparse
 import httpx
 
 from app.database import parse_model_id
+
+
+class ImageBackendHTTPError(ValueError):
+    """HTTP failure from an image backend with retry-relevant metadata."""
+
+    def __init__(self, status_code: int, detail: str = "", retry_after: float | None = None):
+        suffix = f": {detail}" if detail else ""
+        super().__init__(f"image backend returned HTTP {status_code}{suffix}")
+        self.status_code = int(status_code)
+        self.detail = detail
+        self.retry_after = retry_after
+
+
+def _retry_after_seconds(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        pass
+    try:
+        parsed = email.utils.parsedate_to_datetime(value)
+        return max(0.0, parsed.timestamp() - time.time())
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _is_transient_status(status_code: int) -> bool:
+    return status_code == 429 or status_code in {500, 502, 503, 504}
 
 
 @dataclass
@@ -26,6 +60,7 @@ class ImageGenerationResult:
     output_format: str | None = None
     background: str | None = None
     usage: dict[str, Any] = field(default_factory=dict)
+    backend_attempts: int = 1
 
 
 def images_url(api_base: str) -> str:
@@ -106,19 +141,72 @@ def _grok_image_options(size: str | None) -> dict[str, str]:
     return {"aspect_ratio": ratio, "resolution": "2k" if max(width, height) > 1024 else "1k"}
 
 
-async def _download_image(client: httpx.AsyncClient, url: str, max_bytes: int = 25 * 1024 * 1024) -> tuple[str, str]:
+def _is_public_address(value: str) -> bool:
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return not (
+        address.is_private
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_multicast
+        or address.is_reserved
+        or address.is_unspecified
+    )
+
+
+async def _validate_download_host(hostname: str, *, allow_private_hosts: bool) -> None:
+    if allow_private_hosts:
+        return
+    try:
+        addresses = await asyncio.to_thread(
+            socket.getaddrinfo,
+            hostname,
+            None,
+            type=socket.SOCK_STREAM,
+        )
+    except socket.gaierror as exc:
+        raise ValueError(f"image result host could not be resolved: {hostname}") from exc
+    resolved = {str(item[4][0]).split("%", 1)[0] for item in addresses if item[4]}
+    if not resolved or any(not _is_public_address(address) for address in resolved):
+        raise ValueError("image result URL resolves to a private or unsafe network address")
+
+
+async def _download_image(
+    client: httpx.AsyncClient,
+    url: str,
+    max_bytes: int = 25 * 1024 * 1024,
+    *,
+    allow_private_hosts: bool = False,
+) -> tuple[str, str]:
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ValueError("image result URL must use http or https")
-    response = await client.get(url, follow_redirects=False)
-    response.raise_for_status()
-    if len(response.content) > max_bytes:
-        raise ValueError("image result exceeds the configured size limit")
-    mime_type = (response.headers.get("content-type") or "").split(";", 1)[0].strip()
-    mime_type = _mime_from_bytes(response.content, mime_type or mimetypes.guess_type(parsed.path)[0] or "image/png")
+    if parsed.username or parsed.password:
+        raise ValueError("image result URL must not contain credentials")
+    await _validate_download_host(parsed.hostname or "", allow_private_hosts=allow_private_hosts)
+    limit = max(64 * 1024, min(100 * 1024 * 1024, int(max_bytes)))
+    chunks = bytearray()
+    async with client.stream("GET", url, follow_redirects=False) as response:
+        response.raise_for_status()
+        content_length = response.headers.get("content-length")
+        try:
+            declared_length = int(content_length) if content_length is not None else None
+        except (TypeError, ValueError):
+            declared_length = None
+        if declared_length is not None and declared_length > limit:
+            raise ValueError("image result exceeds the configured size limit")
+        async for chunk in response.aiter_bytes():
+            chunks.extend(chunk)
+            if len(chunks) > limit:
+                raise ValueError("image result exceeds the configured size limit")
+        mime_type = (response.headers.get("content-type") or "").split(";", 1)[0].strip()
+    data = bytes(chunks)
+    mime_type = _mime_from_bytes(data, mime_type or mimetypes.guess_type(parsed.path)[0] or "image/png")
     if not mime_type.startswith("image/"):
         raise ValueError("image result URL did not return an image")
-    return f"data:{mime_type};base64,{base64.b64encode(response.content).decode('ascii')}", mime_type
+    return f"data:{mime_type};base64,{base64.b64encode(data).decode('ascii')}", mime_type
 
 
 async def generate_images(config: dict, *, prompt: str, model: str | None = None,
@@ -152,13 +240,45 @@ async def generate_images(config: dict, *, prompt: str, model: str | None = None
     if isinstance(extra, dict):
         payload.update({k: v for k, v in extra.items() if k not in {"model", "prompt", "n", "response_format"} and v is not None})
     timeout = max(1, int(config.get("timeout") or 180))
+    max_retries = max(0, min(5, int(config["max_retries"] if "max_retries" in config else 2)))
+    retry_base = max(0.05, min(30.0, float(config["retry_base_seconds"] if "retry_base_seconds" in config else 1.0)))
+    max_retry_delay = max(retry_base, min(120.0, float(config["max_retry_delay_seconds"] if "max_retry_delay_seconds" in config else 30.0)))
+    result_max_bytes = max(
+        64 * 1024,
+        min(100 * 1024 * 1024, int(config.get("result_max_bytes") or 25 * 1024 * 1024)),
+    )
     async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await client.post(images_url(config.get("api_base") or ""), headers=_headers(config), json=payload)
-        status_code = int(getattr(response, "status_code", 200))
-        if status_code >= 400:
-            detail = response.text[:1000].strip()
-            suffix = f": {detail}" if detail else ""
-            raise ValueError(f"image backend returned HTTP {response.status_code}{suffix}")
+        response = None
+        attempts = 0
+        while True:
+            attempts += 1
+            try:
+                response = await client.post(
+                    images_url(config.get("api_base") or ""),
+                    headers=_headers(config),
+                    json=payload,
+                )
+                status_code = int(getattr(response, "status_code", 200))
+                if status_code >= 400:
+                    detail = response.text[:1000].strip()
+                    error = ImageBackendHTTPError(
+                        status_code,
+                        detail,
+                        _retry_after_seconds(getattr(response, "headers", {}).get("retry-after")),
+                    )
+                    if not _is_transient_status(status_code) or attempts > max_retries:
+                        raise error
+                    delay = error.retry_after
+                    if delay is None:
+                        delay = min(max_retry_delay, retry_base * (2 ** (attempts - 1)))
+                    await asyncio.sleep(delay)
+                    continue
+                break
+            except (httpx.TimeoutException, httpx.TransportError):
+                if attempts > max_retries:
+                    raise
+                await asyncio.sleep(min(max_retry_delay, retry_base * (2 ** (attempts - 1))))
+        assert response is not None
         body = response.json()
         results: list[ImageGenerationResult] = []
         for item in body.get("data") or []:
@@ -166,17 +286,27 @@ async def generate_images(config: dict, *, prompt: str, model: str | None = None
                 continue
             revised = item.get("revised_prompt")
             if item.get("b64_json"):
+                encoded_image = str(item["b64_json"])
+                if len(encoded_image) > ((result_max_bytes + 2) // 3) * 4 + 4:
+                    raise ValueError("image backend result exceeds the configured size limit")
                 try:
-                    raw = base64.b64decode(str(item["b64_json"]), validate=True)
+                    raw = base64.b64decode(encoded_image, validate=True)
                 except (binascii.Error, ValueError, TypeError):
                     raise ValueError("image backend returned invalid base64 data") from None
+                if len(raw) > result_max_bytes:
+                    raise ValueError("image backend result exceeds the configured size limit")
                 mime_type = _mime_from_bytes(raw)
-                data_uri = _data_uri(str(item["b64_json"]), mime_type)
+                data_uri = _data_uri(encoded_image, mime_type)
             elif item.get("url"):
-                data_uri, mime_type = await _download_image(client, str(item["url"]))
+                data_uri, mime_type = await _download_image(
+                    client,
+                    str(item["url"]),
+                    max_bytes=result_max_bytes,
+                    allow_private_hosts=bool(config.get("allow_private_download_hosts", False)),
+                )
             else:
                 continue
-            results.append(ImageGenerationResult(data_uri=data_uri, mime_type=mime_type, revised_prompt=revised, size=size, quality=quality, output_format=output_format, background=background, usage=body.get("usage") or {}))
+            results.append(ImageGenerationResult(data_uri=data_uri, mime_type=mime_type, revised_prompt=revised, size=size, quality=quality, output_format=output_format, background=background, usage=body.get("usage") or {}, backend_attempts=attempts))
         if not results:
             raise RuntimeError("image backend returned no image data")
         return results

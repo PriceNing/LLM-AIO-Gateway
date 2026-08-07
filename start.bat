@@ -20,17 +20,27 @@ if not exist "%VENV_PYTHON%" (
 )
 
 rem Keep an existing virtual environment in sync with requirements.txt.
-rem This is required when new runtime dependencies, such as Pillow, are added.
-%VENV_PYTHON% -c "import PIL" >nul 2>&1
+set "REQUIREMENTS_MARKER=venv\.requirements.sha256"
+set "REQUIREMENTS_HASH="
+for /f %%H in ('%VENV_PYTHON% -c "import hashlib; print(hashlib.sha256(open('requirements.txt','rb').read()).hexdigest())"') do set "REQUIREMENTS_HASH=%%H"
+set "INSTALLED_HASH="
+if exist "%REQUIREMENTS_MARKER%" set /p INSTALLED_HASH=<"%REQUIREMENTS_MARKER%"
+if not "%REQUIREMENTS_HASH%"=="%INSTALLED_HASH%" goto :install_dependencies
+%VENV_PYTHON% -c "import fastapi, uvicorn, pydantic, litellm, multipart, httpx, anyio, PIL" >nul 2>&1
+if errorlevel 1 goto :install_dependencies
+goto :dependencies_ready
+
+:install_dependencies
+echo [INFO] Installing or updating dependencies...
+%VENV_PYTHON% -m pip install -r requirements.txt
 if errorlevel 1 (
-    echo [INFO] Installing or updating dependencies...
-    %VENV_PYTHON% -m pip install -r requirements.txt
-    if errorlevel 1 (
-        echo [ERROR] pip install failed. Check network or requirements.txt.
-        pause
-        exit /b 1
-    )
+    echo [ERROR] pip install failed. Check network or requirements.txt.
+    pause
+    exit /b 1
 )
+>"%REQUIREMENTS_MARKER%" echo %REQUIREMENTS_HASH%
+
+:dependencies_ready
 
 echo [INFO] Starting LLM Gateway...
 echo [INFO] Admin UI: http://localhost:8000

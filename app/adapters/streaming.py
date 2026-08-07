@@ -4,7 +4,7 @@ import threading
 
 import anyio
 
-from app.services.logger import get_logger
+from app.services.logger import get_logger, get_request_id, set_request_id
 
 
 _app_log = get_logger("app")
@@ -14,6 +14,7 @@ _STREAM_SENTINEL = object()
 
 async def iter_stream_async(stream_func):
     """Iterate a sync generator in a background thread without blocking the event loop."""
+    request_id = get_request_id()
     chunk_queue = queue.Queue()
     error = None
     done = threading.Event()
@@ -23,6 +24,10 @@ async def iter_stream_async(stream_func):
 
     def _run():
         nonlocal error, stream_gen
+        # ContextVars do not automatically cross into manually-created
+        # threads. Preserve the HTTP request ID so upstream stream errors
+        # written by this worker can be correlated with access/app logs.
+        set_request_id(request_id)
         try:
             stream_gen = stream_func()
             chunk_idx = 0

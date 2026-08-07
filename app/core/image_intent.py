@@ -6,10 +6,29 @@ import re
 from typing import Any
 
 
-_CN_IMAGE_WORDS = ("图片", "图像", "照片", "插画", "海报", "头像", "壁纸", "图")
+_CN_IMAGE_WORDS = ("图片", "图像", "照片", "插画", "海报", "头像", "壁纸", "素材")
 _CN_ACTION_WORDS = ("生成", "画", "绘制", "制作", "创建", "做一张", "出图", "生图")
 _EN_IMAGE_WORDS = ("image", "picture", "photo", "illustration", "poster", "wallpaper", "avatar")
 _EN_ACTION_RE = re.compile(r"\b(?:generate|draw|create|make|render|illustrate)\b", re.IGNORECASE)
+_NEGATED_IMAGE_REQUEST_RE = re.compile(
+    r"(?:不要|无需|不需要|禁止|别)\s*(?:生成|画|绘制|制作|创建|生图)|"
+    r"\b(?:do\s+not|don't|never|without)\s+(?:generate|draw|create|make|render|illustrate)\b",
+    re.IGNORECASE,
+)
+_IMAGE_DISCUSSION_RE = re.compile(
+    r"(?:如何|怎么|为什么|为何|是否|能否|可否|请解释|介绍一下).{0,24}(?:图片|图像|照片|生图)|"
+    r"\b(?:how|why|whether|explain|describe|documentation|api)\b.{0,40}"
+    r"(?:image|picture|photo|illustration|image[ _-]?generation)",
+    re.IGNORECASE,
+)
+_IMAGE_UI_COMPONENT_RE = re.compile(
+    r"\bimage\s+(?:upload|input|picker|viewer|preview|editor|component|field|button|endpoint|api|model|tool)\b",
+    re.IGNORECASE,
+)
+_CN_STANDALONE_IMAGE_RE = re.compile(
+    r"(?:生成|画|绘制|制作|创建|做|出)\s*(?:一|两|三|四|五|六|七|八|九|十|\d+)?\s*"
+    r"(?:张|幅|个)?\s*图(?:\s|$|[，。！？,.!?])"
+)
 
 
 def _text_from_item(item: Any) -> str:
@@ -55,7 +74,16 @@ def is_image_generation_intent(input_data: Any, instructions: Any = "") -> bool:
         text = f"{instructions.strip()}\n{text}" if text else instructions.strip()
     if not text:
         return False
+    if _NEGATED_IMAGE_REQUEST_RE.search(text) or _IMAGE_DISCUSSION_RE.search(text):
+        return False
     lowered = text.lower()
-    if any(action in text for action in _CN_ACTION_WORDS) and any(word in text for word in _CN_IMAGE_WORDS):
+    if (
+        any(action in text for action in _CN_ACTION_WORDS)
+        and (any(word in text for word in _CN_IMAGE_WORDS) or _CN_STANDALONE_IMAGE_RE.search(text))
+    ):
         return True
-    return bool(_EN_ACTION_RE.search(text) and any(word in lowered for word in _EN_IMAGE_WORDS))
+    return bool(
+        _EN_ACTION_RE.search(text)
+        and any(word in lowered for word in _EN_IMAGE_WORDS)
+        and not _IMAGE_UI_COMPONENT_RE.search(text)
+    )

@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Codex-compatible image generation through `/responses` and `/images/generations`, with batch execution, short-lived originals, compressed previews, idempotent retries, and image statistics.
+- Configurable request-log payload capture and structured secret redaction.
+- Admin login attempt throttling and image-result download network/size safeguards.
+
+### Changed
+- Production startup now disables Uvicorn reload unless `reload` is explicitly enabled.
+- Provider model discovery follows paginated model lists before replacing stored models.
+- Live evaluation tools and examples use UTF-8 and their current `tools/live_eval/` paths.
+
+## [0.9.0] - 2026-08-04
+
+### Added
+- Global image-generation backend configuration and per-chat-model image-generation switches.
+- Generated-image request logging and usage statistics in the admin interface.
+
+## [0.8.4] - 2026-08-02
+
+### Changed
+- Routing, streaming fallback, and Responses compatibility fixes.
+
 ## [0.1.0] - 2026-06-01
 
 ### Added

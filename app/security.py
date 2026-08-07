@@ -11,6 +11,43 @@ from app.config import get_default
 _sessions: dict[str, dict] = {}
 _sessions_lock = threading.Lock()
 SESSION_TTL_HOURS = get_default("session_ttl_hours", 12)
+_login_attempts: dict[str, list[float]] = {}
+_login_blocked_until: dict[str, float] = {}
+_login_attempts_lock = threading.Lock()
+_login_last_prune = 0.0
+
+
+def _prune_login_throttle_locked(now: float, window: int, max_identities: int) -> None:
+    """Expire stale identities and cap memory used by attacker-controlled keys."""
+    global _login_last_prune
+    if now - _login_last_prune >= min(30, window):
+        for identity, values in list(_login_attempts.items()):
+            recent = [value for value in values if now - value <= window]
+            if recent:
+                _login_attempts[identity] = recent
+            else:
+                _login_attempts.pop(identity, None)
+        for identity, blocked_until in list(_login_blocked_until.items()):
+            if blocked_until <= now:
+                _login_blocked_until.pop(identity, None)
+        _login_last_prune = now
+
+    # An identity moves from attempts to blocked state, so these mappings are
+    # disjoint during normal operation and their lengths can be added cheaply.
+    overflow = len(_login_attempts) + len(_login_blocked_until) - max_identities
+    if overflow <= 0:
+        return
+    identities = set(_login_attempts) | set(_login_blocked_until)
+    oldest = sorted(
+        identities,
+        key=lambda identity: max(
+            _login_attempts.get(identity, [0.0])[-1],
+            _login_blocked_until.get(identity, 0.0),
+        ),
+    )
+    for identity in oldest[:overflow]:
+        _login_attempts.pop(identity, None)
+        _login_blocked_until.pop(identity, None)
 
 
 def hash_password(password: str, salt: Optional[str] = None) -> str:
@@ -63,6 +100,46 @@ def get_session_username(token: str) -> Optional[str]:
 def delete_session(token: str) -> None:
     with _sessions_lock:
         _sessions.pop(token, None)
+
+
+def login_retry_after(identity: str) -> int:
+    """Return lockout seconds remaining for an admin login identity."""
+    now = _time.monotonic()
+    window = max(10, int(get_default("login_attempt_window_seconds", 300)))
+    max_identities = max(100, int(get_default("login_attempt_max_identities", 10000)))
+    with _login_attempts_lock:
+        _prune_login_throttle_locked(now, window, max_identities)
+        blocked_until = _login_blocked_until.get(identity, 0.0)
+        if blocked_until <= now:
+            _login_blocked_until.pop(identity, None)
+            return 0
+        return max(1, int(blocked_until - now))
+
+
+def record_login_failure(identity: str) -> int:
+    now = _time.monotonic()
+    window = max(10, int(get_default("login_attempt_window_seconds", 300)))
+    limit = max(1, int(get_default("login_attempt_limit", 10)))
+    lockout = max(10, int(get_default("login_lockout_seconds", 900)))
+    max_identities = max(100, int(get_default("login_attempt_max_identities", 10000)))
+    with _login_attempts_lock:
+        _prune_login_throttle_locked(now, window, max_identities)
+        recent = [value for value in _login_attempts.get(identity, []) if now - value <= window]
+        recent.append(now)
+        _login_attempts[identity] = recent
+        if len(recent) >= limit:
+            _login_attempts.pop(identity, None)
+            _login_blocked_until[identity] = now + lockout
+            _prune_login_throttle_locked(now, window, max_identities)
+            return lockout
+        _prune_login_throttle_locked(now, window, max_identities)
+    return 0
+
+
+def clear_login_failures(identity: str) -> None:
+    with _login_attempts_lock:
+        _login_attempts.pop(identity, None)
+        _login_blocked_until.pop(identity, None)
 
 
 _stop_cleanup = threading.Event()

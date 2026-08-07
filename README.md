@@ -18,6 +18,7 @@ LLM AIO Gateway 是一个基于 FastAPI 的统一 LLM API 网关，用一个服�
 | 共享 IR 流程 | 路由、预处理、reasoning 缓存、工具修复、断路器都运行在统一内部消息上，避免端点各自维护转换逻辑。 |
 | 结构化路由 | 策略层返回 `RoutingDecision`，记录 requested/resolved/target model、目标 provider、命中的规则和原因。 |
 | 视觉模型注入 | 图片可先由配置的视觉模型生成描述，再替换为文本，让纯文本模型也能处理图片上下文。 |
+| 图像生成网关 | 支持 `/images/generations`、Codex `/responses` 生图工具桥接、原图短期存储、压缩缩略图、批量生成和生图统计。 |
 | 工具调用可靠性 | 保留工具调用 ID，修复 malformed JSON 工具参数，并提供工具调用循环断路器。 |
 | Reasoning 连续性 | 对 DeepSeek 等 thinking 模型自动缓存和回传 `reasoning_content`，保证多轮工具调用不中断。 |
 | Web 管理面板 | 管理提供商、用户、API Key、路由规则、模型预处理器和调用统计。 |
@@ -86,6 +87,7 @@ docker compose up -d
 | `POST /v1/completions` | OpenAI 旧版 Completions | `prompt` 会包装成内部 user message，再渲染为 `choices[0].text`。 |
 | `POST /v1/messages` | Anthropic Messages | Claude Code 兼容 Messages API，支持工具、流式、图片。 |
 | `POST /v1/responses` 或 `/responses` | OpenAI Responses | Codex 兼容 Responses API，支持工具、流式、previous response ID。 |
+| `POST /v1/images/generations` 或 `/images/generations` | OpenAI Images | 将 OpenAI Images 兼容请求发送至管理员配置的全局生图后端。 |
 | `GET /v1/models` | OpenAI Models | 返回当前 API Key 可用模型列表。 |
 
 ### Chat Completions 示例
@@ -145,6 +147,12 @@ curl http://localhost:8000/v1/responses \
 
 在管理面板的“视觉模型注入”页面添加预处理器，然后为目标模型开启预处理器。预处理器配置和模型开关存储在 SQLite 数据库中，不再写入 `config.json`。是否预处理取决于用户请求的原始模型，而不是路由后的目标模型。
 
+## 图像生成
+
+图像生成与视觉模型注入是两个独立功能。在管理面板的“图像生成”页面选择一个全局生图后端，再为允许调用生图的聊天模型开启开关。用户能够访问模型 A 且模型 A 已开启生图时，该请求可调用当前全局生图后端；无需把全局生图模型单独加入用户的聊天模型白名单。
+
+当前版本支持已有提供商模型和外部 OpenAI Images 兼容后端。ComfyUI 作为后续可替换后端预留，当前尚未实现。Codex 可通过 `/responses` 工具桥接或 `/images/generations` 调用生图；网关保存短期原图，并向客户端返回受限大小的预览。
+
 ## 路由规则
 
 路由规则可按用户名、API Key 子串、请求模型通配符透明重定向请求。第一条匹配规则生效。
@@ -165,9 +173,9 @@ curl http://localhost:8000/v1/responses \
 }
 ```
 
-Routing rules only describe active routing. Passive fallback is configured separately in `fallback_policies`: match the routed provider/model plus a failure trigger such as `timeout`, `connection_error`, `http_429`, or `http_5xx`, then try the configured fallback chain. The admin UI provides a dedicated fallback policy editor, so users do not need to write JSON in a routing rule.
+路由规则只描述主动路由。被动 fallback 在 `fallback_policies` 中单独配置：根据路由后的 provider/model 和 `timeout`、`connection_error`、`http_429`、`http_5xx` 等失败类型匹配，再依次尝试 fallback 链。管理面板提供独立编辑器，无需在路由规则里手写 JSON。
 
-The request pipeline is: ingress -> vision preprocessing based on the requested model -> active routing -> primary upstream call -> passive fallback on classified failure -> egress. Logs are emitted at each key stage (`preprocess.*`, `routing`, `upstream.primary.*`, `fallback.*`) so route and fallback decisions can be inspected after the fact.
+请求流程为：入口协议 -> 按原始请求模型进行视觉预处理 -> 主动路由 -> 主上游调用 -> 分类失败后的被动 fallback -> 出口协议。关键阶段会记录 `preprocess.*`、`routing`、`upstream.primary.*`、`fallback.*` 日志。
 
 管理接口提供 `POST /admin/routing-rules/dry-run` 用于检查某个用户、API Key 片段和请求模型会命中哪条主动路由规则。Fallback 已拆成独立策略，可通过 `POST /admin/fallback-policies/dry-run` 按 provider、model 和失败类型检查会使用哪条 fallback 链。提供商页面也提供健康检查入口，对 `/models` 可用性、延迟和模型数量做快速探测。
 
@@ -188,6 +196,13 @@ The request pipeline is: ingress -> vision preprocessing based on the requested 
 | `tool_only_turns_ttl` | 600 | 工具调用计数 TTL，单位秒。 |
 | `tool_only_turns_max_size` | 2000 | 工具调用计数容量。 |
 | `image_cache_max_size` | 500 | 图片描述缓存容量。 |
+| `request_log_capture_payloads` | true | 是否保存请求和响应正文；关闭后只记录元数据。 |
+| `login_attempt_max_identities` | 10000 | 管理员登录限流状态最多保留的身份数量。 |
+| `image_result_ttl_seconds` | 86400 | 生图原图的保留时间。 |
+| `image_preview_max_bytes` | 800000 | 单张内联缩略图的目标字节上限。 |
+| `image_generation_batch_concurrency` | 1 | 单个生图批次的并发数。 |
+| `image_generation_result_max_bytes` | 26214400 | 单张上游图像的最大字节数。 |
+| `image_download_allow_private_hosts` | false | 是否允许从私网地址下载上游返回的图像 URL。 |
 
 ## 架构摘要
 
@@ -213,6 +228,10 @@ The request pipeline is: ingress -> vision preprocessing based on the requested 
 | `app/core/state.py` | TTL cache、reasoning cache、tool-only counter、response chain cache。 |
 | `app/core/streaming.py` | 流式事件计量、reasoning 存储、tool-only 计数、流式错误渲染和统计回调。 |
 | `app/core/images.py` | data URI 图片提取、图片内容检测和 OpenAI 图像内容归一化。 |
+| `app/adapters/imagegen.py` | OpenAI Images 兼容生图后端、参数兼容、重试和结果下载。 |
+| `app/core/image_bridge.py` | Codex `/responses` 生图工具发现、调用解析与素材交接。 |
+| `app/core/image_results.py` | 原图存储、缩略图压缩和安全下载令牌。 |
+| `app/core/image_batch.py` | 生图批次的并发协调和短期幂等复用。 |
 | `app/adapters/` | 将内部请求投递给 OpenAI/liteLLM 或 direct Anthropic Messages，并转回内部输出事件。 |
 | `app/protocols/egress.py` | 将内部输出渲染回 Chat、Completions、Messages、Responses 协议。 |
 | `app/services/lite_llm.py` | 仅作为 OpenAI 兼容上游的 liteLLM wrapper 和最小 reasoning 兼容补丁。 |
@@ -223,7 +242,7 @@ The request pipeline is: ingress -> vision preprocessing based on the requested 
 pytest tests/ -q
 ```
 
-当前预期结果：`334 passed`。
+当前预期结果：`602 passed`。
 
 真实烟测建议：
 

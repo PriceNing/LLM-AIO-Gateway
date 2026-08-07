@@ -7,7 +7,23 @@ from app.services.discovery import (
     check_provider_health,
     refresh_provider_models,
 )
-from app.database import add_provider, get_provider
+from app.database import add_provider, get_provider, init_db
+
+
+@pytest.fixture(autouse=True)
+def temp_db(tmp_path):
+    """Keep provider discovery tests isolated from the developer database."""
+    import app.database as db_mod
+
+    previous_path = db_mod.DB_PATH
+    previous_initialized = db_mod._initialized
+    db_mod._initialized = False
+    init_db(str(tmp_path / "discovery.db"))
+    try:
+        yield
+    finally:
+        db_mod.DB_PATH = previous_path
+        db_mod._initialized = previous_initialized
 
 
 def test_anthropic_model_urls_add_v1_when_missing():
@@ -211,3 +227,54 @@ async def test_refresh_provider_models_replaces_stale_models(monkeypatch):
     assert models["renamed-model"]["name"] == "After"
     assert models["renamed-model"]["enabled"] is False
     assert models["new-model"]["enabled"] is True
+
+
+@pytest.mark.asyncio
+async def test_discover_models_follows_anthropic_pagination(monkeypatch):
+    from app.services.discovery import discover_models
+
+    add_provider({
+        "id": "paged-anthropic",
+        "name": "Paged Anthropic",
+        "provider_type": "anthropic",
+        "api_base": "https://api.example/v1",
+        "api_key": "sk-test",
+        "enabled": True,
+        "models": [],
+    })
+    calls = []
+
+    class Response:
+        status_code = 200
+
+        def __init__(self, payload):
+            self.payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.payload
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url, **kwargs):
+            calls.append(kwargs.get("params"))
+            if kwargs.get("params"):
+                return Response({"data": [{"id": "model-2"}], "has_more": False})
+            return Response({"data": [{"id": "model-1"}], "has_more": True, "last_id": "model-1"})
+
+    monkeypatch.setattr("app.services.discovery.httpx.AsyncClient", Client)
+
+    models = await discover_models("paged-anthropic")
+
+    assert [model["id"] for model in models] == ["model-1", "model-2"]
+    assert calls == [None, {"after_id": "model-1"}]

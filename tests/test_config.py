@@ -1,7 +1,7 @@
 import pytest
 from datetime import datetime, timezone
 from app.config import ConfigManager
-from app.services.logger import LogManager
+from app.services.logger import LogManager, SafeFileHandler
 
 
 def test_main_uses_configured_host_port_for_uvicorn(monkeypatch, tmp_path):
@@ -28,6 +28,23 @@ def test_main_uses_configured_host_port_for_uvicorn(monkeypatch, tmp_path):
     assert captured["app_path"] == "main:app"
     assert captured["host"] == "127.0.0.2"
     assert captured["port"] == 8765
+    assert captured["reload"] is False
+
+
+def test_main_allows_explicit_development_reload(monkeypatch, tmp_path):
+    import runpy
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        '{"host":"127.0.0.1","port":8765,"reload":true,"database":"test.db"}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("LLM_GATEWAY_CONFIG", str(config_path))
+    captured = {}
+    monkeypatch.setattr("uvicorn.run", lambda app_path, **kwargs: captured.update(kwargs))
+
+    runpy.run_path("main.py", run_name="__main__")
+
     assert captured["reload"] is True
 
 
@@ -88,3 +105,24 @@ def test_logger_recreates_missing_log_dir(tmp_path):
 
     assert day_dir.exists()
     assert (day_dir / "app.log").exists()
+
+
+def test_logger_rolls_long_lived_handler_to_new_utc_day(tmp_path, monkeypatch):
+    log_root = tmp_path / "logs"
+    mgr = LogManager()
+    mgr.configure({
+        "enabled": True,
+        "level": "INFO",
+        "log_dir": str(log_root),
+        "retention_days": 30,
+        "console": False,
+    })
+    logger = mgr.get_logger("access")
+    handler = next(h for h in logger.handlers if isinstance(h, SafeFileHandler))
+    monkeypatch.setattr(handler, "_current_day", lambda: "2099-01-02")
+
+    logger.info("after rollover")
+
+    rolled = log_root / "2099-01-02" / "access.log"
+    assert rolled.exists()
+    assert "after rollover" in rolled.read_text(encoding="utf-8")

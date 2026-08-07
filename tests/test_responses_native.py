@@ -13,6 +13,7 @@ from app.router.proxy import (
     _responses_required_tool_types,
     _native_response_target_supported,
     _native_downgrade_details,
+    _wait_for_native_response_output,
 )
 from app.core.policy import RouteTarget
 from app.config import load_config
@@ -126,7 +127,7 @@ async def test_real_native_request_promotes_unknown_model_without_background_pro
         "models": [{"id": "gpt-5.6-luna"}],
     })
     async def fake_post(provider, internal):
-        return {"object": "response", "id": "resp_pixel", "output": []}
+        return {"object": "response", "id": "resp_pixel", "output": [{"type": "message"}]}
     monkeypatch.setattr("app.router.proxy.post_native_response", fake_post)
     internal = responses_to_internal({"model": "gpt-5.6-luna", "input": "hello"})
     internal.provider_id = "pixel"
@@ -291,7 +292,8 @@ async def test_completed_native_stream_marks_model_responses_supported(monkeypat
     })
 
     async def events():
-        yield b'data: {"type":"response.completed","response":{"id":"resp_1","usage":{"total_tokens":1}}}\n\n'
+        yield b'data: {"type":"response.output_item.done","item":{"type":"message"}}\n\n'
+        yield b'data: {"type":"response.completed","response":{"id":"resp_1","output":[{"type":"message"}],"usage":{"total_tokens":1}}}\n\n'
 
     monkeypatch.setattr("app.router.proxy._log_request", lambda *_args, **_kwargs: None)
     monkeypatch.setattr("app.router.proxy._record_request_log", lambda **_kwargs: None)
@@ -305,6 +307,23 @@ async def test_completed_native_stream_marks_model_responses_supported(monkeypat
     capability = get_model_responses_capability("pixel", "gpt-5.6-luna")
     assert capability["responses_status"] == "supported"
     assert capability["responses_streaming"] is True
+
+
+@pytest.mark.asyncio
+async def test_empty_completed_native_stream_is_rejected(monkeypatch):
+    add_provider({
+        "id": "pixel-empty", "name": "Pixel", "provider_type": "openai",
+        "api_base": "https://pixel.invalid/v1", "api_key": "key",
+        "models": [{"id": "empty-model"}],
+    })
+
+    async def events():
+        yield b'data: {"type":"response.created","response":{"id":"resp_empty"}}\n\n'
+        yield b'data: {"type":"response.completed","response":{"id":"resp_empty","output":[],"usage":{"total_tokens":1}}}\n\n'
+
+    with pytest.raises(RuntimeError, match="client-visible output"):
+        await _wait_for_native_response_output(events())
+    assert get_model_responses_capability("pixel-empty", "empty-model")["responses_status"] == "unknown"
 
 
 @pytest.mark.asyncio
@@ -331,7 +350,7 @@ async def test_native_fallback_is_used_when_primary_lacks_responses_capability(m
 
     async def fake_post(provider, internal):
         calls.append((provider["id"], internal.target_model))
-        return {"object": "response", "id": "resp_fallback", "output": []}
+        return {"object": "response", "id": "resp_fallback", "output": [{"type": "computer_call"}]}
 
     monkeypatch.setattr("app.router.proxy.post_native_response", fake_post)
     internal = responses_to_internal({
@@ -390,7 +409,7 @@ async def test_unknown_same_model_native_fallback_is_probed_then_used(monkeypatc
     async def fake_post(provider, internal):
         if provider["id"] == "native-primary-fail":
             raise httpx.HTTPStatusError("bad gateway", request=httpx.Request("POST", "https://primary.invalid"), response=httpx.Response(502, request=httpx.Request("POST", "https://primary.invalid")))
-        return {"object": "response", "id": "resp_probed", "output": []}
+        return {"object": "response", "id": "resp_probed", "output": [{"type": "message"}]}
 
     monkeypatch.setattr("app.router.proxy.post_native_response", fake_post)
     internal = responses_to_internal({"model": "shared-model", "input": "hello"})
@@ -438,7 +457,7 @@ async def test_native_fallback_keeps_administrator_chain_order(monkeypatch):
         if provider["id"] in {"order-primary", "order-first"}:
             request = httpx.Request("POST", "https://example.invalid/responses")
             raise httpx.HTTPStatusError("bad gateway", request=request, response=httpx.Response(502, request=request))
-        return {"object": "response", "id": "resp_order", "output": []}
+        return {"object": "response", "id": "resp_order", "output": [{"type": "message"}]}
 
     monkeypatch.setattr("app.router.proxy.post_native_response", fake_post)
     internal = responses_to_internal({"model": "primary-model", "input": "hello"})
@@ -475,7 +494,7 @@ async def test_stateful_request_attempts_unknown_primary_before_any_cross_provid
     })
     internal.provider_id = "stateful-unknown-primary"
     async def fake_post(provider, internal):
-        return {"object": "response", "id": "resp_stateful_compat", "output": []}
+        return {"object": "response", "id": "resp_stateful_compat", "output": [{"type": "message"}]}
     # Unknown is intentionally request-driven: the real user request first
     # verifies the selected target rather than preemptively moving a stateful
     # turn to another provider.

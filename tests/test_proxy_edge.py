@@ -1598,7 +1598,7 @@ def test_chat_completions_stream_logs_fallback_target_model(monkeypatch, temp_db
     logged = []
 
     def fake_log_request(username, api_key, model, provider_id, endpoint, success, tokens, requested_model="", **kwargs):
-        logged.append((model, provider_id, endpoint, success, requested_model))
+        logged.append((model, provider_id, endpoint, success, requested_model, kwargs.get("details") or {}))
 
     async def fake_stream_events(**kwargs):
         if kwargs["provider_id"] == "primary-stream-log-fail":
@@ -1620,7 +1620,8 @@ def test_chat_completions_stream_logs_fallback_target_model(monkeypatch, temp_db
 
     assert response.status_code == 200
     assert "fallback stream response" in body
-    assert logged[-1] == ("fallback-stream-log-ok/fallback-stream-log-model", "fallback-stream-log-ok", "chat_completions", True, "stream-log-source")
+    assert logged[-1][:5] == ("fallback-stream-log-ok/fallback-stream-log-model", "fallback-stream-log-ok", "chat_completions", True, "stream-log-source")
+    assert [item["status"] for item in logged[-1][5]["fallback_attempts"]] == ["failed", "success"]
 
 
 def test_chat_completions_stream_does_not_fallback_after_output(monkeypatch, temp_db):

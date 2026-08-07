@@ -1,10 +1,13 @@
 import json
 import copy
+import hashlib
 import threading
 import time
 import uuid
 from collections import deque
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from functools import partial
 from typing import Any, Optional
 
 import anyio
@@ -13,24 +16,40 @@ from fastapi.responses import FileResponse, StreamingResponse
 from app.database import (
     get_providers, find_user_by_api_key,
     increment_global_stats, increment_image_generation_stats, increment_user_usage, get_db,
-    parse_model_id, add_request_record, add_request_log, trim_request_logs, get_enabled_preprocessor,
+    parse_model_id, add_request_record, add_request_log, update_request_log, trim_request_logs, get_enabled_preprocessor,
     get_enabled_image_generator, get_model_image_generation,
     get_model_responses_capability, set_model_responses_capability, update_model_responses_capability, update_model_responses_tool_types,
 )
 from app.core.text import friendly_error_msg, mask_key
-from app.core.image_intent import latest_user_text
+from app.core.image_intent import is_image_generation_intent, latest_user_text
 from app.core.image_bridge import (
+    GATEWAY_IMAGE_ASSET_MARKER,
     GATEWAY_IMAGE_DISPLAY_CALL_PREFIX,
+    GATEWAY_IMAGE_RESULT_MARKER,
+    IMAGE_BRIDGE_CORRECTION_INSTRUCTIONS,
     IMAGE_BRIDGE_TOOL_NAME,
     configure_internal_image_bridge,
+    gateway_generated_image_asset_context,
     has_codex_generated_image_exec_tool,
     has_codex_image_function_tool,
+    has_gateway_generated_image_history,
     image_call_arguments,
     image_call_arguments_from_exec,
+    image_call_arguments_list_from_exec,
     inject_hosted_image_capability,
     is_gateway_image_display_followup,
+    sanitize_gateway_image_display_followup,
+    sanitize_gateway_generated_image_history,
 )
-from app.core.image_results import find_image_result, image_preview_data_uri, store_image_results
+from app.core.image_results import (
+    StoredImageResult,
+    find_image_result,
+    generation_results_from_stored,
+    image_result_directory,
+    image_preview_data_uri,
+    store_image_results,
+)
+from app.core.image_batch import image_invocation_cache
 from app.core.outcome import (
     apply_outcome_to_details,
     routing_details_from_policy,
@@ -38,6 +57,7 @@ from app.core.outcome import (
     is_client_disconnect_error,
 )
 from app.core.output import InternalOutputEvent, InternalOutputMessage, InternalToolCallOutput
+from app.core.types import InternalMessage, text_part, tool_call_part, tool_result_part
 
 from app.core.state import (
     TOOL_ONLY_LIMIT,
@@ -139,6 +159,30 @@ def _responses_image_generation_tool(body: dict) -> dict | None:
     return None
 
 
+def _responses_is_system_turn(body: dict) -> bool:
+    """Return whether Codex identified this as an app-owned background turn.
+
+    Codex creates auxiliary Responses requests for task titles and other UI
+    metadata.  Their wrapped user prompt can mention image generation even
+    though the request itself must only produce structured metadata.  The
+    client marks these requests with ``thread_source=system``; use that
+    explicit signal instead of guessing from prompt wording or schemas.
+    """
+    metadata = body.get("client_metadata")
+    if not isinstance(metadata, dict):
+        return False
+    turn_metadata = metadata.get("x-codex-turn-metadata")
+    if isinstance(turn_metadata, str):
+        try:
+            turn_metadata = json.loads(turn_metadata)
+        except (TypeError, ValueError):
+            return False
+    return bool(
+        isinstance(turn_metadata, dict)
+        and str(turn_metadata.get("thread_source") or "").lower() == "system"
+    )
+
+
 def _responses_image_prompt(input_data: Any, instructions: Any = "") -> str:
     """Extract the current user request without forwarding conversation history."""
     prompt = latest_user_text(input_data).strip()
@@ -166,11 +210,24 @@ def _resolved_image_generator(config: dict) -> dict:
     return resolved
 
 
-async def _generate_with_configured_backend(prompt: str, options: dict | None = None):
-    configured = get_enabled_image_generator()
-    if not configured:
-        raise HTTPException(status_code=503, detail="No image-generation backend is enabled")
-    generator = _resolved_image_generator(configured)
+async def _generate_with_configured_backend(
+    prompt: str,
+    options: dict | None = None,
+    *,
+    generator: dict | None = None,
+):
+    if generator is None:
+        configured = get_enabled_image_generator()
+        if not configured:
+            raise HTTPException(status_code=503, detail="No image-generation backend is enabled")
+        generator = _resolved_image_generator(configured)
+    else:
+        generator = dict(generator)
+    generator.setdefault("max_retries", get_default("image_generation_max_retries", 2))
+    generator.setdefault("retry_base_seconds", get_default("image_generation_retry_base_seconds", 1.0))
+    generator.setdefault("max_retry_delay_seconds", get_default("image_generation_max_retry_delay_seconds", 30.0))
+    generator.setdefault("result_max_bytes", get_default("image_generation_result_max_bytes", 25 * 1024 * 1024))
+    generator.setdefault("allow_private_download_hosts", get_default("image_download_allow_private_hosts", False))
     opts = options or {}
     prompt = str(prompt or "").strip()
     if not prompt:
@@ -224,6 +281,221 @@ async def _generate_with_configured_backend(prompt: str, options: dict | None = 
     return results, generator
 
 
+@dataclass
+class _CachedImageInvocation:
+    stored: list[StoredImageResult]
+    generator: dict[str, Any]
+    backend_attempts: int
+
+
+@dataclass
+class _ImageInvocationOutcome:
+    call: InternalToolCallOutput
+    arguments: dict[str, Any]
+    stored: list[StoredImageResult]
+    generator: dict[str, Any]
+    backend_attempts: int
+    duration_ms: int
+    reused: bool = False
+    error: Exception | None = None
+
+
+def _image_batch_key(
+    body: dict,
+    *,
+    username: str,
+    api_key_value: str,
+    generator: dict,
+    invocations: list[tuple[InternalToolCallOutput, dict[str, Any]]],
+) -> str:
+    """Scope idempotency to one user, current task prompt, backend and ordered batch."""
+    payload = {
+        "principal": hashlib.sha256(f"{username}\0{api_key_value}".encode()).hexdigest(),
+        "task": latest_user_text(body.get("input") or ""),
+        "backend": generator.get("provider_id") or "",
+        "model": generator.get("model") or generator.get("provider_model") or "",
+        "artifact_dir": str(image_result_directory()),
+        "invocations": [
+            {
+                "prompt_key": _image_prompt_key(arguments),
+                "filename": str(arguments.get("filename") or ""),
+                "n": int(arguments.get("n") or 1),
+            }
+            for _, arguments in invocations
+        ],
+    }
+    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def _image_invocation_cache_key(
+    batch_key: str, arguments: dict[str, Any], occurrence: int,
+) -> str:
+    payload = {
+        "batch": batch_key,
+        "prompt_key": _image_prompt_key(arguments),
+        "filename": str(arguments.get("filename") or ""),
+        "n": int(arguments.get("n") or 1),
+        "occurrence": int(occurrence),
+    }
+    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode()).hexdigest()
+
+
+async def _generate_and_store_cached(
+    *,
+    prompt: str,
+    arguments: dict[str, Any],
+    generator: dict,
+    cache_key: str,
+) -> tuple[list, _CachedImageInvocation, bool]:
+    ttl = get_default("image_generation_idempotency_ttl_seconds", 300)
+    max_entries = get_default("image_generation_idempotency_max_entries", 64)
+    claim = image_invocation_cache.claim(cache_key, ttl_seconds=ttl, max_entries=max_entries)
+    if claim.owner:
+        try:
+            generated, resolved_generator = await _generate_with_configured_backend(
+                prompt, arguments, generator=generator,
+            )
+            stored = await anyio.to_thread.run_sync(store_image_results, generated)
+            cached = _CachedImageInvocation(
+                stored=stored,
+                generator=resolved_generator,
+                backend_attempts=max((int(item.backend_attempts or 1) for item in generated), default=1),
+            )
+            image_invocation_cache.resolve(claim, cached)
+            return generated, cached, False
+        except BaseException as exc:
+            image_invocation_cache.reject(claim, exc)
+            raise
+
+    cached = await anyio.to_thread.run_sync(claim.future.result)
+    if not all(item.path.is_file() for item in cached.stored):
+        image_invocation_cache.invalidate(cache_key)
+        return await _generate_and_store_cached(
+            prompt=prompt,
+            arguments=arguments,
+            generator=generator,
+            cache_key=cache_key,
+        )
+    generated = await anyio.to_thread.run_sync(
+        partial(
+            generation_results_from_stored,
+            cached.stored,
+            size=arguments.get("size"),
+            quality=arguments.get("quality"),
+            output_format=arguments.get("output_format"),
+            background=arguments.get("background"),
+        )
+    )
+    return generated, cached, True
+
+
+async def _execute_image_invocations(
+    body: dict,
+    *,
+    username: str,
+    api_key_value: str,
+    invocations: list[tuple[InternalToolCallOutput, dict[str, Any]]],
+    progress=None,
+) -> list[_ImageInvocationOutcome]:
+    configured = get_enabled_image_generator()
+    if not configured:
+        raise HTTPException(status_code=503, detail="No image-generation backend is enabled")
+    generator = _resolved_image_generator(configured)
+    batch_key = _image_batch_key(
+        body,
+        username=username,
+        api_key_value=api_key_value,
+        generator=generator,
+        invocations=invocations,
+    )
+    batch_id = batch_key[:12]
+    concurrency = max(1, min(8, int(get_default("image_generation_batch_concurrency", 1))))
+    timeout_seconds = max(1, int(get_default("image_generation_batch_timeout_seconds", 2400)))
+    outcomes: list[_ImageInvocationOutcome | None] = [None] * len(invocations)
+    semaphore = anyio.Semaphore(concurrency)
+
+    async def run_one(index: int, call: InternalToolCallOutput, arguments: dict[str, Any]):
+        started = time.monotonic()
+        prompt = str(arguments.get("prompt") or latest_user_text(body.get("input") or "") or "")
+        occurrence = sum(
+            1
+            for prior_index in range(index)
+            if _image_prompt_key(invocations[prior_index][1]) == _image_prompt_key(arguments)
+            and str(invocations[prior_index][1].get("filename") or "")
+            == str(arguments.get("filename") or "")
+        )
+        key = _image_invocation_cache_key(batch_key, arguments, occurrence)
+        _app_log.info(
+            "[responses image_generation.item_start] batch=%s index=%d total=%d filename=%s prompt_chars=%d",
+            batch_id, index + 1, len(invocations), arguments.get("filename") or "-", len(prompt),
+        )
+        try:
+            async with semaphore:
+                _generated, cached, reused = await _generate_and_store_cached(
+                    prompt=prompt,
+                    arguments=arguments,
+                    generator=generator,
+                    cache_key=key,
+                )
+            outcome = _ImageInvocationOutcome(
+                call=call,
+                arguments=arguments,
+                stored=list(cached.stored),
+                generator=dict(cached.generator),
+                backend_attempts=cached.backend_attempts,
+                duration_ms=round((time.monotonic() - started) * 1000),
+                reused=reused,
+            )
+            _app_log.info(
+                "[responses image_generation.item_done] batch=%s index=%d total=%d status=success attempts=%d reused=%s duration_ms=%d bytes=%d",
+                batch_id, index + 1, len(invocations), outcome.backend_attempts,
+                str(reused).lower(), outcome.duration_ms,
+                sum(item.path.stat().st_size for item in outcome.stored),
+            )
+        except Exception as exc:
+            outcome = _ImageInvocationOutcome(
+                call=call,
+                arguments=arguments,
+                stored=[],
+                generator=dict(generator),
+                backend_attempts=0,
+                duration_ms=round((time.monotonic() - started) * 1000),
+                error=exc,
+            )
+            _app_log.warning(
+                "[responses image_generation.item_done] batch=%s index=%d total=%d status=failed duration_ms=%d error=%s",
+                batch_id, index + 1, len(invocations), outcome.duration_ms, friendly_error_msg(exc),
+            )
+        outcomes[index] = outcome
+        if progress is not None:
+            progress(batch_id, [item for item in outcomes if item is not None], len(invocations))
+
+    with anyio.move_on_after(timeout_seconds) as cancel_scope:
+        async with anyio.create_task_group() as task_group:
+            for index, (call, arguments) in enumerate(invocations):
+                task_group.start_soon(run_one, index, call, arguments)
+    if cancel_scope.cancel_called:
+        for index, item in enumerate(outcomes):
+            if item is None:
+                call, arguments = invocations[index]
+                outcomes[index] = _ImageInvocationOutcome(
+                    call=call,
+                    arguments=arguments,
+                    stored=[],
+                    generator=dict(generator),
+                    backend_attempts=0,
+                    duration_ms=timeout_seconds * 1000,
+                    error=TimeoutError(f"image batch deadline exceeded after {timeout_seconds}s"),
+                )
+        _app_log.warning(
+            "[responses image_generation.batch_timeout] batch=%s timeout_s=%d",
+            batch_id, timeout_seconds,
+        )
+    return [item for item in outcomes if item is not None]
+
+
 async def _nonstream_output_events(output: InternalOutputMessage):
     """Replay a buffered planner response through the normal Responses renderer."""
     yield InternalOutputEvent(kind="message_start", role=output.role)
@@ -255,9 +527,110 @@ def _image_result_url(request: Request, token: str) -> str:
     return f"{str(request.base_url).rstrip('/')}/{prefix}image-results/{token}"
 
 
+def _safe_asset_filename(value: Any, index: int, stored: StoredImageResult) -> str:
+    """Return a portable suggested filename with the stored image's real suffix."""
+    raw = str(value or "").replace("\\", "/").rsplit("/", 1)[-1]
+    stem = raw.rsplit(".", 1)[0] if "." in raw else raw
+    stem = "".join(char if char.isalnum() or char in "-_" else "-" for char in stem)
+    stem = "-".join(part for part in stem.split("-") if part).strip("-_")[:80]
+    return f"{stem or f'generated-asset-{index}'}{stored.path.suffix.lower()}"
+
+
+def _unique_asset_filename(filename: str, used_filenames: set[str]) -> str:
+    key = filename.casefold()
+    if key not in used_filenames:
+        used_filenames.add(key)
+        return filename
+    stem, separator, extension = filename.rpartition(".")
+    if not separator:
+        stem, extension = filename, ""
+    suffix = 2
+    while True:
+        candidate = f"{stem}-{suffix}{separator}{extension}"
+        if candidate.casefold() not in used_filenames:
+            used_filenames.add(candidate.casefold())
+            return candidate
+        suffix += 1
+
+
+def _stored_image_artifacts(
+    request: Request,
+    stored: list[StoredImageResult],
+    *,
+    arguments: dict[str, Any],
+    start_index: int,
+    used_filenames: set[str] | None = None,
+) -> list[dict[str, str]]:
+    used_filenames = used_filenames if used_filenames is not None else set()
+    artifacts = []
+    for offset, item in enumerate(stored):
+        index = start_index + offset
+        filename_value = arguments.get("filename") if len(stored) == 1 else ""
+        filename = _unique_asset_filename(
+            _safe_asset_filename(filename_value, index, item), used_filenames
+        )
+        artifacts.append({
+            "filename": filename,
+            "url": _image_result_url(request, item.token),
+            "mime_type": item.mime_type,
+            "prompt": str(arguments.get("prompt") or "")[:500],
+        })
+    return artifacts
+
+
+def _rollback_image_bridge_artifacts(
+    exc: Exception,
+    *,
+    stored: list[StoredImageResult],
+    image_results: list,
+    image_model: str,
+) -> None:
+    """Preserve completed artifacts when a later bridge/continuation step fails."""
+    if not stored:
+        return
+    details = _request_details_from_exception(exc)
+    _attach_request_details(
+        exc,
+        request_kind="image_generation",
+        responses_mode="model_driven_image_generation_failed",
+        upstream_endpoint="images/generations",
+        image_model=image_model,
+        image_count=len(image_results),
+        image_bytes=image_results_bytes(image_results),
+        image_artifact_count=len(stored),
+        image_preserved_count=len(stored),
+    )
+
+
+def _generated_image_asset_manifest(artifacts: list[dict[str, str]]) -> str:
+    """Build a compact, model-readable handoff that survives conversation history."""
+    if not artifacts:
+        return ""
+    lines = [
+        GATEWAY_IMAGE_ASSET_MARKER,
+        "Generated image originals are available as project assets:",
+    ]
+    for index, artifact in enumerate(artifacts, start=1):
+        lines.append(
+            f"{index}. `{artifact['filename']}` ({artifact['mime_type']}): "
+            f"[download original]({artifact['url']})"
+        )
+    lines.extend([
+        "For coding or design tasks, download these URLs into the project workspace with a "
+        "terminal command before continuing, verify the files exist, and reference those files "
+        "from the project. The images are stored by the gateway, not in the agent workspace.",
+        "Do not claim image generation is unavailable and do not recreate these same assets "
+        "with PIL, SVG, Canvas, or CSS unless the user explicitly requests a replacement.",
+    ])
+    return "\n".join(lines)
+
+
 def _generated_image_markdown_output(
-    request: Request, image_results, usage: dict | None = None
-) -> tuple[InternalOutputMessage, list]:
+    image_results,
+    stored: list[StoredImageResult],
+    artifacts: list[dict[str, str]],
+    usage: dict | None = None,
+) -> InternalOutputMessage:
     """Publish inline data images with HTTP download links as a fallback.
 
     Older Codex-compatible clients do not advertise the generatedImage helper.
@@ -266,30 +639,51 @@ def _generated_image_markdown_output(
     the client while the stored artifact URL remains available for opening or
     downloading the original image.
     """
-    stored = store_image_results(image_results)
-    blocks = []
-    for index, (result, item) in enumerate(zip(image_results, stored), start=1):
-        url = _image_result_url(request, item.token)
+    blocks = [_generated_image_asset_manifest(artifacts)]
+    inline_limit = max(1, int(get_default("image_preview_inline_limit", 4)))
+    inline_results = image_results[:inline_limit]
+    for index, result in enumerate(inline_results, start=1):
         label = "Generated image" if len(stored) == 1 else f"Generated image {index}"
         blocks.append(
-            f"![{label}]({image_preview_data_uri(result)})\n\n[Open {label.lower()}]({url})"
+            f"{GATEWAY_IMAGE_RESULT_MARKER}\n![{label}]({image_preview_data_uri(result)})"
+        )
+    omitted = len(image_results) - len(inline_results)
+    if omitted > 0:
+        blocks.append(
+            f"{omitted} additional generated image preview(s) were omitted to keep the "
+            "response small; all originals are listed above."
         )
     return InternalOutputMessage(
-        text="\n\n".join(blocks), finish_reason="stop", usage=dict(usage or {})
-    ), stored
+        text="\n\n".join(block for block in blocks if block),
+        finish_reason="stop",
+        usage=dict(usage or {}),
+    )
 
 
-def _generated_image_exec_output(image_results, usage: dict | None = None) -> InternalOutputMessage:
+def _generated_image_exec_output(
+    image_results,
+    artifacts: list[dict[str, str]],
+    usage: dict | None = None,
+) -> InternalOutputMessage:
     """Ask Codex's client-owned exec runtime to publish native image results."""
-    source = "\n".join(
+    display_source = "\n".join(
         "generatedImage({ image_url: %s, output_hint: %s });" % (
             json.dumps(str(result.data_uri or ""), ensure_ascii=False),
             json.dumps("The generated image has already been displayed to the user.", ensure_ascii=False),
         )
         for result in image_results
     )
+    manifest = _generated_image_asset_manifest(artifacts)
+    source = display_source
+    if manifest:
+        # Keep the project handoff in the tool history rather than ordinary
+        # assistant text. Codex executes only generatedImage(); the trailing
+        # block comment is recovered by the gateway on the next tool round
+        # and injected into private system context for the model.
+        source = f"{display_source}\n/*\n{manifest}\n*/"
     suffix = uuid.uuid4().hex
     return InternalOutputMessage(
+        text="",
         tool_calls=[InternalToolCallOutput(
             id=f"ctc_gateway_image_display_{suffix}",
             call_id=f"{GATEWAY_IMAGE_DISPLAY_CALL_PREFIX}{suffix}",
@@ -302,14 +696,177 @@ def _generated_image_exec_output(image_results, usage: dict | None = None) -> In
 
 
 def _generated_image_client_output(
-    request: Request, body: dict, image_results, usage: dict | None = None
-) -> tuple[InternalOutputMessage, list, str]:
+    body: dict,
+    image_results,
+    stored: list[StoredImageResult],
+    artifacts: list[dict[str, str]],
+    usage: dict | None = None,
+) -> tuple[InternalOutputMessage, str]:
     """Select Codex-native display when advertised, with Markdown as fallback."""
     if has_codex_generated_image_exec_tool(body):
-        stored = store_image_results(image_results)
-        return _generated_image_exec_output(image_results, usage), stored, "codex_exec_generated_image"
-    output, stored = _generated_image_markdown_output(request, image_results, usage)
-    return output, stored, "assistant_message"
+        return _generated_image_exec_output(image_results, artifacts, usage), "codex_exec_generated_image"
+    output = _generated_image_markdown_output(image_results, stored, artifacts, usage)
+    return output, "assistant_message"
+
+
+def _merge_image_bridge_output(
+    planner_output: InternalOutputMessage,
+    image_output: InternalOutputMessage,
+) -> InternalOutputMessage:
+    """Replace private image bridge calls without dropping client-owned work."""
+    replacement_calls = list(image_output.tool_calls)
+    merged_calls: list[InternalToolCallOutput] = []
+    replacement_inserted = False
+    for call in planner_output.tool_calls:
+        is_private_image_call = call.name == IMAGE_BRIDGE_TOOL_NAME
+        is_wrapped_image_call = call.name == "exec" and bool(
+            image_call_arguments_from_exec(call.arguments)
+        )
+        if is_private_image_call or is_wrapped_image_call:
+            if not replacement_inserted:
+                merged_calls.extend(replacement_calls)
+                replacement_inserted = True
+            continue
+        merged_calls.append(call)
+
+    if replacement_calls and not replacement_inserted:
+        merged_calls.extend(replacement_calls)
+
+    text_parts = [part for part in (planner_output.text, image_output.text) if part]
+    return InternalOutputMessage(
+        role=planner_output.role,
+        text="\n\n".join(text_parts),
+        reasoning=planner_output.reasoning,
+        tool_calls=merged_calls,
+        finish_reason="tool_calls" if merged_calls else image_output.finish_reason,
+        # image_output carries the aggregate usage from the initial planner
+        # and every continuation round. planner_output may contain only the
+        # final round and must not replace that total.
+        usage=dict(image_output.usage or planner_output.usage),
+    )
+
+
+def _append_image_bridge_results(
+    internal,
+    invocations: list[tuple[InternalToolCallOutput, dict[str, Any], list[dict[str, str]]]],
+    *,
+    failed: list[tuple[InternalToolCallOutput, dict[str, Any], str]] | None = None,
+) -> None:
+    """Add gateway-executed image calls and compact results to the model history."""
+    call_parts = []
+    failed = failed or []
+    for call, arguments, _ in invocations:
+        call_parts.append(tool_call_part(
+            call.call_id or call.id,
+            call.name,
+            arguments,
+            raw_arguments=call.arguments,
+        ))
+    for call, arguments, _ in failed:
+        call_parts.append(tool_call_part(
+            call.call_id or call.id,
+            call.name,
+            arguments,
+            raw_arguments=call.arguments,
+        ))
+    internal.messages.append(InternalMessage(role="assistant", parts=call_parts))
+    for call, _, artifacts in invocations:
+        if artifacts:
+            summary = _generated_image_asset_manifest(artifacts)
+        else:
+            summary = (
+                "This image was already generated and displayed earlier in the current task. "
+                "Continue without regenerating it."
+            )
+        internal.messages.append(InternalMessage(
+            role="tool",
+            parts=[tool_result_part(call.call_id or call.id, [text_part(summary)])],
+        ))
+    for call, _, error_message in failed:
+        summary = (
+            "Image generation failed for this invocation after gateway retries. "
+            f"Error: {error_message}. Continue the task using successful assets and retry only "
+            "this failed prompt if it is still required; do not regenerate successful prompts."
+        )
+        internal.messages.append(InternalMessage(
+            role="tool",
+            parts=[tool_result_part(call.call_id or call.id, [text_part(summary)])],
+        ))
+
+
+def _image_bridge_invocations(
+    output: InternalOutputMessage,
+) -> list[tuple[InternalToolCallOutput, dict[str, Any]]]:
+    invocations = []
+    for call in output.tool_calls:
+        if call.name == IMAGE_BRIDGE_TOOL_NAME:
+            invocations.append((call, image_call_arguments(call.arguments)))
+            continue
+        if call.name == "exec":
+            wrapped_arguments = image_call_arguments_list_from_exec(call.arguments)
+            if len(wrapped_arguments) == 1:
+                invocations.append((call, wrapped_arguments[0]))
+                continue
+            for index, wrapped_args in enumerate(wrapped_arguments, start=1):
+                base_id = call.call_id or call.id or "exec_image"
+                synthetic_id = f"{base_id}_image_{index}"
+                invocations.append((InternalToolCallOutput(
+                    id=synthetic_id,
+                    call_id=synthetic_id,
+                    name=IMAGE_BRIDGE_TOOL_NAME,
+                    arguments=json.dumps(wrapped_args, ensure_ascii=False),
+                    raw=call.raw,
+                ), wrapped_args))
+    return invocations
+
+
+def _output_reads_imagegen_skill(output: InternalOutputMessage) -> bool:
+    """Allow Codex's mandatory imagegen skill read to execute before correction."""
+    for call in output.tool_calls:
+        if call.name not in {"exec", "shell_command", "exec_command"}:
+            continue
+        serialized = str(call.arguments or "").lower().replace("\\\\", "/").replace("\\", "/")
+        if "skill.md" in serialized and "imagegen" in serialized:
+            return True
+    return False
+
+
+def _output_has_empty_exec_call(output: InternalOutputMessage) -> bool:
+    """Detect an unusable Codex exec emitted by an image correction round."""
+    for call in output.tool_calls:
+        if call.name != "exec":
+            continue
+        arguments = image_call_arguments(call.arguments)
+        if not arguments or not str(arguments.get("input") or "").strip():
+            return True
+    return False
+
+
+def _output_requests_local_openai_key(output: InternalOutputMessage) -> bool:
+    """Detect the imagegen CLI fallback that is invalid behind this gateway."""
+    text = str(output.text or "")
+    if "OPENAI_API_KEY" not in text:
+        return False
+    lowered = text.lower()
+    # Do not retry a correct explanation that explicitly rejects local keys.
+    negative_phrases = (
+        "do not require", "does not require", "don't require", "not needed",
+        "无需", "不需要", "不会访问", "不会要求", "无需配置",
+    )
+    if any(phrase in lowered for phrase in negative_phrases):
+        return False
+    return True
+
+
+def _image_prompt_key(arguments: dict[str, Any]) -> str:
+    prompt = " ".join(str(arguments.get("prompt") or "").lower().split())
+    return json.dumps({
+        "prompt": prompt,
+        "size": arguments.get("size"),
+        "quality": arguments.get("quality"),
+        "background": arguments.get("background"),
+        "output_format": arguments.get("output_format"),
+    }, sort_keys=True, ensure_ascii=False)
 
 
 def _responses_required_tool_types(body: dict) -> set[str]:
@@ -353,19 +910,80 @@ def _observed_response_tool_types(response: dict) -> set[str]:
     return observed
 
 
+class _EmptyNativeResponsesError(RuntimeError):
+    """The upstream completed a Responses request without client-usable output."""
+
+    native_empty_output = True
+
+
+def _native_response_has_output(response: dict | None) -> bool:
+    """Return whether a completed Responses payload contains usable output items."""
+    if not isinstance(response, dict):
+        return False
+    output = response.get("output")
+    if not isinstance(output, list):
+        return bool(str(response.get("output_text") or "").strip())
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+        item_type = str(item.get("type") or "")
+        if item_type in {"message", "function_call", "custom_tool_call", "computer_call", "image_generation_call"}:
+            return True
+        if item_type.endswith("_call") or item_type in {"reasoning", "output_text"}:
+            return True
+    return False
+
+
+def _native_sse_payload_has_output(payload: dict | None) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    event_type = str(payload.get("type") or "")
+    if event_type in {
+        "response.output_item.added", "response.output_item.done",
+        "response.content_part.added", "response.content_part.done",
+        "response.output_text.delta", "response.output_text.done",
+        "response.function_call_arguments.delta",
+        "response.function_call_arguments.done",
+        "response.custom_tool_call_input.delta",
+        "response.custom_tool_call_input.done",
+        "response.computer_call.delta",
+    }:
+        item = payload.get("item") or payload.get("output_item") or {}
+        if event_type.endswith(".delta") or event_type.endswith(".done"):
+            return True
+        return isinstance(item, dict) and bool(str(item.get("type") or ""))
+    return False
+
+
+def _native_empty_output_error(response: dict | None = None) -> _EmptyNativeResponsesError:
+    error = _EmptyNativeResponsesError("native Responses completed without client-visible output")
+    _attach_request_details(
+        error,
+        native_empty_output=True,
+        native_failure_reason="empty_completed_response",
+        error_trigger="connection_error",
+    )
+    return error
+
+
 async def _native_responses_stream_with_accounting(events, *, username, api_key_value, model, provider_id, requested_model, policy, request_body, fallback_attempts=None, required_tool_types=None, remember_response_chain_key=None, conv_key=""):
     """Forward raw Responses SSE while recording the terminal response lifecycle."""
     buffer = b""
     response_body = None
     failed = False
+    saw_output = False
     upstream_endpoint = "responses"
     try:
         async for frame in iter_sse_frames(events):
             payload = sse_payload(frame)
+            saw_output = saw_output or _native_sse_payload_has_output(payload)
             if payload and payload.get("type") in {"response.completed", "response.failed", "response.incomplete"}:
                 response_body = payload.get("response")
                 terminal_error = payload.get("error") or (response_body or {}).get("error")
                 failed = payload.get("type") != "response.completed"
+                if not failed and not saw_output and not _native_response_has_output(response_body):
+                    failed = True
+                    terminal_error = "native Responses completed without client-visible output"
                 if not failed:
                     capability = get_model_responses_capability(provider_id, model) or {}
                     update_model_responses_capability(
@@ -390,7 +1008,7 @@ async def _native_responses_stream_with_accounting(events, *, username, api_key_
     finally:
         usage = (response_body or {}).get("usage") or {}
         tokens = usage.get("total_tokens") or 0
-        success = bool(response_body) and not failed
+        success = bool(response_body) and not failed and saw_output
         response_id = (response_body or {}).get("id")
         if success and response_id and remember_response_chain_key and conv_key:
             remember_response_chain_key(response_id, conv_key)
@@ -400,6 +1018,8 @@ async def _native_responses_stream_with_accounting(events, *, username, api_key_
             details.update({"fallback_status": "used", "attempt_index": len(fallback_attempts) - 1})
         if client_disconnected:
             details.update({"status": "cancelled", "client_disconnected": True})
+        elif not saw_output and response_body and not client_disconnected:
+            details.update({"native_empty_output": True, "native_failure_reason": "empty_completed_response"})
         elif failed and response_body:
             details.update({"status": "partial", "partial_output": True})
         details = apply_outcome_to_details(details, success=success, partial_output=bool(response_body) and failed)
@@ -453,6 +1073,11 @@ def _native_downgrade_details(exc: Exception, attempts: list[dict] | None = None
         "native_failure_reason": classify_upstream_error(exc),
         "native_failure_message": friendly_error_msg(exc),
     }
+    request_details = getattr(exc, "request_details", None)
+    if isinstance(request_details, dict):
+        for key in ("native_empty_output", "native_failure_reason", "error_trigger"):
+            if key in request_details:
+                details[key] = request_details[key]
     if status is not None:
         details["native_failure_status"] = status
     if attempts:
@@ -503,6 +1128,33 @@ async def _wait_for_native_response_event(events) -> bytes:
             buffered = _rest
 
 
+async def _wait_for_native_response_output(events) -> bytes:
+    """Buffer native SSE until usable output, rejecting empty completion before fallback."""
+    buffered = b""
+    saw_output = False
+    while True:
+        chunk = await events.__anext__()
+        buffered += chunk
+        while (split := split_sse_frame(buffered)) is not None:
+            frame, rest = split
+            payload = sse_payload(frame)
+            saw_output = saw_output or _native_sse_payload_has_output(payload)
+            if saw_output:
+                return buffered
+            if payload:
+                event_type = str(payload.get("type") or "")
+                if event_type in {"response.failed", "response.incomplete"}:
+                    error = RuntimeError("native Responses stream ended unsuccessfully")
+                    _attach_request_details(error, native_failure_reason=event_type)
+                    raise error
+                if event_type == "response.completed":
+                    response = payload.get("response")
+                    if not saw_output and not _native_response_has_output(response):
+                        raise _native_empty_output_error(response)
+                    return buffered
+            buffered = rest
+
+
 async def _native_response_with_fallbacks(internal, *, stream: bool, required_tool_types: set[str], stateful_markers: list[str] | None = None):
     """Retry only native-capable fallback targets before any client output."""
     primary = RouteTarget(model=internal.target_model, provider_id=internal.provider_id)
@@ -540,7 +1192,7 @@ async def _native_response_with_fallbacks(internal, *, stream: bool, required_to
                 # Do not yield until the first chunk: this preserves the existing
                 # stream fallback invariant.
                 events = stream_native_response(provider, attempt)
-                first = await _wait_for_native_response_event(events)
+                first = await _wait_for_native_response_output(events)
                 async def prefixed():
                     yield first
                     async for chunk in events:
@@ -548,16 +1200,21 @@ async def _native_response_with_fallbacks(internal, *, stream: bool, required_to
                 attempts.append({"index": index, "stage": "primary" if index == 0 else "fallback", "target": target.model, "provider_id": provider_id, "status": "success"})
                 return prefixed(), target, provider_id, attempts
             response = await post_native_response(provider, attempt)
+            if not _native_response_has_output(response):
+                raise _native_empty_output_error(response)
             attempts.append({"index": index, "stage": "primary" if index == 0 else "fallback", "target": target.model, "provider_id": provider_id, "status": "success"})
             set_model_responses_capability(provider_id, target.model, status="supported", streaming=False, streaming_status="unknown", expires_at=_responses_capability_expiry("supported"))
             return response, target, provider_id, attempts
         except Exception as exc:
             last_exc = exc
+            is_empty_native = bool(getattr(exc, "native_empty_output", False))
             if _native_error_is_explicitly_unsupported(exc):
                 set_model_responses_capability(provider_id, target.model, status="unsupported", expires_at=_responses_capability_expiry("unsupported"), error=friendly_error_msg(exc))
             attempts.append({"index": index, "stage": "primary" if index == 0 else "fallback", "target": target.model, "provider_id": provider_id, "status": "failed", "trigger": classify_upstream_error(exc), "error": friendly_error_msg(exc)})
             if index == 0:
                 decision = apply_fallback_policy(provider_id, target.model, classify_upstream_error(exc))
+                if is_empty_native and not decision.matched:
+                    decision = apply_fallback_policy(provider_id, target.model, "")
                 if decision.matched:
                     # A failed primary native request may have created provider-
                     # side response/tool state.  Do not migrate a stateful
@@ -1223,6 +1880,7 @@ async def _stream_events_with_fallbacks(internal, *, temperature, max_tokens, lo
         fallback_provider_id = _fallback_provider_id_for_target(target)
         emitted = False
         pending_events = []
+        terminal_event = None
         try:
             events, provider_info, adapter_provider_id = _stream_events_for_target(
                 target,
@@ -1255,6 +1913,13 @@ async def _stream_events_with_fallbacks(internal, *, temperature, max_tokens, lo
                 provider_id=adapter_provider_id or fallback_provider_id or "",
             )
             async for event in timed_events:
+                if event.kind == "message_done":
+                    # Protocol renderers stop consuming as soon as they see
+                    # message_done. Hold it until the attempt is recorded as
+                    # successful so final fallback metadata reaches request
+                    # accounting before the client stream terminates.
+                    terminal_event = event
+                    continue
                 if _is_client_visible_stream_event(event):
                     if not emitted:
                         for pending in pending_events:
@@ -1284,6 +1949,8 @@ async def _stream_events_with_fallbacks(internal, *, temperature, max_tokens, lo
                 "fallback_attempts": fallback_attempts,
                 "upstream_endpoint": _upstream_endpoint_for_provider(provider_info),
             })
+            if terminal_event is not None:
+                yield terminal_event
             _app_log.info(
                 "[%s upstream.stream.success] stage=%s target=%s provider=%s",
                 log_label,
@@ -1415,7 +2082,11 @@ def _normalized_request_details(endpoint: str, details: dict | None) -> dict:
         or "image_generation" in mode
     ):
         normalized["request_kind"] = "image_generation"
-        for key in ("image_count", "image_bytes", "image_artifact_count"):
+        for key in (
+            "image_count", "image_bytes", "image_artifact_count",
+            "image_requested_count", "image_succeeded_count", "image_failed_count",
+            "image_retried_count", "image_reused_count",
+        ):
             try:
                 normalized[key] = max(0, int(normalized.get(key) or 0))
             except (TypeError, ValueError):
@@ -1429,6 +2100,7 @@ def _normalized_request_details(endpoint: str, details: dict | None) -> dict:
 def _record_image_generation_failure(
     *, username: str, api_key_value: str, requested_model: str, model: str,
     provider_id: str, endpoint: str, request_body: dict, exc: Exception,
+    request_log_id: int | None = None,
 ) -> None:
     details = _normalized_request_details(
         endpoint,
@@ -1451,6 +2123,7 @@ def _record_image_generation_failure(
         final_provider=final_provider, request_body=request_body,
         success=False, status="fail", tokens=0, details=details,
         error_message=friendly_error_msg(exc),
+        log_id=request_log_id,
     )
     _record_success_metrics(username, api_key_value, 0, "fail")
 
@@ -2318,7 +2991,27 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
     user, api_key = verify_api_key(authorization, endpoint="responses")
 
     body = await request.json()
+    # Read the hidden manifest before display follow-up sanitization replaces
+    # the large generatedImage script with its compact placeholder.
+    image_asset_context = gateway_generated_image_asset_context(body.get("input"))
+    image_display_followup = is_gateway_image_display_followup(body.get("input"))
+    image_already_generated = has_gateway_generated_image_history(body.get("input"))
+    if image_display_followup:
+        sanitize_gateway_image_display_followup(body.get("input"))
+    if sanitize_gateway_generated_image_history(body.get("input")):
+        _app_log.info("[responses image_generation.history_compacted] removed=base64_previews")
     internal = responses_to_internal(body)
+    if image_asset_context:
+        internal.messages.insert(0, InternalMessage(
+            role="system",
+            parts=[text_part(
+                "Gateway-generated project assets from the current user task follow. "
+                "These URLs are available even if the original display message is removed during "
+                "conversation normalization. Download and use the originals before continuing; "
+                "do not regenerate or replace them merely because they are not yet in the local "
+                f"workspace.\n\n{image_asset_context}"
+            )],
+        ))
     model = internal.target_model
     input_data = body.get("input", "")
     instructions = internal.metadata.get("instructions", "")
@@ -2387,40 +3080,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
     image_tool = _responses_image_generation_tool(body)
     explicit_image_choice = isinstance(body.get("tool_choice"), dict) and body["tool_choice"].get("type") == "image_generation"
     image_enabled = bool(provider_info and get_model_image_generation(adapter_provider_id, model))
-    if is_gateway_image_display_followup(input_data):
-        output = InternalOutputMessage(finish_reason="stop")
-        details = {**routing_details_from_policy(policy), "responses_mode": "image_display_followup"}
-        if stream:
-            _log_request(username, api_key_value, model, adapter_provider_id, "responses", True, 0, requested_model, details=details)
-            _record_request_log(
-                endpoint="responses", username=username, api_key_value=api_key_value,
-                requested_model=requested_model, final_model=model,
-                final_provider=adapter_provider_id, request_body=body,
-                response_body={"status": "completed", "output_count": 0},
-                success=True, status="ok", tokens=0, usage={}, details=details, stream=True,
-            )
-            _record_success_metrics(username, api_key_value, 0, "ok")
-            return StreamingResponse(
-                render_responses_sse(
-                    _nonstream_output_events(output), model=model,
-                    previous_response_id=previous_response_id, extra=internal.extra,
-                ),
-                media_type="text/event-stream",
-                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-            )
-        rendered = render_response(
-            output, model=model, previous_response_id=previous_response_id, extra=internal.extra
-        )
-        _log_request(username, api_key_value, model, adapter_provider_id, "responses", True, 0, requested_model, details=details)
-        _record_request_log(
-            endpoint="responses", username=username, api_key_value=api_key_value,
-            requested_model=requested_model, final_model=model,
-            final_provider=adapter_provider_id, request_body=body,
-            response_body=rendered, success=True, status="ok", tokens=0,
-            usage={}, details=details,
-        )
-        _record_success_metrics(username, api_key_value, 0, "ok")
-        return rendered
+    system_turn = _responses_is_system_turn(body)
     # Sub2API leaves Codex's client-owned image_gen namespace intact.  The
     # first Responses turn must therefore return a namespaced function_call;
     # Codex will then call /images/generations itself.  Do not replace this
@@ -2481,15 +3141,27 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
 
     # Match sub2api's public transform, but project the hosted tool to an
     # internal function because this gateway's configured image backend is
-    # separate from the chat provider. Client-owned image_gen.imagegen tools
-    # remain untouched and execute in Codex itself.
-    if image_enabled and not has_codex_image_function_tool(body):
+    # separate from the chat provider. Keep the capability on display-result
+    # follow-up turns: a project can require several distinct assets over
+    # multiple Codex tool rounds. Idempotency and the per-request invocation
+    # budget prevent duplicate loops; merely having one result in history must
+    # not disable the remaining task's image capability.
+    if (
+        image_enabled
+        and not system_turn
+        and not has_codex_image_function_tool(body)
+    ):
         inject_hosted_image_capability(body)
         configure_internal_image_bridge(internal, body)
         image_bridge = True
         _app_log.info(
             "[responses image_generation.bridge_injected] model=%s provider=%s tool_choice=%s",
             model, adapter_provider_id or "-", body.get("tool_choice"),
+        )
+    elif image_enabled and system_turn:
+        _app_log.info(
+            "[responses image_generation.bridge_suppressed] model=%s provider=%s reason=system_turn",
+            model, adapter_provider_id or "-",
         )
     conv_key = policy.conv_key
 
@@ -2503,6 +3175,10 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
             conv_key[:60],
         )
 
+    bridge_stored_images: list[StoredImageResult] = []
+    bridge_image_results = []
+    bridge_image_model = ""
+    image_request_log_id = 0
     try:
         provider_info = resolve_provider(model, provider_id)
         adapter_provider_id = provider_for_log(provider_info, provider_id)
@@ -2523,17 +3199,209 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                 policy, internal, temperature=temperature, max_tokens=max_tokens,
                 log_label="responses.image_bridge",
             )
-            image_calls = [call for call in output.tool_calls if call.name == IMAGE_BRIDGE_TOOL_NAME]
-            exec_image_args = next(
-                (image_call_arguments_from_exec(call.arguments) for call in output.tool_calls if call.name == "exec"),
-                {},
+            requested_image_invocations = _image_bridge_invocations(output)
+            max_image_invocations = 8
+            image_invocations = requested_image_invocations[:max_image_invocations]
+            skipped_initial_invocations = requested_image_invocations[max_image_invocations:]
+            if skipped_initial_invocations:
+                _app_log.warning(
+                    "[responses image_generation.batch_limited] requested=%d allowed=%d",
+                    len(requested_image_invocations), max_image_invocations,
+                )
+            _app_log.info(
+                "[responses image_generation.planner_calls] total=%d image=%d names=%s",
+                len(output.tool_calls), len(image_invocations),
+                [call.name for call in output.tool_calls],
             )
-            if image_calls or exec_image_args:
-                args = image_call_arguments(image_calls[0].arguments) if image_calls else exec_image_args
-                prompt = str(args.get("prompt") or latest_user_text(input_data) or "")
-                image_results, generator = await _generate_with_configured_backend(prompt, args)
+            image_correction_applied = False
+            if (
+                not image_invocations
+                and is_image_generation_intent(input_data)
+                and not _output_reads_imagegen_skill(output)
+                and (
+                    not image_already_generated
+                    or _output_requests_local_openai_key(output)
+                )
+            ):
+                # A Codex/Luna planner can emit an ordinary exec call after
+                # reading its local image skill instead of invoking the
+                # gateway function. Give it one explicit, bounded retry. The
+                # response-history marker prevents a long task from entering
+                # a correction loop on later Responses turns without making
+                # unrelated new tasks with the same prompt share global state.
+                image_correction_applied = True
+                internal.messages.append(InternalMessage(
+                    role="system",
+                    parts=[text_part(IMAGE_BRIDGE_CORRECTION_INSTRUCTIONS)],
+                ))
+                previous_tool_choice = internal.tool_choice
+                had_allowed_params = "allowed_openai_params" in internal.extra
+                previous_allowed_params = internal.extra.get("allowed_openai_params")
+                allowed_params = list(previous_allowed_params or [])
+                if "tool_choice" not in allowed_params:
+                    allowed_params.append("tool_choice")
+                internal.extra["allowed_openai_params"] = allowed_params
+                internal.tool_choice = {
+                    "type": "function",
+                    "function": {"name": IMAGE_BRIDGE_TOOL_NAME},
+                }
+                try:
+                    corrected, provider_info, adapter_provider_id = await _call_nonstream_with_fallbacks(
+                        policy, internal, temperature=temperature, max_tokens=max_tokens,
+                        log_label="responses.image_bridge.correction",
+                    )
+                finally:
+                    internal.tool_choice = previous_tool_choice
+                    if had_allowed_params:
+                        internal.extra["allowed_openai_params"] = previous_allowed_params
+                    else:
+                        internal.extra.pop("allowed_openai_params", None)
+                corrected.usage = {
+                    key: int(output.usage.get(key, 0) or 0) + int(corrected.usage.get(key, 0) or 0)
+                    for key in set(output.usage) | set(corrected.usage)
+                }
+                correction_deferred = _output_reads_imagegen_skill(corrected)
+                correction_invalid = (
+                    not _image_bridge_invocations(corrected)
+                    and _output_has_empty_exec_call(corrected)
+                )
+                if correction_invalid:
+                    # Do not replace a usable planner result with Luna's
+                    # occasional ``exec({})`` correction. Keep the original
+                    # action and mark this bounded retry as consumed.
+                    corrected = output
+                    correction_deferred = False
+                output = corrected
+                requested_image_invocations = _image_bridge_invocations(output)
+                image_invocations = requested_image_invocations[:max_image_invocations]
+                skipped_initial_invocations = requested_image_invocations[max_image_invocations:]
+                _app_log.info(
+                    "[responses image_generation.correction] applied=true deferred=%s invalid=%s image=%d names=%s",
+                    str(correction_deferred).lower(), str(correction_invalid).lower(), len(image_invocations),
+                    [call.name for call in output.tool_calls],
+                )
+            all_initial_calls_are_images = len(requested_image_invocations) == len(output.tool_calls)
+            if image_invocations:
+                image_results = bridge_image_results
+                stored_images = bridge_stored_images
+                image_artifacts: list[dict[str, str]] = []
+                used_asset_filenames: set[str] = set()
+                completed_invocations = []
+                failed_invocations = []
+                generator = {}
+                prompt_chars = 0
+                image_failure_attempt_count = 0
+                image_retried_count = 0
+                image_reused_count = 0
+                unresolved_failed_keys: set[str] = set()
+                image_invocation_attempt_count = 0
+                configured_generator = _resolved_image_generator(get_enabled_image_generator() or {})
+                image_model = configured_generator.get("model") or configured_generator.get("provider_model") or ""
+                image_provider = configured_generator.get("provider_id") or adapter_provider_id
+                running_details = {
+                    **routing_details_from_policy(policy),
+                    "request_kind": "image_generation",
+                    "responses_mode": "model_driven_image_generation_running",
+                    "upstream_endpoint": "images/generations",
+                    "image_model": image_model,
+                    "image_requested_count": len(image_invocations),
+                    "image_succeeded_count": 0,
+                    "image_failed_count": 0,
+                    "image_count": 0,
+                    "image_bytes": 0,
+                    "image_artifact_count": 0,
+                    "status": "running",
+                }
+                image_request_log_id = _record_request_log(
+                    endpoint="responses", username=username, api_key_value=api_key_value,
+                    requested_model=requested_model, final_model=model,
+                    final_provider=image_provider, request_body=body,
+                    response_body=None, success=True, status="running", tokens=0,
+                    details=running_details, stream=stream,
+                )
+
+                def record_image_progress(batch_id, outcomes, total):
+                    succeeded = [item for item in outcomes if item.error is None]
+                    failed = [item for item in outcomes if item.error is not None]
+                    progress_details = {
+                        **running_details,
+                        "image_batch_id": batch_id,
+                        "image_completed_count": len(outcomes),
+                        "image_requested_count": total,
+                        "image_succeeded_count": len(succeeded),
+                        "image_failed_count": len(failed),
+                        "image_artifact_count": sum(len(item.stored) for item in succeeded),
+                        "image_retried_count": sum(max(0, item.backend_attempts - 1) for item in succeeded),
+                        "image_reused_count": sum(1 for item in succeeded if item.reused),
+                    }
+                    _record_request_log(
+                        endpoint="responses", username=username, api_key_value=api_key_value,
+                        requested_model=requested_model, final_model=model,
+                        final_provider=image_provider, request_body=body,
+                        response_body=None, success=True, status="running", tokens=0,
+                        details=progress_details, stream=stream, log_id=image_request_log_id,
+                    )
+
+                initial_outcomes = await _execute_image_invocations(
+                    body,
+                    username=username,
+                    api_key_value=api_key_value,
+                    invocations=image_invocations,
+                    progress=record_image_progress,
+                )
+                image_invocation_attempt_count += len(initial_outcomes)
+                for outcome in initial_outcomes:
+                    call, args = outcome.call, outcome.arguments
+                    prompt = str(args.get("prompt") or latest_user_text(input_data) or "")
+                    prompt_chars += len(prompt)
+                    if outcome.error is not None:
+                        image_failure_attempt_count += 1
+                        unresolved_failed_keys.add(_image_prompt_key(args))
+                        failed_invocations.append((call, args, friendly_error_msg(outcome.error)))
+                        continue
+                    generator = outcome.generator
+                    image_retried_count += max(0, outcome.backend_attempts - 1)
+                    image_reused_count += 1 if outcome.reused else 0
+                    invocation_results = await anyio.to_thread.run_sync(
+                        partial(
+                            generation_results_from_stored,
+                            outcome.stored,
+                            size=args.get("size"), quality=args.get("quality"),
+                            output_format=args.get("output_format"), background=args.get("background"),
+                        )
+                    )
+                    stored_images.extend(item for item in outcome.stored if item not in stored_images)
+                    invocation_artifacts = _stored_image_artifacts(
+                        request, outcome.stored, arguments=args,
+                        start_index=len(image_artifacts) + 1,
+                        used_filenames=used_asset_filenames,
+                    )
+                    image_results.extend(invocation_results)
+                    image_artifacts.extend(invocation_artifacts)
+                    completed_invocations.append((call, args, invocation_artifacts))
+                    unresolved_failed_keys.discard(_image_prompt_key(args))
+                if not completed_invocations:
+                    first_error = next((item.error for item in initial_outcomes if item.error), None)
+                    if first_error is None:
+                        first_error = RuntimeError("image batch returned no successful images")
+                    _attach_request_details(
+                        first_error,
+                        request_kind="image_generation",
+                        responses_mode="model_driven_image_generation_failed",
+                        upstream_endpoint="images/generations",
+                        image_model=image_model,
+                        attempted_provider=image_provider,
+                        image_requested_count=len(image_invocations),
+                        image_succeeded_count=0,
+                        image_failed_count=len(failed_invocations),
+                        image_count=0,
+                        image_bytes=0,
+                    )
+                    raise first_error
                 image_model = generator.get("model") or generator.get("provider_model") or ""
-                tokens = output.usage.get("total_tokens", 0)
+                bridge_image_model = image_model
+                planner_tokens = output.usage.get("total_tokens", 0)
+                tokens = planner_tokens
                 details = {
                     **routing_details_from_policy(policy),
                     "request_kind": "image_generation",
@@ -2542,40 +3410,274 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                     "image_model": image_model,
                     "image_count": len(image_results),
                     "image_bytes": image_results_bytes(image_results),
-                    "planner_tokens": tokens,
+                    "planner_tokens": planner_tokens,
+                    "image_invocation_count": len(completed_invocations),
+                    "image_requested_count": len(image_invocations),
+                    "image_succeeded_count": len(completed_invocations),
+                    "image_failed_count": len(unresolved_failed_keys),
+                    "image_failure_attempt_count": image_failure_attempt_count,
+                    "image_retried_count": image_retried_count,
+                    "image_reused_count": image_reused_count,
+                    "image_correction_applied": image_correction_applied,
                 }
                 _app_log.info(
-                    "[responses image_generation.model_invoked] prompt_chars=%d image_model=%s",
-                    len(prompt), image_model,
+                    "[responses image_generation.model_invoked] invocations=%d prompt_chars=%d image_model=%s",
+                    len(completed_invocations), prompt_chars, image_model,
                 )
-                # API-key Codex does not register the account-authenticated
-                # image_gen extension, and its ordinary Responses stream drops
-                # server-synthesized image_generation_call items. Return an
-                # assistant message so the completed result is not discarded.
-                image_output, stored_images, display_mode = _generated_image_client_output(
-                    request, body, image_results, output.usage
+                continuation_tokens = 0
+                continuation_usage: dict[str, int] = {}
+                continuation_error = ""
+                planner_output = output
+                if not has_codex_generated_image_exec_tool(body) and all_initial_calls_are_images:
+                    _append_image_bridge_results(internal, [
+                        *completed_invocations,
+                        *((call, args, []) for call, args in skipped_initial_invocations),
+                    ], failed=failed_invocations)
+                    generated_prompt_keys = {
+                        _image_prompt_key(args) for _, args, _ in completed_invocations
+                    }
+                    continuation = InternalOutputMessage()
+                    max_continuation_rounds = 4
+                    force_without_image_tool = False
+                    for continuation_round in range(1, max_continuation_rounds + 1):
+                        try:
+                            continuation, provider_info, adapter_provider_id = await _call_nonstream_with_fallbacks(
+                                policy, internal, temperature=temperature, max_tokens=max_tokens,
+                                log_label="responses.image_bridge.continuation",
+                            )
+                        except Exception as exc:
+                            continuation_error = friendly_error_msg(exc)
+                            continuation = InternalOutputMessage(
+                                text=(
+                                    "Generated image assets are available, but the agent continuation "
+                                    "failed. Continue the task in the next turn using the listed originals."
+                                ),
+                                finish_reason="stop",
+                            )
+                            _app_log.warning(
+                                "[responses image_generation.continuation_failed] round=%d images=%d error=%s",
+                                continuation_round, len(image_results), continuation_error,
+                            )
+                            break
+                        for key, value in continuation.usage.items():
+                            continuation_usage[key] = continuation_usage.get(key, 0) + int(value or 0)
+                        continuation_tokens = continuation_usage.get("total_tokens", 0)
+                        pending_images = _image_bridge_invocations(continuation)
+                        if not pending_images:
+                            break
+                        fresh_images = [
+                            (call, args) for call, args in pending_images
+                            if _image_prompt_key(args) not in generated_prompt_keys
+                        ]
+                        remaining_image_budget = max_image_invocations - len(completed_invocations)
+                        if remaining_image_budget <= 0:
+                            fresh_images = []
+                            force_without_image_tool = len(pending_images) == len(continuation.tool_calls)
+                        else:
+                            fresh_images = fresh_images[:remaining_image_budget]
+                        _app_log.info(
+                            "[responses image_generation.continuation_images] round=%d requested=%d fresh=%d",
+                            continuation_round, len(pending_images), len(fresh_images),
+                        )
+                        if not fresh_images:
+                            _append_image_bridge_results(
+                                internal, [(call, args, []) for call, args in pending_images]
+                            )
+                            if len(pending_images) < len(continuation.tool_calls):
+                                break
+                            if force_without_image_tool:
+                                break
+                            if continuation_round == max_continuation_rounds:
+                                force_without_image_tool = True
+                                break
+                            continue
+                        round_results = []
+                        round_completed = []
+                        round_failed = []
+
+                        def record_continuation_progress(batch_id, outcomes, total):
+                            current_success = sum(1 for item in outcomes if item.error is None)
+                            current_failed = sum(1 for item in outcomes if item.error is not None)
+                            progress_details = {
+                                **running_details,
+                                "image_batch_id": batch_id,
+                                "image_completed_count": image_invocation_attempt_count + len(outcomes),
+                                "image_requested_count": len(image_invocations) + len(fresh_images),
+                                "image_succeeded_count": len(completed_invocations) + current_success,
+                                "image_failed_count": len(unresolved_failed_keys) + current_failed,
+                                "image_artifact_count": len(stored_images) + sum(
+                                    len(item.stored) for item in outcomes if item.error is None
+                                ),
+                                "image_retried_count": image_retried_count + sum(
+                                    max(0, item.backend_attempts - 1)
+                                    for item in outcomes if item.error is None
+                                ),
+                                "image_reused_count": image_reused_count + sum(
+                                    1 for item in outcomes if item.error is None and item.reused
+                                ),
+                            }
+                            _record_request_log(
+                                endpoint="responses", username=username, api_key_value=api_key_value,
+                                requested_model=requested_model, final_model=model,
+                                final_provider=image_provider, request_body=body,
+                                response_body=None, success=True, status="running", tokens=0,
+                                details=progress_details, stream=stream, log_id=image_request_log_id,
+                            )
+
+                        round_outcomes = await _execute_image_invocations(
+                            body,
+                            username=username,
+                            api_key_value=api_key_value,
+                            invocations=fresh_images,
+                            progress=record_continuation_progress,
+                        )
+                        image_invocation_attempt_count += len(round_outcomes)
+                        for outcome in round_outcomes:
+                            call, args = outcome.call, outcome.arguments
+                            prompt = str(args.get("prompt") or latest_user_text(input_data) or "")
+                            prompt_chars += len(prompt)
+                            if outcome.error is not None:
+                                image_failure_attempt_count += 1
+                                unresolved_failed_keys.add(_image_prompt_key(args))
+                                round_failed.append((call, args, friendly_error_msg(outcome.error)))
+                                continue
+                            generator = outcome.generator
+                            image_retried_count += max(0, outcome.backend_attempts - 1)
+                            image_reused_count += 1 if outcome.reused else 0
+                            invocation_results = await anyio.to_thread.run_sync(
+                                partial(
+                                    generation_results_from_stored,
+                                    outcome.stored,
+                                    size=args.get("size"), quality=args.get("quality"),
+                                    output_format=args.get("output_format"), background=args.get("background"),
+                                )
+                            )
+                            stored_images.extend(item for item in outcome.stored if item not in stored_images)
+                            invocation_artifacts = _stored_image_artifacts(
+                                request, outcome.stored, arguments=args,
+                                start_index=len(image_artifacts) + 1,
+                                used_filenames=used_asset_filenames,
+                            )
+                            round_results.extend(invocation_results)
+                            image_artifacts.extend(invocation_artifacts)
+                            round_completed.append((call, args, invocation_artifacts))
+                            generated_prompt_keys.add(_image_prompt_key(args))
+                            unresolved_failed_keys.discard(_image_prompt_key(args))
+                        image_results.extend(round_results)
+                        completed_invocations.extend(round_completed)
+                        image_model = generator.get("model") or generator.get("provider_model") or image_model
+                        bridge_image_model = image_model
+                        completed_call_ids = {call.call_id or call.id for call, _, _ in round_completed}
+                        failed_call_ids = {call.call_id or call.id for call, _, _ in round_failed}
+                        skipped_invocations = [
+                            (call, args, []) for call, args in pending_images
+                            if (call.call_id or call.id) not in completed_call_ids | failed_call_ids
+                        ]
+                        _append_image_bridge_results(
+                            internal, [*round_completed, *skipped_invocations], failed=round_failed
+                        )
+                        if len(pending_images) < len(continuation.tool_calls):
+                            break
+                        if len(completed_invocations) >= max_image_invocations:
+                            force_without_image_tool = True
+                            break
+                        if continuation_round == max_continuation_rounds:
+                            force_without_image_tool = True
+                    if force_without_image_tool:
+                        internal.tools = [
+                            tool for tool in internal.tools if tool.name != IMAGE_BRIDGE_TOOL_NAME
+                        ]
+                        remaining_tools = internal.chat_tools()
+                        if remaining_tools:
+                            internal.extra["tools"] = remaining_tools
+                        else:
+                            internal.extra.pop("tools", None)
+                        try:
+                            continuation, provider_info, adapter_provider_id = await _call_nonstream_with_fallbacks(
+                                policy, internal, temperature=temperature, max_tokens=max_tokens,
+                                log_label="responses.image_bridge.continuation.final",
+                            )
+                            for key, value in continuation.usage.items():
+                                continuation_usage[key] = continuation_usage.get(key, 0) + int(value or 0)
+                            continuation_tokens = continuation_usage.get("total_tokens", 0)
+                        except Exception as exc:
+                            continuation_error = friendly_error_msg(exc)
+                            continuation = InternalOutputMessage(
+                                text=(
+                                    "Generated image assets are available, but the agent continuation "
+                                    "failed. Continue the task in the next turn using the listed originals."
+                                ),
+                                finish_reason="stop",
+                            )
+                            _app_log.warning(
+                                "[responses image_generation.continuation_failed] stage=final images=%d error=%s",
+                                len(image_results), continuation_error,
+                            )
+                    planner_output = continuation
+                    continuation.tool_calls = [
+                        call for call in continuation.tool_calls
+                        if call.name != IMAGE_BRIDGE_TOOL_NAME
+                        and not (call.name == "exec" and image_call_arguments_from_exec(call.arguments))
+                    ]
+                    _app_log.info(
+                        "[responses image_generation.continuation] text_chars=%d tool_calls=%d tokens=%d",
+                        len(continuation.text or ""), len(continuation.tool_calls), continuation_tokens,
+                    )
+                combined_usage = {
+                    key: int(output.usage.get(key, 0) or 0) + int(continuation_usage.get(key, 0) or 0)
+                    for key in set(output.usage) | set(continuation_usage)
+                }
+                tokens = combined_usage.get("total_tokens", planner_tokens + continuation_tokens)
+                image_output, display_mode = await anyio.to_thread.run_sync(
+                    _generated_image_client_output,
+                    body, image_results, stored_images, image_artifacts, combined_usage,
                 )
+                image_output = _merge_image_bridge_output(planner_output, image_output)
                 details = {
                     **details,
                     "responses_mode": f"model_driven_image_generation_{display_mode}",
                     "image_artifact_count": len(stored_images),
+                    "continuation_tokens": continuation_tokens,
+                    "image_count": len(image_results),
+                    "image_bytes": image_results_bytes(image_results),
+                    "image_invocation_count": len(completed_invocations),
+                    "image_invocation_attempt_count": image_invocation_attempt_count,
+                    "image_requested_count": len(image_invocations),
+                    "image_succeeded_count": len(completed_invocations),
+                    "image_failed_count": len(unresolved_failed_keys),
+                    "image_failure_attempt_count": image_failure_attempt_count,
+                    "image_retried_count": image_retried_count,
+                    "image_reused_count": image_reused_count,
+                    "image_continuation_error": continuation_error,
+                    "image_correction_applied": image_correction_applied,
                 }
+                request_status = (
+                    "degraded"
+                    if (
+                        image_failure_attempt_count > 0
+                        or image_retried_count > 0
+                        or unresolved_failed_keys
+                        or continuation_error
+                    )
+                    else "ok"
+                )
+                details["status"] = request_status
                 _app_log.info(
                     "[responses image_generation.assistant_message] images=%d artifact_bytes=%d",
                     len(stored_images),
                     sum(item.path.stat().st_size for item in stored_images),
                 )
                 if stream:
-                    _log_request(username, api_key_value, model, adapter_provider_id, "responses", True, tokens, requested_model, details=details)
+                    _log_request(username, api_key_value, model, image_provider, "responses", True, tokens, requested_model, details=details)
                     _record_request_log(
                         endpoint="responses", username=username, api_key_value=api_key_value,
                         requested_model=requested_model, final_model=model,
-                        final_provider=adapter_provider_id, request_body=body,
+                        final_provider=image_provider, request_body=body,
                         response_body={"status": "completed", "output_count": len(image_results)},
-                        success=True, status="ok", tokens=tokens, usage=output.usage,
-                        details=details, stream=True,
+                        success=True, status=request_status, tokens=tokens, usage=image_output.usage,
+                        details=details, stream=True, log_id=image_request_log_id,
                     )
-                    _record_success_metrics(username, api_key_value, tokens, "ok")
+                    _record_success_metrics(username, api_key_value, tokens, request_status)
                     return StreamingResponse(
                         render_responses_sse(
                             _nonstream_output_events(image_output), model=model,
@@ -2589,15 +3691,15 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                     image_output, model=model, previous_response_id=previous_response_id,
                     extra=internal.extra,
                 )
-                _log_request(username, api_key_value, model, adapter_provider_id, "responses", True, tokens, requested_model, details=details)
+                _log_request(username, api_key_value, model, image_provider, "responses", True, tokens, requested_model, details=details)
                 _record_request_log(
                     endpoint="responses", username=username, api_key_value=api_key_value,
                     requested_model=requested_model, final_model=model,
-                    final_provider=adapter_provider_id, request_body=body,
-                    response_body=rendered, success=True, status="ok", tokens=tokens,
-                    usage=output.usage, details=details,
+                    final_provider=image_provider, request_body=body,
+                    response_body=rendered, success=True, status=request_status, tokens=tokens,
+                    usage=image_output.usage, details=details, log_id=image_request_log_id,
                 )
-                _record_success_metrics(username, api_key_value, tokens, "ok")
+                _record_success_metrics(username, api_key_value, tokens, request_status)
                 return rendered
 
             # The model chose not to generate an image. Never expose the
@@ -2653,7 +3755,11 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
         # compatibility adapter already maps image_gen-imagegen to a function
         # tool and egress restores namespace=image_gen, matching Sub2API's
         # client-owned tool loop.
-        if (native_supported and not codex_image_tool) or native_required:
+        if (
+            not image_display_followup
+            and not image_already_generated
+            and ((native_supported and not codex_image_tool) or native_required)
+        ):
             _app_log.info("[responses native] provider=%s model=%s stream=%s", adapter_provider_id or "-", model, stream)
             try:
                 if stream:
@@ -2790,15 +3896,28 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
         _record_success_metrics(username, api_key_value, tokens, status)
         return rendered
     except HTTPException as e:
+        _rollback_image_bridge_artifacts(
+            e,
+            stored=bridge_stored_images,
+            image_results=bridge_image_results,
+            image_model=bridge_image_model,
+        )
         if _request_details_from_exception(e).get("request_kind") == "image_generation":
             _record_image_generation_failure(
                 username=username, api_key_value=api_key_value,
                 requested_model=requested_model, model=model,
                 provider_id=adapter_provider_id, endpoint="responses",
                 request_body=body, exc=e,
+                request_log_id=image_request_log_id or None,
             )
         raise
     except Exception as e:
+        _rollback_image_bridge_artifacts(
+            e,
+            stored=bridge_stored_images,
+            image_results=bridge_image_results,
+            image_model=bridge_image_model,
+        )
         details = _request_details_from_exception(
             e,
             stream=False,
@@ -2814,6 +3933,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
             request_body=body, response_body=None,
             success=False, status=details.get("status", "fail"),
             tokens=0, details=details, error_message=friendly_error_msg(e),
+            log_id=image_request_log_id or None,
         )
         increment_global_stats(success=False, stateful_fallback_blocked=bool(details.get("stateful_fallback_blocked")))
         if username != "legacy":
@@ -2842,6 +3962,11 @@ async def _images_generation_request(request: Request, authorization: Optional[s
     if not configured_generator:
         raise HTTPException(status_code=503, detail="No image-generation backend is enabled")
     generator = _resolved_image_generator(configured_generator)
+    generator.setdefault("max_retries", get_default("image_generation_max_retries", 2))
+    generator.setdefault("retry_base_seconds", get_default("image_generation_retry_base_seconds", 1.0))
+    generator.setdefault("max_retry_delay_seconds", get_default("image_generation_max_retry_delay_seconds", 30.0))
+    generator.setdefault("result_max_bytes", get_default("image_generation_result_max_bytes", 25 * 1024 * 1024))
+    generator.setdefault("allow_private_download_hosts", get_default("image_download_allow_private_hosts", False))
     image_provider_id = str(generator.get("provider_id") or provider_id or "")
     image_model = str(generator.get("model") or generator.get("provider_model") or "")
     try:
@@ -2902,6 +4027,23 @@ _PAYLOAD_MAX_BYTES = 64 * 1024
 _STREAMED_TEXT_MAX = 16 * 1024
 _STREAMED_REASONING_MAX = 16 * 1024
 _STREAMED_TOOL_MAX = 8
+
+
+def _redact_log_payload(value):
+    fields = get_default(
+        "request_log_redact_fields",
+        ["api_key", "authorization", "cookie", "password", "secret", "token"],
+    )
+    blocked = {str(field).casefold() for field in fields} if isinstance(fields, list) else set()
+    if isinstance(value, dict):
+        return {
+            key: "[REDACTED]" if str(key).casefold() in blocked else _redact_log_payload(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_log_payload(item) for item in value]
+    return value
+
 
 def _truncate_payload(value, max_bytes=_PAYLOAD_MAX_BYTES):
     if value is None:
@@ -2982,21 +4124,23 @@ def _record_request_log(
     details=None,
     partial_output=False,
     error_message=None,
+    log_id=None,
 ):
+    capture_payloads = bool(get_default("request_log_capture_payloads", True))
     payload_details = _normalized_request_details(endpoint, details)
     if usage and 'usage' not in payload_details:
         payload_details['usage'] = usage
-    if streamed_text is not None:
+    if capture_payloads and streamed_text is not None:
         compact = _compact_text(streamed_text, _STREAMED_TEXT_MAX)
         payload_details['streamed_text'] = compact
         if compact != streamed_text:
             payload_details['streamed_text_truncated'] = True
-    if streamed_reasoning is not None:
+    if capture_payloads and streamed_reasoning is not None:
         compact = _compact_text(streamed_reasoning, _STREAMED_REASONING_MAX)
         payload_details['streamed_reasoning'] = compact
         if compact != streamed_reasoning:
             payload_details['streamed_reasoning_truncated'] = True
-    if streamed_tool_calls is not None:
+    if capture_payloads and streamed_tool_calls is not None:
         if len(streamed_tool_calls) > _STREAMED_TOOL_MAX:
             payload_details['streamed_tool_calls'] = streamed_tool_calls[:_STREAMED_TOOL_MAX]
             payload_details['streamed_tool_calls_truncated'] = True
@@ -3018,8 +4162,15 @@ def _record_request_log(
         status=status,
         error_message=error_message,
     )
+    if capture_payloads:
+        request_body = _redact_log_payload(request_body)
+        final_response_body = _redact_log_payload(final_response_body)
+    else:
+        request_body = {"_omitted": True, "reason": "request_log_capture_payloads=false"}
+        final_response_body = {"_omitted": True, "reason": "request_log_capture_payloads=false"}
     try:
-        add_request_log(
+        writer = update_request_log if log_id else add_request_log
+        writer_kwargs = dict(
             timestamp=time.strftime('%Y-%m-%d %H:%M:%S'),
             endpoint=endpoint,
             username=username or '',
@@ -3035,12 +4186,19 @@ def _record_request_log(
             details=payload_details,
             error=(error_message or ''),
         )
+        if log_id:
+            writer(int(log_id), **writer_kwargs)
+            written_id = int(log_id)
+        else:
+            written_id = writer(**writer_kwargs)
     except Exception as exc:
         _app_log.warning('add_request_log failed: %s', exc)
+        written_id = int(log_id or 0)
     try:
         trim_request_logs(get_default('request_log_max', 500))
     except Exception as exc:
         _app_log.warning('trim_request_logs failed: %s', exc)
+    return written_id
 
 def _build_stream_recorder(
     endpoint,

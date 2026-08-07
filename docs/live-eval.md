@@ -1,13 +1,13 @@
 # Live Gateway Evaluation
 
-`tools/live_eval.py` runs real requests against an already deployed LLM AIO Gateway and its configured upstream providers. It is intentionally separate from the normal pytest suite because it can spend tokens, depends on live provider health, and may exercise every model visible to the supplied API key.
+`tools/live_eval/live_eval.py` runs real requests against an already deployed LLM AIO Gateway and its configured upstream providers. It is intentionally separate from the normal pytest suite because it can spend tokens, depends on live provider health, and may exercise every model visible to the supplied API key.
 
 ## Quick Start
 
 ```powershell
-Copy-Item tools/live-eval.config.example.json tools/live-eval.config.json
-# Edit tools/live-eval.config.json and fill in base_url/api_key.
-python tools/live_eval.py --limit 2
+Copy-Item tools/live_eval/live-eval.config.example.json tools/live_eval/live-eval.config.local.json
+# Edit tools/live_eval/live-eval.config.local.json and fill in base_url/api_key.
+python tools/live_eval/live_eval.py --limit 2
 ```
 
 Reports are written to `reports/live-eval/` as JSON and Markdown.
@@ -16,30 +16,30 @@ Reports are written to `reports/live-eval/` as JSON and Markdown.
 
 ```powershell
 # Test specific models only
-python tools/live_eval.py --model provider/model-a --model provider/model-b
+python tools/live_eval/live_eval.py --model provider/model-a --model provider/model-b
 
 # Use another config file
-python tools/live_eval.py --config local-live-eval.json
+python tools/live_eval/live_eval.py --config local-live-eval.json
 
 # Skip token-expensive capability probes
-python tools/live_eval.py --skip-multimodal --skip-stream
+python tools/live_eval/live_eval.py --skip-multimodal --skip-stream
 
 # Include admin dashboard request logs in each case result
-# Fill admin_username/admin_password in live-eval.config.json.
-python tools/live_eval.py --model provider/model-a
+# Fill admin_username/admin_password in live-eval.config.local.json.
+python tools/live_eval/live_eval.py --model provider/model-a
 
 # Ask a configured gateway model to judge the run summary
-# Fill judge_model in live-eval.config.json.
-python tools/live_eval.py --model provider/model-a
+# Fill judge_model in live-eval.config.local.json.
+python tools/live_eval/live_eval.py --model provider/model-a
 ```
 
-Default config file: `tools/live-eval.config.json`.
+Default config file: `tools/live_eval/live-eval.config.json`. The Windows launcher prefers `live-eval.config.local.json` when present.
 
 Example:
 
 ```json
 {
-  "base_url": "http://192.168.75.100:8000",
+  "base_url": "http://localhost:8000",
   "api_key": "sk-aio-...",
   "admin_username": "admin",
   "admin_password": "password",
@@ -59,7 +59,7 @@ Config fields:
 
 | Variable | Meaning |
 |---|---|
-| `base_url` | Gateway base URL. Defaults to `http://192.168.75.100:8000`. |
+| `base_url` | Gateway base URL. Defaults to `http://localhost:8000`. |
 | `api_key` | User API key used for `/v1/models` and proxy endpoints. Required. |
 | `admin_username` | Optional admin username for `/admin/stats` logs. |
 | `admin_password` | Optional admin password for `/admin/stats` logs. |

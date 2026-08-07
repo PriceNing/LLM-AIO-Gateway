@@ -73,6 +73,59 @@ def add_request_log(
         return int(cursor.lastrowid or 0)
 
 
+def update_request_log(
+    get_db,
+    log_id,
+    *,
+    timestamp,
+    endpoint,
+    username,
+    api_key,
+    requested_model,
+    model,
+    provider,
+    status,
+    stream,
+    tokens,
+    request_body=None,
+    response_body=None,
+    details=None,
+    error=None,
+):
+    """Replace a running request-log row with its latest lifecycle snapshot."""
+    with get_db() as db:
+        cursor = db.execute(
+            """
+            UPDATE request_logs SET
+                timestamp = ?, endpoint = ?, username = ?, api_key = ?,
+                requested_model = ?, model = ?, provider = ?, status = ?,
+                stream = ?, tokens = ?, request_body = ?, response_body = ?,
+                details = ?, error = ?
+            WHERE id = ?
+            """,
+            (
+                timestamp,
+                endpoint,
+                username or "",
+                api_key or "",
+                requested_model or "",
+                model or "",
+                provider or "",
+                status or "",
+                1 if stream else 0,
+                int(tokens or 0),
+                json.dumps(request_body, ensure_ascii=False, default=str)
+                if request_body is not None else None,
+                json.dumps(response_body, ensure_ascii=False, default=str)
+                if response_body is not None else None,
+                json.dumps(details or {}, ensure_ascii=False, default=str),
+                error or "",
+                int(log_id),
+            ),
+        )
+        return cursor.rowcount > 0
+
+
 def list_request_logs(
     get_db,
     *,
@@ -188,6 +241,9 @@ def _decode_request_log(entry):
     entry["request_kind"] = "image_generation" if is_image else str(details.get("request_kind") or "text_generation")
     for key in (
         "image_model", "image_count", "image_bytes", "image_artifact_count",
+        "image_requested_count", "image_succeeded_count", "image_failed_count",
+        "image_retried_count", "image_reused_count", "image_completed_count",
+        "image_batch_id",
         "responses_mode", "upstream_endpoint",
     ):
         if key in details:

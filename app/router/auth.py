@@ -1,9 +1,18 @@
 import asyncio
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Header, HTTPException, Request
 from typing import Optional
 from app import __version__
 from app.database import get_admins, get_admin, add_admin, update_admin_password
-from app.security import create_session, delete_session, get_session_username, hash_password, verify_password
+from app.security import (
+    clear_login_failures,
+    create_session,
+    delete_session,
+    get_session_username,
+    hash_password,
+    login_retry_after,
+    record_login_failure,
+    verify_password,
+)
 
 router = APIRouter()
 
@@ -49,15 +58,27 @@ async def setup_admin(payload: dict):
 
 
 @router.post("/login")
-async def login(payload: dict):
+async def login(payload: dict, request: Request):
     username = payload.get("username", "").strip()
     password = payload.get("password", "")
+    client_host = request.client.host if request.client else "unknown"
+    identity = f"{client_host}\0{username.casefold()}"
+    retry_after = login_retry_after(identity)
+    if retry_after:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many failed login attempts; try again later",
+            headers={"Retry-After": str(retry_after)},
+        )
     admin = get_admin(username)
     if not admin or not admin.get("enabled", True):
+        record_login_failure(identity)
         raise HTTPException(status_code=401, detail="Invalid username or password")
     valid = await asyncio.to_thread(verify_password, password, admin.get("password_hash", ""))
     if not valid:
+        record_login_failure(identity)
         raise HTTPException(status_code=401, detail="Invalid username or password")
+    clear_login_failures(identity)
     token = create_session(username)
     return {"token": token, "username": username, "display_name": admin.get("display_name", username)}
 

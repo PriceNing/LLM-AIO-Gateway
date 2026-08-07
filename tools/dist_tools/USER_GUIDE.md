@@ -4,13 +4,12 @@
 
 ## 1. 下载
 
-从 [GitHub Releases](https://github.com/your-org/llm-aio-gateway/releases) 找到最新版本，下载对应你电脑的压缩包：
+从 [GitHub Releases](https://github.com/pricening/llm-aio-gateway/releases) 找到最新版本，下载对应你电脑的压缩包：
 
 | 你的电脑 | 下载 |
 |---|---|
 | Windows 10/11 | `LLM-AIO-Gateway-windows-x86_64-vX.Y.Z.zip` |
 | macOS Apple Silicon（M1/M2/M3/M4） | `LLM-AIO-Gateway-macos-arm64-vX.Y.Z.zip` |
-| macOS Intel | `LLM-AIO-Gateway-macos-x86_64-vX.Y.Z.zip` |
 | Linux | `LLM-AIO-Gateway-linux-x86_64-vX.Y.Z.tar.gz` |
 
 ## 2. 解压

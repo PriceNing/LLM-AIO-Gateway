@@ -5,7 +5,7 @@
 ## 目录结构
 
 ```
-tools/standalone/
+tools/dist_tools/
 ├── README.md                   # 本文件
 ├── launcher/
 │   └── gui.py                  # Tkinter 启动器（启动/停止/打开面板/检查更新）
@@ -27,27 +27,27 @@ curl -LsSf https://astral.sh/uv/install.sh | sh   # macOS / Linux
 
 ```bash
 # Windows
-python tools/standalone/scripts/build_standalone.py --target windows
+python tools/dist_tools/scripts/build_standalone.py --target windows
 
-# macOS（x86_64 / arm64 分开打，发布时同时给两个）
-python tools/standalone/scripts/build_standalone.py --target macos-arm64
-python tools/standalone/scripts/build_standalone.py --target macos-x86_64
+# macOS（官方发布构建 arm64；x86_64 目标仍可用于本地兼容构建）
+python tools/dist_tools/scripts/build_standalone.py --target macos-arm64
+python tools/dist_tools/scripts/build_standalone.py --target macos-x86_64
 
 # Linux
-python tools/standalone/scripts/build_standalone.py --target linux
+python tools/dist_tools/scripts/build_standalone.py --target linux
 
 # 或者一次打完所有平台（仅当前机器能打的）
-python tools/standalone/scripts/build_standalone.py --target all
+python tools/dist_tools/scripts/build_standalone.py --target all
 ```
 
 ### 输出
 
 ```
 dist/standalone/
-├── LLM-AIO-Gateway-windows-x86_64-v0.9.0.zip
-├── LLM-AIO-Gateway-macos-arm64-v0.9.0.zip
-├── LLM-AIO-Gateway-macos-x86_64-v0.9.0.zip
-├── LLM-AIO-Gateway-linux-x86_64-v0.9.0.tar.gz
+├── LLM-AIO-Gateway-windows-x86_64-v0.9.1.zip
+├── LLM-AIO-Gateway-macos-arm64-v0.9.1.zip
+├── LLM-AIO-Gateway-macos-x86_64-v0.9.1.zip  # 仅在本地选择该目标时生成
+├── LLM-AIO-Gateway-linux-x86_64-v0.9.1.tar.gz
 ├── version.json
 └── cache/                       # wheels + PBS，重复构建会复用
 ```
@@ -89,11 +89,11 @@ LLM-AIO-Gateway/
 
 ```json
 {
-  "version": "0.9.0",
+  "version": "0.9.1",
   "released_at": "2026-06-15T00:00:00Z",
   "notes": "修复 xxx",
   "artifacts": [
-    {"target": "windows", "filename": "LLM-AIO-Gateway-windows-x86_64-v0.9.0.zip",
+    {"target": "windows", "filename": "LLM-AIO-Gateway-windows-x86_64-v0.9.1.zip",
      "size": 188743424, "sha256": "abc..."},
     ...
   ]

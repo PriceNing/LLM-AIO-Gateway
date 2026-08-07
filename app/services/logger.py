@@ -75,7 +75,35 @@ class JsonFormatter(logging.Formatter):
 
 
 class SafeFileHandler(logging.FileHandler):
-    """FileHandler that recreates missing parent directories before opening."""
+    """FileHandler that recreates directories and follows UTC day rollover.
+
+    Application modules keep logger instances for the lifetime of the process,
+    so ``LogManager.get_logger()`` may not run again after midnight. Rotate at
+    emit time as well, otherwise those long-lived loggers reopen and continue
+    writing the previous day's file after its handler was closed.
+    """
+
+    def __init__(self, filename, *args, **kwargs):
+        initial = Path(filename).resolve()
+        self._daily_root = initial.parent.parent
+        self._daily_name = initial.name
+        super().__init__(str(initial), *args, **kwargs)
+
+    def _current_day(self) -> str:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    def _rollover_if_needed(self) -> None:
+        target = (self._daily_root / self._current_day() / self._daily_name).resolve()
+        if Path(self.baseFilename) == target:
+            return
+        if self.stream:
+            self.stream.close()
+            self.stream = None
+        self.baseFilename = str(target)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self._rollover_if_needed()
+        super().emit(record)
 
     def _open(self):
         Path(self.baseFilename).parent.mkdir(parents=True, exist_ok=True)

@@ -226,12 +226,18 @@ def _extract_python(progress) -> bool:
 
 def _smoke_test() -> bool:
     """用子进程调 PBS python + PYTHONPATH 指向 site-packages，验证关键依赖能 import"""
-    cmd = [str(PY_EXE), "-c",
-           "import fastapi, litellm, pydantic, uvicorn, httpx, anyio; print('OK')"]
+    cmd = [
+        str(PY_EXE),
+        "-c",
+        (
+            "import fastapi, litellm, pydantic, uvicorn, httpx, anyio, PIL; "
+            "from main import app; print(app.title)"
+        ),
+    ]
     env = _child_env()
     try:
         out = subprocess.check_output(
-            cmd, env=env, stderr=subprocess.STDOUT, timeout=30)
+            cmd, cwd=ROOT_DIR, env=env, stderr=subprocess.STDOUT, timeout=30)
     except (subprocess.CalledProcessError, OSError, subprocess.TimeoutExpired) as exc:
         # 把 stderr 写到日志，便于排查
         if isinstance(exc, subprocess.CalledProcessError):
@@ -239,7 +245,7 @@ def _smoke_test() -> bool:
         else:
             log(f"smoke test failed: {exc}")
         return False
-    return b"OK" in out
+    return b"LLM AIO Gateway" in out
 
 
 def _child_env() -> dict:

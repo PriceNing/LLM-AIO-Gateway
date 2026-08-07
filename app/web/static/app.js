@@ -1987,11 +1987,12 @@ function renderImageGeneration() {
     var html = '<div class="preprocessors-layout">';
     var providerOptions = '<option value="">' + t('imageGeneration.selectModel') + '</option>';
     (imageGenerationData.providers || []).forEach(function(provider) {
-        providerOptions += '<optgroup label="' + escHtml(provider.name || provider.id) + '">';
         (provider.models || []).forEach(function(model) {
-            providerOptions += '<option value="' + escHtml(model.provider_model) + '">' + escHtml(model.model_name) + '</option>';
+            // Native optgroup labels are unreadable in some Windows dark-theme
+            // dropdowns. Keep the exact composite ID visible on every option so
+            // duplicate model names from different providers are unambiguous.
+            providerOptions += '<option value="' + escHtml(model.provider_model) + '">' + escHtml(model.provider_model) + '</option>';
         });
-        providerOptions += '</optgroup>';
     });
     html += '<div class="preprocessor-config-col"><div class="section-sub-header"><h3>' + t('imageGeneration.config') + '</h3></div>';
     html += '<div class="preprocessor-card glass"><div class="preprocessor-card-body">' +
@@ -3300,6 +3301,12 @@ async function showRequestLogDetail(logId) {
             body += detailRow(t('stats.imageCount') || 'Image Count', entry.image_count || 0);
             body += detailRow(t('stats.imageBytes') || 'Image Bytes', entry.image_bytes || 0);
             body += detailRow(t('stats.imageArtifactCount') || 'Stored Artifacts', entry.image_artifact_count || 0);
+            body += detailRow('Requested', entry.image_requested_count || 0);
+            body += detailRow('Succeeded', entry.image_succeeded_count || 0);
+            body += detailRow('Failed', entry.image_failed_count || 0);
+            body += detailRow('Retried', entry.image_retried_count || 0);
+            body += detailRow('Reused', entry.image_reused_count || 0);
+            body += detailRow('Batch ID', entry.image_batch_id || '');
             body += detailRow(t('stats.upstreamEndpoint') || 'Upstream Endpoint', entry.upstream_endpoint || '');
             body += detailRow(t('stats.responsesMode') || 'Responses Mode', entry.responses_mode || '');
             body += '</div></div>';

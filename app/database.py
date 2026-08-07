@@ -1630,6 +1630,43 @@ def add_request_log(
     )
 
 
+def update_request_log(
+    log_id: int,
+    timestamp: str,
+    endpoint: str,
+    username: str,
+    api_key: str,
+    requested_model: str,
+    model: str,
+    provider: str,
+    status: str,
+    stream: bool,
+    tokens: int,
+    request_body=None,
+    response_body=None,
+    details: Optional[dict] = None,
+    error: Optional[str] = None,
+) -> bool:
+    return request_logs_db.update_request_log(
+        get_db,
+        log_id,
+        timestamp=timestamp,
+        endpoint=endpoint,
+        username=username,
+        api_key=api_key,
+        requested_model=requested_model,
+        model=model,
+        provider=provider,
+        status=status,
+        stream=stream,
+        tokens=tokens,
+        request_body=request_body,
+        response_body=response_body,
+        details=details,
+        error=error,
+    )
+
+
 def list_request_logs(
     limit: int = 100,
     offset: int = 0,

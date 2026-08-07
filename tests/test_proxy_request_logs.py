@@ -133,3 +133,53 @@ def test_record_request_log_stream_summary_response_body(temp_db):
         "tool_calls": [{"id": "call_1", "name": "tool", "arguments": "{}"}],
         "usage": {"total_tokens": 3},
     }
+
+
+def test_request_log_redacts_structured_secrets(temp_db):
+    from app.router.proxy import _record_request_log
+
+    _record_request_log(
+        endpoint="responses",
+        username="alice",
+        api_key_value="sk-test",
+        requested_model="m",
+        final_model="m",
+        final_provider="p",
+        request_body={"api_key": "secret-key", "nested": {"password": "secret", "prompt": "safe"}},
+        response_body={"token": "secret-token", "status": "ok"},
+        success=True,
+        status="ok",
+        tokens=0,
+    )
+
+    entry = list_request_logs(limit=1)[0]
+    assert entry["request_body"]["api_key"] == "[REDACTED]"
+    assert entry["request_body"]["nested"]["password"] == "[REDACTED]"
+    assert entry["request_body"]["nested"]["prompt"] == "safe"
+    assert entry["response_body"]["token"] == "[REDACTED]"
+
+
+def test_request_log_payload_capture_can_be_disabled(temp_db, monkeypatch):
+    from app.router.proxy import _record_request_log
+
+    monkeypatch.setattr(
+        "app.router.proxy.get_default",
+        lambda key, fallback=None: False if key == "request_log_capture_payloads" else fallback,
+    )
+    _record_request_log(
+        endpoint="responses",
+        username="alice",
+        api_key_value="sk-test",
+        requested_model="m",
+        final_model="m",
+        final_provider="p",
+        request_body={"input": "private prompt"},
+        response_body={"output": "private response"},
+        success=True,
+        status="ok",
+        tokens=0,
+    )
+
+    entry = list_request_logs(limit=1)[0]
+    assert entry["request_body"]["_omitted"] is True
+    assert entry["response_body"]["_omitted"] is True

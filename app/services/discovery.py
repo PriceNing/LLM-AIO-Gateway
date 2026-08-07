@@ -76,11 +76,35 @@ async def discover_models(provider_id: str) -> list[dict]:
         for url in model_list_urls(api_base, provider_type):
             for headers in auth_headers(api_key, provider_type):
                 try:
-                    resp = await client.get(url, headers=headers, timeout=10.0)
-                    resp.raise_for_status()
-                    models = parse_models(resp.json())
-                    if models:
-                        return models
+                    models_by_id = {}
+                    cursor = ""
+                    seen_cursors = set()
+                    for _page in range(100):
+                        params = None
+                        if cursor:
+                            params = {"after_id" if provider_type == "anthropic" else "after": cursor}
+                        request_kwargs = {"headers": headers, "timeout": 10.0}
+                        if params:
+                            request_kwargs["params"] = params
+                        resp = await client.get(url, **request_kwargs)
+                        resp.raise_for_status()
+                        payload = resp.json()
+                        page_models = parse_models(payload)
+                        for model in page_models:
+                            models_by_id[str(model["id"])] = model
+                        if not payload.get("has_more"):
+                            break
+                        next_cursor = str(payload.get("last_id") or "").strip()
+                        if not next_cursor and page_models:
+                            next_cursor = str(page_models[-1]["id"])
+                        if not next_cursor or next_cursor in seen_cursors:
+                            raise RuntimeError("model discovery returned an invalid pagination cursor")
+                        seen_cursors.add(next_cursor)
+                        cursor = next_cursor
+                    else:
+                        raise RuntimeError("model discovery exceeded 100 pages")
+                    if models_by_id:
+                        return list(models_by_id.values())
                 except Exception as exc:
                     last_error = exc
 

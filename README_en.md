@@ -18,6 +18,7 @@ The current proxy core is built around a provider-neutral internal representatio
 | Shared IR pipeline | Routing, preprocessing, reasoning cache, tool repair, and circuit-breaking run once on internal messages instead of duplicated endpoint-specific conversions. |
 | Structured routing | The policy layer returns `RoutingDecision` with requested/resolved/target model, target provider, matched rule, and reason. |
 | Vision model injection | Images can be described by a configured vision model, then replaced with text so text-only models can handle visual context. |
+| Image-generation gateway | Supports `/images/generations`, Codex `/responses` tool bridging, short-lived originals, compressed previews, batches, and image usage statistics. |
 | Tool-call reliability | Preserves tool IDs across protocol conversions, repairs malformed tool JSON, and includes a tool-only loop circuit breaker. |
 | Reasoning continuity | Caches and replays `reasoning_content` for DeepSeek-style thinking models across multi-turn tool flows. |
 | Web admin panel | Manage providers, users, API keys, routing rules, model preprocessors, and usage stats. |
@@ -86,6 +87,7 @@ All proxy endpoints are available at both root and `/v1` paths.
 | `POST /v1/completions` | OpenAI legacy Completions | `prompt` is wrapped into an internal user message, then rendered back as `choices[0].text`. |
 | `POST /v1/messages` | Anthropic Messages | Claude Code-compatible Messages API, tools, streaming, images. |
 | `POST /v1/responses` or `/responses` | OpenAI Responses | Codex-compatible Responses API, tools, streaming, previous response IDs. |
+| `POST /v1/images/generations` or `/images/generations` | OpenAI Images | Sends OpenAI Images-compatible requests to the globally configured image backend. |
 | `GET /v1/models` | OpenAI Models | Lists models allowed for the caller's API key. |
 
 ### Chat Completions Example
@@ -145,6 +147,12 @@ Vision injection lets text-only models handle image input. When enabled for the 
 
 Add preprocessors in the admin panel under Vision Model Injection, then enable preprocessing for target models there. Preprocessor definitions and model toggles are stored in SQLite, not `config.json`. The decision is based on the originally requested model, not the routed target model.
 
+## Image Generation
+
+Image generation is separate from vision-model injection. Select one global image backend in the Image Generation admin page, then enable image generation for each chat model that may use it. If a user can access model A and image generation is enabled for model A, requests through A may use the global image backend; the backend image model does not need separate inclusion in that user's chat-model allow-list.
+
+This release supports existing provider models and external OpenAI Images-compatible backends. ComfyUI is reserved as a future interchangeable backend and is not implemented yet. Codex can invoke image generation through the `/responses` tool bridge or `/images/generations`. The gateway stores short-lived originals and returns bounded previews to clients.
+
 ## Routing Rules
 
 Routing rules can transparently redirect requests by username, API-key substring, and requested model pattern. The first matching enabled rule wins.
@@ -186,6 +194,13 @@ Important defaults:
 | `tool_only_turns_ttl` | 600 | Tool-only counter TTL in seconds. |
 | `tool_only_turns_max_size` | 2000 | Tool-only counter capacity. |
 | `image_cache_max_size` | 500 | Image description cache capacity. |
+| `request_log_capture_payloads` | true | Store request/response bodies; disable to retain metadata only. |
+| `login_attempt_max_identities` | 10000 | Maximum number of admin-login throttle identities retained in memory. |
+| `image_result_ttl_seconds` | 86400 | Retention time for generated originals. |
+| `image_preview_max_bytes` | 800000 | Target byte limit for each inline preview. |
+| `image_generation_batch_concurrency` | 1 | Concurrency within one image batch. |
+| `image_generation_result_max_bytes` | 26214400 | Maximum bytes accepted for one upstream image. |
+| `image_download_allow_private_hosts` | false | Allow image-result URL downloads from private networks. |
 
 ## Architecture Summary
 
@@ -211,6 +226,10 @@ Main code boundaries:
 | `app/core/state.py` | TTL caches, reasoning cache, tool-only counter, response-chain cache. |
 | `app/core/streaming.py` | Streaming event metering, reasoning storage, tool-only counting, stream error rendering, stats callback. |
 | `app/core/images.py` | Data URI extraction, image-content detection, and OpenAI image-content normalization. |
+| `app/adapters/imagegen.py` | OpenAI Images-compatible backends, parameter compatibility, retries, and result downloads. |
+| `app/core/image_bridge.py` | Codex `/responses` image-tool discovery, invocation parsing, and asset handoff. |
+| `app/core/image_results.py` | Original storage, preview compression, and capability-token downloads. |
+| `app/core/image_batch.py` | Image batch coordination and short-lived idempotent reuse. |
 | `app/adapters/` | Sends internal requests to OpenAI/liteLLM or direct Anthropic Messages and converts responses to internal output/events. |
 | `app/protocols/egress.py` | Renders internal output back into Chat, Completions, Messages, and Responses protocols. |
 | `app/services/lite_llm.py` | OpenAI-compatible liteLLM wrapper only, plus minimal reasoning compatibility patches. |
@@ -221,7 +240,7 @@ Main code boundaries:
 pytest tests/ -q
 ```
 
-Expected current result: `334 passed`.
+Expected current result: `602 passed`.
 
 Live smoke matrix:
 

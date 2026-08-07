@@ -76,20 +76,38 @@ def image_preview_data_uri(result: ImageGenerationResult) -> str:
     if not get_default("image_preview_enabled", True):
         return result.data_uri
     try:
+        dimension, quality, max_bytes = _preview_settings()
         with Image.open(BytesIO(data)) as source:
+            max_source_pixels = max(
+                1_000_000,
+                min(200_000_000, int(get_default("image_preview_max_source_pixels", 40_000_000))),
+            )
+            if source.width * source.height > max_source_pixels:
+                raise Image.DecompressionBombError(
+                    f"generated image has {source.width * source.height} pixels; limit is {max_source_pixels}"
+                )
             image = ImageOps.exif_transpose(source).convert("RGB")
-            image.thumbnail((_preview_settings()[0], _preview_settings()[0]), Image.Resampling.LANCZOS)
-            _dimension, quality, max_bytes = _preview_settings()
-            encoded = b""
-            for current_quality in range(quality, 34, -8):
-                output = BytesIO()
-                image.save(output, format="JPEG", quality=current_quality, optimize=True, progressive=True)
-                encoded = output.getvalue()
-                if len(encoded) <= max_bytes:
+            image.thumbnail((dimension, dimension), Image.Resampling.LANCZOS)
+            while True:
+                for current_quality in range(quality, 24, -8):
+                    output = BytesIO()
+                    image.save(
+                        output,
+                        format="JPEG",
+                        quality=current_quality,
+                        optimize=True,
+                        progressive=True,
+                    )
+                    encoded = output.getvalue()
+                    if len(encoded) <= max_bytes:
+                        return "data:image/jpeg;base64," + base64.b64encode(encoded).decode("ascii")
+                largest_dimension = max(image.size)
+                if largest_dimension <= 64:
                     break
-            if encoded and len(encoded) <= max_bytes:
-                return "data:image/jpeg;base64," + base64.b64encode(encoded).decode("ascii")
-    except (OSError, ValueError):
+                scale = max(64 / largest_dimension, 0.75)
+                next_size = tuple(max(1, round(value * scale)) for value in image.size)
+                image = image.resize(next_size, Image.Resampling.LANCZOS)
+    except (Image.DecompressionBombError, OSError, ValueError):
         # Keep compatibility with providers/tests that return non-decodable
         # placeholder bytes; the original artifact remains available.
         pass
@@ -133,13 +151,56 @@ def store_image_results(
     decoded = [_decode_data_uri(result) for result in results]
     stored: list[StoredImageResult] = []
     with _lock:
-        for data, mime_type in decoded:
-            token = uuid.uuid4().hex
-            path = target / f"{token}.{_MIME_EXTENSIONS[mime_type]}"
-            path.write_bytes(data)
-            stored.append(StoredImageResult(token=token, path=path, mime_type=mime_type))
-        _cleanup(target, now=time.time(), preserve={item.path for item in stored})
+        try:
+            for data, mime_type in decoded:
+                token = uuid.uuid4().hex
+                path = target / f"{token}.{_MIME_EXTENSIONS[mime_type]}"
+                path.write_bytes(data)
+                stored.append(StoredImageResult(token=token, path=path, mime_type=mime_type))
+            _cleanup(target, now=time.time(), preserve={item.path for item in stored})
+        except Exception:
+            for item in stored:
+                try:
+                    item.path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            raise
     return stored
+
+
+def remove_stored_image_results(results: list[StoredImageResult]) -> None:
+    """Best-effort rollback for artifacts from an incomplete image batch."""
+    with _lock:
+        for result in results:
+            try:
+                result.path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def generation_results_from_stored(
+    stored: list[StoredImageResult],
+    *,
+    size: str | None = None,
+    quality: str | None = None,
+    output_format: str | None = None,
+    background: str | None = None,
+) -> list[ImageGenerationResult]:
+    """Rehydrate normalized results from durable artifacts for idempotent reuse."""
+    results = []
+    for item in stored:
+        data = item.path.read_bytes()
+        encoded = base64.b64encode(data).decode("ascii")
+        results.append(ImageGenerationResult(
+            data_uri=f"data:{item.mime_type};base64,{encoded}",
+            mime_type=item.mime_type,
+            size=size,
+            quality=quality,
+            output_format=output_format,
+            background=background,
+            backend_attempts=0,
+        ))
+    return results
 
 
 def find_image_result(token: str, *, directory: Path | None = None) -> StoredImageResult | None:

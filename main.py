@@ -95,5 +95,5 @@ if __name__ == "__main__":
         "main:app",
         host=cfg.config.get("host", "0.0.0.0"),
         port=int(cfg.config.get("port", 8000)),
-        reload=True,
+        reload=bool(cfg.config.get("reload", False)),
     )

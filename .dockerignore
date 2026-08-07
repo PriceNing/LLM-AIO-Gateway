@@ -12,14 +12,22 @@ venv/
 
 # Git
 .git/
+.svn/
 .gitignore
 
 # Runtime data (volume mounted)
 data.db
+data.db-shm
+data.db-wal
 config.json
 data/
 logs/
+generated_images/
 *.log
+
+# Private local evaluation configuration
+tools/live_eval/live-eval.config.json
+tools/live_eval/live-eval.config.local.json
 
 # Test
 .pytest_cache/

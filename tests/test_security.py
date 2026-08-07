@@ -6,6 +6,7 @@ import pytest
 from app.security import (
     hash_password, verify_password, new_api_key,
     create_session, get_session_username, delete_session,
+    clear_login_failures, login_retry_after, record_login_failure,
 )
 
 # -- Password hashing --
@@ -122,3 +123,42 @@ def test_session_cleanup_removes_expired(monkeypatch):
     remaining = [s for s in security._sessions.values()
                  if s.get("username", "").startswith("user-")]
     assert len(remaining) == 0
+
+
+def test_failed_login_attempts_trigger_and_clear_lockout(monkeypatch):
+    identity = "127.0.0.1\0rate-limit-test"
+    clear_login_failures(identity)
+    monkeypatch.setattr("app.security.get_default", lambda key, fallback=None: {
+        "login_attempt_window_seconds": 60,
+        "login_attempt_limit": 2,
+        "login_lockout_seconds": 30,
+    }.get(key, fallback))
+
+    assert record_login_failure(identity) == 0
+    assert record_login_failure(identity) == 30
+    assert login_retry_after(identity) > 0
+
+    clear_login_failures(identity)
+    assert login_retry_after(identity) == 0
+
+
+def test_failed_login_identity_cache_is_bounded(monkeypatch):
+    from app import security
+
+    monkeypatch.setattr("app.security.get_default", lambda key, fallback=None: {
+        "login_attempt_window_seconds": 60,
+        "login_attempt_limit": 10,
+        "login_lockout_seconds": 30,
+        "login_attempt_max_identities": 100,
+    }.get(key, fallback))
+    identities = [f"bounded-login-{index}" for index in range(105)]
+    for identity in identities:
+        clear_login_failures(identity)
+        record_login_failure(identity)
+
+    active = set(security._login_attempts) | set(security._login_blocked_until)
+    assert len(active) <= 100
+    assert identities[-1] in active
+
+    for identity in identities:
+        clear_login_failures(identity)

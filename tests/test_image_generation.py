@@ -1,5 +1,6 @@
 import base64
 import json
+import re
 
 import httpx
 import pytest
@@ -10,10 +11,10 @@ from app.database import add_admin, add_provider, add_user, add_user_api_key
 from app.security import create_session, hash_password
 
 from app.adapters.imagegen import (
-    ImageGenerationResult, generate_images, image_results_bytes, images_url,
+    ImageGenerationResult, _download_image, _is_public_address, generate_images,
+    image_results_bytes, images_url,
 )
 from app.database import (
-    add_provider,
     get_enabled_image_generator,
     get_global_stats,
     get_model_image_generation,
@@ -26,16 +27,28 @@ from app.protocols.egress import render_response, render_responses_image_generat
 from app.protocols.ingress import responses_to_internal
 from app.core.image_intent import is_image_generation_intent, latest_user_text
 from app.core.image_bridge import (
+    GATEWAY_IMAGE_ASSET_MARKER,
     GATEWAY_IMAGE_DISPLAY_CALL_PREFIX,
+    GATEWAY_IMAGE_RESULT_MARKER,
+    IMAGE_BRIDGE_CORRECTION_MARKER,
     IMAGE_BRIDGE_MARKER,
     IMAGE_BRIDGE_TOOL_NAME,
+    configure_internal_image_bridge,
     has_codex_generated_image_exec_tool,
     has_codex_image_function_tool,
+    gateway_generated_image_asset_context,
+    has_gateway_generated_image_history,
     image_call_arguments_from_exec,
+    image_call_arguments_list_from_exec,
     inject_hosted_image_capability,
+    sanitize_gateway_image_display_followup,
+    sanitize_gateway_generated_image_history,
 )
-from app.core.image_results import find_image_result, image_preview_data_uri, store_image_results
-from app.core.output import InternalOutputMessage, InternalToolCallOutput
+from app.core.image_results import (
+    find_image_result, image_preview_data_uri, remove_stored_image_results, store_image_results,
+)
+from app.core.output import InternalOutputEvent, InternalOutputMessage, InternalToolCallOutput
+from app.core.image_batch import ImageInvocationCache
 
 
 @pytest.fixture
@@ -66,6 +79,100 @@ def test_image_results_bytes_counts_decoded_payload():
     ]) == 6
 
 
+def test_image_download_address_policy_rejects_private_networks():
+    assert _is_public_address("8.8.8.8") is True
+    assert _is_public_address("127.0.0.1") is False
+    assert _is_public_address("10.0.0.1") is False
+    assert _is_public_address("169.254.169.254") is False
+    assert _is_public_address("::1") is False
+
+
+def _mock_dns(monkeypatch, address):
+    monkeypatch.setattr(
+        "app.adapters.imagegen.socket.getaddrinfo",
+        lambda *args, **kwargs: [(2, 1, 6, "", (address, 443))],
+    )
+
+
+@pytest.mark.asyncio
+async def test_image_download_accepts_public_host(monkeypatch):
+    _mock_dns(monkeypatch, "8.8.8.8")
+    png = b"\x89PNG\r\n\x1a\nimage-data"
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, content=png, headers={"content-type": "image/png"})
+    )
+    async with httpx.AsyncClient(transport=transport) as client:
+        data_uri, mime_type = await _download_image(client, "https://images.example/result.png")
+    assert mime_type == "image/png"
+    assert base64.b64decode(data_uri.split(",", 1)[1]) == png
+
+
+@pytest.mark.asyncio
+async def test_image_download_rejects_private_dns_result(monkeypatch):
+    _mock_dns(monkeypatch, "10.0.0.8")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda request: None)) as client:
+        with pytest.raises(ValueError, match="private or unsafe"):
+            await _download_image(client, "https://images.example/result.png")
+
+
+@pytest.mark.asyncio
+async def test_image_download_rejects_url_credentials():
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda request: None)) as client:
+        with pytest.raises(ValueError, match="must not contain credentials"):
+            await _download_image(client, "https://user:password@images.example/result.png")
+
+
+@pytest.mark.asyncio
+async def test_image_download_rejects_declared_length_over_limit(monkeypatch):
+    _mock_dns(monkeypatch, "8.8.8.8")
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, headers={"content-length": "70000", "content-type": "image/png"})
+    )
+    async with httpx.AsyncClient(transport=transport) as client:
+        with pytest.raises(ValueError, match="configured size limit"):
+            await _download_image(client, "https://images.example/result.png", max_bytes=65536)
+
+
+@pytest.mark.asyncio
+async def test_image_download_rejects_stream_over_limit(monkeypatch):
+    _mock_dns(monkeypatch, "8.8.8.8")
+    payload = b"\x89PNG\r\n\x1a\n" + (b"x" * 65536)
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, content=payload, headers={"content-type": "image/png"})
+    )
+    async with httpx.AsyncClient(transport=transport) as client:
+        with pytest.raises(ValueError, match="configured size limit"):
+            await _download_image(client, "https://images.example/result.png", max_bytes=65536)
+
+
+@pytest.mark.asyncio
+async def test_image_download_private_host_requires_explicit_override(monkeypatch):
+    _mock_dns(monkeypatch, "127.0.0.1")
+    png = b"\x89PNG\r\n\x1a\nimage-data"
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, content=png, headers={"content-type": "image/png"})
+    )
+    async with httpx.AsyncClient(transport=transport) as client:
+        data_uri, mime_type = await _download_image(
+            client,
+            "http://127.0.0.1/result.png",
+            allow_private_hosts=True,
+        )
+    assert mime_type == "image/png"
+    assert base64.b64decode(data_uri.split(",", 1)[1]) == png
+
+
+def test_image_invocation_cache_rejects_new_key_when_all_entries_are_active():
+    cache = ImageInvocationCache()
+    first = cache.claim("first", ttl_seconds=60, max_entries=1)
+    assert first.owner is True
+    with pytest.raises(RuntimeError, match="too many concurrent"):
+        cache.claim("second", ttl_seconds=60, max_entries=1)
+    duplicate = cache.claim("first", ttl_seconds=60, max_entries=1)
+    assert duplicate.owner is False
+    assert duplicate.future is first.future
+
+
 def test_image_preview_is_jpeg_and_bounded(tmp_path, monkeypatch):
     from PIL import Image
     from io import BytesIO
@@ -86,6 +193,53 @@ def test_image_preview_is_jpeg_and_bounded(tmp_path, monkeypatch):
     with Image.open(BytesIO(preview_bytes)) as image:
         assert image.format == "JPEG"
         assert max(image.size) <= 640
+
+
+def test_image_preview_reduces_dimensions_until_byte_limit(monkeypatch):
+    from PIL import Image
+    from io import BytesIO
+
+    source = BytesIO()
+    Image.effect_noise((2048, 2048), 100).convert("RGB").save(source, format="PNG")
+    result = ImageGenerationResult(
+        "data:image/png;base64," + base64.b64encode(source.getvalue()).decode()
+    )
+    monkeypatch.setattr("app.core.image_results.get_default", lambda key, fallback=None: {
+        "image_preview_enabled": True,
+        "image_preview_max_dimension": 2048,
+        "image_preview_quality": 82,
+        "image_preview_max_bytes": 70000,
+    }.get(key, fallback))
+
+    preview = image_preview_data_uri(result)
+    preview_bytes = base64.b64decode(preview.split(",", 1)[1])
+    assert preview.startswith("data:image/jpeg;base64,")
+    assert len(preview_bytes) <= 70000
+    with Image.open(BytesIO(preview_bytes)) as image:
+        assert max(image.size) < 2048
+
+
+def test_store_image_results_rolls_back_partial_write(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    original_write_bytes = Path.write_bytes
+    writes = 0
+
+    def fail_second_write(path, data):
+        nonlocal writes
+        writes += 1
+        if writes == 2:
+            raise OSError("disk full")
+        return original_write_bytes(path, data)
+
+    monkeypatch.setattr(Path, "write_bytes", fail_second_write)
+    results = [
+        ImageGenerationResult("data:image/png;base64," + base64.b64encode(value).decode())
+        for value in (b"first", b"second")
+    ]
+    with pytest.raises(OSError, match="disk full"):
+        store_image_results(results, directory=tmp_path)
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_image_generator_config_and_model_flag(tmp_path):
@@ -160,6 +314,47 @@ async def test_generate_images_preserves_upstream_error_body(monkeypatch):
         await generate_images({"api_base": "http://image.test/v1", "model": "image-model"}, prompt="an apple")
 
 
+@pytest.mark.anyio
+async def test_generate_images_retries_transient_504(monkeypatch):
+    calls = 0
+
+    class MockResponse:
+        headers = {}
+
+        def __init__(self, status_code, text="", body=None):
+            self.status_code = status_code
+            self.text = text
+            self._body = body or {}
+
+        def json(self):
+            return self._body
+
+    class MockClient:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): return False
+
+        async def post(self, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return MockResponse(504, '{"error":"timeout"}')
+            return MockResponse(200, body={
+                "data": [{"b64_json": base64.b64encode(b"image").decode()}],
+            })
+
+    async def no_sleep(_delay):
+        return None
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: MockClient())
+    monkeypatch.setattr("app.adapters.imagegen.asyncio.sleep", no_sleep)
+    result = await generate_images(
+        {"api_base": "http://image.test/v1", "model": "image-model", "max_retries": 1},
+        prompt="an apple",
+    )
+    assert calls == 2
+    assert result[0].backend_attempts == 2
+
+
 def test_render_responses_image_generation():
     response = render_responses_image_generation([ImageGenerationResult("data:image/png;base64,AAAA", size="1024x1024")], model="chat-model")
     assert response["object"] == "response"
@@ -195,6 +390,10 @@ def test_image_generation_intent_is_conservative():
     assert is_image_generation_intent("generate an image of an apple") is True
     assert is_image_generation_intent("这张图片为什么打不开") is False
     assert is_image_generation_intent("请解释 image_generation 工具") is False
+    assert is_image_generation_intent("Build the UI and create an image upload component") is False
+    assert is_image_generation_intent("不要生成图像，只解释接口") is False
+    assert is_image_generation_intent("制作一个流程图并写进文档") is False
+    assert is_image_generation_intent("生成一张图") is True
 
 
 def test_responses_model_driven_bridge_generates_after_model_tool_call(image_app_db, monkeypatch):
@@ -223,8 +422,12 @@ def test_responses_model_driven_bridge_generates_after_model_tool_call(image_app
     assert item["type"] == "message"
     assert item["status"] == "completed"
     text = item["content"][0]["text"]
+    assert GATEWAY_IMAGE_ASSET_MARKER in text
+    assert "download these URLs into the project workspace" in text
+    assert "`generated-asset-1.png`" in text
+    assert text.index("download original") < text.index("data:image/png;base64")
     assert "![Generated image](data:image/png;base64,AAAA)" in text
-    assert "[Open generated image](http://testserver/v1/image-results/" in text
+    assert "[download original](http://testserver/v1/image-results/" in text
     assert len(list(image_app_db["image_dir"].glob("*.png"))) == 1
     assert calls == ["生成一个苹果的图像"]
 
@@ -260,7 +463,15 @@ def test_responses_api_key_codex_streams_image_through_generated_image_exec(imag
     assert "generatedImage({ image_url:" in response.text
     assert "data:image/png;base64,AAAA" in response.text
     assert '"type": "image_generation_call"' not in response.text
-    assert "image-results" not in response.text
+    assert "image-results" in response.text
+    payloads = [
+        json.loads(line.removeprefix("data: "))
+        for line in response.text.splitlines()
+        if line.startswith("data: {")
+    ]
+    completed = next(item for item in payloads if item["type"] == "response.completed")
+    messages = [item for item in completed["response"]["output"] if item["type"] == "message"]
+    assert all(GATEWAY_IMAGE_ASSET_MARKER not in json.dumps(item) for item in messages)
     assert len(list(image_app_db["image_dir"].glob("*.png"))) == 1
     log = list_request_logs(limit=1)[0]
     assert log["request_kind"] == "image_generation"
@@ -268,26 +479,620 @@ def test_responses_api_key_codex_streams_image_through_generated_image_exec(imag
     assert get_global_stats()["image_generation_calls"] == 1
 
 
-def test_generated_image_exec_followup_completes_without_regenerating(image_app_db, monkeypatch):
-    async def fail_generate(*args, **kwargs):
-        raise AssertionError("display tool follow-up must not generate another image")
+def test_responses_image_bridge_preserves_other_agent_tools(image_app_db, monkeypatch):
+    async def fake_planner(*args, **kwargs):
+        return InternalOutputMessage(tool_calls=[
+            InternalToolCallOutput(
+                id="call_image", call_id="call_image", name=IMAGE_BRIDGE_TOOL_NAME,
+                arguments='{"prompt":"paint a gomoku board"}',
+            ),
+            InternalToolCallOutput(
+                id="call_plan", call_id="call_plan", name="update_plan",
+                arguments='{"plan":[{"step":"Build the game","status":"in_progress"}]}',
+            ),
+        ], finish_reason="tool_calls", usage={"total_tokens": 9}), {"id": "chat"}, "chat"
 
-    monkeypatch.setattr("app.router.proxy.generate_images", fail_generate)
-    call_id = GATEWAY_IMAGE_DISPLAY_CALL_PREFIX + "abc"
+    async def fake_generate(config, **kwargs):
+        return [ImageGenerationResult("data:image/png;base64,AAAA")]
+
+    monkeypatch.setattr("app.router.proxy.generate_images", fake_generate)
+    monkeypatch.setattr("app.router.proxy._call_nonstream_with_fallbacks", fake_planner)
     response = TestClient(app).post("/v1/responses", headers=image_app_db["headers"], json={
         "model": "chat/chat-model",
         "stream": True,
         "input": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Build a Gomoku game and generate its art"}]},
+            {"type": "additional_tools", "tools": [
+                {
+                    "type": "custom", "name": "exec",
+                    "description": "Run JavaScript. generatedImage(result) appends an image-generation result.",
+                    "format": {"type": "text"},
+                },
+                {
+                    "type": "custom", "name": "update_plan",
+                    "description": "Update the task plan.", "format": {"type": "text"},
+                },
+            ]},
+        ],
+    })
+    assert response.status_code == 200
+    assert response.text.count('"type": "custom_tool_call"') >= 2
+    assert '"name": "exec"' in response.text
+    assert '"name": "update_plan"' in response.text
+    assert "generatedImage({ image_url:" in response.text
+    assert IMAGE_BRIDGE_TOOL_NAME not in response.text
+
+
+def test_responses_multiple_image_calls_continue_to_agent_tools(image_app_db, monkeypatch):
+    planner_calls = 0
+    generated_prompts = []
+
+    async def fake_planner(policy, internal, **kwargs):
+        nonlocal planner_calls
+        planner_calls += 1
+        if planner_calls == 1:
+            return InternalOutputMessage(tool_calls=[
+                InternalToolCallOutput(
+                    id=f"call_image_{index}", call_id=f"call_image_{index}",
+                    name=IMAGE_BRIDGE_TOOL_NAME,
+                    arguments=json.dumps({
+                        "prompt": prompt,
+                        "filename": f"{prompt.replace(' ', '-')}.png",
+                    }),
+                )
+                for index, prompt in enumerate(("board", "black stone", "white stone"), start=1)
+            ], finish_reason="tool_calls", usage={"total_tokens": 9}), {"id": "chat"}, "chat"
+        assert any(tool.name == IMAGE_BRIDGE_TOOL_NAME for tool in internal.tools)
+        result_text = "\n".join(
+            nested.text
+            for message in internal.messages
+            for part in message.parts
+            if part.kind == "tool_result"
+            for nested in part.parts
+            if nested.kind == "text"
+        )
+        assert "download original" in result_text
+        assert "http://testserver/v1/image-results/" in result_text
+        assert "`board.png`" in result_text
+        assert "data:image/" not in result_text
+        return InternalOutputMessage(tool_calls=[InternalToolCallOutput(
+            id="call_build", call_id="call_build", name="update_plan",
+            arguments='{"plan":[{"step":"Build game files","status":"in_progress"}]}',
+        )], finish_reason="tool_calls", usage={"total_tokens": 4}), {"id": "chat"}, "chat"
+
+    async def fake_generate(config, **kwargs):
+        generated_prompts.append(kwargs["prompt"])
+        return [ImageGenerationResult("data:image/png;base64,AAAA")]
+
+    monkeypatch.setattr("app.router.proxy.generate_images", fake_generate)
+    monkeypatch.setattr("app.router.proxy._call_nonstream_with_fallbacks", fake_planner)
+    response = TestClient(app).post("/v1/responses", headers=image_app_db["headers"], json={
+        "model": "chat/chat-model",
+        "input": "Build a Gomoku game and generate its visual assets first",
+    })
+    assert response.status_code == 200, response.text
+    assert planner_calls == 2
+    assert generated_prompts == ["board", "black stone", "white stone"]
+    output = response.json()["output"]
+    assert output[0]["type"] == "message"
+    assert output[0]["content"][0]["text"].count("![Generated image") == 3
+    assert "`board.png`" in output[0]["content"][0]["text"]
+    assert "`black-stone.png`" in output[0]["content"][0]["text"]
+    assert output[1]["type"] == "function_call"
+    assert output[1]["name"] == "update_plan"
+
+
+def test_responses_duplicate_asset_filenames_are_made_unique(image_app_db, monkeypatch):
+    planner_calls = 0
+
+    async def fake_planner(policy, internal, **kwargs):
+        nonlocal planner_calls
+        planner_calls += 1
+        if planner_calls == 1:
+            return InternalOutputMessage(tool_calls=[
+                InternalToolCallOutput(
+                    id=f"call_image_{index}", call_id=f"call_image_{index}",
+                    name=IMAGE_BRIDGE_TOOL_NAME,
+                    arguments=json.dumps({"prompt": prompt, "filename": "asset.png"}),
+                )
+                for index, prompt in enumerate(("first", "second"), start=1)
+            ], finish_reason="tool_calls"), {"id": "chat"}, "chat"
+        return InternalOutputMessage(text="continue"), {"id": "chat"}, "chat"
+
+    async def fake_generate(config, **kwargs):
+        return [ImageGenerationResult("data:image/png;base64,AAAA")]
+
+    monkeypatch.setattr("app.router.proxy.generate_images", fake_generate)
+    monkeypatch.setattr("app.router.proxy._call_nonstream_with_fallbacks", fake_planner)
+    response = TestClient(app).post("/v1/responses", headers=image_app_db["headers"], json={
+        "model": "chat/chat-model", "input": "Generate two assets",
+    })
+    assert response.status_code == 200
+    text = response.json()["output"][0]["content"][0]["text"]
+    assert "`asset.png`" in text
+    assert "`asset-2.png`" in text
+
+
+def test_responses_multi_image_invocation_uses_distinct_fallback_names(
+    image_app_db, monkeypatch
+):
+    planner_calls = 0
+
+    async def fake_planner(policy, internal, **kwargs):
+        nonlocal planner_calls
+        planner_calls += 1
+        if planner_calls == 1:
+            return InternalOutputMessage(tool_calls=[InternalToolCallOutput(
+                id="call_image", call_id="call_image", name=IMAGE_BRIDGE_TOOL_NAME,
+                arguments=json.dumps({"prompt": "two variants", "filename": "ignored.png"}),
+            )], finish_reason="tool_calls"), {"id": "chat"}, "chat"
+        return InternalOutputMessage(text="continue"), {"id": "chat"}, "chat"
+
+    async def fake_generate(config, **kwargs):
+        return [
+            ImageGenerationResult("data:image/png;base64,AAAA"),
+            ImageGenerationResult("data:image/png;base64,BBBB"),
+        ]
+
+    monkeypatch.setattr("app.router.proxy.generate_images", fake_generate)
+    monkeypatch.setattr("app.router.proxy._call_nonstream_with_fallbacks", fake_planner)
+    response = TestClient(app).post("/v1/responses", headers=image_app_db["headers"], json={
+        "model": "chat/chat-model", "input": "Generate two variants",
+    })
+    assert response.status_code == 200
+    text = response.json()["output"][0]["content"][0]["text"]
+    assert "`generated-asset-1.png`" in text
+    assert "`generated-asset-2.png`" in text
+
+
+def test_responses_multi_image_markdown_caps_inline_previews(image_app_db, monkeypatch):
+    planner_calls = 0
+
+    async def fake_planner(*args, **kwargs):
+        nonlocal planner_calls
+        planner_calls += 1
+        if planner_calls == 1:
+            return InternalOutputMessage(tool_calls=[
+                InternalToolCallOutput(
+                    id=f"call_image_{index}", call_id=f"call_image_{index}",
+                    name=IMAGE_BRIDGE_TOOL_NAME,
+                    arguments=json.dumps({"prompt": f"asset {index}"}),
+                )
+                for index in range(1, 6)
+            ], finish_reason="tool_calls"), {"id": "chat"}, "chat"
+        return InternalOutputMessage(text="continue"), {"id": "chat"}, "chat"
+
+    async def fake_generate(config, **kwargs):
+        return [ImageGenerationResult("data:image/png;base64,AAAA")]
+
+    monkeypatch.setattr("app.router.proxy.generate_images", fake_generate)
+    monkeypatch.setattr("app.router.proxy._call_nonstream_with_fallbacks", fake_planner)
+    response = TestClient(app).post("/v1/responses", headers=image_app_db["headers"], json={
+        "model": "chat/chat-model", "input": "Generate five assets",
+    })
+    assert response.status_code == 200
+    text = response.json()["output"][0]["content"][0]["text"]
+    assert text.count("![Generated image") == 4
+    assert "1 additional generated image preview(s) were omitted" in text
+    assert text.count("[download original]") == 5
+
+
+def test_responses_failed_image_batch_preserves_success_and_retries_failed_item(image_app_db, monkeypatch):
+    calls = 0
+
+    async def fake_planner(*args, **kwargs):
+        return InternalOutputMessage(tool_calls=[
+            InternalToolCallOutput(
+                id=f"call_image_{index}", call_id=f"call_image_{index}",
+                name=IMAGE_BRIDGE_TOOL_NAME, arguments=json.dumps({"prompt": prompt}),
+            )
+            for index, prompt in enumerate(("first", "second"), start=1)
+        ], finish_reason="tool_calls"), {"id": "chat"}, "chat"
+
+    async def fake_generate(config, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("second image failed")
+        return [ImageGenerationResult("data:image/png;base64,AAAA")]
+
+    monkeypatch.setattr("app.router.proxy.generate_images", fake_generate)
+    monkeypatch.setattr("app.router.proxy._call_nonstream_with_fallbacks", fake_planner)
+    response = TestClient(app).post("/v1/responses", headers=image_app_db["headers"], json={
+        "model": "chat/chat-model", "input": "Generate two assets",
+    })
+    assert response.status_code == 200
+    assert len(list(image_app_db["image_dir"].glob("*"))) == 2
+    assert response.json()["output"][0]["content"][0]["text"].count("![Generated image") == 2
+    log = list_request_logs(limit=1)[0]
+    assert log["status"] in {"ok", "degraded"}
+    assert log["image_count"] == 2
+
+
+def test_responses_failed_continuation_returns_preserved_images_as_degraded(
+    image_app_db, monkeypatch
+):
+    planner_calls = 0
+
+    async def fake_planner(*args, **kwargs):
+        nonlocal planner_calls
+        planner_calls += 1
+        if planner_calls == 1:
+            return InternalOutputMessage(tool_calls=[InternalToolCallOutput(
+                id="call_image", call_id="call_image", name=IMAGE_BRIDGE_TOOL_NAME,
+                arguments='{"prompt":"board texture"}',
+            )], finish_reason="tool_calls"), {"id": "chat"}, "chat"
+        raise RuntimeError("continuation failed")
+
+    async def fake_generate(config, **kwargs):
+        return [ImageGenerationResult("data:image/png;base64,AAAA")]
+
+    monkeypatch.setattr("app.router.proxy.generate_images", fake_generate)
+    monkeypatch.setattr("app.router.proxy._call_nonstream_with_fallbacks", fake_planner)
+    response = TestClient(app).post("/v1/responses", headers=image_app_db["headers"], json={
+        "model": "chat/chat-model", "input": "Build a game with a generated board texture",
+    })
+
+    assert response.status_code == 200
+    assert len(list(image_app_db["image_dir"].glob("*"))) == 1
+    text = response.json()["output"][0]["content"][0]["text"]
+    assert "![Generated image" in text
+    assert "agent continuation failed" in text
+    log = list_request_logs(limit=1)[0]
+    assert log["request_kind"] == "image_generation"
+    assert log["image_count"] == 1
+    assert log["status"] == "degraded"
+
+
+def test_responses_staged_image_batches_then_continue_to_code(image_app_db, monkeypatch):
+    planner_calls = 0
+    generated_prompts = []
+
+    async def fake_planner(policy, internal, **kwargs):
+        nonlocal planner_calls
+        planner_calls += 1
+        if planner_calls == 1:
+            prompts = ("board background", "wood texture")
+        elif planner_calls == 2:
+            prompts = ("black stone", "white stone")
+        else:
+            return InternalOutputMessage(tool_calls=[InternalToolCallOutput(
+                id="call_code", call_id="call_code", name="exec_command",
+                arguments='{"cmd":"write index.html"}',
+            )], finish_reason="tool_calls", usage={"total_tokens": 5}), {"id": "chat"}, "chat"
+        return InternalOutputMessage(tool_calls=[
+            InternalToolCallOutput(
+                id=f"call_image_{planner_calls}_{index}",
+                call_id=f"call_image_{planner_calls}_{index}",
+                name=IMAGE_BRIDGE_TOOL_NAME,
+                arguments=json.dumps({"prompt": prompt}),
+            )
+            for index, prompt in enumerate(prompts, start=1)
+        ], finish_reason="tool_calls", usage={"total_tokens": 4}), {"id": "chat"}, "chat"
+
+    async def fake_generate(config, **kwargs):
+        generated_prompts.append(kwargs["prompt"])
+        return [ImageGenerationResult("data:image/png;base64,AAAA")]
+
+    monkeypatch.setattr("app.router.proxy.generate_images", fake_generate)
+    monkeypatch.setattr("app.router.proxy._call_nonstream_with_fallbacks", fake_planner)
+    response = TestClient(app).post("/v1/responses", headers=image_app_db["headers"], json={
+        "model": "chat/chat-model",
+        "input": "Build a Gomoku game with generated board and stone assets",
+    })
+    assert response.status_code == 200
+    assert planner_calls == 3
+    assert generated_prompts == ["board background", "wood texture", "black stone", "white stone"]
+    output = response.json()["output"]
+    assert output[0]["content"][0]["text"].count("![Generated image") == 4
+    assert output[1]["type"] == "function_call"
+    assert output[1]["name"] == "exec_command"
+    assert response.json()["usage"]["total_tokens"] == 13
+
+
+def test_codex_long_task_downloads_gateway_asset_then_continues(
+    image_app_db, monkeypatch, tmp_path
+):
+    """Simulate the critical Codex asset handoff across two Responses turns."""
+    planner_calls = 0
+    image_calls = 0
+
+    async def fake_planner(policy, internal, **kwargs):
+        nonlocal planner_calls
+        planner_calls += 1
+        if planner_calls == 1:
+            return InternalOutputMessage(tool_calls=[InternalToolCallOutput(
+                id="call_image", call_id="call_image", name=IMAGE_BRIDGE_TOOL_NAME,
+                arguments=json.dumps({
+                    "prompt": "seamless modern wooden Gomoku board texture, no stones",
+                    "filename": "board-texture.png",
+                }),
+            )], finish_reason="tool_calls", usage={"total_tokens": 8}), {"id": "chat"}, "chat"
+        context = "\n".join(
+            nested.text
+            for message in internal.messages
+            for part in message.parts
+            for nested in ([part] if part.kind == "text" else part.parts)
+            if nested.kind == "text"
+        )
+        assert "board-texture.png" in context
+        assert "/v1/image-results/" in context
+        assert "data:image/" not in context
+        if planner_calls == 2:
+            url = re.search(r"https?://[^)\s]+/v1/image-results/[0-9a-f]{32}", context).group(0)
+            return InternalOutputMessage(tool_calls=[InternalToolCallOutput(
+                id="call_download", call_id="call_download", name="exec_command",
+                arguments=json.dumps({
+                    "cmd": f"Invoke-WebRequest -Uri '{url}' -OutFile 'assets/board-texture.png'"
+                }),
+            )], finish_reason="tool_calls", usage={"total_tokens": 5}), {"id": "chat"}, "chat"
+        assert any(tool.name == IMAGE_BRIDGE_TOOL_NAME for tool in internal.tools)
+        return InternalOutputMessage(
+            text="Game implementation completed using assets/board-texture.png.",
+            finish_reason="stop", usage={"total_tokens": 4},
+        ), {"id": "chat"}, "chat"
+
+    async def fake_generate(config, **kwargs):
+        nonlocal image_calls
+        image_calls += 1
+        return [ImageGenerationResult(
+            "data:image/png;base64," + base64.b64encode(b"gateway-original-image").decode()
+        )]
+
+    monkeypatch.setattr("app.router.proxy.generate_images", fake_generate)
+    monkeypatch.setattr("app.router.proxy._call_nonstream_with_fallbacks", fake_planner)
+    client = TestClient(app)
+    first = client.post("/v1/responses", headers=image_app_db["headers"], json={
+        "model": "chat/chat-model",
+        "input": "Build a complete Gomoku game and generate its board asset",
+    })
+    assert first.status_code == 200
+    first_output = first.json()["output"]
+    manifest_text = first_output[0]["content"][0]["text"]
+    download_call = first_output[1]
+    command = json.loads(download_call["arguments"])["cmd"]
+    url = re.search(r"https?://[^']+/v1/image-results/[0-9a-f]{32}", command).group(0)
+
+    # Execute the material part of Codex's proposed download against the same app.
+    downloaded = client.get(url.replace("http://testserver", ""))
+    assert downloaded.status_code == 200
+    asset = tmp_path / "project" / "assets" / "board-texture.png"
+    asset.parent.mkdir(parents=True)
+    asset.write_bytes(downloaded.content)
+    assert asset.read_bytes() == b"gateway-original-image"
+
+    second = client.post("/v1/responses", headers=image_app_db["headers"], json={
+        "model": "chat/chat-model",
+        "input": [
+            {"type": "message", "role": "user", "content": [{
+                "type": "input_text",
+                "text": "Build a complete Gomoku game and generate its board asset",
+            }]},
+            {"type": "message", "role": "assistant", "content": [{
+                "type": "output_text", "text": manifest_text,
+            }]},
+            {
+                "type": "function_call", "call_id": "call_download",
+                "name": "exec_command", "arguments": download_call["arguments"],
+            },
+            {
+                "type": "function_call_output", "call_id": "call_download",
+                "output": "Downloaded assets/board-texture.png and verified it exists.",
+            },
+        ],
+    })
+    assert second.status_code == 200
+    assert "completed using assets/board-texture.png" in second.json()["output"][0]["content"][0]["text"]
+    assert image_calls == 1
+    assert planner_calls == 3
+
+
+def test_generated_image_exec_followup_continues_without_regenerating(image_app_db, monkeypatch):
+    async def fail_generate(*args, **kwargs):
+        raise AssertionError("display tool follow-up must not generate another image")
+
+    async def fake_planner(policy, internal, **kwargs):
+        assert any(tool.name == IMAGE_BRIDGE_TOOL_NAME for tool in internal.tools)
+        return InternalOutputMessage(
+            text="The image is displayed; continuing with the game implementation.",
+            usage={"total_tokens": 5},
+        ), {"id": "chat"}, "chat"
+
+    monkeypatch.setattr("app.router.proxy.generate_images", fail_generate)
+    monkeypatch.setattr("app.router.proxy._call_nonstream_with_fallbacks", fake_planner)
+    call_id = GATEWAY_IMAGE_DISPLAY_CALL_PREFIX + "abc"
+    response = TestClient(app).post("/v1/responses", headers=image_app_db["headers"], json={
+        "model": "chat/chat-model",
+        "stream": False,
+        "input": [
             {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Generate an image"}]},
-            {"type": "custom_tool_call", "call_id": call_id, "name": "exec", "input": "generatedImage(...);"},
+            {"type": "custom_tool_call", "call_id": call_id, "name": "exec", "input": "generatedImage({ image_url: 'data:image/png;base64,AAAA' });"},
             {"type": "custom_tool_call_output", "call_id": call_id, "output": [{
                 "type": "input_image", "image_url": "data:image/png;base64,AAAA",
             }]},
         ],
     })
     assert response.status_code == 200
-    assert '"type": "response.completed"' in response.text
-    assert '"output": []' in response.text
+    item = response.json()["output"][0]
+    assert item["type"] == "message"
+    assert "continuing with the game implementation" in item["content"][0]["text"]
+
+
+def test_gateway_image_display_followup_sanitizes_image_bytes():
+    call_id = GATEWAY_IMAGE_DISPLAY_CALL_PREFIX + "abc"
+    input_data = [
+        {"type": "custom_tool_call", "call_id": call_id, "name": "exec", "input": "data:image/png;base64,AAAA"},
+        {"type": "custom_tool_call_output", "call_id": call_id, "output": [{
+            "type": "input_image", "image_url": "data:image/png;base64,BBBB",
+        }]},
+    ]
+    assert sanitize_gateway_image_display_followup(input_data) is True
+    assert "AAAA" not in input_data[0]["input"]
+    assert input_data[1]["output"] == "The generated image was displayed successfully."
+
+
+def test_gateway_generated_image_history_detection_is_assistant_scoped():
+    assert has_gateway_generated_image_history([{
+        "type": "message", "role": "assistant",
+        "content": [{"type": "output_text", "text": f"{GATEWAY_IMAGE_RESULT_MARKER}\n![Generated image](data:image/png;base64,AAAA)"}],
+    }]) is True
+    assert has_gateway_generated_image_history([{
+        "type": "message", "role": "user",
+        "content": [{"type": "input_image", "image_url": "data:image/png;base64,AAAA"}],
+    }]) is False
+    assert has_gateway_generated_image_history([
+        {
+            "type": "message", "role": "assistant",
+            "content": [{"type": "output_text", "text": f"{GATEWAY_IMAGE_RESULT_MARKER}\nold image"}],
+        },
+        {
+            "type": "message", "role": "user",
+            "content": [{"type": "input_text", "text": "Generate a different image"}],
+        },
+    ]) is False
+    assert has_gateway_generated_image_history([{
+        "type": "message", "role": "assistant",
+        "content": [{
+            "type": "output_text",
+            "text": "See /image-results/example and ![Generated image](https://example.test/a.png)",
+        }],
+    }]) is False
+
+
+def test_gateway_generated_image_history_compacts_only_gateway_assistant_previews():
+    input_data = [
+        {
+            "type": "message", "role": "assistant",
+            "content": [{
+                "type": "output_text",
+                "text": (
+                    f"{GATEWAY_IMAGE_ASSET_MARKER}\n"
+                    "[download original](http://gateway.test/v1/image-results/abc)\n\n"
+                    f"{GATEWAY_IMAGE_RESULT_MARKER}\n"
+                    "![Generated image](data:image/png;base64,QUJDRA==)"
+                ),
+            }],
+        },
+        {
+            "type": "message", "role": "user",
+            "content": [{"type": "input_image", "image_url": "data:image/png;base64,VVNFUg=="}],
+        },
+    ]
+    assert sanitize_gateway_generated_image_history(input_data) is True
+    assistant_text = input_data[0]["content"][0]["text"]
+    assert "QUJDRA==" not in assistant_text
+    assert "http://gateway.test/v1/image-results/abc" in assistant_text
+    assert input_data[1]["content"][0]["image_url"].endswith("VVNFUg==")
+
+
+def test_gateway_generated_image_asset_context_keeps_manifest_without_preview():
+    input_data = [{
+        "type": "message", "role": "assistant", "content": [{
+            "type": "output_text",
+            "text": (
+                f"{GATEWAY_IMAGE_ASSET_MARKER}\nasset URL\n\n"
+                f"{GATEWAY_IMAGE_RESULT_MARKER}\n"
+                "![Generated image](data:image/png;base64,QUJDRA==)"
+            ),
+        }],
+    }]
+    context = gateway_generated_image_asset_context(input_data)
+    assert "asset URL" in context
+    assert GATEWAY_IMAGE_RESULT_MARKER not in context
+    assert "QUJDRA==" not in context
+
+
+def test_gateway_generated_image_asset_context_reads_hidden_exec_manifest():
+    input_data = [{
+        "type": "custom_tool_call",
+        "call_id": f"{GATEWAY_IMAGE_DISPLAY_CALL_PREFIX}abc",
+        "name": "exec",
+        "input": (
+            'generatedImage({ image_url: "data:image/png;base64,QUJDRA==" });\n'
+            f"/*\n{GATEWAY_IMAGE_ASSET_MARKER}\n"
+            "asset.png: http://gateway.test/v1/image-results/abc\n*/"
+        ),
+    }]
+    context = gateway_generated_image_asset_context(input_data)
+    assert GATEWAY_IMAGE_ASSET_MARKER in context
+    assert "http://gateway.test/v1/image-results/abc" in context
+    assert "QUJDRA==" not in context
+    assert "*/" not in context
+
+
+def test_prior_gateway_image_keeps_optional_bridge_on_later_tool_turn(image_app_db, monkeypatch):
+    async def fake_planner(policy, internal, **kwargs):
+        assert any(tool.name == IMAGE_BRIDGE_TOOL_NAME for tool in internal.tools)
+        history_text = "\n".join(
+            part.text
+            for message in internal.messages
+            for part in message.parts
+            if part.kind == "text"
+        )
+        assert "http://testserver/v1/image-results/abc" in history_text
+        assert "QUJDRA==" not in history_text
+        return InternalOutputMessage(tool_calls=[InternalToolCallOutput(
+            id="call_build", call_id="call_build", name="exec_command",
+            arguments='{"cmd":"write game files"}',
+        )], finish_reason="tool_calls", usage={"total_tokens": 4}), {"id": "chat"}, "chat"
+
+    async def fail_generate(*args, **kwargs):
+        raise AssertionError("an available bridge must not generate unless the model calls it")
+
+    monkeypatch.setattr("app.router.proxy._call_nonstream_with_fallbacks", fake_planner)
+    monkeypatch.setattr("app.router.proxy.generate_images", fail_generate)
+    response = TestClient(app).post("/v1/responses", headers=image_app_db["headers"], json={
+        "model": "chat/chat-model",
+        "input": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Build a game and generate its assets"}]},
+            {"type": "message", "role": "assistant", "content": [{
+                "type": "output_text",
+                "text": (
+                    f"{GATEWAY_IMAGE_ASSET_MARKER}\n"
+                    "[download original](http://testserver/v1/image-results/abc)\n\n"
+                    f"{GATEWAY_IMAGE_RESULT_MARKER}\n"
+                    "![Generated image](data:image/png;base64,QUJDRA==)"
+                ),
+            }]},
+            {"type": "function_call", "call_id": "call_plan", "name": "update_plan", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_plan", "output": "ok"},
+        ],
+    })
+    assert response.status_code == 200
+    assert response.json()["output"][-1]["name"] == "exec_command"
+
+
+def test_generated_image_exec_stream_followup_uses_compatibility_loop(image_app_db, monkeypatch):
+    async def fail_native(*args, **kwargs):
+        raise AssertionError("gateway display follow-up must not switch into native Responses")
+
+    async def fake_planner(policy, internal, **kwargs):
+        assert any(tool.name == IMAGE_BRIDGE_TOOL_NAME for tool in internal.tools)
+        return InternalOutputMessage(
+            text="Continuing the agent task.", finish_reason="stop",
+            usage={"total_tokens": 3},
+        ), {"id": "chat"}, "chat"
+
+    monkeypatch.setattr("app.router.proxy._native_response_with_fallbacks", fail_native)
+    monkeypatch.setattr("app.router.proxy._call_nonstream_with_fallbacks", fake_planner)
+    call_id = GATEWAY_IMAGE_DISPLAY_CALL_PREFIX + "stream"
+    response = TestClient(app).post("/v1/responses", headers=image_app_db["headers"], json={
+        "model": "chat/chat-model",
+        "stream": True,
+        "input": [
+            {"type": "custom_tool_call", "call_id": call_id, "name": "exec", "input": "generatedImage(...);"},
+            {"type": "custom_tool_call_output", "call_id": call_id, "output": "ok"},
+        ],
+    })
+    assert response.status_code == 200
+    assert "Continuing the agent task." in response.text
+    payloads = [
+        json.loads(line.removeprefix("data: "))
+        for line in response.text.splitlines()
+        if line.startswith("data: {")
+    ]
+    completed = next(item for item in payloads if item["type"] == "response.completed")
+    assert completed["response"]["output"][0]["type"] == "message"
 
 
 def test_responses_codex_intent_bridge_excludes_large_context(image_app_db, monkeypatch):
@@ -315,6 +1120,328 @@ def test_responses_normal_chat_does_not_trigger_codex_bridge(image_app_db, monke
         "input": "请解释一下图片生成模型和视觉模型的区别",
     })
     assert response.status_code != 500
+
+
+def test_responses_codex_exec_planner_gets_one_bounded_image_correction(image_app_db, monkeypatch):
+    planner_calls = 0
+    generated = []
+
+    async def fake_planner(policy, internal, **kwargs):
+        nonlocal planner_calls
+        planner_calls += 1
+        if planner_calls == 1:
+            return InternalOutputMessage(
+                tool_calls=[InternalToolCallOutput(
+                    id="call_exec", call_id="call_exec", name="exec",
+                    arguments=json.dumps({"input": "Get-ChildItem -Force"}),
+                )], finish_reason="tool_calls", usage={"total_tokens": 3},
+            ), {"id": "chat"}, "chat"
+        assert any(
+            IMAGE_BRIDGE_CORRECTION_MARKER in part.text
+            for message in internal.messages
+            for part in message.parts
+            if part.kind == "text"
+        )
+        assert internal.tool_choice == {
+            "type": "function",
+            "function": {"name": IMAGE_BRIDGE_TOOL_NAME},
+        }
+        assert "tool_choice" in internal.extra["allowed_openai_params"]
+        exec_tool = next(tool for tool in internal.tools if tool.name == "exec")
+        assert "tools.llm_aio_image_generation" in exec_tool.description
+        return InternalOutputMessage(
+            tool_calls=[InternalToolCallOutput(
+                id="call_image", call_id="call_image", name="exec",
+                arguments=json.dumps({
+                    "input": 'const r = await tools.llm_aio_image_generation({prompt:"board texture",filename:"board.png"}); text(r);',
+                }),
+            )], finish_reason="tool_calls", usage={"total_tokens": 4},
+        ), {"id": "chat"}, "chat"
+
+    async def fake_generate(config, **kwargs):
+        generated.append(kwargs["prompt"])
+        return [ImageGenerationResult("data:image/png;base64,AAAA")]
+
+    monkeypatch.setattr("app.router.proxy.generate_images", fake_generate)
+    monkeypatch.setattr("app.router.proxy._call_nonstream_with_fallbacks", fake_planner)
+    response = TestClient(app).post("/v1/responses", headers=image_app_db["headers"], json={
+        "model": "chat/chat-model",
+        "stream": True,
+        "input": [
+            {"type": "message", "role": "user", "content": [{
+                "type": "input_text", "text": "实现网页游戏，素材文件通过图像生成功能自动生成",
+            }]},
+            {"type": "additional_tools", "tools": [{
+                "type": "custom", "name": "exec", "description": "Run commands and generatedImage(...).",
+            }]},
+        ],
+    })
+    assert response.status_code == 200, response.text
+    assert planner_calls == 2
+    assert generated == ["board texture"]
+    assert IMAGE_BRIDGE_CORRECTION_MARKER not in response.text
+    assert "generatedImage" in response.text
+
+
+def test_display_followup_rejecting_gateway_for_local_key_is_forced_back_to_bridge(
+    image_app_db, monkeypatch,
+):
+    planner_calls = 0
+    generated = []
+
+    async def fake_planner(policy, internal, **kwargs):
+        nonlocal planner_calls
+        planner_calls += 1
+        assert any(tool.name == IMAGE_BRIDGE_TOOL_NAME for tool in internal.tools)
+        if planner_calls == 1:
+            assert internal.tool_choice is None
+            return InternalOutputMessage(
+                text="Please configure local OPENAI_API_KEY before I generate the remaining posters.",
+                usage={"total_tokens": 3},
+            ), {"id": "chat"}, "chat"
+        assert internal.tool_choice == {
+            "type": "function",
+            "function": {"name": IMAGE_BRIDGE_TOOL_NAME},
+        }
+        assert "tool_choice" in internal.extra["allowed_openai_params"]
+        return InternalOutputMessage(
+            tool_calls=[InternalToolCallOutput(
+                id="call_poster", call_id="call_poster", name=IMAGE_BRIDGE_TOOL_NAME,
+                arguments=json.dumps({
+                    "prompt": "original anime character poster on transparent background",
+                    "filename": "character-poster-2.png",
+                }),
+            )],
+            finish_reason="tool_calls",
+            usage={"total_tokens": 4},
+        ), {"id": "chat"}, "chat"
+
+    async def fake_generate(config, **kwargs):
+        generated.append(kwargs["prompt"])
+        return [ImageGenerationResult("data:image/png;base64,AAAA")]
+
+    monkeypatch.setattr("app.router.proxy.generate_images", fake_generate)
+    monkeypatch.setattr("app.router.proxy._call_nonstream_with_fallbacks", fake_planner)
+    call_id = GATEWAY_IMAGE_DISPLAY_CALL_PREFIX + "first"
+    response = TestClient(app).post("/v1/responses", headers=image_app_db["headers"], json={
+        "model": "chat/chat-model",
+        "stream": True,
+        "input": [
+            {"type": "message", "role": "user", "content": [{
+                "type": "input_text",
+                "text": "生成木质背景与 5 张原创角色海报，并完成 HTML 页面",
+            }]},
+            {"type": "additional_tools", "tools": [{
+                "type": "custom", "name": "exec",
+                "description": "Run JavaScript; generatedImage(result) displays generated images.",
+            }]},
+            {"type": "custom_tool_call", "call_id": call_id, "name": "exec",
+             "input": "generatedImage({ image_url: 'data:image/png;base64,AAAA' });"},
+            {"type": "custom_tool_call_output", "call_id": call_id,
+             "output": "The generated image was displayed successfully."},
+        ],
+    })
+    assert response.status_code == 200, response.text
+    assert planner_calls == 2
+    assert generated == ["original anime character poster on transparent background"]
+    assert "generatedImage" in response.text
+    assert "OPENAI_API_KEY" not in response.text
+    assert IMAGE_BRIDGE_CORRECTION_MARKER not in response.text
+
+
+def test_codex_exec_batch_generates_every_nested_image_call(image_app_db, monkeypatch):
+    generated = []
+
+    async def fake_planner(policy, internal, **kwargs):
+        script = (
+            "const r = await Promise.all(["
+            "tools.llm_aio_image_generation({filename:'aria.png',prompt:'original Aria poster'}),"
+            "tools.llm_aio_image_generation({filename:'ren.png',prompt:'original Ren poster'})"
+            "]); text(JSON.stringify(r));"
+        )
+        return InternalOutputMessage(
+            tool_calls=[InternalToolCallOutput(
+                id="call_batch", call_id="call_batch", name="exec",
+                arguments=json.dumps({"input": script}),
+            )],
+            finish_reason="tool_calls",
+            usage={"total_tokens": 5},
+        ), {"id": "chat"}, "chat"
+
+    async def fake_generate(config, **kwargs):
+        generated.append(kwargs["prompt"])
+        encoded = base64.b64encode(kwargs["prompt"].encode()).decode()
+        return [ImageGenerationResult(f"data:image/png;base64,{encoded}")]
+
+    monkeypatch.setattr("app.router.proxy.generate_images", fake_generate)
+    monkeypatch.setattr("app.router.proxy._call_nonstream_with_fallbacks", fake_planner)
+    response = TestClient(app).post("/v1/responses", headers=image_app_db["headers"], json={
+        "model": "chat/chat-model",
+        "stream": True,
+        "input": [
+            {"type": "message", "role": "user", "content": [{
+                "type": "input_text", "text": "Generate two original character posters",
+            }]},
+            {"type": "additional_tools", "tools": [{
+                "type": "custom", "name": "exec",
+                "description": "Run JavaScript; generatedImage(result) displays generated images.",
+            }]},
+        ],
+    })
+    assert response.status_code == 200, response.text
+    assert generated == ["original Aria poster", "original Ren poster"]
+    # Responses SSE repeats the completed tool input in several lifecycle
+    # events; assert both distinct generated payloads are present instead of
+    # counting serialized occurrences.
+    assert base64.b64encode(b"original Aria poster").decode() in response.text
+    assert base64.b64encode(b"original Ren poster").decode() in response.text
+    logs = list_request_logs(limit=5)
+    image_log = next(item for item in logs if item["details"].get("request_kind") == "image_generation")
+    assert image_log["details"]["image_requested_count"] == 2
+    assert image_log["details"]["image_succeeded_count"] == 2
+
+
+def test_responses_codex_system_turn_does_not_inject_or_correct_image_bridge(image_app_db, monkeypatch):
+    planner_calls = 0
+
+    async def fake_planner(policy, internal, **kwargs):
+        nonlocal planner_calls
+        planner_calls += 1
+        assert all(tool.name != IMAGE_BRIDGE_TOOL_NAME for tool in internal.tools)
+        assert IMAGE_BRIDGE_MARKER not in internal.system
+        return InternalOutputMessage(
+            text='{"title":"实现五子棋","description":"自动生成素材"}',
+            usage={"total_tokens": 3},
+        ), {"id": "chat"}, "chat"
+
+    async def fail_generate(*args, **kwargs):
+        raise AssertionError("a Codex system turn must not invoke the image backend")
+
+    monkeypatch.setattr("app.router.proxy.generate_images", fail_generate)
+    monkeypatch.setattr("app.router.proxy._call_nonstream_with_fallbacks", fake_planner)
+    response = TestClient(app).post("/v1/responses", headers=image_app_db["headers"], json={
+        "model": "chat/chat-model",
+        "input": [{
+            "type": "message", "role": "user", "content": [{
+                "type": "input_text",
+                "text": "Create a task title for: 生成一个游戏背景图像素材",
+            }],
+        }],
+        "client_metadata": {
+            "x-codex-turn-metadata": json.dumps({
+                "request_kind": "turn", "thread_source": "system",
+            }),
+        },
+        "text": {"format": {"type": "json_schema", "name": "codex_output_schema"}},
+    })
+    assert response.status_code == 200
+    assert planner_calls == 1
+    assert IMAGE_BRIDGE_CORRECTION_MARKER not in response.text
+
+
+def test_responses_invalid_empty_exec_correction_keeps_original_planner_call(image_app_db, monkeypatch):
+    planner_calls = 0
+
+    async def fake_planner(policy, internal, **kwargs):
+        nonlocal planner_calls
+        planner_calls += 1
+        if planner_calls == 1:
+            return InternalOutputMessage(
+                text="I will inspect the workspace first.",
+                tool_calls=[InternalToolCallOutput(
+                    id="call_original", call_id="call_original", name="exec",
+                    arguments=json.dumps({"input": "const r = await tools.shell_command({command:\"Get-ChildItem -Force\"}); text(r)"}),
+                )],
+                finish_reason="tool_calls", usage={"total_tokens": 3},
+            ), {"id": "chat"}, "chat"
+        return InternalOutputMessage(
+            text="I will generate the requested asset.",
+            tool_calls=[InternalToolCallOutput(
+                id="call_empty", call_id="call_empty", name="exec", arguments="{}",
+            )],
+            finish_reason="tool_calls", usage={"total_tokens": 4},
+        ), {"id": "chat"}, "chat"
+
+    async def fail_generate(*args, **kwargs):
+        raise AssertionError("an empty exec is not an image invocation")
+
+    monkeypatch.setattr("app.router.proxy.generate_images", fail_generate)
+    monkeypatch.setattr("app.router.proxy._call_nonstream_with_fallbacks", fake_planner)
+    response = TestClient(app).post("/v1/responses", headers=image_app_db["headers"], json={
+        "model": "chat/chat-model",
+        "input": "实现网页游戏，素材文件通过图像生成功能自动生成",
+    })
+    assert response.status_code == 200
+    assert planner_calls == 2
+    assert "call_original" in response.text
+    assert "call_empty" not in response.text
+    assert IMAGE_BRIDGE_CORRECTION_MARKER not in response.text
+
+
+def test_responses_allows_required_imagegen_skill_read_before_correction(image_app_db, monkeypatch):
+    planner_calls = 0
+
+    async def fake_planner(*args, **kwargs):
+        nonlocal planner_calls
+        planner_calls += 1
+        return InternalOutputMessage(
+            tool_calls=[InternalToolCallOutput(
+                id="call_skill", call_id="call_skill", name="exec",
+                arguments=json.dumps({
+                    "input": "const r = await tools.shell_command({command:"
+                    "\"Get-Content C:/Users/NRC/.codex/skills/.system/imagegen/SKILL.md\"}); text(r);",
+                }),
+            )], finish_reason="tool_calls", usage={"total_tokens": 3},
+        ), {"id": "chat"}, "chat"
+
+    async def fail_generate(*args, **kwargs):
+        raise AssertionError("skill discovery turn must reach Codex before image correction")
+
+    monkeypatch.setattr("app.router.proxy.generate_images", fail_generate)
+    monkeypatch.setattr("app.router.proxy._call_nonstream_with_fallbacks", fake_planner)
+    response = TestClient(app).post("/v1/responses", headers=image_app_db["headers"], json={
+        "model": "chat/chat-model",
+        "input": "生成一个游戏背景图像素材",
+    })
+    assert response.status_code == 200
+    assert planner_calls == 1
+    assert "SKILL.md" in response.text
+    assert IMAGE_BRIDGE_CORRECTION_MARKER not in response.text
+
+
+def test_responses_correction_skill_read_does_not_consume_retry(image_app_db, monkeypatch):
+    planner_calls = 0
+
+    async def fake_planner(*args, **kwargs):
+        nonlocal planner_calls
+        planner_calls += 1
+        if planner_calls == 1:
+            script = "const r = await tools.shell_command({command:\"Get-ChildItem -Force\"}); text(r)"
+        else:
+            script = (
+                "const r = await tools.shell_command({command:"
+                "\"Get-Content C:/Users/NRC/.codex/skills/.system/imagegen/SKILL.md\"}); text(r)"
+            )
+        return InternalOutputMessage(
+            tool_calls=[InternalToolCallOutput(
+                id=f"call_{planner_calls}", call_id=f"call_{planner_calls}", name="exec",
+                arguments=json.dumps({"input": script}),
+            )], finish_reason="tool_calls", usage={"total_tokens": 3},
+        ), {"id": "chat"}, "chat"
+
+    async def fail_generate(*args, **kwargs):
+        raise AssertionError("skill read is not an image backend invocation")
+
+    monkeypatch.setattr("app.router.proxy.generate_images", fail_generate)
+    monkeypatch.setattr("app.router.proxy._call_nonstream_with_fallbacks", fake_planner)
+    response = TestClient(app).post("/v1/responses", headers=image_app_db["headers"], json={
+        "model": "chat/chat-model",
+        "input": "生成一个游戏背景图像素材",
+    })
+    assert response.status_code == 200
+    assert planner_calls == 2
+    assert "SKILL.md" in response.text
+    assert IMAGE_BRIDGE_CORRECTION_MARKER not in response.text
 
 
 def test_responses_explicit_image_words_require_model_tool_call(image_app_db, monkeypatch):
@@ -448,7 +1575,7 @@ def test_responses_image_generation_uses_configured_backend(image_app_db, monkey
     item = response.json()["output"][0]
     assert item["type"] == "message"
     assert "![Generated image](data:image/png;base64,AAAA)" in item["content"][0]["text"]
-    assert "[Open generated image](http://testserver/v1/image-results/" in item["content"][0]["text"]
+    assert "[download original](http://testserver/v1/image-results/" in item["content"][0]["text"]
     assert len(list(image_app_db["image_dir"].glob("*.png"))) == 1
 
 
@@ -481,6 +1608,59 @@ def test_codex_exec_image_call_is_consumed_by_gateway():
     }
 
 
+def test_codex_exec_image_call_accepts_luna_javascript_object_literal():
+    arguments = json.dumps({
+        "input": (
+            'const r = await tools.llm_aio_image_generation({'
+            'filename:"gomoku-board-texture.png",size:"1024x1024",quality:"high",'
+            'prompt:"dark texture with literal {accent:blue} text"}); text(r);'
+        ),
+    })
+    assert image_call_arguments_from_exec(arguments) == {
+        "filename": "gomoku-board-texture.png",
+        "size": "1024x1024",
+        "quality": "high",
+        "prompt": "dark texture with literal {accent:blue} text",
+    }
+
+
+def test_codex_exec_image_call_accepts_multiple_single_quoted_javascript_literals():
+    arguments = json.dumps({
+        "input": (
+            "const r = await Promise.all(["
+            "tools.llm_aio_image_generation({filename:'aria.png',prompt:'Aria with {gold} light'}),"
+            "tools.llm_aio_image_generation({filename:'ren.png',size:'1024x1536',prompt:'Ren poster'})"
+            "]); text(JSON.stringify(r));"
+        ),
+    })
+    assert image_call_arguments_list_from_exec(arguments) == [
+        {"filename": "aria.png", "prompt": "Aria with {gold} light"},
+        {"filename": "ren.png", "size": "1024x1536", "prompt": "Ren poster"},
+    ]
+    assert image_call_arguments_from_exec(arguments) == {
+        "filename": "aria.png", "prompt": "Aria with {gold} light",
+    }
+
+
+def test_codex_exec_description_advertises_gateway_virtual_image_tool():
+    body = {
+        "model": "chat/chat-model",
+        "input": [{
+            "type": "additional_tools",
+            "tools": [{"type": "custom", "name": "exec", "description": "Run JavaScript."}],
+        }],
+    }
+    internal = responses_to_internal(body)
+    inject_hosted_image_capability(body)
+    configure_internal_image_bridge(internal, body)
+    exec_tool = next(tool for tool in internal.tools if tool.name == "exec")
+    assert "tools.llm_aio_image_generation" in exec_tool.description
+    assert "absent from ALL_TOOLS" in exec_tool.description
+    assert "OPENAI_API_KEY" in internal.system
+    assert "do not inspect" in internal.system.lower()
+    assert "scripts/image_gen.py" in internal.system
+
+
 def test_image_result_storage_rejects_invalid_tokens_and_serves_exact_bytes(tmp_path):
     stored = store_image_results(
         [ImageGenerationResult("data:image/png;base64," + base64.b64encode(b"png-bytes").decode())],
@@ -490,6 +1670,8 @@ def test_image_result_storage_rejects_invalid_tokens_and_serves_exact_bytes(tmp_
     assert found is not None
     assert found.path.read_bytes() == b"png-bytes"
     assert find_image_result("../" + stored[0].token, directory=tmp_path) is None
+    remove_stored_image_results(stored)
+    assert not stored[0].path.exists()
 
 
 def test_codex_image_namespace_round_trips_as_client_tool_call():

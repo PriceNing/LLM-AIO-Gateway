@@ -26,6 +26,7 @@ svn-update-docker.sh
 *.log
 data/
 generated_images/
+/grok_apple_test.jpg
 
 # Project-local notes (not for distribution)
 AGENTS.md
