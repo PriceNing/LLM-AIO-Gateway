@@ -799,6 +799,36 @@ a.icon-btn { text-decoration: none; }
   flex-direction: column;
   gap: 8px;
 }
+.image-workflow-json {
+  min-height: 220px !important;
+  font-family: var(--font-mono) !important;
+  font-size: 12px !important;
+  line-height: 1.5;
+  white-space: pre;
+}
+.form-hint {
+  margin-top: 6px;
+  color: var(--text-tertiary);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.form-actions.compact { margin: -4px 0 16px; }
+.comfy-mapping-panel {
+  margin: 8px 0 16px;
+  padding: 14px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--bg-input) 72%, transparent);
+}
+.comfy-mapping-panel h4 { margin: 0 0 14px; font-size: 14px; }
+.comfy-mapping-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 12px;
+}
+@media (max-width: 760px) {
+  .comfy-mapping-grid { grid-template-columns: 1fr; }
+}
 .preprocessor-field {
   display: flex;
   align-items: center;

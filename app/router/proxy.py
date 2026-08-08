@@ -21,12 +21,11 @@ from app.database import (
     get_model_responses_capability, set_model_responses_capability, update_model_responses_capability, update_model_responses_tool_types,
 )
 from app.core.text import friendly_error_msg, mask_key
-from app.core.image_intent import is_image_generation_intent, latest_user_text
+from app.core.image_intent import latest_user_text
 from app.core.image_bridge import (
     GATEWAY_IMAGE_ASSET_MARKER,
     GATEWAY_IMAGE_DISPLAY_CALL_PREFIX,
     GATEWAY_IMAGE_RESULT_MARKER,
-    IMAGE_BRIDGE_CORRECTION_INSTRUCTIONS,
     IMAGE_BRIDGE_TOOL_NAME,
     configure_internal_image_bridge,
     gateway_generated_image_asset_context,
@@ -639,14 +638,18 @@ def _generated_image_markdown_output(
     the client while the stored artifact URL remains available for opening or
     downloading the original image.
     """
-    blocks = [_generated_image_asset_manifest(artifacts)]
+    # This is public assistant text. Private bridge markers and agent-only
+    # instructions must never be rendered in the user's conversation.
+    asset_links = [
+        f"[`{artifact['filename']}` — download original]({artifact['url']})"
+        for artifact in artifacts
+    ]
+    blocks = ["Original: " + " · ".join(asset_links)] if asset_links else []
     inline_limit = max(1, int(get_default("image_preview_inline_limit", 4)))
     inline_results = image_results[:inline_limit]
     for index, result in enumerate(inline_results, start=1):
         label = "Generated image" if len(stored) == 1 else f"Generated image {index}"
-        blocks.append(
-            f"{GATEWAY_IMAGE_RESULT_MARKER}\n![{label}]({image_preview_data_uri(result)})"
-        )
+        blocks.append(f"![{label}]({image_preview_data_uri(result)})")
     omitted = len(image_results) - len(inline_results)
     if omitted > 0:
         blocks.append(
@@ -818,44 +821,6 @@ def _image_bridge_invocations(
                     raw=call.raw,
                 ), wrapped_args))
     return invocations
-
-
-def _output_reads_imagegen_skill(output: InternalOutputMessage) -> bool:
-    """Allow Codex's mandatory imagegen skill read to execute before correction."""
-    for call in output.tool_calls:
-        if call.name not in {"exec", "shell_command", "exec_command"}:
-            continue
-        serialized = str(call.arguments or "").lower().replace("\\\\", "/").replace("\\", "/")
-        if "skill.md" in serialized and "imagegen" in serialized:
-            return True
-    return False
-
-
-def _output_has_empty_exec_call(output: InternalOutputMessage) -> bool:
-    """Detect an unusable Codex exec emitted by an image correction round."""
-    for call in output.tool_calls:
-        if call.name != "exec":
-            continue
-        arguments = image_call_arguments(call.arguments)
-        if not arguments or not str(arguments.get("input") or "").strip():
-            return True
-    return False
-
-
-def _output_requests_local_openai_key(output: InternalOutputMessage) -> bool:
-    """Detect the imagegen CLI fallback that is invalid behind this gateway."""
-    text = str(output.text or "")
-    if "OPENAI_API_KEY" not in text:
-        return False
-    lowered = text.lower()
-    # Do not retry a correct explanation that explicitly rejects local keys.
-    negative_phrases = (
-        "do not require", "does not require", "don't require", "not needed",
-        "无需", "不需要", "不会访问", "不会要求", "无需配置",
-    )
-    if any(phrase in lowered for phrase in negative_phrases):
-        return False
-    return True
 
 
 def _image_prompt_key(arguments: dict[str, Any]) -> str:
@@ -3213,73 +3178,11 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                 len(output.tool_calls), len(image_invocations),
                 [call.name for call in output.tool_calls],
             )
+            # The bridge advertises an optional capability. Never replace the
+            # model's chosen text or ordinary tool call with a forced image
+            # invocation. Besides overriding agent intent, that behavior made
+            # unrelated tasks fail when the global image backend was disabled.
             image_correction_applied = False
-            if (
-                not image_invocations
-                and is_image_generation_intent(input_data)
-                and not _output_reads_imagegen_skill(output)
-                and (
-                    not image_already_generated
-                    or _output_requests_local_openai_key(output)
-                )
-            ):
-                # A Codex/Luna planner can emit an ordinary exec call after
-                # reading its local image skill instead of invoking the
-                # gateway function. Give it one explicit, bounded retry. The
-                # response-history marker prevents a long task from entering
-                # a correction loop on later Responses turns without making
-                # unrelated new tasks with the same prompt share global state.
-                image_correction_applied = True
-                internal.messages.append(InternalMessage(
-                    role="system",
-                    parts=[text_part(IMAGE_BRIDGE_CORRECTION_INSTRUCTIONS)],
-                ))
-                previous_tool_choice = internal.tool_choice
-                had_allowed_params = "allowed_openai_params" in internal.extra
-                previous_allowed_params = internal.extra.get("allowed_openai_params")
-                allowed_params = list(previous_allowed_params or [])
-                if "tool_choice" not in allowed_params:
-                    allowed_params.append("tool_choice")
-                internal.extra["allowed_openai_params"] = allowed_params
-                internal.tool_choice = {
-                    "type": "function",
-                    "function": {"name": IMAGE_BRIDGE_TOOL_NAME},
-                }
-                try:
-                    corrected, provider_info, adapter_provider_id = await _call_nonstream_with_fallbacks(
-                        policy, internal, temperature=temperature, max_tokens=max_tokens,
-                        log_label="responses.image_bridge.correction",
-                    )
-                finally:
-                    internal.tool_choice = previous_tool_choice
-                    if had_allowed_params:
-                        internal.extra["allowed_openai_params"] = previous_allowed_params
-                    else:
-                        internal.extra.pop("allowed_openai_params", None)
-                corrected.usage = {
-                    key: int(output.usage.get(key, 0) or 0) + int(corrected.usage.get(key, 0) or 0)
-                    for key in set(output.usage) | set(corrected.usage)
-                }
-                correction_deferred = _output_reads_imagegen_skill(corrected)
-                correction_invalid = (
-                    not _image_bridge_invocations(corrected)
-                    and _output_has_empty_exec_call(corrected)
-                )
-                if correction_invalid:
-                    # Do not replace a usable planner result with Luna's
-                    # occasional ``exec({})`` correction. Keep the original
-                    # action and mark this bounded retry as consumed.
-                    corrected = output
-                    correction_deferred = False
-                output = corrected
-                requested_image_invocations = _image_bridge_invocations(output)
-                image_invocations = requested_image_invocations[:max_image_invocations]
-                skipped_initial_invocations = requested_image_invocations[max_image_invocations:]
-                _app_log.info(
-                    "[responses image_generation.correction] applied=true deferred=%s invalid=%s image=%d names=%s",
-                    str(correction_deferred).lower(), str(correction_invalid).lower(), len(image_invocations),
-                    [call.name for call in output.tool_calls],
-                )
             all_initial_calls_are_images = len(requested_image_invocations) == len(output.tool_calls)
             if image_invocations:
                 image_results = bridge_image_results

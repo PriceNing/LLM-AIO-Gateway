@@ -721,6 +721,50 @@ async def list_image_generation(authorization: Optional[str] = Header(None)):
     return {"generators": generators, "models": models, "providers": list(providers.values())}
 
 
+@router.post("/image-generation/comfyui/analyze-workflow")
+async def analyze_comfyui_workflow(body: dict, authorization: Optional[str] = Header(None)):
+    """Inspect API-format workflow JSON and return safe dropdown choices."""
+    await require_admin_session(authorization)
+    from app.adapters.comfyui import analyze_workflow
+    try:
+        return analyze_workflow((body or {}).get("workflow"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/image-generation/comfyui/workflows")
+async def list_comfyui_workflows(body: dict, authorization: Optional[str] = Header(None)):
+    await require_admin_session(authorization)
+    from app.adapters.comfyui import list_saved_workflows
+    body = dict(body or {})
+    try:
+        workflows = await list_saved_workflows(
+            str(body.get("api_base") or ""),
+            api_key=str(body.get("api_key") or ""),
+            timeout=int(body.get("timeout") or 30),
+        )
+        return {"workflows": workflows}
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/image-generation/comfyui/load-workflow")
+async def load_comfyui_workflow(body: dict, authorization: Optional[str] = Header(None)):
+    await require_admin_session(authorization)
+    from app.adapters.comfyui import load_saved_workflow
+    body = dict(body or {})
+    try:
+        workflow = await load_saved_workflow(
+            str(body.get("api_base") or ""),
+            str(body.get("workflow_name") or ""),
+            api_key=str(body.get("api_key") or ""),
+            timeout=int(body.get("timeout") or 30),
+        )
+        return {"workflow": workflow}
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.post("/image-generation/test")
 async def test_image_generation(body: dict, authorization: Optional[str] = Header(None)):
     await require_admin_session(authorization)
@@ -745,11 +789,22 @@ async def update_image_generation(generator_id: str, config: dict, authorization
     await require_admin_session(authorization)
     config = dict(config or {})
     backend_type = str(config.get("backend_type") or "existing_model")
-    if backend_type != "existing_model" and not str(config.get("api_key") or "").strip():
+    existing = get_image_generators().get(generator_id) or {}
+    if backend_type in {"external_model", "comfyui"} and not str(config.get("api_key") or "").strip():
         # The admin read endpoint never returns stored secrets. An empty
         # password field therefore means "keep the current key", matching
         # provider and preprocessor configuration behavior.
-        config.pop("api_key", None)
+        same_secret_scope = (
+            str(existing.get("backend_type") or "") == backend_type
+            and str(existing.get("api_base") or "").rstrip("/")
+            == str(config.get("api_base") or "").rstrip("/")
+        )
+        if same_secret_scope:
+            config.pop("api_key", None)
+        else:
+            # Never forward a credential retained from a different backend or
+            # host when the administrator changes the generator target.
+            config["api_key"] = ""
     provider_model = str(config.get("provider_model") or "").strip()
     if backend_type == "existing_model" and provider_model:
         mid = parse_model_id(provider_model)
@@ -764,8 +819,17 @@ async def update_image_generation(generator_id: str, config: dict, authorization
         raise HTTPException(status_code=400, detail="an existing provider model is required")
     if backend_type == "external_model" and (not config.get("api_base") or not config.get("model")):
         raise HTTPException(status_code=400, detail="external model requires api_base and model")
-    if backend_type == "comfyui" and config.get("enabled", True):
-        raise HTTPException(status_code=400, detail="ComfyUI image generation is not implemented yet")
+    if backend_type == "comfyui":
+        from app.adapters.comfyui import normalize_workflow, validate_mapping
+        if not config.get("api_base"):
+            raise HTTPException(status_code=400, detail="ComfyUI requires api_base")
+        try:
+            config["workflow"] = normalize_workflow(config.get("workflow"))
+            config["workflow_mapping"] = validate_mapping(
+                config["workflow"], config.get("workflow_mapping") or {},
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     if backend_type not in {"existing_model", "external_model", "comfyui"}:
         raise HTTPException(status_code=400, detail="unsupported image-generation backend type")
     try:

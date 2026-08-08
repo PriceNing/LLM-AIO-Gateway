@@ -324,12 +324,40 @@ zh: {
     'imageGeneration.backendType': '后端类型',
     'imageGeneration.existingModel': '已有提供商模型',
     'imageGeneration.externalModel': '外部模型',
-    'imageGeneration.notAvailable': '暂不可用',
+    'imageGeneration.comfyui': 'ComfyUI',
     'imageGeneration.providerModel': '提供商模型',
     'imageGeneration.selectModel': '请选择提供商模型',
     'imageGeneration.apiBase': 'API Base URL',
     'imageGeneration.apiKey': 'API Key',
     'imageGeneration.model': '模型名称',
+    'imageGeneration.comfyBase': 'ComfyUI Base URL',
+    'imageGeneration.workflow': 'API 格式工作流 JSON',
+    'imageGeneration.workflowHint': '支持 ComfyUI 普通工作流和 API Format 工作流；普通工作流会自动转换',
+    'imageGeneration.analyzeWorkflow': '解析工作流',
+    'imageGeneration.fetchWorkflows': '获取服务器工作流',
+    'imageGeneration.fetchingWorkflows': '正在获取...',
+    'imageGeneration.savedWorkflow': '服务器工作流',
+    'imageGeneration.selectWorkflow': '请选择工作流',
+    'imageGeneration.loadWorkflow': '载入所选工作流',
+    'imageGeneration.workflowLoaded': '工作流已载入，可以直接解析；普通工作流会自动转换为 API Format',
+    'imageGeneration.workflowConverted': '普通 ComfyUI 工作流已自动转换为 API Format',
+    'imageGeneration.fetchWorkflowsFail': '获取 ComfyUI 工作流失败',
+    'imageGeneration.analyzingWorkflow': '解析中...',
+    'imageGeneration.workflowAnalyzed': '已解析工作流节点',
+    'imageGeneration.workflowAnalyzeFail': '工作流解析失败',
+    'imageGeneration.mapping': '工作流输入映射',
+    'imageGeneration.positivePrompt': '正向提示词',
+    'imageGeneration.negativePrompt': '负向提示词（可选）',
+    'imageGeneration.width': '宽度（可选）',
+    'imageGeneration.height': '高度（可选）',
+    'imageGeneration.seed': 'Seed（可选）',
+    'imageGeneration.steps': '采样步数（可选）',
+    'imageGeneration.cfg': 'CFG（可选）',
+    'imageGeneration.batchSize': '批量数量（可选）',
+    'imageGeneration.outputNode': '图像输出节点',
+    'imageGeneration.selectMapping': '请选择节点输入',
+    'imageGeneration.autoOutput': '自动查找所有输出节点',
+    'imageGeneration.pollInterval': '状态轮询间隔（秒）',
     'imageGeneration.timeout': '超时时间（秒）',
     'imageGeneration.enabled': '启用',
     'imageGeneration.on': '开',
@@ -653,12 +681,40 @@ en: {
     'imageGeneration.backendType': 'Backend Type',
     'imageGeneration.existingModel': 'Existing Provider Model',
     'imageGeneration.externalModel': 'External Model',
-    'imageGeneration.notAvailable': 'Not available',
+    'imageGeneration.comfyui': 'ComfyUI',
     'imageGeneration.providerModel': 'Provider Model',
     'imageGeneration.selectModel': 'Select a provider model',
     'imageGeneration.apiBase': 'API Base URL',
     'imageGeneration.apiKey': 'API Key',
     'imageGeneration.model': 'Model Name',
+    'imageGeneration.comfyBase': 'ComfyUI Base URL',
+    'imageGeneration.workflow': 'API-format Workflow JSON',
+    'imageGeneration.workflowHint': 'Both regular ComfyUI workflows and API-format workflows are supported; regular workflows are converted automatically',
+    'imageGeneration.analyzeWorkflow': 'Analyze Workflow',
+    'imageGeneration.fetchWorkflows': 'Fetch Server Workflows',
+    'imageGeneration.fetchingWorkflows': 'Fetching...',
+    'imageGeneration.savedWorkflow': 'Server Workflow',
+    'imageGeneration.selectWorkflow': 'Select a workflow',
+    'imageGeneration.loadWorkflow': 'Load Selected Workflow',
+    'imageGeneration.workflowLoaded': 'Workflow loaded and ready to analyze; regular workflows are converted to API format automatically',
+    'imageGeneration.workflowConverted': 'Regular ComfyUI workflow converted to API format automatically',
+    'imageGeneration.fetchWorkflowsFail': 'Failed to fetch ComfyUI workflows',
+    'imageGeneration.analyzingWorkflow': 'Analyzing...',
+    'imageGeneration.workflowAnalyzed': 'Workflow nodes analyzed',
+    'imageGeneration.workflowAnalyzeFail': 'Workflow analysis failed',
+    'imageGeneration.mapping': 'Workflow Input Mapping',
+    'imageGeneration.positivePrompt': 'Positive Prompt',
+    'imageGeneration.negativePrompt': 'Negative Prompt (optional)',
+    'imageGeneration.width': 'Width (optional)',
+    'imageGeneration.height': 'Height (optional)',
+    'imageGeneration.seed': 'Seed (optional)',
+    'imageGeneration.steps': 'Sampling Steps (optional)',
+    'imageGeneration.cfg': 'CFG (optional)',
+    'imageGeneration.batchSize': 'Batch Size (optional)',
+    'imageGeneration.outputNode': 'Image Output Node',
+    'imageGeneration.selectMapping': 'Select a node input',
+    'imageGeneration.autoOutput': 'Discover all output nodes automatically',
+    'imageGeneration.pollInterval': 'Status Poll Interval (seconds)',
     'imageGeneration.timeout': 'Timeout (seconds)',
     'imageGeneration.enabled': 'Enabled',
     'imageGeneration.on': 'ON',
@@ -1979,6 +2035,7 @@ async function testModel(modelId, btn) {
 var preprocessorsData = { preprocessors: {}, models: [] };
 
 var imageGenerationData = { generators: {}, models: [], providers: [] };
+var comfyWorkflowAnalysis = null;
 
 async function loadImageGeneration() {
     try {
@@ -2004,12 +2061,21 @@ function renderImageGeneration() {
     });
     html += '<div class="preprocessor-config-col"><div class="section-sub-header"><h3>' + t('imageGeneration.config') + '</h3></div>';
     html += '<div class="preprocessor-card glass"><div class="preprocessor-card-body">' +
-        '<div class="form-group"><label>' + t('imageGeneration.backendType') + '</label><select id="imageBackendType" onchange="updateImageBackendFields()"><option value="existing_model">' + t('imageGeneration.existingModel') + '</option><option value="external_model">' + t('imageGeneration.externalModel') + '</option><option value="comfyui" disabled>ComfyUI (' + t('imageGeneration.notAvailable') + ')</option></select></div>' +
+        '<div class="form-group"><label>' + t('imageGeneration.backendType') + '</label><select id="imageBackendType" onchange="updateImageBackendFields()"><option value="existing_model">' + t('imageGeneration.existingModel') + '</option><option value="external_model">' + t('imageGeneration.externalModel') + '</option><option value="comfyui">' + t('imageGeneration.comfyui') + '</option></select></div>' +
         '<div class="form-group"><label>' + t('imageGeneration.providerModel') + '</label><select id="imageProviderModel">' + providerOptions + '</select></div>' +
         '<div id="imageExternalFields" style="display:none">' +
         '<div class="form-group"><label>' + t('imageGeneration.apiBase') + '</label><input id="imageApiBase"></div>' +
         '<div class="form-group"><label>' + t('imageGeneration.apiKey') + '</label><input type="password" id="imageApiKey"></div>' +
         '<div class="form-group"><label>' + t('imageGeneration.model') + '</label><input id="imageModel"></div></div>' +
+        '<div id="imageComfyFields" style="display:none">' +
+        '<div class="form-group"><label>' + t('imageGeneration.comfyBase') + '</label><input id="imageComfyBase" placeholder="http://127.0.0.1:8188"></div>' +
+        '<div class="form-group"><label>' + t('imageGeneration.apiKey') + '</label><input type="password" id="imageComfyApiKey"></div>' +
+        '<div class="form-actions compact comfy-workflow-actions"><button type="button" class="btn btn-secondary" id="imageFetchWorkflowsBtn" onclick="fetchComfyWorkflows(this)">' + t('imageGeneration.fetchWorkflows') + '</button></div>' +
+        '<div id="imageSavedWorkflowFields" style="display:none"><div class="form-group"><label>' + t('imageGeneration.savedWorkflow') + '</label><select id="imageSavedWorkflow"><option value="">' + t('imageGeneration.selectWorkflow') + '</option></select></div><div class="form-actions compact"><button type="button" class="btn btn-secondary" onclick="loadSelectedComfyWorkflow()">' + t('imageGeneration.loadWorkflow') + '</button></div></div>' +
+        '<div class="form-group"><label>' + t('imageGeneration.workflow') + '</label><textarea id="imageComfyWorkflow" class="image-workflow-json" spellcheck="false"></textarea><div class="form-hint">' + t('imageGeneration.workflowHint') + '</div></div>' +
+        '<div class="form-actions compact"><button type="button" class="btn btn-secondary" id="imageWorkflowAnalyzeBtn" onclick="analyzeComfyWorkflow(this)">' + t('imageGeneration.analyzeWorkflow') + '</button></div>' +
+        '<div id="imageComfyMappings"></div>' +
+        '<div class="form-group"><label>' + t('imageGeneration.pollInterval') + '</label><input type="number" id="imageComfyPollInterval" value="1" min="0.2" max="10" step="0.1"></div></div>' +
         '<div class="form-group"><label>' + t('imageGeneration.timeout') + '</label><input type="number" id="imageTimeout" value="' + (active.timeout || 180) + '" min="1" max="3600"></div>' +
         '<div class="form-group"><label><input type="checkbox" id="imageEnabled"' + (active.enabled === false ? '' : ' checked') + '> ' + t('imageGeneration.enabled') + '</label></div>' +
         '<div class="form-actions"><button class="btn btn-secondary" id="imageGenerationTestBtn" onclick="testImageGeneration(this)">' + t('imageGeneration.test') + '</button><button class="btn btn-primary" onclick="saveImageGeneration()">' + t('imageGeneration.save') + '</button></div>' +
@@ -2061,20 +2127,140 @@ function renderImageGeneration() {
     document.getElementById('imageApiKey').value = '';
     document.getElementById('imageApiKey').placeholder = active.has_api_key ? '********' : '';
     document.getElementById('imageModel').value = active.model || '';
+    document.getElementById('imageComfyBase').value = active.backend_type === 'comfyui' ? (active.api_base || '') : '';
+    document.getElementById('imageComfyApiKey').value = '';
+    document.getElementById('imageComfyApiKey').placeholder = active.backend_type === 'comfyui' && active.has_api_key ? '********' : '';
+    document.getElementById('imageComfyWorkflow').value = active.workflow && Object.keys(active.workflow).length ? JSON.stringify(active.workflow, null, 2) : '';
+    document.getElementById('imageComfyPollInterval').value = active.poll_interval || 1;
+    if (active.workflow && Object.keys(active.workflow).length) {
+        comfyWorkflowAnalysis = buildLocalComfyAnalysis(active.workflow, active.workflow_mapping || {});
+        renderComfyMappings(active.workflow_mapping || {});
+    } else {
+        comfyWorkflowAnalysis = null;
+        renderComfyMappings({});
+    }
     updateImageBackendFields();
 }
 
 function updateImageBackendFields() {
     var type = document.getElementById('imageBackendType').value;
     document.getElementById('imageProviderModel').closest('.form-group').style.display = type === 'existing_model' ? '' : 'none';
-    document.getElementById('imageExternalFields').style.display = type === 'external_model' || type === 'comfyui' ? '' : 'none';
+    document.getElementById('imageExternalFields').style.display = type === 'external_model' ? '' : 'none';
+    document.getElementById('imageComfyFields').style.display = type === 'comfyui' ? '' : 'none';
+}
+
+async function fetchComfyWorkflows(btn) {
+    var old = btn ? btn.textContent : '';
+    try {
+        if (btn) { btn.disabled = true; btn.textContent = t('imageGeneration.fetchingWorkflows'); }
+        var result = await api('/admin/image-generation/comfyui/workflows', { method: 'POST', body: JSON.stringify({ api_base: document.getElementById('imageComfyBase').value.trim(), api_key: document.getElementById('imageComfyApiKey').value.trim(), timeout: 30 }) });
+        var select = document.getElementById('imageSavedWorkflow');
+        select.innerHTML = '<option value="">' + t('imageGeneration.selectWorkflow') + '</option>' + (result.workflows || []).map(function(name) { return '<option value="' + escHtml(name) + '">' + escHtml(name.replace(/\.json$/i, '')) + '</option>'; }).join('');
+        document.getElementById('imageSavedWorkflowFields').style.display = '';
+    } catch (e) { toast(t('imageGeneration.fetchWorkflowsFail') + ': ' + e.message, 'error'); }
+    finally { if (btn) { btn.disabled = false; btn.textContent = old || t('imageGeneration.fetchWorkflows'); } }
+}
+
+async function loadSelectedComfyWorkflow() {
+    try {
+        var name = document.getElementById('imageSavedWorkflow').value;
+        if (!name) return;
+        var result = await api('/admin/image-generation/comfyui/load-workflow', { method: 'POST', body: JSON.stringify({ api_base: document.getElementById('imageComfyBase').value.trim(), api_key: document.getElementById('imageComfyApiKey').value.trim(), workflow_name: name, timeout: 30 }) });
+        document.getElementById('imageComfyWorkflow').value = JSON.stringify(result.workflow || {}, null, 2);
+        comfyWorkflowAnalysis = null; renderComfyMappings({});
+        toast(t('imageGeneration.workflowLoaded'), 'success');
+    } catch (e) { toast(t('imageGeneration.fetchWorkflowsFail') + ': ' + e.message, 'error'); }
+}
+
+function buildLocalComfyAnalysis(workflow, mapping) {
+    var candidates = { prompt: [], negative_prompt: [], width: [], height: [], seed: [], steps: [], cfg: [], batch_size: [] };
+    var outputs = [];
+    Object.keys(workflow || {}).forEach(function(nodeId) {
+        var node = workflow[nodeId] || {};
+        var label = nodeId + ' · ' + (((node._meta || {}).title) || node.class_type || 'Node') + ' (' + (node.class_type || '?') + ')';
+        if (/saveimage|previewimage|output|save_image/i.test(node.class_type || '')) outputs.push({ node_id: nodeId, label: label });
+        Object.keys(node.inputs || {}).forEach(function(input) {
+            var value = node.inputs[input];
+            if (typeof value === 'string') {
+                var item = { node_id: nodeId, input: input, label: label + ' → ' + input };
+                candidates.prompt.push(item); candidates.negative_prompt.push(item);
+            }
+            var normalized = ({ noise_seed: 'seed', cfg_scale: 'cfg', batch: 'batch_size' })[input.toLowerCase()] || input.toLowerCase();
+            if (candidates[normalized] && (typeof value === 'number' || typeof value === 'string')) candidates[normalized].push({ node_id: nodeId, input: input, label: label + ' → ' + input });
+        });
+    });
+    return { workflow: workflow, candidates: candidates, outputs: outputs, suggestions: mapping || {} };
+}
+
+function mappingValue(item) { return item ? JSON.stringify([item.node_id, item.input]) : ''; }
+function mappingOptions(items, selected) {
+    var selectedValue = mappingValue(selected);
+    var html = '<option value="">' + t('imageGeneration.selectMapping') + '</option>';
+    (items || []).forEach(function(item) {
+        var value = mappingValue(item);
+        html += '<option value="' + escHtml(value) + '"' + (value === selectedValue ? ' selected' : '') + '>' + escHtml(item.label) + '</option>';
+    });
+    return html;
+}
+
+function renderComfyMappings(selected) {
+    var container = document.getElementById('imageComfyMappings');
+    if (!container) return;
+    if (!comfyWorkflowAnalysis) { container.innerHTML = ''; return; }
+    selected = selected || comfyWorkflowAnalysis.suggestions || {};
+    var fields = [
+        ['prompt', 'positivePrompt'], ['negative_prompt', 'negativePrompt'], ['width', 'width'],
+        ['height', 'height'], ['seed', 'seed'], ['steps', 'steps'], ['cfg', 'cfg'], ['batch_size', 'batchSize']
+    ];
+    var html = '<div class="comfy-mapping-panel"><h4>' + t('imageGeneration.mapping') + '</h4><div class="comfy-mapping-grid">';
+    fields.forEach(function(pair) {
+        var choice = selected[pair[0]] || (comfyWorkflowAnalysis.suggestions || {})[pair[0]];
+        html += '<div class="form-group"><label>' + t('imageGeneration.' + pair[1]) + '</label><select data-comfy-mapping="' + pair[0] + '">' + mappingOptions(comfyWorkflowAnalysis.candidates[pair[0]], choice) + '</select></div>';
+    });
+    var outputSelected = selected.output_node_id || (comfyWorkflowAnalysis.suggestions || {}).output_node_id || '';
+    html += '<div class="form-group"><label>' + t('imageGeneration.outputNode') + '</label><select id="imageComfyOutputNode"><option value="">' + t('imageGeneration.autoOutput') + '</option>';
+    (comfyWorkflowAnalysis.outputs || []).forEach(function(item) { html += '<option value="' + escHtml(item.node_id) + '"' + (item.node_id === outputSelected ? ' selected' : '') + '>' + escHtml(item.label) + '</option>'; });
+    html += '</select></div></div></div>';
+    container.innerHTML = html;
+}
+
+async function analyzeComfyWorkflow(btn) {
+    var old = btn ? btn.textContent : '';
+    try {
+        var workflow = JSON.parse(document.getElementById('imageComfyWorkflow').value || '{}');
+        if (btn) { btn.disabled = true; btn.textContent = t('imageGeneration.analyzingWorkflow'); }
+        comfyWorkflowAnalysis = await api('/admin/image-generation/comfyui/analyze-workflow', { method: 'POST', body: JSON.stringify({ workflow: workflow }) });
+        document.getElementById('imageComfyWorkflow').value = JSON.stringify(comfyWorkflowAnalysis.workflow || workflow, null, 2);
+        renderComfyMappings(comfyWorkflowAnalysis.suggestions || {});
+        toast(t('imageGeneration.workflowAnalyzed') + ': ' + comfyWorkflowAnalysis.node_count, 'success');
+        if (comfyWorkflowAnalysis.converted) toast(t('imageGeneration.workflowConverted'), 'info');
+    } catch (e) { toast(t('imageGeneration.workflowAnalyzeFail') + ': ' + e.message, 'error'); }
+    finally { if (btn) { btn.disabled = false; btn.textContent = old || t('imageGeneration.analyzeWorkflow'); } }
+}
+
+function collectComfyMapping() {
+    var result = {};
+    document.querySelectorAll('[data-comfy-mapping]').forEach(function(select) {
+        if (!select.value) return;
+        var parts = JSON.parse(select.value);
+        result[select.getAttribute('data-comfy-mapping')] = { node_id: parts[0], input: parts[1] };
+    });
+    var output = document.getElementById('imageComfyOutputNode');
+    result.output_node_id = output ? output.value : '';
+    return result;
 }
 
 async function saveImageGeneration() {
     var id = Object.keys(imageGenerationData.generators)[0] || 'default';
     try {
         var type = document.getElementById('imageBackendType').value;
-        await api('/admin/image-generation/' + encodeURIComponent(id), { method: 'PUT', body: JSON.stringify({ backend_type: type, provider_model: type === 'existing_model' ? document.getElementById('imageProviderModel').value : '', api_base: type !== 'existing_model' ? document.getElementById('imageApiBase').value.trim() : '', api_key: type !== 'existing_model' ? document.getElementById('imageApiKey').value.trim() : '', model: type !== 'existing_model' ? document.getElementById('imageModel').value.trim() : '', timeout: parseInt(document.getElementById('imageTimeout').value) || 180, enabled: document.getElementById('imageEnabled').checked }) });
+        var config = { backend_type: type, provider_model: type === 'existing_model' ? document.getElementById('imageProviderModel').value : '', api_base: type === 'external_model' ? document.getElementById('imageApiBase').value.trim() : (type === 'comfyui' ? document.getElementById('imageComfyBase').value.trim() : ''), api_key: type === 'external_model' ? document.getElementById('imageApiKey').value.trim() : (type === 'comfyui' ? document.getElementById('imageComfyApiKey').value.trim() : ''), model: type === 'external_model' ? document.getElementById('imageModel').value.trim() : '', timeout: parseInt(document.getElementById('imageTimeout').value) || 180, enabled: document.getElementById('imageEnabled').checked };
+        if (type === 'comfyui') {
+            config.workflow = JSON.parse(document.getElementById('imageComfyWorkflow').value || '{}');
+            config.workflow_mapping = collectComfyMapping();
+            config.poll_interval = parseFloat(document.getElementById('imageComfyPollInterval').value) || 1;
+        }
+        await api('/admin/image-generation/' + encodeURIComponent(id), { method: 'PUT', body: JSON.stringify(config) });
         toast(t('common.saved') || t('imageGeneration.save'), 'success'); loadImageGeneration();
     } catch (e) { toast(t('imageGeneration.saveFail') + ': ' + e.message, 'error'); }
 }

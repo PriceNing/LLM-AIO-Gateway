@@ -14,6 +14,10 @@ from app.adapters.imagegen import (
     ImageGenerationResult, _download_image, _is_public_address, generate_images,
     image_results_bytes, images_url,
 )
+from app.adapters.comfyui import (
+    analyze_workflow, convert_ui_workflow, generate_comfyui_images, list_saved_workflows,
+    load_saved_workflow, validate_mapping, workflow_userdata_url,
+)
 from app.database import (
     get_enabled_image_generator,
     get_global_stats,
@@ -392,8 +396,27 @@ def test_image_generation_intent_is_conservative():
     assert is_image_generation_intent("请解释 image_generation 工具") is False
     assert is_image_generation_intent("Build the UI and create an image upload component") is False
     assert is_image_generation_intent("不要生成图像，只解释接口") is False
+    assert is_image_generation_intent("请不要调用任何图像生成") is False
+    assert is_image_generation_intent("禁止使用生图工具，只检查代码") is False
     assert is_image_generation_intent("制作一个流程图并写进文档") is False
     assert is_image_generation_intent("生成一张图") is True
+
+
+def test_image_generation_intent_ignores_tool_outputs_and_instructions():
+    input_data = [
+        {"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "review 代码并补充文档"},
+        ]},
+        {"type": "function_call_output", "call_id": "call_1",
+         "output": "日志包含：生成一张诊断图片"},
+        {"type": "custom_tool_call_output", "call_id": "call_2",
+         "output": "image generation is available"},
+    ]
+    assert latest_user_text(input_data) == "review 代码并补充文档"
+    assert is_image_generation_intent(input_data) is False
+    assert is_image_generation_intent(
+        input_data, instructions="When useful, generate an image with the image tool."
+    ) is False
 
 
 def test_responses_model_driven_bridge_generates_after_model_tool_call(image_app_db, monkeypatch):
@@ -422,12 +445,12 @@ def test_responses_model_driven_bridge_generates_after_model_tool_call(image_app
     assert item["type"] == "message"
     assert item["status"] == "completed"
     text = item["content"][0]["text"]
-    assert GATEWAY_IMAGE_ASSET_MARKER in text
-    assert "download these URLs into the project workspace" in text
-    assert "`generated-asset-1.png`" in text
-    assert text.index("download original") < text.index("data:image/png;base64")
+    assert GATEWAY_IMAGE_ASSET_MARKER not in text
+    assert GATEWAY_IMAGE_RESULT_MARKER not in text
+    assert "download these URLs into the project workspace" not in text
+    assert "[`generated-asset-1.png` — download original](http://testserver/v1/image-results/" in text
+    assert text.index("Original:") < text.index("data:image/png;base64")
     assert "![Generated image](data:image/png;base64,AAAA)" in text
-    assert "[download original](http://testserver/v1/image-results/" in text
     assert len(list(image_app_db["image_dir"].glob("*.png"))) == 1
     assert calls == ["生成一个苹果的图像"]
 
@@ -674,7 +697,7 @@ def test_responses_multi_image_markdown_caps_inline_previews(image_app_db, monke
     text = response.json()["output"][0]["content"][0]["text"]
     assert text.count("![Generated image") == 4
     assert "1 additional generated image preview(s) were omitted" in text
-    assert text.count("[download original]") == 5
+    assert text.count("download original]") == 5
 
 
 def test_responses_failed_image_batch_preserves_success_and_retries_failed_item(image_app_db, monkeypatch):
@@ -985,6 +1008,24 @@ def test_gateway_generated_image_history_compacts_only_gateway_assistant_preview
     assert input_data[1]["content"][0]["image_url"].endswith("VVNFUg==")
 
 
+def test_marker_free_gateway_image_history_is_compacted_and_rehydrates_assets():
+    input_data = [{
+        "type": "message", "role": "assistant", "content": [{
+            "type": "output_text",
+            "text": (
+                "Original: [test-apple.png](http://gateway.test/v1/image-results/abc)\n\n"
+                "![Generated image](data:image/png;base64,QUJDRA==)"
+            ),
+        }],
+    }]
+    assert has_gateway_generated_image_history(input_data) is True
+    context = gateway_generated_image_asset_context(input_data)
+    assert GATEWAY_IMAGE_ASSET_MARKER in context
+    assert "test-apple.png: http://gateway.test/v1/image-results/abc" in context
+    assert sanitize_gateway_generated_image_history(input_data) is True
+    assert "QUJDRA==" not in input_data[0]["content"][0]["text"]
+
+
 def test_gateway_generated_image_asset_context_keeps_manifest_without_preview():
     input_data = [{
         "type": "message", "role": "assistant", "content": [{
@@ -1122,7 +1163,7 @@ def test_responses_normal_chat_does_not_trigger_codex_bridge(image_app_db, monke
     assert response.status_code != 500
 
 
-def test_responses_codex_exec_planner_gets_one_bounded_image_correction(image_app_db, monkeypatch):
+def test_responses_codex_exec_planner_is_not_forced_into_image_generation(image_app_db, monkeypatch):
     planner_calls = 0
     generated = []
 
@@ -1177,13 +1218,13 @@ def test_responses_codex_exec_planner_gets_one_bounded_image_correction(image_ap
         ],
     })
     assert response.status_code == 200, response.text
-    assert planner_calls == 2
-    assert generated == ["board texture"]
+    assert planner_calls == 1
+    assert generated == []
     assert IMAGE_BRIDGE_CORRECTION_MARKER not in response.text
-    assert "generatedImage" in response.text
+    assert "Get-ChildItem -Force" in response.text
 
 
-def test_display_followup_rejecting_gateway_for_local_key_is_forced_back_to_bridge(
+def test_display_followup_rejecting_gateway_for_local_key_is_not_forced_back_to_bridge(
     image_app_db, monkeypatch,
 ):
     planner_calls = 0
@@ -1242,10 +1283,9 @@ def test_display_followup_rejecting_gateway_for_local_key_is_forced_back_to_brid
         ],
     })
     assert response.status_code == 200, response.text
-    assert planner_calls == 2
-    assert generated == ["original anime character poster on transparent background"]
-    assert "generatedImage" in response.text
-    assert "OPENAI_API_KEY" not in response.text
+    assert planner_calls == 1
+    assert generated == []
+    assert "OPENAI_API_KEY" in response.text
     assert IMAGE_BRIDGE_CORRECTION_MARKER not in response.text
 
 
@@ -1339,7 +1379,7 @@ def test_responses_codex_system_turn_does_not_inject_or_correct_image_bridge(ima
     assert IMAGE_BRIDGE_CORRECTION_MARKER not in response.text
 
 
-def test_responses_invalid_empty_exec_correction_keeps_original_planner_call(image_app_db, monkeypatch):
+def test_responses_ordinary_exec_is_not_replanned_as_image_generation(image_app_db, monkeypatch):
     planner_calls = 0
 
     async def fake_planner(policy, internal, **kwargs):
@@ -1372,7 +1412,7 @@ def test_responses_invalid_empty_exec_correction_keeps_original_planner_call(ima
         "input": "实现网页游戏，素材文件通过图像生成功能自动生成",
     })
     assert response.status_code == 200
-    assert planner_calls == 2
+    assert planner_calls == 1
     assert "call_original" in response.text
     assert "call_empty" not in response.text
     assert IMAGE_BRIDGE_CORRECTION_MARKER not in response.text
@@ -1409,7 +1449,7 @@ def test_responses_allows_required_imagegen_skill_read_before_correction(image_a
     assert IMAGE_BRIDGE_CORRECTION_MARKER not in response.text
 
 
-def test_responses_correction_skill_read_does_not_consume_retry(image_app_db, monkeypatch):
+def test_responses_ordinary_exec_does_not_trigger_image_skill_correction(image_app_db, monkeypatch):
     planner_calls = 0
 
     async def fake_planner(*args, **kwargs):
@@ -1439,8 +1479,8 @@ def test_responses_correction_skill_read_does_not_consume_retry(image_app_db, mo
         "input": "生成一个游戏背景图像素材",
     })
     assert response.status_code == 200
-    assert planner_calls == 2
-    assert "SKILL.md" in response.text
+    assert planner_calls == 1
+    assert "Get-ChildItem" in response.text
     assert IMAGE_BRIDGE_CORRECTION_MARKER not in response.text
 
 
@@ -1516,6 +1556,25 @@ def test_image_generation_admin_menu_masks_external_api_key(image_app_db):
     assert payload["generators"]["default"]["has_api_key"] is True
 
 
+def test_image_generation_admin_does_not_reuse_key_across_backend_hosts(image_app_db):
+    upsert_image_generator("default", {
+        "backend_type": "external_model",
+        "api_base": "https://images.example/v1",
+        "model": "image-model",
+        "api_key": "secret-image-key",
+    })
+    admin = {"Authorization": f"Bearer {create_session('admin')}"}
+    workflow = _comfy_workflow()
+    mapping = analyze_workflow(workflow)["suggestions"]
+    response = TestClient(app).put("/admin/image-generation/default", headers=admin, json={
+        "backend_type": "comfyui", "api_base": "http://comfy.test",
+        "api_key": "", "workflow": workflow, "workflow_mapping": mapping,
+        "enabled": True,
+    })
+    assert response.status_code == 200
+    assert get_enabled_image_generator()["api_key"] == ""
+
+
 def test_image_generation_admin_connection_test(image_app_db, monkeypatch):
     async def fake_generate(config, **kwargs):
         assert config["model"] == "image-model"
@@ -1574,9 +1633,173 @@ def test_image_generation_backend_validation(image_app_db):
     assert response.status_code == 400
     response = TestClient(app).put("/admin/image-generation/default", headers=admin, json={
         "backend_type": "comfyui", "api_base": "http://comfy.test", "enabled": True,
+        "workflow": {}, "workflow_mapping": {},
     })
     assert response.status_code == 400
-    assert "not implemented" in response.json()["detail"]
+    assert "workflow" in response.json()["detail"]
+
+
+def _comfy_workflow():
+    return {
+        "6": {"class_type": "CLIPTextEncode", "inputs": {"text": "positive", "clip": ["4", 1]}, "_meta": {"title": "Positive Prompt"}},
+        "7": {"class_type": "CLIPTextEncode", "inputs": {"text": "negative", "clip": ["4", 1]}, "_meta": {"title": "Negative Prompt"}},
+        "5": {"class_type": "EmptyLatentImage", "inputs": {"width": 512, "height": 512, "batch_size": 1}},
+        "3": {"class_type": "KSampler", "inputs": {"seed": 1, "steps": 20, "cfg": 7.0, "latent_image": ["5", 0]}},
+        "9": {"class_type": "SaveImage", "inputs": {"filename_prefix": "ComfyUI", "images": ["8", 0]}},
+    }
+
+
+def _comfy_ui_workflow():
+    return {
+        "id": "demo",
+        "nodes": [
+            {"id": 4, "type": "CLIPTextEncode", "title": "CLIP Text Encode (Positive)", "mode": 0, "inputs": [{"name": "clip", "type": "CLIP", "link": 19}, {"name": "text", "type": "STRING", "widget": {"name": "text"}, "link": None}], "widgets_values": ["a cat"]},
+            {"id": 5, "type": "CLIPTextEncode", "title": "CLIP Text Encode (Negative)", "mode": 0, "inputs": [{"name": "clip", "type": "CLIP", "link": 20}, {"name": "text", "type": "STRING", "widget": {"name": "text"}, "link": None}], "widgets_values": ["blurry"]},
+            {"id": 6, "type": "EmptyLatentImage", "mode": 0, "inputs": [{"name": "width", "type": "INT", "widget": {"name": "width"}, "link": None}, {"name": "height", "type": "INT", "widget": {"name": "height"}, "link": None}, {"name": "batch_size", "type": "INT", "widget": {"name": "batch_size"}, "link": None}], "widgets_values": [896, 1344, 1]},
+            {"id": 7, "type": "KSampler", "mode": 0, "inputs": [{"name": "model", "type": "MODEL", "link": 22}, {"name": "positive", "type": "CONDITIONING", "link": 1}, {"name": "negative", "type": "CONDITIONING", "link": 2}, {"name": "latent_image", "type": "LATENT", "link": 3}, {"name": "seed", "type": "INT", "widget": {"name": "seed"}, "link": None}, {"name": "steps", "type": "INT", "widget": {"name": "steps"}, "link": None}, {"name": "cfg", "type": "FLOAT", "widget": {"name": "cfg"}, "link": None}, {"name": "sampler_name", "type": "COMBO", "widget": {"name": "sampler_name"}, "link": None}, {"name": "scheduler", "type": "COMBO", "widget": {"name": "scheduler"}, "link": None}, {"name": "denoise", "type": "FLOAT", "widget": {"name": "denoise"}, "link": None}], "widgets_values": [43593584383551, "randomize", 10, 1, "er_sde", "simple", 1]},
+            {"id": 8, "type": "VAEDecode", "mode": 0, "inputs": [{"name": "samples", "type": "LATENT", "link": 4}, {"name": "vae", "type": "VAE", "link": 21}], "widgets_values": []},
+            {"id": 9, "type": "SaveImage", "mode": 0, "inputs": [{"name": "images", "type": "IMAGE", "link": 9}, {"name": "filename_prefix", "type": "STRING", "widget": {"name": "filename_prefix"}, "link": None}], "widgets_values": ["output"]},
+            {"id": 16, "type": "CheckpointLoaderSimple", "mode": 0, "inputs": [{"name": "ckpt_name", "type": "COMBO", "widget": {"name": "ckpt_name"}, "link": None}], "widgets_values": ["krea.safetensors"]},
+        ],
+        "links": [[1, 4, 0, 7, 1, "CONDITIONING"], [2, 5, 0, 7, 2, "CONDITIONING"], [3, 6, 0, 7, 3, "LATENT"], [4, 7, 0, 8, 0, "LATENT"], [9, 8, 0, 9, 0, "IMAGE"], [19, 16, 1, 4, 0, "CLIP"], [20, 16, 1, 5, 0, "CLIP"], [21, 16, 2, 8, 1, "VAE"], [22, 16, 0, 7, 0, "MODEL"]],
+    }
+
+
+def test_comfyui_workflow_analysis_suggests_dropdown_mappings():
+    analysis = analyze_workflow(_comfy_workflow())
+    assert analysis["node_count"] == 5
+    assert analysis["suggestions"]["prompt"] == {"node_id": "6", "input": "text"}
+    assert analysis["suggestions"]["negative_prompt"] == {"node_id": "7", "input": "text"}
+    assert analysis["suggestions"]["width"] == {"node_id": "5", "input": "width"}
+    assert analysis["suggestions"]["output_node_id"] == "9"
+
+
+def test_comfyui_regular_ui_workflow_is_converted_and_analyzed():
+    converted = convert_ui_workflow(_comfy_ui_workflow())
+    assert converted["4"]["inputs"] == {"clip": ["16", 1], "text": "a cat"}
+    assert converted["6"]["inputs"] == {"width": 896, "height": 1344, "batch_size": 1}
+    assert converted["7"]["inputs"]["seed"] == 43593584383551
+    assert converted["7"]["inputs"]["steps"] == 10
+    assert converted["7"]["inputs"]["cfg"] == 1
+    assert converted["7"]["inputs"]["sampler_name"] == "er_sde"
+    analysis = analyze_workflow(_comfy_ui_workflow())
+    assert analysis["converted"] is True
+    assert analysis["source_format"] == "ui"
+    assert analysis["suggestions"]["prompt"] == {"node_id": "4", "input": "text"}
+    assert analysis["suggestions"]["negative_prompt"] == {"node_id": "5", "input": "text"}
+
+
+def test_comfyui_mapping_rejects_unknown_node_inputs():
+    with pytest.raises(ValueError, match="unknown node input"):
+        validate_mapping(_comfy_workflow(), {"prompt": {"node_id": "404", "input": "text"}})
+
+
+def test_comfyui_workflow_userdata_url_encodes_nested_path():
+    assert workflow_userdata_url("http://comfy.test/", "folder/demo") == (
+        "http://comfy.test/api/userdata/workflows%2Ffolder%2Fdemo.json"
+    )
+
+
+@pytest.mark.asyncio
+async def test_comfyui_saved_workflow_discovery(monkeypatch):
+    class FakeClient:
+        def __init__(self, *args, **kwargs): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        async def get(self, url, params=None):
+            if params:
+                assert params == {"dir": "workflows", "recurse": "true"}
+                return httpx.Response(200, json=["krea2_demo.json", "folder/other.json", "notes.txt"], request=httpx.Request("GET", url))
+            assert url.endswith("/api/userdata/workflows%2Fkrea2_demo.json")
+            return httpx.Response(200, json={"nodes": []}, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr("app.adapters.comfyui.httpx.AsyncClient", FakeClient)
+    assert await list_saved_workflows("http://comfy.test") == ["folder/other.json", "krea2_demo.json"]
+    assert await load_saved_workflow("http://comfy.test", "krea2_demo") == {"nodes": []}
+
+
+def test_comfyui_workflow_admin_analysis_and_save(image_app_db):
+    admin = {"Authorization": f"Bearer {create_session('admin')}"}
+    client = TestClient(app)
+    analysis = client.post(
+        "/admin/image-generation/comfyui/analyze-workflow", headers=admin,
+        json={"workflow": _comfy_workflow()},
+    )
+    assert analysis.status_code == 200
+    mapping = analysis.json()["suggestions"]
+    response = client.put("/admin/image-generation/default", headers=admin, json={
+        "backend_type": "comfyui", "api_base": "http://comfy.test",
+        "workflow": _comfy_workflow(), "workflow_mapping": mapping,
+        "timeout": 300, "poll_interval": 0.5, "enabled": True,
+    })
+    assert response.status_code == 200
+    stored = get_enabled_image_generator()
+    assert stored["backend_type"] == "comfyui"
+    assert stored["workflow"]["6"]["class_type"] == "CLIPTextEncode"
+    assert stored["workflow_mapping"]["prompt"] == {"node_id": "6", "input": "text"}
+    assert stored["poll_interval"] == 0.5
+
+
+@pytest.mark.asyncio
+async def test_comfyui_adapter_submits_polls_and_downloads(monkeypatch):
+    png = b"\x89PNG\r\n\x1a\n" + b"test-image"
+    calls = []
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        async def post(self, url, json):
+            calls.append(("post", url, json))
+            return httpx.Response(200, json={"prompt_id": "job-1"})
+        async def get(self, url, params=None):
+            calls.append(("get", url, params))
+            if url.endswith("/history/job-1"):
+                return httpx.Response(200, json={"job-1": {"status": {"completed": True}, "outputs": {"9": {"images": [{"filename": "result.png", "subfolder": "", "type": "output"}]}}}})
+            return httpx.Response(200, content=png, headers={"content-type": "image/png"})
+
+    monkeypatch.setattr("app.adapters.comfyui.httpx.AsyncClient", FakeClient)
+    mapping = analyze_workflow(_comfy_workflow())["suggestions"]
+    results = await generate_comfyui_images({
+        "api_base": "http://comfy.test", "workflow": _comfy_workflow(),
+        "workflow_mapping": mapping, "timeout": 10,
+    }, prompt="draw an apple", n=1, size="768x1024", extra={"steps": 30})
+    submitted = calls[0][2]["prompt"]
+    assert submitted["6"]["inputs"]["text"] == "draw an apple"
+    assert submitted["5"]["inputs"]["width"] == 768
+    assert submitted["5"]["inputs"]["height"] == 1024
+    assert submitted["3"]["inputs"]["steps"] == 30
+    assert results[0].mime_type == "image/png"
+    assert results[0].data_uri.startswith("data:image/png;base64,")
+
+
+@pytest.mark.asyncio
+async def test_comfyui_adapter_repeats_jobs_when_workflow_has_no_batch_mapping(monkeypatch):
+    workflow = _comfy_workflow()
+    del workflow["5"]["inputs"]["batch_size"]
+    mapping = analyze_workflow(workflow)["suggestions"]
+    calls = {"post": 0}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        async def post(self, url, json):
+            calls["post"] += 1
+            return httpx.Response(200, json={"prompt_id": f"job-{calls['post']}"})
+        async def get(self, url, params=None):
+            if "/history/" in url:
+                prompt_id = url.rsplit("/", 1)[-1]
+                return httpx.Response(200, json={prompt_id: {"status": {"completed": True}, "outputs": {"9": {"images": [{"filename": f"{prompt_id}.png"}]}}}})
+            return httpx.Response(200, content=b"\x89PNG\r\n\x1a\nimage", headers={"content-type": "image/png"})
+
+    monkeypatch.setattr("app.adapters.comfyui.httpx.AsyncClient", FakeClient)
+    results = await generate_comfyui_images({
+        "api_base": "http://comfy.test", "workflow": workflow,
+        "workflow_mapping": mapping, "timeout": 10,
+    }, prompt="three images", n=3)
+    assert calls["post"] == 3
+    assert len(results) == 3
 
 
 def test_responses_image_generation_uses_configured_backend(image_app_db, monkeypatch):
@@ -1602,7 +1825,7 @@ def test_responses_image_generation_uses_configured_backend(image_app_db, monkey
     item = response.json()["output"][0]
     assert item["type"] == "message"
     assert "![Generated image](data:image/png;base64,AAAA)" in item["content"][0]["text"]
-    assert "[download original](http://testserver/v1/image-results/" in item["content"][0]["text"]
+    assert "download original](http://testserver/v1/image-results/" in item["content"][0]["text"]
     assert len(list(image_app_db["image_dir"].glob("*.png"))) == 1
 
 

@@ -218,7 +218,17 @@ async def generate_images(config: dict, *, prompt: str, model: str | None = None
     # openai_images is retained as a read-only compatibility alias for old
     # configurations; new configuration uses existing_model or external_model.
     if backend_type == "comfyui":
-        raise ValueError("ComfyUI image generation backend is not implemented yet")
+        from app.adapters.comfyui import generate_comfyui_images
+        comfy_extra = dict(extra or {})
+        if quality not in (None, ""):
+            comfy_extra.setdefault("quality", quality)
+        if background not in (None, ""):
+            comfy_extra.setdefault("background", background)
+        if output_format not in (None, ""):
+            comfy_extra.setdefault("output_format", output_format)
+        return await generate_comfyui_images(
+            config, prompt=prompt, n=n, size=size, extra=comfy_extra,
+        )
     if backend_type not in {"existing_model", "external_model", "openai_images"}:
         raise ValueError(f"unsupported image backend type: {config.get('backend_type')}")
     request_model = model or config.get("model") or parse_model_id(config.get("provider_model") or "").model_name

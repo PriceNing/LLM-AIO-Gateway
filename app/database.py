@@ -176,6 +176,14 @@ def _migrate_image_generation(conn: sqlite3.Connection) -> None:
             updated_at TEXT NOT NULL DEFAULT ''
         )
     """)
+    generator_columns = {row[1] for row in conn.execute("PRAGMA table_info(image_generators)").fetchall()}
+    for column, ddl in {
+        "workflow": "TEXT NOT NULL DEFAULT '{}'",
+        "workflow_mapping": "TEXT NOT NULL DEFAULT '{}'",
+        "poll_interval": "REAL NOT NULL DEFAULT 1.0",
+    }.items():
+        if column not in generator_columns:
+            conn.execute(f"ALTER TABLE image_generators ADD COLUMN {column} {ddl}")
 
 
 def _migrate_request_records_image_generation(conn: sqlite3.Connection) -> None:
@@ -357,6 +365,9 @@ CREATE TABLE IF NOT EXISTS image_generators (
     model TEXT NOT NULL DEFAULT '',
     api_key TEXT NOT NULL DEFAULT '',
     timeout INTEGER NOT NULL DEFAULT 180,
+    workflow TEXT NOT NULL DEFAULT '{}',
+    workflow_mapping TEXT NOT NULL DEFAULT '{}',
+    poll_interval REAL NOT NULL DEFAULT 1.0,
     enabled INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL DEFAULT ''
@@ -1172,6 +1183,7 @@ def _model_from_row(row: sqlite3.Row) -> dict:
 IMAGE_GENERATOR_DEFAULTS = {
     "backend_type": "existing_model", "provider_model": "", "api_base": "",
     "model": "", "api_key": "", "timeout": 180, "enabled": True,
+    "workflow": {}, "workflow_mapping": {}, "poll_interval": 1.0,
 }
 
 
@@ -1182,6 +1194,12 @@ def _image_generator_from_row(row: sqlite3.Row) -> dict:
         data["timeout"] = int(data.get("timeout") or 180)
     except (TypeError, ValueError):
         data["timeout"] = 180
+    data["workflow"] = _json_loads(data.get("workflow", "{}")) or {}
+    data["workflow_mapping"] = _json_loads(data.get("workflow_mapping", "{}")) or {}
+    try:
+        data["poll_interval"] = float(data.get("poll_interval") or 1.0)
+    except (TypeError, ValueError):
+        data["poll_interval"] = 1.0
     return data
 
 
@@ -1211,18 +1229,25 @@ def upsert_image_generator(generator_id: str, config: dict) -> dict:
         merged["backend_type"] = str(merged.get("backend_type") or "existing_model")
         for key in ("provider_model", "api_base", "model", "api_key"):
             merged[key] = str(merged.get(key) or "")
+        for key in ("workflow", "workflow_mapping"):
+            if not isinstance(merged.get(key), dict):
+                raise ValueError(f"{key} must be an object")
         try:
             merged["timeout"] = max(1, min(3600, int(merged.get("timeout") or 180)))
         except (TypeError, ValueError):
             merged["timeout"] = 180
+        try:
+            merged["poll_interval"] = max(0.2, min(10.0, float(merged.get("poll_interval") or 1.0)))
+        except (TypeError, ValueError):
+            merged["poll_interval"] = 1.0
         merged["enabled"] = _to_bool(merged.get("enabled", True))
         if merged["enabled"]:
             db.execute("UPDATE image_generators SET enabled = 0 WHERE id <> ?", (generator_id,))
-        values = (merged["backend_type"], merged["provider_model"], merged["api_base"], merged["model"], merged["api_key"], merged["timeout"], 1 if merged["enabled"] else 0, now)
+        values = (merged["backend_type"], merged["provider_model"], merged["api_base"], merged["model"], merged["api_key"], merged["timeout"], json.dumps(merged["workflow"], ensure_ascii=False), json.dumps(merged["workflow_mapping"], ensure_ascii=False), merged["poll_interval"], 1 if merged["enabled"] else 0, now)
         if row:
-            db.execute("UPDATE image_generators SET backend_type=?, provider_model=?, api_base=?, model=?, api_key=?, timeout=?, enabled=?, updated_at=? WHERE id=?", values + (generator_id,))
+            db.execute("UPDATE image_generators SET backend_type=?, provider_model=?, api_base=?, model=?, api_key=?, timeout=?, workflow=?, workflow_mapping=?, poll_interval=?, enabled=?, updated_at=? WHERE id=?", values + (generator_id,))
         else:
-            db.execute("INSERT INTO image_generators (id, backend_type, provider_model, api_base, model, api_key, timeout, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (generator_id,) + values[:7] + (now, now))
+            db.execute("INSERT INTO image_generators (id, backend_type, provider_model, api_base, model, api_key, timeout, workflow, workflow_mapping, poll_interval, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (generator_id,) + values[:-1] + (now, now))
         return _image_generator_from_row(db.execute("SELECT * FROM image_generators WHERE id = ?", (generator_id,)).fetchone())
 
 

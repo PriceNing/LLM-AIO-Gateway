@@ -12,6 +12,7 @@ _EN_IMAGE_WORDS = ("image", "picture", "photo", "illustration", "poster", "wallp
 _EN_ACTION_RE = re.compile(r"\b(?:generate|draw|create|make|render|illustrate)\b", re.IGNORECASE)
 _NEGATED_IMAGE_REQUEST_RE = re.compile(
     r"(?:不要|无需|不需要|禁止|别)\s*(?:生成|画|绘制|制作|创建|生图)|"
+    r"(?:不要|无需|不需要|禁止|别).{0,12}(?:调用|使用|进入|触发).{0,12}(?:图像生成|图片生成|生图)(?:功能|工具|服务)?|"
     r"\b(?:do\s+not|don't|never|without)\s+(?:generate|draw|create|make|render|illustrate)\b",
     re.IGNORECASE,
 )
@@ -52,7 +53,12 @@ def _text_from_item(item: Any) -> str:
 
 
 def latest_user_text(input_data: Any) -> str:
-    """Return only the latest user-facing text, excluding historical turns."""
+    """Return only the latest explicit user input, excluding tool output.
+
+    Responses tool-result items normally omit ``role``.  Treating a missing
+    role as a user role lets command output, logs, or injected context become
+    an image-generation intent on later agent turns.
+    """
     if isinstance(input_data, str):
         return input_data.strip()
     if not isinstance(input_data, list):
@@ -60,7 +66,10 @@ def latest_user_text(input_data: Any) -> str:
     for item in reversed(input_data):
         if not isinstance(item, dict):
             continue
-        if item.get("role") in {None, "user"}:
+        item_type = str(item.get("type") or "")
+        if item.get("role") == "user" or (
+            not item.get("role") and item_type in {"input_text", "input_message"}
+        ):
             text = _text_from_item(item)
             if text:
                 return text
@@ -70,8 +79,9 @@ def latest_user_text(input_data: Any) -> str:
 def is_image_generation_intent(input_data: Any, instructions: Any = "") -> bool:
     """Detect an explicit request to create an image, not image discussion."""
     text = latest_user_text(input_data)
-    if isinstance(instructions, str) and instructions.strip():
-        text = f"{instructions.strip()}\n{text}" if text else instructions.strip()
+    # System/developer instructions describe agent capabilities and repository
+    # policy; they are never user authorization to invoke image generation.
+    del instructions
     if not text:
         return False
     if _NEGATED_IMAGE_REQUEST_RE.search(text) or _IMAGE_DISCUSSION_RE.search(text):

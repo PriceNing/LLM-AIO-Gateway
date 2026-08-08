@@ -158,7 +158,11 @@ def has_gateway_generated_image_history(input_data: Any) -> bool:
         if str(item.get("type") or "") != "message" or str(item.get("role") or "") != "assistant":
             continue
         serialized = json.dumps(item, ensure_ascii=False).lower()
-        if GATEWAY_IMAGE_RESULT_MARKER in serialized or GATEWAY_IMAGE_ASSET_MARKER in serialized:
+        if (
+            GATEWAY_IMAGE_RESULT_MARKER in serialized
+            or GATEWAY_IMAGE_ASSET_MARKER in serialized
+            or _is_public_gateway_image_text(serialized)
+        ):
             return True
     return False
 
@@ -187,6 +191,21 @@ def sanitize_gateway_image_display_followup(input_data: Any) -> bool:
 _GENERATED_IMAGE_DATA_URI_RE = re.compile(
     r"data:image/[a-zA-Z0-9.+-]+;base64,[a-zA-Z0-9+/=]+"
 )
+_GATEWAY_IMAGE_RESULT_URL_RE = re.compile(
+    r"https?://[^\s)]+/(?:v1/)?image-results/[a-zA-Z0-9._~-]+"
+)
+_GATEWAY_ASSET_LINK_RE = re.compile(
+    r"\[([^]\r\n]+)\]\((https?://[^\s)]+/(?:v1/)?image-results/[a-zA-Z0-9._~-]+)\)"
+)
+
+
+def _is_public_gateway_image_text(value: str) -> bool:
+    """Recognize marker-free generated-image Markdown from this gateway."""
+    return bool(
+        _GATEWAY_IMAGE_RESULT_URL_RE.search(value)
+        and ("download original" in value.lower() or "original:" in value.lower())
+        and "![generated image" in value.lower()
+    )
 
 
 def sanitize_gateway_generated_image_history(input_data: Any) -> bool:
@@ -214,7 +233,10 @@ def sanitize_gateway_generated_image_history(input_data: Any) -> bool:
             if not isinstance(block, dict):
                 continue
             value = block.get("text")
-            if not isinstance(value, str) or GATEWAY_IMAGE_RESULT_MARKER not in value:
+            if not isinstance(value, str) or (
+                GATEWAY_IMAGE_RESULT_MARKER not in value
+                and not _is_public_gateway_image_text(value)
+            ):
                 continue
             compact = _GENERATED_IMAGE_DATA_URI_RE.sub(
                 "[generated-image-preview-omitted]", value
@@ -266,14 +288,24 @@ def gateway_generated_image_asset_context(input_data: Any) -> str:
             if not isinstance(block, dict):
                 continue
             value = block.get("text")
-            if not isinstance(value, str) or GATEWAY_IMAGE_ASSET_MARKER not in value:
+            if not isinstance(value, str):
                 continue
-            compact = _GENERATED_IMAGE_DATA_URI_RE.sub(
-                "[generated-image-preview-omitted]", value
-            )
-            # Preview blocks are display-only; the manifest before the first
-            # preview marker contains everything the agent needs to download.
-            manifests.append(compact.split(GATEWAY_IMAGE_RESULT_MARKER, 1)[0].strip())
+            if GATEWAY_IMAGE_ASSET_MARKER in value:
+                compact = _GENERATED_IMAGE_DATA_URI_RE.sub(
+                    "[generated-image-preview-omitted]", value
+                )
+                # Legacy preview blocks included the private manifest in the
+                # assistant body. Keep reading those histories during upgrade.
+                manifests.append(compact.split(GATEWAY_IMAGE_RESULT_MARKER, 1)[0].strip())
+                continue
+            if not _is_public_gateway_image_text(value):
+                continue
+            links = _GATEWAY_ASSET_LINK_RE.findall(value)
+            if links:
+                lines = [GATEWAY_IMAGE_ASSET_MARKER, "Generated project assets:"]
+                lines.extend(f"{name}: {url}" for name, url in links)
+                lines.append("Download these originals into the workspace before using them.")
+                manifests.append("\n".join(lines))
     return "\n\n".join(dict.fromkeys(value for value in manifests if value))
 
 
