@@ -207,6 +207,31 @@ async def test_explicit_protocol_rejection_is_short_lived_model_negative_cache(m
 
 
 @pytest.mark.asyncio
+async def test_transient_native_failure_invalidates_supported_capability(monkeypatch):
+    add_provider({
+        "id": "pixel-transient", "name": "Pixel", "provider_type": "openai",
+        "api_base": "https://pixel.invalid/v1", "models": [{"id": "model"}],
+    })
+    set_model_responses_capability(
+        "pixel-transient", "model", status="supported",
+        expires_at="2999-01-01T00:00:00+00:00",
+    )
+    request = httpx.Request("POST", "https://pixel.invalid/v1/responses")
+    async def fake_post(provider, internal):
+        raise httpx.HTTPStatusError(
+            "upstream unavailable", request=request,
+            response=httpx.Response(503, request=request),
+        )
+    monkeypatch.setattr("app.router.proxy.post_native_response", fake_post)
+    internal = responses_to_internal({"model": "model", "input": "hello"})
+    internal.provider_id = "pixel-transient"
+    with pytest.raises(httpx.HTTPStatusError):
+        await _native_response_with_fallbacks(internal, stream=False, required_tool_types=set())
+    capability = get_model_responses_capability("pixel-transient", "model")
+    assert capability["responses_status"] == "unknown"
+
+
+@pytest.mark.asyncio
 async def test_model_not_found_404_does_not_create_negative_capability_cache(monkeypatch):
     add_provider({
         "id": "provider", "name": "Provider", "provider_type": "openai",

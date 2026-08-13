@@ -104,6 +104,7 @@ _error_log = get_logger("error")
 _tool_log = get_logger("tool_calls")
 _req_log = get_logger("request")
 _app_log = get_logger("app")
+_RESPONSES_CAPABILITY_PROBE_MARKER = "auto_probe_v2"
 
 router = APIRouter()
 
@@ -1013,6 +1014,15 @@ def _responses_capability_expiry(status: str) -> str:
     return (datetime.now(timezone.utc) + timedelta(seconds=max(0, int(get_default(ttl_key, fallback))))).isoformat()
 
 
+def _mark_model_responses_unknown(provider_id: str, model: str, error: Exception | str = "") -> None:
+    """Invalidate native capability after a transient upstream failure."""
+    set_model_responses_capability(
+        provider_id, model, status="unknown",
+        expires_at=_responses_capability_expiry("transient"),
+        error=str(error)[:500],
+    )
+
+
 def _native_error_is_explicitly_unsupported(exc: Exception) -> bool:
     response = getattr(exc, "response", None)
     status = getattr(exc, "status_code", None) or getattr(response, "status_code", None)
@@ -1096,6 +1106,7 @@ async def _probe_model_responses_capability(provider: dict, model: str) -> bool:
             set_model_responses_capability(
                 provider_id, model, status="supported",
                 streaming=False, streaming_status="unknown",
+                error=_RESPONSES_CAPABILITY_PROBE_MARKER,
                 expires_at=_responses_capability_expiry("supported"),
             )
         return supported
@@ -1123,7 +1134,14 @@ async def _native_capability_for_request(provider: dict | None, model: str) -> b
     provider_id = str(provider.get("id") or "")
     capability = get_model_responses_capability(provider_id, model)
     if _responses_capability_is_fresh(capability):
-        return capability.get("responses_status") == "supported"
+        status = capability.get("responses_status")
+        if status == "supported":
+            # Legacy optimistic supported rows are revalidated once.
+            return capability.get("responses_error") == _RESPONSES_CAPABILITY_PROBE_MARKER
+        if status == "unsupported":
+            return False
+    # Unknown/degraded rows deliberately probe immediately; their TTL is a
+    # backoff marker, not permission to send native Responses.
     return await _probe_model_responses_capability(provider, model)
 
 
@@ -1222,13 +1240,24 @@ async def _native_response_with_fallbacks(internal, *, stream: bool, required_to
             if not _native_response_has_output(response):
                 raise _native_empty_output_error(response)
             attempts.append({"index": index, "stage": "primary" if index == 0 else "fallback", "target": target.model, "provider_id": provider_id, "status": "success"})
-            set_model_responses_capability(provider_id, target.model, status="supported", streaming=False, streaming_status="unknown", expires_at=_responses_capability_expiry("supported"))
+            set_model_responses_capability(
+                provider_id, target.model, status="supported",
+                streaming=False, streaming_status="unknown",
+                error=_RESPONSES_CAPABILITY_PROBE_MARKER,
+                expires_at=_responses_capability_expiry("supported"),
+            )
             return response, target, provider_id, attempts
         except Exception as exc:
             last_exc = exc
             is_empty_native = bool(getattr(exc, "native_empty_output", False))
-            if _native_error_is_explicitly_unsupported(exc):
+            is_protocol_unsupported = _native_error_is_explicitly_unsupported(exc) or (
+                getattr(exc, "response", None) is not None
+                and getattr(exc.response, "status_code", None) == 400
+            )
+            if is_protocol_unsupported:
                 set_model_responses_capability(provider_id, target.model, status="unsupported", expires_at=_responses_capability_expiry("unsupported"), error=friendly_error_msg(exc))
+            else:
+                _mark_model_responses_unknown(provider_id, target.model, exc)
             attempts.append({"index": index, "stage": "primary" if index == 0 else "fallback", "target": target.model, "provider_id": provider_id, "status": "failed", "trigger": classify_upstream_error(exc), "error": friendly_error_msg(exc)})
             if index == 0:
                 decision = apply_fallback_policy(provider_id, target.model, classify_upstream_error(exc))
@@ -3700,6 +3729,10 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
         capability = get_model_responses_capability(adapter_provider_id, model) if provider_info else None
         native_downgrade_details = {}
         native_supported = await _native_capability_for_request(provider_info, model)
+        _app_log.info(
+            "[responses capability] provider=%s model=%s native=%s",
+            adapter_provider_id or "-", model, native_supported,
+        )
         # A native-only feature may still be served by a configured native
         # fallback even when the routed primary lacks Responses support.  Basic
         # requests, on the other hand, remain eligible for the Chat/Anthropic
@@ -3712,7 +3745,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
         if (
             not image_display_followup
             and not image_already_generated
-            and ((native_supported and not codex_image_tool) or native_required)
+            and (native_supported and not codex_image_tool)
         ):
             _app_log.info("[responses native] provider=%s model=%s stream=%s", adapter_provider_id or "-", model, stream)
             try:
