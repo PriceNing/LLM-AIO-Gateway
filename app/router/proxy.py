@@ -1073,6 +1073,60 @@ def _native_response_target_supported(target: RouteTarget, *, stream: bool, requ
     return provider, provider_for_log(provider, target.provider_id)
 
 
+async def _probe_model_responses_capability(provider: dict, model: str) -> bool:
+    """Probe native Responses support and cache the result per provider/model.
+
+    A normal OpenAI-compatible provider is not proof of Responses support.  The
+    probe intentionally requires a valid Responses object; HTTP 4xx responses
+    (including llama.cpp's unsupported endpoint response) are cached as a
+    negative capability, while transient 5xx/network failures remain unknown.
+    """
+    provider_id = str(provider.get("id") or "")
+    probe = responses_to_internal({
+        "model": model,
+        "input": "capability probe",
+        "stream": False,
+    })
+    probe.target_model = model
+    probe.provider_id = provider_id
+    try:
+        payload = await post_native_response(provider, probe)
+        supported = isinstance(payload, dict) and payload.get("object") == "response"
+        if supported:
+            set_model_responses_capability(
+                provider_id, model, status="supported",
+                streaming=False, streaming_status="unknown",
+                expires_at=_responses_capability_expiry("supported"),
+            )
+        return supported
+    except Exception as exc:
+        response = getattr(exc, "response", None)
+        status = getattr(exc, "status_code", None) or getattr(response, "status_code", None)
+        # A 400 from the probe means this upstream accepted the endpoint but
+        # rejected the minimal Responses protocol request; for llama.cpp and
+        # similar Chat-only servers this is the practical unsupported signal.
+        # Other 4xx responses are only negative when the body explicitly
+        # identifies the Responses endpoint/protocol as unsupported.
+        explicitly_unsupported = _native_error_is_explicitly_unsupported(exc)
+        if status == 400 or explicitly_unsupported:
+            set_model_responses_capability(
+                provider_id, model, status="unsupported",
+                expires_at=_responses_capability_expiry("unsupported"),
+                error=friendly_error_msg(exc),
+            )
+        return False
+
+
+async def _native_capability_for_request(provider: dict | None, model: str) -> bool:
+    if not provider or provider.get("provider_type") != "openai":
+        return False
+    provider_id = str(provider.get("id") or "")
+    capability = get_model_responses_capability(provider_id, model)
+    if _responses_capability_is_fresh(capability):
+        return capability.get("responses_status") == "supported"
+    return await _probe_model_responses_capability(provider, model)
+
+
 async def _wait_for_native_response_event(events) -> bytes:
     """Buffer initial SSE keepalives until an actual Responses lifecycle event."""
     buffered = b""
@@ -3645,10 +3699,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
         stateful_markers = _responses_stateful_tool_markers(body)
         capability = get_model_responses_capability(adapter_provider_id, model) if provider_info else None
         native_downgrade_details = {}
-        native_supported = bool(provider_info and provider_info.get("provider_type") == "openai" and not (
-            _responses_capability_is_fresh(capability)
-            and capability.get("responses_status") == "unsupported"
-        ))
+        native_supported = await _native_capability_for_request(provider_info, model)
         # A native-only feature may still be served by a configured native
         # fallback even when the routed primary lacks Responses support.  Basic
         # requests, on the other hand, remain eligible for the Chat/Anthropic

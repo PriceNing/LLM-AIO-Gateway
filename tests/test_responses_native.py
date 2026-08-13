@@ -14,6 +14,7 @@ from app.router.proxy import (
     _native_response_target_supported,
     _native_downgrade_details,
     _wait_for_native_response_output,
+    _native_capability_for_request,
 )
 from app.core.policy import RouteTarget
 from app.config import load_config
@@ -117,6 +118,24 @@ def test_anthropic_provider_never_uses_openai_native_responses_probe_path():
         RouteTarget(model="MiniMax-M3", provider_id="minimax"),
         stream=True, required_tool_types=set(), is_primary=True,
     ) == (None, "")
+
+
+@pytest.mark.asyncio
+async def test_unknown_capability_probe_caches_unsupported_on_llamacpp_400(monkeypatch):
+    add_provider({
+        "id": "llamacpp", "name": "llama.cpp", "provider_type": "openai",
+        "api_base": "http://llamacpp.invalid/v1", "models": [{"id": "qwen"}],
+    })
+    request = httpx.Request("POST", "http://llamacpp.invalid/v1/responses")
+    async def fake_post(provider, internal):
+        raise httpx.HTTPStatusError(
+            "bad request", request=request,
+            response=httpx.Response(400, text="unsupported", request=request),
+        )
+    monkeypatch.setattr("app.router.proxy.post_native_response", fake_post)
+    provider = {"id": "llamacpp", "provider_type": "openai"}
+    assert await _native_capability_for_request(provider, "qwen") is False
+    assert get_model_responses_capability("llamacpp", "qwen")["responses_status"] == "unsupported"
 
 
 @pytest.mark.asyncio
