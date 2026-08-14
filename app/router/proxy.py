@@ -21,7 +21,7 @@ from app.database import (
     get_model_responses_capability, set_model_responses_capability, update_model_responses_capability, update_model_responses_tool_types,
 )
 from app.core.text import friendly_error_msg, mask_key
-from app.core.image_intent import latest_user_text
+from app.core.image_intent import is_image_generation_intent, latest_user_text
 from app.core.image_bridge import (
     GATEWAY_IMAGE_ASSET_MARKER,
     GATEWAY_IMAGE_DISPLAY_CALL_PREFIX,
@@ -1367,6 +1367,26 @@ def _merge_request_details(*parts: dict | None) -> dict:
     for part in parts:
         if isinstance(part, dict) and part:
             merged.update(part)
+    return merged
+
+
+def _merge_bridge_request_details(existing: dict | None, latest: dict | None) -> dict:
+    """Merge metadata across planner and continuation upstream calls.
+
+    A continuation is a second upstream request, so its attempt list must not
+    erase the planner's primary/fallback history.  Once any stage used a
+    fallback, the overall image-bridge request remains degraded.
+    """
+    merged = _merge_request_details(existing, latest)
+    old_attempts = (existing or {}).get("fallback_attempts") if isinstance(existing, dict) else None
+    new_attempts = (latest or {}).get("fallback_attempts") if isinstance(latest, dict) else None
+    if isinstance(old_attempts, list) or isinstance(new_attempts, list):
+        merged["fallback_attempts"] = [
+            *(old_attempts if isinstance(old_attempts, list) else []),
+            *(new_attempts if isinstance(new_attempts, list) else []),
+        ]
+    if str((existing or {}).get("fallback_status") or "") == "used" or str((latest or {}).get("fallback_status") or "") == "used":
+        merged["fallback_status"] = "used"
     return merged
 
 
@@ -3129,6 +3149,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
     explicit_image_choice = isinstance(body.get("tool_choice"), dict) and body["tool_choice"].get("type") == "image_generation"
     image_enabled = bool(provider_info and get_model_image_generation(adapter_provider_id, model))
     system_turn = _responses_is_system_turn(body)
+    image_request_intent = is_image_generation_intent(input_data, instructions)
     # Sub2API leaves Codex's client-owned image_gen namespace intact.  The
     # first Responses turn must therefore return a namespaced function_call;
     # Codex will then call /images/generations itself.  Do not replace this
@@ -3194,8 +3215,21 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
     # multiple Codex tool rounds. Idempotency and the per-request invocation
     # budget prevent duplicate loops; merely having one result in history must
     # not disable the remaining task's image capability.
+    # Model capability is not user intent.  Injecting the private bridge for
+    # every request made to an image-capable model causes ordinary Responses
+    # traffic (including code/tool turns) to be routed through the image
+    # planner and makes its logs look like image-generation requests.
+    # Require an explicit image request or an explicit hosted image tool; the
+    # two follow-up markers preserve an already-started gateway image flow.
+    should_bridge_image = (
+        image_request_intent
+        or image_tool is not None
+        or image_display_followup
+        or bool(image_asset_context)
+    )
     if (
         image_enabled
+        and should_bridge_image
         and not system_turn
         and not has_codex_image_function_tool(body)
     ):
@@ -3247,6 +3281,16 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                 policy, internal, temperature=temperature, max_tokens=max_tokens,
                 log_label="responses.image_bridge",
             )
+            # The fallback runner attaches the authoritative attempt/final
+            # target metadata to the output. Preserve it through the image
+            # bridge so billing and admin stats use the model that actually
+            # served the request, not the client-requested primary.
+            bridge_upstream_details = _output_request_details(output)
+            bridge_final_model = _target_model_for_log(
+                RouteTarget(model=internal.target_model, provider_id=adapter_provider_id),
+                adapter_provider_id,
+            )
+            bridge_final_provider = adapter_provider_id
             requested_image_invocations = _image_bridge_invocations(output)
             max_image_invocations = 8
             image_invocations = requested_image_invocations[:max_image_invocations]
@@ -3583,6 +3627,14 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                                 policy, internal, temperature=temperature, max_tokens=max_tokens,
                                 log_label="responses.image_bridge.continuation.final",
                             )
+                            bridge_upstream_details = _merge_bridge_request_details(
+                                bridge_upstream_details, _output_request_details(continuation),
+                            )
+                            bridge_final_model = _target_model_for_log(
+                                RouteTarget(model=internal.target_model, provider_id=adapter_provider_id),
+                                adapter_provider_id,
+                            )
+                            bridge_final_provider = adapter_provider_id
                             for key, value in continuation.usage.items():
                                 continuation_usage[key] = continuation_usage.get(key, 0) + int(value or 0)
                             continuation_tokens = continuation_usage.get("total_tokens", 0)
@@ -3621,6 +3673,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                 image_output = _merge_image_bridge_output(planner_output, image_output)
                 details = {
                     **details,
+                    **bridge_upstream_details,
                     "responses_mode": f"model_driven_image_generation_{display_mode}",
                     "image_artifact_count": len(stored_images),
                     "continuation_tokens": continuation_tokens,
@@ -3648,17 +3701,20 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                     else "ok"
                 )
                 details["status"] = request_status
+                details = apply_outcome_to_details(details, success=True)
+                request_status = details.get("status", request_status)
                 _app_log.info(
                     "[responses image_generation.assistant_message] images=%d artifact_bytes=%d",
                     len(stored_images),
                     sum(item.path.stat().st_size for item in stored_images),
                 )
                 if stream:
-                    _log_request(username, api_key_value, model, image_provider, "responses", True, tokens, requested_model, details=details)
+                    details = apply_outcome_to_details(details, success=True)
+                    _log_request(username, api_key_value, bridge_final_model, bridge_final_provider, "responses", True, tokens, requested_model, details=details)
                     _record_request_log(
                         endpoint="responses", username=username, api_key_value=api_key_value,
-                        requested_model=requested_model, final_model=model,
-                        final_provider=image_provider, request_body=body,
+                        requested_model=requested_model, final_model=bridge_final_model,
+                        final_provider=bridge_final_provider, request_body=body,
                         response_body={"status": "completed", "output_count": len(image_results)},
                         success=True, status=request_status, tokens=tokens, usage=image_output.usage,
                         details=details, stream=True, log_id=image_request_log_id,
@@ -3677,11 +3733,12 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                     image_output, model=model, previous_response_id=previous_response_id,
                     extra=internal.extra,
                 )
-                _log_request(username, api_key_value, model, image_provider, "responses", True, tokens, requested_model, details=details)
+                details = apply_outcome_to_details(details, success=True)
+                _log_request(username, api_key_value, bridge_final_model, bridge_final_provider, "responses", True, tokens, requested_model, details=details)
                 _record_request_log(
                     endpoint="responses", username=username, api_key_value=api_key_value,
-                    requested_model=requested_model, final_model=model,
-                    final_provider=image_provider, request_body=body,
+                    requested_model=requested_model, final_model=bridge_final_model,
+                    final_provider=bridge_final_provider, request_body=body,
                     response_body=rendered, success=True, status=request_status, tokens=tokens,
                     usage=image_output.usage, details=details, log_id=image_request_log_id,
                 )
@@ -3699,7 +3756,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                         provider_id=adapter_provider_id, requested_model=requested_model,
                         log_request=_log_request,
                         record_request_log=_build_stream_recorder("responses", username, api_key_value, requested_model, body),
-                        base_details={**routing_details_from_policy(policy), "responses_mode": "image_bridge_model_passthrough"},
+                        base_details={**routing_details_from_policy(policy), **_output_request_details(output), "responses_mode": "image_bridge_model_passthrough"},
                         previous_response_id=previous_response_id, conv_key=conv_key,
                         remember_response_chain_key=_remember_response_chain_key,
                         remember_reasoning_content=_remember_reasoning_content,
@@ -3711,13 +3768,15 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
             _remember_response_chain_key(resp_id, conv_key)
             rendered = render_response(output, model=model, previous_response_id=previous_response_id, response_id=resp_id, extra=internal.extra)
             tokens = output.usage.get("total_tokens", 0)
-            details = {**routing_details_from_policy(policy), "responses_mode": "image_bridge_model_passthrough", "response_id": resp_id}
-            _log_request(username, api_key_value, model, adapter_provider_id, "responses", True, tokens, requested_model, details=details)
+            details = {**routing_details_from_policy(policy), **_output_request_details(output), "responses_mode": "image_bridge_model_passthrough", "response_id": resp_id}
+            final_model = _target_model_for_log(RouteTarget(model=internal.target_model, provider_id=adapter_provider_id), adapter_provider_id)
+            details = apply_outcome_to_details(details, success=True)
+            _log_request(username, api_key_value, final_model, adapter_provider_id, "responses", True, tokens, requested_model, details=details)
             _record_request_log(
                 endpoint="responses", username=username, api_key_value=api_key_value,
-                requested_model=requested_model, final_model=model,
+                requested_model=requested_model, final_model=final_model,
                 final_provider=adapter_provider_id, request_body=body,
-                response_body=rendered, success=True, status="ok", tokens=tokens,
+                response_body=rendered, success=True, status=details.get("status", "ok"), tokens=tokens,
                 usage=output.usage, details=details,
             )
             _record_success_metrics(username, api_key_value, tokens, "ok")

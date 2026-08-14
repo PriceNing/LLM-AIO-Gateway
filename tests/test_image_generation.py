@@ -455,6 +455,56 @@ def test_responses_model_driven_bridge_generates_after_model_tool_call(image_app
     assert calls == ["生成一个苹果的图像"]
 
 
+def test_responses_ordinary_request_does_not_enter_image_bridge(image_app_db, monkeypatch):
+    calls = 0
+
+    async def fake_planner(policy, internal, **kwargs):
+        nonlocal calls
+        calls += 1
+        assert all(tool.name != IMAGE_BRIDGE_TOOL_NAME for tool in internal.tools)
+        return InternalOutputMessage(text="Reviewed the code.", usage={"total_tokens": 3}), {"id": "chat"}, "chat"
+
+    monkeypatch.setattr("app.router.proxy._call_nonstream_with_fallbacks", fake_planner)
+    response = TestClient(app).post("/v1/responses", headers=image_app_db["headers"], json={
+        "model": "chat/chat-model",
+        "input": "Review the code and explain the failing test.",
+    })
+    assert response.status_code == 200, response.text
+    assert calls == 1
+    assert "Reviewed the code." in response.text
+    assert not list(image_app_db["image_dir"].glob("*.png"))
+
+
+def test_responses_image_bridge_logs_actual_fallback_target(image_app_db, monkeypatch):
+    async def fake_planner(policy, internal, **kwargs):
+        internal.target_model = "qianye/chat-model"
+        internal.provider_id = "qianye"
+        output = InternalOutputMessage(text="No image needed.", usage={"total_tokens": 4})
+        output.raw = {"request_details": {
+            "fallback_status": "used",
+            "attempt_index": 1,
+            "fallback_attempts": [
+                {"index": 0, "stage": "primary", "status": "failed", "target": "chat/chat-model"},
+                {"index": 1, "stage": "fallback", "status": "success", "target": "qianye/chat-model"},
+            ],
+        }}
+        return output, {"id": "qianye"}, "qianye"
+
+    monkeypatch.setattr("app.router.proxy._call_nonstream_with_fallbacks", fake_planner)
+    response = TestClient(app).post("/v1/responses", headers=image_app_db["headers"], json={
+        "model": "chat/chat-model",
+        "input": "Generate an image of an apple",
+    })
+    assert response.status_code == 200, response.text
+    log = list_request_logs(limit=1)[0]
+    assert log["requested_model"] == "chat/chat-model"
+    assert log["model"] == "qianye/chat-model"
+    assert log["provider"] == "qianye"
+    assert log["status"] == "degraded"
+    assert log["details"]["fallback_status"] == "used"
+    assert len(log["details"]["fallback_attempts"]) == 2
+
+
 def test_responses_api_key_codex_streams_image_through_generated_image_exec(image_app_db, monkeypatch):
     async def fake_planner(*args, **kwargs):
         return InternalOutputMessage(tool_calls=[InternalToolCallOutput(

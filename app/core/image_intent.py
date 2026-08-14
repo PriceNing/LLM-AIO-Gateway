@@ -8,8 +8,13 @@ from typing import Any
 
 _CN_IMAGE_WORDS = ("图片", "图像", "照片", "插画", "海报", "头像", "壁纸", "素材")
 _CN_ACTION_WORDS = ("生成", "画", "绘制", "制作", "创建", "做一张", "出图", "生图")
-_EN_IMAGE_WORDS = ("image", "picture", "photo", "illustration", "poster", "wallpaper", "avatar")
-_EN_ACTION_RE = re.compile(r"\b(?:generate|draw|create|make|render|illustrate)\b", re.IGNORECASE)
+_EN_IMAGE_WORDS = (
+    "image", "picture", "photo", "illustration", "poster",
+    "wallpaper", "avatar", "art", "asset", "assets",
+    "visual asset", "visuals", "texture", "textures", "variant",
+    "variants",
+)
+_EN_ACTION_RE = re.compile(r"\b(?:generate|generated|draw|create|make|render|illustrate)\b", re.IGNORECASE)
 _NEGATED_IMAGE_REQUEST_RE = re.compile(
     r"(?:不要|无需|不需要|禁止|别)\s*(?:生成|画|绘制|制作|创建|生图)|"
     r"(?:不要|无需|不需要|禁止|别).{0,12}(?:调用|使用|进入|触发).{0,12}(?:图像生成|图片生成|生图)(?:功能|工具|服务)?|"
