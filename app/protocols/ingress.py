@@ -70,7 +70,19 @@ def _custom_tool_parameters(tool: dict[str, Any]) -> dict[str, Any]:
 
 
 def _namespace_tool_name(namespace: str, name: str) -> str:
-    return f"{namespace}-{name}"
+    """Return the Chat-facing name for a Responses namespace function.
+
+    Keep the original function name so Chat Completions models continue to see
+    Codex tools such as spawn_agent or imagegen. Namespace is restored on egress
+    through responses_namespace_tools, not by rewriting the tool identity.
+    """
+    return name
+
+
+def _namespace_map_key(namespace: str, name: str) -> str:
+    if namespace and name:
+        return f"{namespace}.{name}"
+    return name
 
 
 def responses_tools_to_chat_tools(tools: list[Any] | None) -> list[dict[str, Any]]:
@@ -148,7 +160,10 @@ def responses_tool_maps(tools: list[Any] | None) -> tuple[dict[str, dict[str, st
                     continue
                 sub_name = str(sub_tool.get("name") or "")
                 if sub_name:
-                    namespace_tools[_namespace_tool_name(name, sub_name)] = {"namespace": name, "name": sub_name}
+                    mapped = {"namespace": name, "name": sub_name}
+                    namespace_tools[sub_name] = mapped
+                    namespace_tools[_namespace_map_key(name, sub_name)] = mapped
+                    namespace_tools[f"{name}-{sub_name}"] = mapped
         elif tool_type == "custom" and name:
             custom_tools[name] = {"name": name, "argument_field": _custom_tool_argument_field(tool)}
         elif tool_type == "function" and name == "apply_patch":

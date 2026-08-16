@@ -195,6 +195,33 @@ def test_responses_tools_project_to_openai_chat_tools():
     assert converted[1]["function"]["parameters"]["required"] == ["input"]
 
 
+def test_responses_namespace_round_trip_keeps_original_name():
+    from app.protocols.egress import render_response
+    from app.core.output import InternalOutputMessage, InternalToolCallOutput
+    from app.protocols.ingress import responses_to_internal
+
+    req = responses_to_internal({
+        "model": "gpt-test",
+        "input": "hi",
+        "tools": [{
+            "type": "namespace",
+            "name": "collaboration",
+            "tools": [{"type": "function", "name": "spawn_agent", "parameters": {"type": "object"}}],
+        }],
+    })
+    rendered = render_response(
+        InternalOutputMessage(tool_calls=[InternalToolCallOutput(
+            id="fc_1", call_id="call_1", name="spawn_agent", arguments="{}",
+        )]),
+        model="gpt-test",
+        extra=req.extra,
+    )
+    item = rendered["output"][0]
+    assert item["type"] == "function_call"
+    assert item["name"] == "spawn_agent"
+    assert item["namespace"] == "collaboration"
+
+
 def test_responses_to_internal_preserves_additional_tools_for_upstream_request():
     from app.protocols.ingress import responses_to_internal
 

@@ -27,6 +27,7 @@ from app.core.image_bridge import (
     GATEWAY_IMAGE_DISPLAY_CALL_PREFIX,
     GATEWAY_IMAGE_RESULT_MARKER,
     IMAGE_BRIDGE_TOOL_NAME,
+    IMAGE_BRIDGE_CORRECTION_INSTRUCTIONS,
     configure_internal_image_bridge,
     gateway_generated_image_asset_context,
     has_codex_generated_image_exec_tool,
@@ -111,6 +112,35 @@ router = APIRouter()
 # Rolling log of recent requests for the admin stats dashboard
 _request_log = deque(maxlen=get_default("request_log_max", 200))
 _request_log_lock = threading.Lock()
+
+
+def _responses_client_owned_tool_markers(body: dict) -> list[str]:
+    """Identify Codex-owned Responses tools that Chat rewrite cannot preserve faithfully."""
+    found: list[str] = []
+    for tool in body.get("tools") or []:
+        if not isinstance(tool, dict):
+            continue
+        tool_type = str(tool.get("type") or "")
+        name = str(tool.get("name") or "")
+        if tool_type == "custom" and name and f"custom:{name}" not in found:
+            found.append(f"custom:{name}")
+        elif tool_type == "namespace" and name and f"namespace:{name}" not in found:
+            found.append(f"namespace:{name}")
+    input_data = body.get("input")
+    if isinstance(input_data, list):
+        for item in input_data:
+            if not isinstance(item, dict) or item.get("type") != "additional_tools":
+                continue
+            for tool in item.get("tools") or []:
+                if not isinstance(tool, dict):
+                    continue
+                tool_type = str(tool.get("type") or "")
+                name = str(tool.get("name") or "")
+                if tool_type == "custom" and name and f"custom:{name}" not in found:
+                    found.append(f"custom:{name}")
+                elif tool_type == "namespace" and name and f"namespace:{name}" not in found:
+                    found.append(f"namespace:{name}")
+    return found
 
 
 def _responses_requires_native(body: dict) -> list[str]:
@@ -1026,14 +1056,21 @@ def _mark_model_responses_unknown(provider_id: str, model: str, error: Exception
 def _native_error_is_explicitly_unsupported(exc: Exception) -> bool:
     response = getattr(exc, "response", None)
     status = getattr(exc, "status_code", None) or getattr(response, "status_code", None)
-    if status not in {400, 404, 405, 422, 501}:
+    if status in {404, 405, 501}:
+        return True
+    if status not in {400, 422}:
         return False
     try:
         detail = response.text.lower()
     except Exception:
         detail = str(exc).lower()
     mentions_responses = any(marker in detail for marker in ("/responses", "responses api", "response api", "responses endpoint", "native responses"))
-    rejects_protocol = any(marker in detail for marker in ("not supported", "unsupported", "not implemented", "unknown endpoint", "method not allowed"))
+    rejects_protocol = any(marker in detail for marker in (
+        "not supported", "unsupported", "not implemented", "unknown endpoint",
+        "method not allowed", "unprocessable", "invalid request",
+    ))
+    if status == 422:
+        return mentions_responses or rejects_protocol or not detail.strip()
     return mentions_responses and rejects_protocol
 
 
@@ -1113,13 +1150,13 @@ async def _probe_model_responses_capability(provider: dict, model: str) -> bool:
     except Exception as exc:
         response = getattr(exc, "response", None)
         status = getattr(exc, "status_code", None) or getattr(response, "status_code", None)
-        # A 400 from the probe means this upstream accepted the endpoint but
-        # rejected the minimal Responses protocol request; for llama.cpp and
-        # similar Chat-only servers this is the practical unsupported signal.
-        # Other 4xx responses are only negative when the body explicitly
-        # identifies the Responses endpoint/protocol as unsupported.
+        # A 400/422 from the probe means this upstream accepted the endpoint
+        # but rejected the minimal Responses protocol request.  For Chat-only
+        # or incomplete Responses proxies this is the practical unsupported
+        # signal.  Other 4xx responses are only negative when the body
+        # explicitly identifies the Responses endpoint/protocol as unsupported.
         explicitly_unsupported = _native_error_is_explicitly_unsupported(exc)
-        if status == 400 or explicitly_unsupported:
+        if status in {400, 422} or explicitly_unsupported:
             set_model_responses_capability(
                 provider_id, model, status="unsupported",
                 expires_at=_responses_capability_expiry("unsupported"),
@@ -1252,7 +1289,7 @@ async def _native_response_with_fallbacks(internal, *, stream: bool, required_to
             is_empty_native = bool(getattr(exc, "native_empty_output", False))
             is_protocol_unsupported = _native_error_is_explicitly_unsupported(exc) or (
                 getattr(exc, "response", None) is not None
-                and getattr(exc.response, "status_code", None) == 400
+                and getattr(exc.response, "status_code", None) in {400, 422}
             )
             if is_protocol_unsupported:
                 set_model_responses_capability(provider_id, target.model, status="unsupported", expires_at=_responses_capability_expiry("unsupported"), error=friendly_error_msg(exc))
@@ -2175,19 +2212,22 @@ def _record_image_generation_failure(
         {
             **_request_details_from_exception(exc),
             "request_kind": "image_generation",
-            "responses_mode": "image_generation",
+            "responses_mode": _request_details_from_exception(exc).get(
+                "responses_mode", "image_generation"
+            ),
             "upstream_endpoint": "images/generations",
             "error_message": friendly_error_msg(exc),
         },
     )
+    final_model = str(details.get("attempted_model") or model or requested_model)
     final_provider = str(details.get("attempted_provider") or provider_id or "")
     _log_request(
-        username, api_key_value, model or requested_model, final_provider,
+        username, api_key_value, final_model, final_provider,
         endpoint, False, 0, requested_model, details=details,
     )
     _record_request_log(
         endpoint=endpoint, username=username, api_key_value=api_key_value,
-        requested_model=requested_model, final_model=model or requested_model,
+        requested_model=requested_model, final_model=final_model,
         final_provider=final_provider, request_body=request_body,
         success=False, status="fail", tokens=0, details=details,
         error_message=friendly_error_msg(exc),
@@ -3311,6 +3351,89 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
             # unrelated tasks fail when the global image backend was disabled.
             image_correction_applied = False
             all_initial_calls_are_images = len(requested_image_invocations) == len(output.tool_calls)
+            # An explicit image request must not silently degrade into a text
+            # completion when the model ignores the advertised image tool.
+            # Ordinary image discussion never reaches this branch because
+            # ``image_bridge`` is gated by ``image_request_intent`` above.
+            # Client-owned Codex image tools are also excluded: their tool
+            # loop belongs to the client, not this hosted bridge.
+            if (
+                image_request_intent
+                and not requested_image_invocations
+                and not output.tool_calls
+                and not codex_image_tool
+                and not has_codex_generated_image_exec_tool(body)
+                and not image_display_followup
+                and not image_already_generated
+                and not system_turn
+                and (isinstance(input_data, str) or not isinstance(input_data, list) or not any(
+                    isinstance(item, dict) and item.get("role") == "assistant"
+                    for item in input_data
+                ))
+            ):
+                correction_message = InternalMessage(
+                    role="system",
+                    parts=[text_part(IMAGE_BRIDGE_CORRECTION_INSTRUCTIONS)],
+                )
+                internal.messages.append(correction_message)
+                internal.tool_choice = {
+                    "type": "function",
+                    "function": {"name": IMAGE_BRIDGE_TOOL_NAME},
+                }
+                allowed = internal.extra.setdefault("allowed_openai_params", [])
+                if "tool_choice" not in allowed:
+                    allowed.append("tool_choice")
+                image_correction_applied = True
+                _app_log.warning(
+                    "[responses image_generation.correction] no image invocation; "
+                    "forcing bridge tool choice model=%s provider=%s",
+                    internal.target_model, adapter_provider_id or "-",
+                )
+                correction_output, provider_info, adapter_provider_id = await _call_nonstream_with_fallbacks(
+                    policy, internal, temperature=temperature, max_tokens=max_tokens,
+                    log_label="responses.image_bridge.correction",
+                )
+                correction_invocations = _image_bridge_invocations(correction_output)
+                if correction_invocations:
+                    output = correction_output
+                    bridge_upstream_details = _merge_bridge_request_details(
+                        bridge_upstream_details, _output_request_details(correction_output),
+                    )
+                    bridge_final_model = _target_model_for_log(
+                        RouteTarget(model=internal.target_model, provider_id=adapter_provider_id),
+                        adapter_provider_id,
+                    )
+                    bridge_final_provider = adapter_provider_id
+                    requested_image_invocations = correction_invocations
+                    image_invocations = correction_invocations[:max_image_invocations]
+                    skipped_initial_invocations = correction_invocations[max_image_invocations:]
+                    all_initial_calls_are_images = len(correction_invocations) == len(correction_output.tool_calls)
+                    # Continue through the existing backend execution path.
+                else:
+                    correction_error = HTTPException(
+                        status_code=502,
+                        detail="The model did not invoke the image-generation tool",
+                    )
+                    # The correction is a second planner request. Preserve
+                    # the first request's authoritative fallback history and
+                    # final target, otherwise a failed correction is logged as
+                    # if it only touched the primary model.
+                    failure_details = {
+                        **bridge_upstream_details,
+                        "attempted_model": bridge_final_model,
+                        "attempted_provider": bridge_final_provider,
+                        "request_kind": "image_generation",
+                        "responses_mode": "image_generation_failed",
+                        "upstream_endpoint": "images/generations",
+                        "image_count": 0,
+                        "image_failed_count": 1,
+                        "image_correction_applied": True,
+                        "error_message": "model did not invoke image generation tool after correction",
+                    }
+                    _attach_request_details(
+                        correction_error, **failure_details,
+                    )
+                    raise correction_error
             if image_invocations:
                 image_results = bridge_image_results
                 stored_images = bridge_stored_images
@@ -3797,10 +3920,9 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
         # requests, on the other hand, remain eligible for the Chat/Anthropic
         # compatibility path when no native stream is available.
         # Native Responses forwarding is not suitable for client-owned
-        # Codex namespaces on ordinary provider API endpoints.  The
-        # compatibility adapter already maps image_gen-imagegen to a function
-        # tool and egress restores namespace=image_gen, matching Sub2API's
-        # client-owned tool loop.
+        # Codex image namespaces on ordinary provider API endpoints.  The
+        # compatibility adapter keeps the original function name and egress
+        # restores namespace=image_gen, matching Sub2API's client-owned loop.
         if (
             not image_display_followup
             and not image_already_generated
@@ -3840,26 +3962,17 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                 return rendered
             except Exception as native_error:
                 native_attempts = list(getattr(native_error, "request_details", {}).get("fallback_attempts", []) or [])
-                if native_required:
-                    # A model can explicitly reject the Responses protocol
-                    # (for example DeepSeek Pro) while a sibling supports it.
-                    # Only that clear signal may downgrade a native-only turn;
-                    # arbitrary 4xx responses can be malformed user input or
-                    # an upstream defect and must remain visible.
-                    if _native_error_is_explicitly_unsupported(native_error):
-                        _app_log.warning(
-                            "[responses native] model-level Responses incompatibility; "
-                            "downgrading to compatibility path (stateful=%s): %s",
-                            bool(stateful_markers), native_error,
-                        )
-                        native_required = []
-                    else:
-                        if getattr(native_error, "native_capability_unavailable", False):
-                            raise HTTPException(status_code=422, detail=(
-                                "No configured provider supports native Responses required by this request: "
-                                + ", ".join(native_required)
-                            )) from native_error
-                        raise
+                client_owned_tools = _responses_client_owned_tool_markers(body)
+                if native_required or client_owned_tools:
+                    # Codex custom/namespace tools and other native-only
+                    # features must not silently fall back to Chat.  The Chat
+                    # adapter can still serve ordinary text/function requests.
+                    if getattr(native_error, "native_capability_unavailable", False) or _native_error_is_explicitly_unsupported(native_error):
+                        raise HTTPException(status_code=422, detail=(
+                            "No configured provider supports native Responses required by this request: "
+                            + ", ".join(native_required or client_owned_tools)
+                        )) from native_error
+                    raise
                 _app_log.warning("[responses native fallback] no native target succeeded; downgrading basic request: %s", native_error)
                 native_downgrade_details = _native_downgrade_details(native_error, native_attempts)
 

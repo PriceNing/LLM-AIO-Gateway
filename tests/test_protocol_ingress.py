@@ -232,6 +232,32 @@ def test_responses_to_internal_converts_function_items_tools_and_additional_tool
     assert req.chat_tools()[1]["function"]["parameters"]["required"] == ["input"]
 
 
+def test_responses_namespace_tools_keep_original_chat_names():
+    req = responses_to_internal({
+        "model": "gpt-test",
+        "input": "hi",
+        "tools": [{
+            "type": "namespace",
+            "name": "collaboration",
+            "tools": [{"type": "function", "name": "spawn_agent", "parameters": {"type": "object"}}],
+        }, {
+            "type": "custom",
+            "name": "exec_command",
+            "description": "Run a command",
+        }],
+    })
+
+    names = [tool.name for tool in req.tools]
+    assert "spawn_agent" in names
+    assert "exec_command" in names
+    assert "collaboration-spawn_agent" not in names
+    assert req.extra["responses_namespace_tools"]["spawn_agent"] == {"namespace": "collaboration", "name": "spawn_agent"}
+    kwargs = chat_kwargs_from_internal(req)
+    chat_names = [tool["function"]["name"] for tool in kwargs["tools"]]
+    assert "spawn_agent" in chat_names
+    assert "exec_command" in chat_names
+
+
 def test_responses_tool_choice_projects_to_openai_chat_shape():
     req = responses_to_internal({
         "model": "gpt-test",

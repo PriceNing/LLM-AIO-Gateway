@@ -495,14 +495,15 @@ def test_responses_image_bridge_logs_actual_fallback_target(image_app_db, monkey
         "model": "chat/chat-model",
         "input": "Generate an image of an apple",
     })
-    assert response.status_code == 200, response.text
+    assert response.status_code == 502, response.text
+    assert "did not invoke the image-generation tool" in response.text
     log = list_request_logs(limit=1)[0]
     assert log["requested_model"] == "chat/chat-model"
     assert log["model"] == "qianye/chat-model"
     assert log["provider"] == "qianye"
-    assert log["status"] == "degraded"
-    assert log["details"]["fallback_status"] == "used"
-    assert len(log["details"]["fallback_attempts"]) == 2
+    assert log["status"] == "fail"
+    assert log["details"]["request_kind"] == "image_generation"
+    assert log["details"]["responses_mode"] == "image_generation_failed"
 
 
 def test_responses_api_key_codex_streams_image_through_generated_image_exec(image_app_db, monkeypatch):
@@ -1996,10 +1997,10 @@ def test_codex_image_namespace_round_trips_as_client_tool_call():
     }
     assert has_codex_image_function_tool(body) is True
     internal = responses_to_internal(body)
-    assert [tool.name for tool in internal.tools] == ["image_gen-imagegen"]
+    assert [tool.name for tool in internal.tools] == ["imagegen"]
 
     rendered = render_response(InternalOutputMessage(tool_calls=[InternalToolCallOutput(
-        id="fc_image", call_id="call_image", name="image_gen-imagegen",
+        id="fc_image", call_id="call_image", name="imagegen",
         arguments='{"prompt":"paint a blue whale"}',
     )]), model="chat/chat-model", extra=internal.extra)
     item = rendered["output"][0]
@@ -2041,7 +2042,7 @@ def test_flattened_codex_image_namespace_is_client_owned():
 def test_codex_client_owned_image_tool_returns_function_call_without_gateway_bridge(image_app_db, monkeypatch):
     async def fake_planner(*args, **kwargs):
         return InternalOutputMessage(tool_calls=[InternalToolCallOutput(
-            id="fc_image", call_id="call_image", name="image_gen-imagegen",
+            id="fc_image", call_id="call_image", name="imagegen",
             arguments='{"prompt":"draw an apple"}',
         )], finish_reason="tool_calls", usage={"total_tokens": 4}), {"id": "chat"}, "chat"
 

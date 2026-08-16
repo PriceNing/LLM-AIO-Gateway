@@ -121,6 +121,24 @@ def test_anthropic_provider_never_uses_openai_native_responses_probe_path():
 
 
 @pytest.mark.asyncio
+async def test_unknown_capability_probe_caches_unsupported_on_incomplete_422(monkeypatch):
+    add_provider({
+        "id": "compat-proxy", "name": "Compat", "provider_type": "openai",
+        "api_base": "http://compat.invalid/v1", "models": [{"id": "gpt-5.6-luna"}],
+    })
+    request = httpx.Request("POST", "http://compat.invalid/v1/responses")
+    async def fake_post(provider, internal):
+        raise httpx.HTTPStatusError(
+            "unprocessable", request=request,
+            response=httpx.Response(422, text="Unprocessable Entity", request=request),
+        )
+    monkeypatch.setattr("app.router.proxy.post_native_response", fake_post)
+    provider = {"id": "compat-proxy", "provider_type": "openai"}
+    assert await _native_capability_for_request(provider, "gpt-5.6-luna") is False
+    assert get_model_responses_capability("compat-proxy", "gpt-5.6-luna")["responses_status"] == "unsupported"
+
+
+@pytest.mark.asyncio
 async def test_unknown_capability_probe_caches_unsupported_on_llamacpp_400(monkeypatch):
     add_provider({
         "id": "llamacpp", "name": "llama.cpp", "provider_type": "openai",
@@ -584,6 +602,15 @@ def test_responses_native_required_fields_do_not_include_common_codex_options():
 def test_responses_native_required_fields_do_not_include_codex_custom_tools():
     from app.router.proxy import _responses_requires_native
     assert _responses_requires_native({"model": "x", "input": "hello", "tools": [{"type": "custom", "name": "exec_command"}]}) == []
+
+
+def test_codex_owned_tools_are_tracked_separately_from_native_required_fields():
+    from app.router.proxy import _responses_client_owned_tool_markers
+    assert _responses_client_owned_tool_markers({
+        "model": "x",
+        "input": [{"type": "additional_tools", "tools": [{"type": "namespace", "name": "collaboration"}]}],
+        "tools": [{"type": "custom", "name": "exec_command"}],
+    }) == ["custom:exec_command", "namespace:collaboration"]
 
 
 def test_responses_compatibility_accepts_client_metadata_and_hosted_tools():

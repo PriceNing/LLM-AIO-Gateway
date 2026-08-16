@@ -209,6 +209,11 @@ def _responses_tool_name(raw_name: str, namespace_tools: dict[str, dict[str, str
     mapped = namespace_tools.get(raw_name)
     if isinstance(mapped, dict):
         return mapped.get("namespace") or None, mapped.get("name") or raw_name
+    if "-" in raw_name:
+        namespace, name = raw_name.split("-", 1)
+        mapped = namespace_tools.get(name)
+        if isinstance(mapped, dict) and (mapped.get("namespace") or "") == namespace:
+            return mapped.get("namespace") or None, mapped.get("name") or name
     if "." in raw_name:
         namespace, name = raw_name.split(".", 1)
         if namespace and name:
