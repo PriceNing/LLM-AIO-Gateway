@@ -258,6 +258,38 @@ def test_responses_namespace_tools_keep_original_chat_names():
     assert "exec_command" in chat_names
 
 
+def test_responses_namespace_custom_tools_survive_chat_rewrite():
+    req = responses_to_internal({
+        "model": "gpt-test",
+        "input": "hi",
+        "tools": [{
+            "type": "namespace",
+            "name": "functions",
+            "tools": [
+                {"type": "custom", "name": "exec", "description": "Run JavaScript"},
+                {"type": "custom", "name": "apply_patch", "description": "Apply a patch"},
+                {"type": "function", "name": "wait", "parameters": {"type": "object"}},
+            ],
+        }],
+    })
+
+    names = [tool.name for tool in req.tools]
+    assert "exec" in names
+    assert "apply_patch" in names
+    assert "wait" in names
+
+    kwargs = chat_kwargs_from_internal(req)
+    chat_names = [tool["function"]["name"] for tool in kwargs["tools"]]
+    assert "exec" in chat_names
+    assert "apply_patch" in chat_names
+    assert "wait" in chat_names
+
+    custom = req.extra["responses_custom_tools"]
+    assert custom["exec"] == {"name": "exec", "argument_field": "input"}
+    assert custom["apply_patch"] == {"name": "apply_patch", "argument_field": "patch"}
+    assert custom["functions.exec"] == {"name": "exec", "argument_field": "input"}
+
+
 def test_responses_tool_choice_projects_to_openai_chat_shape():
     req = responses_to_internal({
         "model": "gpt-test",

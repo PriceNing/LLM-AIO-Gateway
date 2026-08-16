@@ -85,6 +85,20 @@ def _namespace_map_key(namespace: str, name: str) -> str:
     return name
 
 
+def _responses_custom_tool_to_chat_tool(tool: dict[str, Any], *, override_name: str | None = None) -> dict[str, Any] | None:
+    name = override_name or str(tool.get("name") or "")
+    if not name:
+        return None
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": tool.get("description") or "Provide the raw custom tool input.",
+            "parameters": _custom_tool_parameters(tool),
+        },
+    }
+
+
 def responses_tools_to_chat_tools(tools: list[Any] | None) -> list[dict[str, Any]]:
     converted = []
     for tool in tools or []:
@@ -97,24 +111,27 @@ def responses_tools_to_chat_tools(tools: list[Any] | None) -> list[dict[str, Any
         if tool_type == "namespace":
             namespace = str(tool.get("name") or "")
             for sub_tool in tool.get("tools") or []:
-                if isinstance(sub_tool, dict) and sub_tool.get("type") == "function":
+                if not isinstance(sub_tool, dict):
+                    continue
+                sub_type = sub_tool.get("type")
+                sub_name = _namespace_tool_name(namespace, str(sub_tool.get("name") or ""))
+                if sub_type == "function":
                     converted.append(_responses_function_tool_to_chat_tool(
                         sub_tool,
-                        override_name=_namespace_tool_name(namespace, str(sub_tool.get("name") or "")),
+                        override_name=sub_name,
                     ))
+                elif sub_type == "custom":
+                    converted_custom = _responses_custom_tool_to_chat_tool(
+                        sub_tool,
+                        override_name=sub_name,
+                    )
+                    if converted_custom:
+                        converted.append(converted_custom)
             continue
         if tool_type == "custom":
-            name = str(tool.get("name") or "")
-            if not name:
-                continue
-            converted.append({
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "description": tool.get("description") or "Provide the raw custom tool input.",
-                    "parameters": _custom_tool_parameters(tool),
-                },
-            })
+            converted_custom = _responses_custom_tool_to_chat_tool(tool)
+            if converted_custom:
+                converted.append(converted_custom)
             continue
         if tool_type != "function":
             continue
@@ -146,6 +163,17 @@ def _responses_request_tools(body: dict[str, Any]) -> list[dict[str, Any]]:
     return tools
 
 
+def _register_custom_tool_aliases(custom_tools: dict[str, dict[str, str]], tool: dict[str, Any], *, namespace: str = "") -> None:
+    name = str(tool.get("name") or "")
+    if not name:
+        return
+    mapped = {"name": name, "argument_field": _custom_tool_argument_field(tool)}
+    custom_tools[name] = mapped
+    if namespace:
+        custom_tools[_namespace_map_key(namespace, name)] = mapped
+        custom_tools[f"{namespace}-{name}"] = mapped
+
+
 def responses_tool_maps(tools: list[Any] | None) -> tuple[dict[str, dict[str, str]], dict[str, dict[str, str]]]:
     namespace_tools: dict[str, dict[str, str]] = {}
     custom_tools: dict[str, dict[str, str]] = {}
@@ -156,16 +184,23 @@ def responses_tool_maps(tools: list[Any] | None) -> tuple[dict[str, dict[str, st
         name = str(tool.get("name") or "")
         if tool_type == "namespace" and name:
             for sub_tool in tool.get("tools") or []:
-                if not isinstance(sub_tool, dict) or sub_tool.get("type") != "function":
+                if not isinstance(sub_tool, dict):
                     continue
+                sub_type = sub_tool.get("type")
                 sub_name = str(sub_tool.get("name") or "")
-                if sub_name:
-                    mapped = {"namespace": name, "name": sub_name}
-                    namespace_tools[sub_name] = mapped
-                    namespace_tools[_namespace_map_key(name, sub_name)] = mapped
-                    namespace_tools[f"{name}-{sub_name}"] = mapped
+                if not sub_name:
+                    continue
+                if sub_type == "custom":
+                    _register_custom_tool_aliases(custom_tools, sub_tool, namespace=name)
+                    continue
+                if sub_type != "function":
+                    continue
+                mapped = {"namespace": name, "name": sub_name}
+                namespace_tools[sub_name] = mapped
+                namespace_tools[_namespace_map_key(name, sub_name)] = mapped
+                namespace_tools[f"{name}-{sub_name}"] = mapped
         elif tool_type == "custom" and name:
-            custom_tools[name] = {"name": name, "argument_field": _custom_tool_argument_field(tool)}
+            _register_custom_tool_aliases(custom_tools, tool)
         elif tool_type == "function" and name == "apply_patch":
             custom_tools[name] = {"name": name, "argument_field": _single_string_parameter_name(tool) or _custom_tool_argument_field(tool)}
     return namespace_tools, custom_tools

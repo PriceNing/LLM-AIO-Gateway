@@ -222,6 +222,40 @@ def test_responses_namespace_round_trip_keeps_original_name():
     assert item["namespace"] == "collaboration"
 
 
+def test_responses_namespace_custom_tools_round_trip_as_custom_tool_call():
+    from app.protocols.egress import render_response
+    from app.core.output import InternalOutputMessage, InternalToolCallOutput
+    from app.protocols.ingress import responses_to_internal, responses_tools_to_chat_tools
+
+    tools = [{
+        "type": "namespace",
+        "name": "functions",
+        "tools": [
+            {"type": "custom", "name": "exec", "description": "Run JavaScript"},
+            {"type": "function", "name": "wait", "parameters": {"type": "object"}},
+        ],
+    }]
+    converted = responses_tools_to_chat_tools(tools)
+    assert [tool["function"]["name"] for tool in converted] == ["exec", "wait"]
+
+    req = responses_to_internal({
+        "model": "gpt-test",
+        "input": "hi",
+        "tools": tools,
+    })
+    rendered = render_response(
+        InternalOutputMessage(tool_calls=[InternalToolCallOutput(
+            id="ctc_1", call_id="call_1", name="exec", arguments='{"input": "1+1"}',
+        )]),
+        model="gpt-test",
+        extra=req.extra,
+    )
+    item = rendered["output"][0]
+    assert item["type"] == "custom_tool_call"
+    assert item["name"] == "exec"
+    assert item["input"] == "1+1"
+
+
 def test_responses_to_internal_preserves_additional_tools_for_upstream_request():
     from app.protocols.ingress import responses_to_internal
 
