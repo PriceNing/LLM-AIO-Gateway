@@ -1056,9 +1056,7 @@ def _mark_model_responses_unknown(provider_id: str, model: str, error: Exception
 def _native_error_is_explicitly_unsupported(exc: Exception) -> bool:
     response = getattr(exc, "response", None)
     status = getattr(exc, "status_code", None) or getattr(response, "status_code", None)
-    if status in {404, 405, 501}:
-        return True
-    if status not in {400, 422}:
+    if status not in {400, 404, 405, 422, 501}:
         return False
     try:
         detail = response.text.lower()
@@ -1069,6 +1067,8 @@ def _native_error_is_explicitly_unsupported(exc: Exception) -> bool:
         "not supported", "unsupported", "not implemented", "unknown endpoint",
         "method not allowed", "unprocessable", "invalid request",
     ))
+    if status in {404, 405, 501}:
+        return mentions_responses or rejects_protocol
     if status == 422:
         return mentions_responses or rejects_protocol or not detail.strip()
     return mentions_responses and rejects_protocol
@@ -1289,7 +1289,7 @@ async def _native_response_with_fallbacks(internal, *, stream: bool, required_to
             is_empty_native = bool(getattr(exc, "native_empty_output", False))
             is_protocol_unsupported = _native_error_is_explicitly_unsupported(exc) or (
                 getattr(exc, "response", None) is not None
-                and getattr(exc.response, "status_code", None) in {400, 422}
+                and getattr(exc.response, "status_code", None) == 400
             )
             if is_protocol_unsupported:
                 set_model_responses_capability(provider_id, target.model, status="unsupported", expires_at=_responses_capability_expiry("unsupported"), error=friendly_error_msg(exc))
