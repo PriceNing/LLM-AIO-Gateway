@@ -45,6 +45,54 @@ def text_part(text: Any, *, raw: Any = None, extensions: dict[str, Any] | None =
     return InternalPart(kind="text", text="" if text is None else str(text), raw=raw, extensions=extensions or {})
 
 
+def _system_text_already_present(haystack: str, value: str) -> bool:
+    """Skip only exact instruction blocks, not short substring matches."""
+    existing = haystack or ""
+    needle = value.strip()
+    if not needle:
+        return True
+    if existing.strip() == needle:
+        return True
+    return any(block.strip() == needle for block in existing.split("\n\n"))
+
+
+def prepend_system_text(messages: list[InternalMessage], text: Any, *, raw: Any = None) -> None:
+    """Keep a single leading system message instead of inserting another one."""
+    value = "" if text is None else str(text)
+    if not value.strip():
+        return
+    if messages and messages[0].role == "system":
+        first = messages[0]
+        if any(part.kind == "text" and _system_text_already_present(part.text or "", value) for part in first.parts):
+            return
+        if first.parts and first.parts[0].kind == "text":
+            existing = first.parts[0].text or ""
+            first.parts[0].text = f"{value}\n\n{existing}" if existing else value
+            return
+        first.parts.insert(0, text_part(value, raw=raw))
+        return
+    messages.insert(0, InternalMessage(role="system", parts=[text_part(value, raw=raw)]))
+
+
+def append_system_text(messages: list[InternalMessage], text: Any, *, raw: Any = None) -> None:
+    """Fold extra system instructions into the existing leading system message."""
+    value = "" if text is None else str(text)
+    if not value.strip():
+        return
+    for message in messages:
+        if message.role != "system":
+            continue
+        if any(part.kind == "text" and _system_text_already_present(part.text or "", value) for part in message.parts):
+            return
+        if message.parts and message.parts[-1].kind == "text":
+            existing = message.parts[-1].text or ""
+            message.parts[-1].text = f"{existing}\n\n{value}" if existing else value
+            return
+        message.parts.append(text_part(value, raw=raw))
+        return
+    messages.insert(0, InternalMessage(role="system", parts=[text_part(value, raw=raw)]))
+
+
 def image_part(source: dict[str, Any], *, raw: Any = None, extensions: dict[str, Any] | None = None) -> InternalPart:
     return InternalPart(kind="image", source=source, raw=raw, extensions=extensions or {})
 

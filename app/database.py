@@ -1444,10 +1444,15 @@ def update_provider(provider_id: str, updates: dict) -> Optional[dict]:
         existing = db.execute("SELECT 1 FROM providers WHERE id = ?", (provider_id,)).fetchone()
         if not existing:
             return None
-        _updatable = {"name", "provider_type", "api_base", "api_key", "force_chat_completions"}
+        _updatable = {"name", "provider_type", "api_base", "api_key"}
         for key in _updatable:
             if key in updates:
                 db.execute(f"UPDATE providers SET {key} = ? WHERE id = ?", (updates[key], provider_id))
+        if "force_chat_completions" in updates:
+            db.execute(
+                "UPDATE providers SET force_chat_completions = ? WHERE id = ?",
+                (1 if updates["force_chat_completions"] else 0, provider_id),
+            )
         if any(key in updates for key in PROVIDER_REQUEST_DEFAULTS):
             options = _normalize_provider_request_options({**PROVIDER_REQUEST_DEFAULTS, **updates})
             for key, value in options.items():

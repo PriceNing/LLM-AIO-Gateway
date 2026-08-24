@@ -2959,7 +2959,8 @@ function _buildRealtimePanel(stats) {
         var reqModel = entry.requested_model || entry.model;
         var details = entry.details || {};
         var routedModel = entry.routed_model || details.routed_model || '';
-        var isDegraded = entry.status === 'degraded' || entry.fallback_status === 'used' || details.fallback_status === 'used';
+        var isImageRequest = entry.request_kind === 'image_generation' || details.request_kind === 'image_generation';
+        var isDegraded = entry.status === 'degraded' || (!isImageRequest && (entry.fallback_status === 'used' || details.fallback_status === 'used'));
         var modelChanged = reqModel && entry.model && reqModel !== entry.model;
         tableHTML += '<tr>' +
             '<td>' + escHtml(entry.time) + '</td>' +
@@ -3090,6 +3091,11 @@ function showRequestDetail(index) {
     if (entry.request_kind === 'image_generation' || details.request_kind === 'image_generation') {
         imageRows = [
             detailRow(t('stats.imageModel') || 'Image Model', entry.image_model || details.image_model),
+            detailRow(t('stats.imageBackendType') || 'Image Backend Type', entry.image_backend_type || details.image_backend_type),
+            detailRow(t('stats.imageBackendProvider') || 'Image Backend Provider', entry.image_backend_provider || details.image_backend_provider),
+            detailRow(t('stats.imageBackendModel') || 'Image Backend Model', entry.image_backend_model || details.image_backend_model),
+            detailRow(t('stats.imageFallback') || 'Image Fallback', entry.image_fallback_status || details.image_fallback_status || 'unused'),
+            detailRow(t('stats.plannerFallback') || 'Planner Fallback', entry.planner_fallback_status || details.planner_fallback_status),
             detailRow(t('stats.imageCount') || 'Image Count', detailPick(entry.image_count, details.image_count)),
             detailRow(t('stats.imageBytes') || 'Image Bytes', detailPick(entry.image_bytes, details.image_bytes)),
             detailRow(t('stats.imageArtifactCount') || 'Stored Artifacts', detailPick(entry.image_artifact_count, details.image_artifact_count))
@@ -3545,12 +3551,12 @@ async function showRequestLogDetail(logId) {
             body += detailRow(t('stats.imageCount') || 'Image Count', entry.image_count || 0);
             body += detailRow(t('stats.imageBytes') || 'Image Bytes', entry.image_bytes || 0);
             body += detailRow(t('stats.imageArtifactCount') || 'Stored Artifacts', entry.image_artifact_count || 0);
-            body += detailRow('Requested', entry.image_requested_count || 0);
-            body += detailRow('Succeeded', entry.image_succeeded_count || 0);
-            body += detailRow('Failed', entry.image_failed_count || 0);
-            body += detailRow('Retried', entry.image_retried_count || 0);
-            body += detailRow('Reused', entry.image_reused_count || 0);
-            body += detailRow('Batch ID', entry.image_batch_id || '');
+            body += detailRow(t('stats.imageRequestedCount') || 'Requested', entry.image_requested_count || 0);
+            body += detailRow(t('stats.imageSucceededCount') || 'Succeeded', entry.image_succeeded_count || 0);
+            body += detailRow(t('stats.imageFailedCount') || 'Failed', entry.image_failed_count || 0);
+            body += detailRow(t('stats.imageRetriedCount') || 'Retried', entry.image_retried_count || 0);
+            body += detailRow(t('stats.imageReusedCount') || 'Reused', entry.image_reused_count || 0);
+            body += detailRow(t('stats.imageBatchId') || 'Batch ID', entry.image_batch_id || '');
             body += detailRow(t('stats.upstreamEndpoint') || 'Upstream Endpoint', entry.upstream_endpoint || '');
             body += detailRow(t('stats.responsesMode') || 'Responses Mode', entry.responses_mode || '');
             body += '</div></div>';
@@ -3861,6 +3867,17 @@ Object.assign(I18N.zh, {
     'stats.imageCount': '图像数量',
     'stats.imageBytes': '图像字节数',
     'stats.imageArtifactCount': '已存储图像',
+    'stats.imageBackendType': '生图后端类型',
+    'stats.imageBackendProvider': '生图后端提供商',
+    'stats.imageBackendModel': '生图后端模型',
+    'stats.imageFallback': '生图回退',
+    'stats.plannerFallback': '规划回退',
+    'stats.imageRequestedCount': '请求次数',
+    'stats.imageSucceededCount': '成功次数',
+    'stats.imageFailedCount': '失败次数',
+    'stats.imageRetriedCount': '重试次数',
+    'stats.imageReusedCount': '复用次数',
+    'stats.imageBatchId': '批次 ID',
     'systemLogs.title': '系统日志',
     'systemLogs.allLevels': '全部级别',
     'systemLogs.search': '搜索日志',
@@ -3952,6 +3969,17 @@ Object.assign(I18N.en, {
     'stats.imageCount': 'Image Count',
     'stats.imageBytes': 'Image Bytes',
     'stats.imageArtifactCount': 'Stored Images',
+    'stats.imageBackendType': 'Image Backend Type',
+    'stats.imageBackendProvider': 'Image Backend Provider',
+    'stats.imageBackendModel': 'Image Backend Model',
+    'stats.imageFallback': 'Image Fallback',
+    'stats.plannerFallback': 'Planner Fallback',
+    'stats.imageRequestedCount': 'Requested',
+    'stats.imageSucceededCount': 'Succeeded',
+    'stats.imageFailedCount': 'Failed',
+    'stats.imageRetriedCount': 'Retried',
+    'stats.imageReusedCount': 'Reused',
+    'stats.imageBatchId': 'Batch ID',
     'systemLogs.title': 'System Logs',
     'systemLogs.allLevels': 'All levels',
     'systemLogs.search': 'Search logs',

@@ -57,7 +57,7 @@ from app.core.outcome import (
     is_client_disconnect_error,
 )
 from app.core.output import InternalOutputEvent, InternalOutputMessage, InternalToolCallOutput
-from app.core.types import InternalMessage, text_part, tool_call_part, tool_result_part
+from app.core.types import InternalMessage, append_system_text, prepend_system_text, text_part, tool_call_part, tool_result_part
 
 from app.core.state import (
     TOOL_ONLY_LIMIT,
@@ -240,6 +240,17 @@ def _resolved_image_generator(config: dict) -> dict:
     return resolved
 
 
+def _image_generator_identity(generator: dict) -> tuple[str, str]:
+    """Return the effective backend identity, not the client's model hint."""
+    backend_type = str(generator.get("backend_type") or "existing_model").strip()
+    if backend_type == "comfyui":
+        return "comfyui", "comfyui"
+    return (
+        str(generator.get("provider_id") or "").strip(),
+        str(generator.get("model") or generator.get("provider_model") or "").strip(),
+    )
+
+
 async def _generate_with_configured_backend(
     prompt: str,
     options: dict | None = None,
@@ -265,10 +276,12 @@ async def _generate_with_configured_backend(
     if len(prompt) > 8000:
         _app_log.warning("[responses image_generation] truncating image prompt from %d to 8000 chars", len(prompt))
         prompt = prompt[:8000]
+    backend_provider, backend_model = _image_generator_identity(generator)
     _app_log.info(
-        "[responses image_generation] backend=%s model=%s params=%s",
-        generator.get("provider_id") or "-",
-        generator.get("model") or "-",
+        "[responses image_generation] backend_type=%s api_base=%s provider_model=%s provider_id=%s model=%s effective_provider=%s effective_model=%s params=%s",
+        generator.get("backend_type") or "-", generator.get("api_base") or "-",
+        generator.get("provider_model") or "-", generator.get("provider_id") or "-",
+        generator.get("model") or "-", backend_provider or "-", backend_model or "-",
         sorted(key for key in ("n", "size", "quality", "background", "output_format") if opts.get(key) not in (None, "")),
     )
     try:
@@ -288,10 +301,10 @@ async def _generate_with_configured_backend(
             request_kind="image_generation",
             responses_mode="image_generation",
             upstream_endpoint="images/generations",
-            image_model=generator.get("model") or generator.get("provider_model") or "",
+            image_model=backend_model,
             image_count=0,
             image_bytes=0,
-            attempted_provider=generator.get("provider_id") or "",
+            attempted_provider=backend_provider,
         )
         raise
     except Exception as exc:
@@ -302,10 +315,10 @@ async def _generate_with_configured_backend(
             request_kind="image_generation",
             responses_mode="image_generation",
             upstream_endpoint="images/generations",
-            image_model=generator.get("model") or generator.get("provider_model") or "",
+            image_model=backend_model,
             image_count=0,
             image_bytes=0,
-            attempted_provider=generator.get("provider_id") or "",
+            attempted_provider=backend_provider,
         )
         raise error from exc
     return results, generator
@@ -342,8 +355,8 @@ def _image_batch_key(
     payload = {
         "principal": hashlib.sha256(f"{username}\0{api_key_value}".encode()).hexdigest(),
         "task": latest_user_text(body.get("input") or ""),
-        "backend": generator.get("provider_id") or "",
-        "model": generator.get("model") or generator.get("provider_model") or "",
+        "backend": _image_generator_identity(generator)[0],
+        "model": _image_generator_identity(generator)[1],
         "artifact_dir": str(image_result_directory()),
         "invocations": [
             {
@@ -2286,6 +2299,12 @@ def _log_request(username: str, api_key: str, model: str, provider_id: str,
         "responses_mode",
         "request_kind",
         "image_model",
+        "image_backend_type",
+        "image_backend_provider",
+        "image_backend_model",
+        "image_fallback_status",
+        "planner_fallback_status",
+        "planner_fallback_attempts",
         "image_count",
         "image_bytes",
         "image_artifact_count",
@@ -3112,16 +3131,14 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
         _app_log.info("[responses image_generation.history_compacted] removed=base64_previews")
     internal = responses_to_internal(body)
     if image_asset_context:
-        internal.messages.insert(0, InternalMessage(
-            role="system",
-            parts=[text_part(
-                "Gateway-generated project assets from the current user task follow. "
-                "These URLs are available even if the original display message is removed during "
-                "conversation normalization. Download and use the originals before continuing; "
-                "do not regenerate or replace them merely because they are not yet in the local "
-                f"workspace.\n\n{image_asset_context}"
-            )],
-        ))
+        prepend_system_text(
+            internal.messages,
+            "Gateway-generated project assets from the current user task follow. "
+            "These URLs are available even if the original display message is removed during "
+            "conversation normalization. Download and use the originals before continuing; "
+            "do not regenerate or replace them merely because they are not yet in the local "
+            f"workspace.\n\n{image_asset_context}",
+        )
     model = internal.target_model
     input_data = body.get("input", "")
     instructions = internal.metadata.get("instructions", "")
@@ -3217,14 +3234,14 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
             "background": image_tool.get("background") or body.get("background"),
             "output_format": image_tool.get("output_format") or body.get("output_format"),
         })
-        image_model = generator.get("model") or generator.get("provider_model") or ""
-        details = {**routing_details_from_policy(policy), "request_kind": "image_generation", "responses_mode": "image_generation", "upstream_endpoint": "images/generations", "image_model": image_model, "image_count": len(image_results), "image_bytes": image_results_bytes(image_results)}
+        image_provider, image_model = _image_generator_identity(generator)
+        details = {**routing_details_from_policy(policy), "request_kind": "image_generation", "responses_mode": "image_generation", "upstream_endpoint": "images/generations", "image_model": image_model, "image_backend_provider": image_provider, "image_backend_model": image_model, "image_backend_type": str(generator.get("backend_type") or ""), "image_fallback_status": "unused", "image_count": len(image_results), "image_bytes": image_results_bytes(image_results)}
         if stream:
             # Streaming requests return before the body iterator runs. Record
             # the completed backend operation here so the admin statistics do
             # not lose successful image requests.
-            _log_request(username, api_key_value, model, adapter_provider_id, "responses", True, 0, requested_model, details=details)
-            _record_request_log(endpoint="responses", username=username, api_key_value=api_key_value, requested_model=requested_model, final_model=model, final_provider=adapter_provider_id, request_body=body, response_body={"status": "completed", "output_count": len(image_results)}, success=True, status="ok", tokens=0, usage={}, details={**details, "stream": True}, stream=True)
+            _log_request(username, api_key_value, image_model, image_provider, "responses", True, 0, requested_model, details=details)
+            _record_request_log(endpoint="responses", username=username, api_key_value=api_key_value, requested_model=requested_model, final_model=image_model, final_provider=image_provider, request_body=body, response_body={"status": "completed", "output_count": len(image_results)}, success=True, status="ok", tokens=0, usage={}, details={**details, "stream": True}, stream=True)
             _record_success_metrics(username, api_key_value, 0, "ok")
             _app_log.info(
                 "[responses image_generation.bridge_wire] stream=true output_items=%d image_bytes=%d "
@@ -3239,11 +3256,11 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
             )
         rendered = render_responses_image_generation(image_results, model=model, previous_response_id=previous_response_id,
                                                      tool={"type": "image_generation", "output_format": "png"})
-        _log_request(username, api_key_value, model, adapter_provider_id, "responses", True, 0, requested_model, details=details)
+        _log_request(username, api_key_value, image_model, image_provider, "responses", True, 0, requested_model, details=details)
         _record_request_log(
             endpoint="responses", username=username, api_key_value=api_key_value,
-            requested_model=requested_model, final_model=model,
-            final_provider=adapter_provider_id, request_body=body,
+            requested_model=requested_model, final_model=image_model,
+            final_provider=image_provider, request_body=body,
             response_body={"status": "completed", "output_count": len(image_results)},
             success=True, status="ok", tokens=0, usage={}, details=details,
         )
@@ -3373,11 +3390,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                     for item in input_data
                 ))
             ):
-                correction_message = InternalMessage(
-                    role="system",
-                    parts=[text_part(IMAGE_BRIDGE_CORRECTION_INSTRUCTIONS)],
-                )
-                internal.messages.append(correction_message)
+                append_system_text(internal.messages, IMAGE_BRIDGE_CORRECTION_INSTRUCTIONS)
                 internal.tool_choice = {
                     "type": "function",
                     "function": {"name": IMAGE_BRIDGE_TOOL_NAME},
@@ -3451,14 +3464,19 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                 unresolved_failed_keys: set[str] = set()
                 image_invocation_attempt_count = 0
                 configured_generator = _resolved_image_generator(get_enabled_image_generator() or {})
-                image_model = configured_generator.get("model") or configured_generator.get("provider_model") or ""
-                image_provider = configured_generator.get("provider_id") or adapter_provider_id
+                image_provider, image_model = _image_generator_identity(configured_generator)
+                image_provider = image_provider or adapter_provider_id
+                image_model = image_model or model
                 running_details = {
                     **routing_details_from_policy(policy),
                     "request_kind": "image_generation",
                     "responses_mode": "model_driven_image_generation_running",
                     "upstream_endpoint": "images/generations",
                     "image_model": image_model,
+                    "image_backend_provider": image_provider,
+                    "image_backend_model": image_model,
+                    "image_backend_type": str(configured_generator.get("backend_type") or ""),
+                    "image_fallback_status": "unused",
                     "image_requested_count": len(image_invocations),
                     "image_succeeded_count": 0,
                     "image_failed_count": 0,
@@ -3553,7 +3571,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                         image_bytes=0,
                     )
                     raise first_error
-                image_model = generator.get("model") or generator.get("provider_model") or ""
+                image_provider, image_model = _image_generator_identity(generator)
                 bridge_image_model = image_model
                 planner_tokens = output.usage.get("total_tokens", 0)
                 tokens = planner_tokens
@@ -3720,7 +3738,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                             unresolved_failed_keys.discard(_image_prompt_key(args))
                         image_results.extend(round_results)
                         completed_invocations.extend(round_completed)
-                        image_model = generator.get("model") or generator.get("provider_model") or image_model
+                        _continuation_provider, image_model = _image_generator_identity(generator)
                         bridge_image_model = image_model
                         completed_call_ids = {call.call_id or call.id for call, _, _ in round_completed}
                         failed_call_ids = {call.call_id or call.id for call, _, _ in round_failed}
@@ -3815,6 +3833,15 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                     "image_continuation_error": continuation_error,
                     "image_correction_applied": image_correction_applied,
                 }
+                # Planner fallback is independent from the configured image backend.
+                # Do not present a recovered chat-planning request as image fallback.
+                if "fallback_status" in details:
+                    details["planner_fallback_status"] = details.pop("fallback_status")
+                if "fallback_attempts" in details:
+                    details["planner_fallback_attempts"] = details.pop("fallback_attempts")
+                details["image_fallback_status"] = "unused"
+                details["image_backend_provider"] = image_provider
+                details["image_backend_model"] = image_model
                 request_status = (
                     "degraded"
                     if (
@@ -4123,13 +4150,22 @@ async def _images_generation_request(request: Request, authorization: Optional[s
     if not configured_generator:
         raise HTTPException(status_code=503, detail="No image-generation backend is enabled")
     generator = _resolved_image_generator(configured_generator)
+    _app_log.info(
+        "[images endpoint] requested_model=%s backend_type=%s api_base=%s provider_model=%s provider_id=%s model=%s effective_provider=%s effective_model=%s",
+        requested_model,
+        generator.get("backend_type") or "-", generator.get("api_base") or "-",
+        generator.get("provider_model") or "-", generator.get("provider_id") or "-",
+        generator.get("model") or "-",
+        _image_generator_identity(generator)[0] or "-", _image_generator_identity(generator)[1] or "-",
+    )
     generator.setdefault("max_retries", get_default("image_generation_max_retries", 2))
     generator.setdefault("retry_base_seconds", get_default("image_generation_retry_base_seconds", 1.0))
     generator.setdefault("max_retry_delay_seconds", get_default("image_generation_max_retry_delay_seconds", 30.0))
     generator.setdefault("result_max_bytes", get_default("image_generation_result_max_bytes", 25 * 1024 * 1024))
     generator.setdefault("allow_private_download_hosts", get_default("image_download_allow_private_hosts", False))
-    image_provider_id = str(generator.get("provider_id") or provider_id or "")
-    image_model = str(generator.get("model") or generator.get("provider_model") or "")
+    image_provider_id, image_model = _image_generator_identity(generator)
+    image_provider_id = image_provider_id or provider_id
+    image_model = image_model or requested_model
     try:
         results = await generate_images(generator, prompt=prompt, model=generator.get("model") or None, n=body.get("n", 1), size=body.get("size"), quality=body.get("quality"), background=body.get("background"), output_format=body.get("output_format"), extra={k: v for k, v in body.items() if k not in {"model", "prompt", "n", "size", "quality", "background", "output_format"}})
     except Exception as exc:
@@ -4138,25 +4174,27 @@ async def _images_generation_request(request: Request, authorization: Optional[s
         details = {
             "request_kind": "image_generation", "responses_mode": "image_generation",
             "upstream_endpoint": "images/generations", "image_model": image_model,
+            "image_backend_provider": image_provider_id, "image_backend_model": image_model,
+            "image_backend_type": str(generator.get("backend_type") or ""), "image_fallback_status": "unused",
             "image_count": 0, "image_bytes": 0, "error_message": friendly_error_msg(exc),
         }
-        _log_request(username, api_key_value, requested_model, image_provider_id, "images_generations", False, 0, requested_model, details=details)
+        _log_request(username, api_key_value, image_model, image_provider_id, "images_generations", False, 0, requested_model, details=details)
         _record_request_log(
             endpoint="images_generations", username=username, api_key_value=api_key_value,
-            requested_model=requested_model, final_model=requested_model,
+            requested_model=requested_model, final_model=image_model,
             final_provider=image_provider_id, request_body=body, success=False,
             status="fail", tokens=0, details=details, error_message=friendly_error_msg(exc),
         )
         _record_success_metrics(username, api_key_value, 0, "fail")
         raise HTTPException(status_code=502, detail=friendly_error_msg(exc)) from exc
     data = [{"b64_json": item.data_uri.split(",", 1)[1], "mime_type": item.mime_type} for item in results]
-    details = {"request_kind": "image_generation", "responses_mode": "image_generation", "upstream_endpoint": "images/generations", "image_model": image_model, "image_count": len(results), "image_bytes": image_results_bytes(results)}
+    details = {"request_kind": "image_generation", "responses_mode": "image_generation", "upstream_endpoint": "images/generations", "image_model": image_model, "image_backend_provider": image_provider_id, "image_backend_model": image_model, "image_backend_type": str(generator.get("backend_type") or ""), "image_fallback_status": "unused", "image_count": len(results), "image_bytes": image_results_bytes(results)}
     username = user.get("username", "legacy")
     api_key_value = api_key.get("key", "")
-    _log_request(username, api_key_value, requested_model, image_provider_id, "images_generations", True, 0, requested_model, details=details)
+    _log_request(username, api_key_value, image_model, image_provider_id, "images_generations", True, 0, requested_model, details=details)
     _record_request_log(
         endpoint="images_generations", username=username, api_key_value=api_key_value,
-        requested_model=requested_model, final_model=requested_model,
+        requested_model=requested_model, final_model=image_model,
         final_provider=image_provider_id, request_body=body,
         response_body={"created": True, "image_count": len(results)},
         success=True, status="ok", tokens=0, details=details,

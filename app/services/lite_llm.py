@@ -208,6 +208,34 @@ def _disable_thinking_when_tools_forced(kwargs: dict[str, Any]) -> None:
         extra_body["thinking"] = {"type": "disabled"}
 
 
+def _merge_system_contents(contents: list) -> Any:
+    if not contents:
+        return ""
+    if all(isinstance(item, str) for item in contents):
+        return "\n\n".join(item for item in contents if item)
+    merged: list = []
+    for item in contents:
+        if isinstance(item, list):
+            merged.extend(item)
+        elif isinstance(item, str) and item:
+            merged.append({"type": "text", "text": item})
+        elif item not in (None, ""):
+            merged.append(item)
+    return merged or ""
+
+
+def _system_messages_first(messages: list) -> list:
+    """Guarantee a single leading system message for llama.cpp/Qwen templates."""
+    if not isinstance(messages, list):
+        return messages
+    systems = [item for item in messages if isinstance(item, dict) and item.get("role") == "system"]
+    if not systems:
+        return messages
+    conversation = [item for item in messages if not (isinstance(item, dict) and item.get("role") == "system")]
+    content = _merge_system_contents([item.get("content") for item in systems])
+    return [{"role": "system", "content": content}] + conversation
+
+
 def create_chat_completion(
     model: str,
     messages: list,
@@ -218,6 +246,7 @@ def create_chat_completion(
     kwargs.update(extra_params)
     _normalize_gpt5_temperature(litellm_model, kwargs)
     _disable_thinking_when_tools_forced(kwargs)
+    messages = _system_messages_first(messages)
     normalize_image_content(messages)
     if has_image_content(messages):
         kwargs["max_tokens"] = max(kwargs.get("max_tokens", 0), MIN_IMAGE_MAX_TOKENS)
@@ -238,6 +267,7 @@ def create_chat_completion_stream(
     kwargs["stream"] = True
     if "stream_options" not in kwargs:
         kwargs["stream_options"] = {"include_usage": True}
+    messages = _system_messages_first(messages)
     normalize_image_content(messages)
     if has_image_content(messages):
         kwargs["max_tokens"] = max(kwargs.get("max_tokens", 0), MIN_IMAGE_MAX_TOKENS)

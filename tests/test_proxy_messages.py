@@ -13,7 +13,7 @@ from app.core.think import extract_and_strip_think as _extract_and_strip_think
 from app.core.think import strip_think_tags as _strip_think_tags
 from app.core.tool_args import fix_tool_args as _fix_tool_args
 from app.core.tool_args import sanitize_args as _sanitize_args
-from app.core.types import InternalRequest
+from app.core.types import InternalMessage, InternalRequest, append_system_text, prepend_system_text, text_part
 from app.core.state import (
     conversation_cache_key as _conversation_cache_key,
     reasoning_cache as _reasoning_cache,
@@ -394,7 +394,7 @@ def test_normalize_single():
 
 
 def test_normalize_interleaved():
-    """Test behavior."""
+    """Non-adjacent system turns collapse into one leading system message."""
     msgs = [
         {"role": "system", "content": "S1"},
         {"role": "user", "content": "U1"},
@@ -402,7 +402,24 @@ def test_normalize_interleaved():
         {"role": "user", "content": "U2"},
     ]
     result = _normalize_internal_messages_for_test(msgs)
-    assert len(result) == 4
+    assert [item["role"] for item in result] == ["system", "user", "user"]
+    assert result[0]["content"] == "S1\n\nS2"
+    assert result[1]["content"] == "U1"
+    assert result[2]["content"] == "U2"
+
+
+def test_prepend_system_text_does_not_skip_short_substring():
+    messages = [InternalMessage(role="system", parts=[text_part("When the user asks for raster image generation, call the attached image-generation tool")])]
+    prepend_system_text(messages, "When the user asks for raster image generation")
+    assert messages[0].parts[0].text.startswith("When the user asks for raster image generation\n\n")
+
+
+def test_append_system_text_skips_only_exact_instruction_block():
+    messages = [InternalMessage(role="system", parts=[text_part("hello world extra text")])]
+    append_system_text(messages, "hello")
+    assert messages[0].parts[0].text == "hello world extra text\n\nhello"
+    append_system_text(messages, "hello")
+    assert messages[0].parts[0].text == "hello world extra text\n\nhello"
 
 
 # Test section

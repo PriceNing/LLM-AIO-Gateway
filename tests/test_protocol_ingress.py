@@ -9,16 +9,41 @@ from app.protocols.ingress import (
 from app.core.policy import prepare_request_policy
 from app.core.policy import RouteTarget, RoutingDecision
 from app.core.policy import fix_tool_args, inject_reasoning_content, request_has_tools, strip_tools
-from app.protocols.ir import ir_to_anthropic_messages, ir_to_openai_messages, openai_messages_to_ir
+from app.protocols.ir import ir_to_anthropic_messages, ir_to_openai_messages, openai_messages_to_ir, responses_input_to_ir
 from app.core.types import InternalMessage, text_part
+from app.adapters.anthropic import anthropic_body_from_internal
+from app.adapters.openai import chat_kwargs_from_internal, chat_messages_from_internal
+from app.services.preprocessing import preprocess_messages
 
 
 def test_ir_to_openai_messages_moves_late_system_turns_to_front():
     messages = [InternalMessage(role="user", parts=[text_part("hi")]), InternalMessage(role="system", parts=[text_part("rules")])]
     assert [m["role"] for m in ir_to_openai_messages(messages)] == ["system", "user"]
-from app.adapters.anthropic import anthropic_body_from_internal
-from app.adapters.openai import chat_kwargs_from_internal, chat_messages_from_internal
-from app.services.preprocessing import preprocess_messages
+    assert ir_to_openai_messages(messages)[0]["content"] == "rules"
+
+
+def test_ir_to_openai_messages_collapses_multiple_system_turns():
+    messages = [
+        InternalMessage(role="system", parts=[text_part("base")]),
+        InternalMessage(role="user", parts=[text_part("hi")]),
+        InternalMessage(role="system", parts=[text_part("extra")]),
+    ]
+    projected = ir_to_openai_messages(messages)
+    assert [m["role"] for m in projected] == ["system", "user"]
+    assert projected[0]["content"] == "base\n\nextra"
+
+
+def test_responses_input_merges_instructions_and_developer_into_one_system():
+    messages = responses_input_to_ir(
+        [
+            {"type": "message", "role": "developer", "content": "You are helpful."},
+            {"type": "message", "role": "user", "content": "Hi"},
+            {"type": "message", "role": "system", "content": "Stay concise."},
+        ],
+        instructions="Base rules",
+    )
+    assert [m.role for m in messages] == ["system", "user"]
+    assert messages[0].parts[0].text == "Base rules\n\nYou are helpful.\n\nStay concise."
 
 
 def test_ingress_uses_config_temperature_default(monkeypatch):

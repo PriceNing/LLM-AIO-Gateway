@@ -4,6 +4,7 @@ from typing import Any
 from app.core.types import (
     InternalMessage,
     InternalPart,
+    append_system_text,
     image_part,
     reasoning_part,
     text_part,
@@ -413,7 +414,10 @@ def responses_input_to_ir(
             rc = item.get("reasoning_content")
             if role == "assistant" and rc:
                 parts.insert(0, reasoning_part(rc, raw=rc))
-            messages.append(InternalMessage(role=role, parts=parts, raw=dict(item)))
+            if role == "system":
+                append_system_text(messages, _text_from_parts(parts) or "", raw=dict(item))
+            else:
+                messages.append(InternalMessage(role=role, parts=parts, raw=dict(item)))
             i += 1
 
         elif "role" in item:
@@ -422,7 +426,11 @@ def responses_input_to_ir(
                 role = "system"
             if role not in ("system", "user", "assistant", "tool"):
                 role = "user"
-            messages.append(InternalMessage(role=role, parts=_parts_from_responses_content(item.get("content", "")), raw=dict(item)))
+            parts = _parts_from_responses_content(item.get("content", ""))
+            if role == "system":
+                append_system_text(messages, _text_from_parts(parts) or "", raw=dict(item))
+            else:
+                messages.append(InternalMessage(role=role, parts=parts, raw=dict(item)))
             i += 1
 
         elif item_type in ("function_call", "custom_tool_call"):
@@ -501,15 +509,34 @@ def responses_input_to_ir(
     return messages
 
 
+def _merge_openai_system_contents(contents: list[Any]) -> Any:
+    if not contents:
+        return ""
+    if all(isinstance(item, str) for item in contents):
+        return "\n\n".join(item for item in contents if item)
+    merged: list[Any] = []
+    for item in contents:
+        if isinstance(item, list):
+            merged.extend(item)
+        elif isinstance(item, str) and item:
+            merged.append({"type": "text", "text": item})
+        elif item not in (None, ""):
+            merged.append(item)
+    return merged or ""
+
+
 def ir_to_openai_messages(messages: list[InternalMessage]) -> list[dict[str, Any]]:
     result = []
-    # OpenAI-compatible chat templates (notably llama.cpp/Qwen) require all
-    # system messages to precede the conversation. Responses input can carry
-    # historical/developer items in a later position, so project system turns
-    # first while preserving their relative order.
-    ordered_messages = [msg for msg in (messages or []) if msg.role == "system"]
-    ordered_messages.extend(msg for msg in (messages or []) if msg.role != "system")
-    for msg in ordered_messages:
+    # llama.cpp/Qwen templates reject both late system turns and more than one
+    # system turn. Collapse every system message into a single leading prompt.
+    system_contents: list[Any] = []
+    conversation = [msg for msg in (messages or []) if msg.role != "system"]
+    for msg in messages or []:
+        if msg.role == "system":
+            system_contents.append(_parts_to_openai_content(msg.parts))
+    if system_contents:
+        result.append({"role": "system", "content": _merge_openai_system_contents(system_contents)})
+    for msg in conversation:
         if msg.role in ("user", "tool") and any(part.kind == "tool_result" for part in msg.parts):
             pending_user_parts = []
             for part in msg.parts:

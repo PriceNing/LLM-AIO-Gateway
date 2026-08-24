@@ -6,6 +6,7 @@ from app.core.images import extract_image_data_uris, has_image_content, normaliz
 from app.services.lite_llm import (
     _disable_thinking_when_tools_forced,
     _normalize_gpt5_temperature,
+    _system_messages_first,
     get_litellm_model_name,
 )
 
@@ -39,6 +40,20 @@ def test_get_litellm_model_name_already_prefixed():
     provider = {"id": "any", "provider_type": "openai", "api_base": "https://api.test.com/v1"}
     assert get_litellm_model_name("openai/my-model", provider) == "openai/my-model"
     assert get_litellm_model_name("deepseek/v4", provider) == "openai/v4"
+
+
+def test_system_messages_first_collapses_to_one_leading_system():
+    messages = [
+        {"role": "system", "content": "base"},
+        {"role": "user", "content": "hi"},
+        {"role": "system", "content": "extra"},
+        {"role": "assistant", "content": "ok"},
+    ]
+    assert _system_messages_first(messages) == [
+        {"role": "system", "content": "base\n\nextra"},
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "ok"},
+    ]
 
 
 def test_disable_thinking_when_tools_forced_only_with_tools():

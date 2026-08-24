@@ -14,7 +14,7 @@ import json
 import re
 from typing import Any
 
-from app.core.types import InternalMessage, InternalRequest, InternalTool, text_part
+from app.core.types import InternalRequest, InternalTool, prepend_system_text, text_part
 
 
 IMAGE_BRIDGE_MARKER = "<llm-aio-codex-image-generation>"
@@ -388,7 +388,7 @@ def configure_internal_image_bridge(internal: InternalRequest, body: dict[str, A
         for part in message.parts
         if part.kind == "text"
     ):
-        internal.messages.insert(0, InternalMessage(role="system", parts=[text_part(IMAGE_BRIDGE_INSTRUCTIONS)]))
+        prepend_system_text(internal.messages, IMAGE_BRIDGE_INSTRUCTIONS)
     internal.extra["tools"] = internal.chat_tools()
     internal.tool_choice = None
     internal.extra.pop("tool_choice", None)

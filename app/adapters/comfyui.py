@@ -12,6 +12,10 @@ from urllib.parse import quote, urlparse
 
 import httpx
 
+from app.services.logger import get_logger
+
+_app_log = get_logger("app")
+
 
 _MAPPING_FIELDS = (
     "prompt", "negative_prompt", "width", "height", "seed",
@@ -343,6 +347,7 @@ async def generate_comfyui_images(
         if not prompt_id:
             details = submission.get("node_errors") or submission.get("error") or submission
             raise ValueError(f"ComfyUI rejected the workflow: {str(details)[:1000]}")
+        _app_log.info("[comfyui] submitted prompt_id=%s api_base=%s requested=%d", prompt_id, base, requested)
 
         history_item: dict[str, Any] | None = None
         while time.monotonic() - started < timeout:
@@ -362,6 +367,7 @@ async def generate_comfyui_images(
             await asyncio.sleep(poll_interval)
         if history_item is None:
             raise TimeoutError(f"ComfyUI workflow did not complete within {timeout} seconds")
+        _app_log.info("[comfyui] completed prompt_id=%s api_base=%s outputs=%d elapsed_ms=%d", prompt_id, base, len(history_item.get("outputs") or {}), int((time.monotonic() - started) * 1000))
 
         outputs = history_item.get("outputs") or {}
         selected_output = mapping.get("output_node_id")
@@ -396,4 +402,5 @@ async def generate_comfyui_images(
             ))
         if not results:
             raise RuntimeError("ComfyUI returned no downloadable image output")
+        _app_log.info("[comfyui] downloaded prompt_id=%s images=%d bytes=%d", prompt_id, len(results), sum(len(r.data_uri) for r in results))
         return results

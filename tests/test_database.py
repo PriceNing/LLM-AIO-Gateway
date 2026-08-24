@@ -277,6 +277,27 @@ def test_update_provider():
     assert result["retry_backoff"] == 2
 
 
+def test_update_provider_force_chat_completions_persists_as_int():
+    add_provider({"id": "force-chat", "name": "Force", "provider_type": "openai",
+                  "api_base": "", "api_key": "", "enabled": True, "models": []})
+    result = update_provider("force-chat", {"force_chat_completions": True})
+    assert result["force_chat_completions"] is True
+    with get_db() as db:
+        stored = db.execute(
+            "SELECT force_chat_completions FROM providers WHERE id = ?",
+            ("force-chat",),
+        ).fetchone()[0]
+    assert stored == 1
+    result = update_provider("force-chat", {"force_chat_completions": False})
+    assert result["force_chat_completions"] is False
+    with get_db() as db:
+        stored = db.execute(
+            "SELECT force_chat_completions FROM providers WHERE id = ?",
+            ("force-chat",),
+        ).fetchone()[0]
+    assert stored == 0
+
+
 def test_update_nonexistent_provider():
     assert update_provider("nope", {"name": "X"}) is None
 

@@ -18,6 +18,18 @@ ConversationKeyFunc = Callable[[str, list[InternalMessage], str], str]
 ReasoningContextFunc = Callable[[str, list[InternalMessage]], tuple[str | None, dict]]
 
 
+def _merge_compatible_messages(target: InternalMessage, source: InternalMessage) -> None:
+    if _message_parts_are_text_only(target.parts) and _message_parts_are_text_only(source.parts):
+        if target.parts and source.parts:
+            target.parts[-1].text = f"{target.parts[-1].text}\n\n{source.parts[0].text}"
+            target.parts.extend(source.parts[1:])
+        elif source.parts:
+            target.parts.extend(source.parts)
+    else:
+        target.parts.extend(source.parts)
+    _merge_message_metadata(target, source)
+
+
 def normalize_messages(request: InternalRequest) -> None:
     if not request.messages:
         return
@@ -30,19 +42,17 @@ def normalize_messages(request: InternalRequest) -> None:
                     part.text = strip_billing_header(part.text)
 
         if merged and merged[-1].role == msg.role and msg.role in ("system", "user"):
-            prev = merged[-1]
-            if _message_parts_are_text_only(prev.parts) and _message_parts_are_text_only(msg.parts):
-                if prev.parts and msg.parts:
-                    prev.parts[-1].text = f"{prev.parts[-1].text}\n\n{msg.parts[0].text}"
-                    prev.parts.extend(msg.parts[1:])
-                elif msg.parts:
-                    prev.parts.extend(msg.parts)
-            else:
-                prev.parts.extend(msg.parts)
-            _merge_message_metadata(prev, msg)
+            _merge_compatible_messages(merged[-1], msg)
             continue
 
         merged.append(msg)
+
+    systems = [msg for msg in merged if msg.role == "system"]
+    if len(systems) > 1:
+        combined = systems[0]
+        for extra in systems[1:]:
+            _merge_compatible_messages(combined, extra)
+        merged = [combined] + [msg for msg in merged if msg.role != "system"]
 
     request.messages = merged
 
