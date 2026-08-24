@@ -1168,6 +1168,8 @@ async def _probe_model_responses_capability(provider: dict, model: str) -> bool:
 async def _native_capability_for_request(provider: dict | None, model: str) -> bool:
     if not provider or provider.get("provider_type") != "openai":
         return False
+    if provider.get("force_chat_completions"):
+        return False
     provider_id = str(provider.get("id") or "")
     capability = get_model_responses_capability(provider_id, model)
     if _responses_capability_is_fresh(capability):

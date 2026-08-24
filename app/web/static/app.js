@@ -118,6 +118,7 @@ zh: {
     'providers.retryCount': '重试次数',
     'providers.retryBackoff': '重试退避（秒）',
     'providers.extraHeaders': '扩展 Headers (JSON)',
+    'providers.forceChatCompletions': '强制使用 Chat Completions（跳过 Responses 探测）',
     'providers.addFail': '新增失败',
     'providers.updateFail': '更新失败',
     'providers.deleteConfirm': '确定要删除这个提供商吗？',
@@ -474,6 +475,7 @@ en: {
     'providers.retryCount': 'Retry Count',
     'providers.retryBackoff': 'Retry Backoff (s)',
     'providers.extraHeaders': 'Extra Headers (JSON)',
+    'providers.forceChatCompletions': 'Force Chat Completions (skip Responses detection)',
     'providers.addFail': 'Failed to add',
     'providers.updateFail': 'Failed to update',
     'providers.deleteConfirm': 'Delete this provider?',
@@ -1859,6 +1861,7 @@ function providerFormHtml(title, provider, submitAction) {
                 '<input type="number" id="providerRetryBackoff" value="' + escHtml(provider.retry_backoff == null ? 0.5 : provider.retry_backoff) + '" min="0" max="60" step="0.1"></div>' +
         '</div>' +
         '<div class="form-group"><label><input type="checkbox" id="providerEnabled"' + (provider.enabled === false ? '' : ' checked') + '> ' + t('providers.enabled') + '</label></div>' +
+        '<div class="form-group"><label><input type="checkbox" id="providerForceChatCompletions"' + (provider.force_chat_completions ? ' checked' : '') + '> ' + t('providers.forceChatCompletions') + '</label></div>' +
         '<div class="form-group"><label>' + t('providers.extraHeaders') + '</label>' +
             '<textarea id="providerExtraHeaders" rows="3" style="font-family:monospace;font-size:12px" placeholder=\'{"thinking": "enabled"}\'>' + escHtml(JSON.stringify(provider.extra_headers || {}, null, 2)) + '</textarea></div>' +
         '<div class="form-actions">' +
@@ -1881,6 +1884,7 @@ function readProviderForm() {
         request_timeout: parseInt(document.getElementById('providerRequestTimeout').value, 10) || 120,
         retry_count: parseInt(document.getElementById('providerRetryCount').value, 10) || 0,
         retry_backoff: parseFloat(document.getElementById('providerRetryBackoff').value) || 0
+        ,force_chat_completions: document.getElementById('providerForceChatCompletions').checked
     };
 }
 

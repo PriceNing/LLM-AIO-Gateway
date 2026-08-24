@@ -119,6 +119,14 @@ def test_anthropic_provider_never_uses_openai_native_responses_probe_path():
         stream=True, required_tool_types=set(), is_primary=True,
     ) == (None, "")
 
+@pytest.mark.asyncio
+async def test_force_chat_completions_skips_responses_probe(monkeypatch):
+    provider = {"id": "llamacpp", "provider_type": "openai", "force_chat_completions": True}
+    async def fail_probe(*args, **kwargs):
+        raise AssertionError("Responses probe should be skipped")
+    monkeypatch.setattr("app.router.proxy._probe_model_responses_capability", fail_probe)
+    assert await _native_capability_for_request(provider, "qwen") is False
+
 
 @pytest.mark.asyncio
 async def test_unknown_capability_probe_caches_unsupported_on_incomplete_422(monkeypatch):

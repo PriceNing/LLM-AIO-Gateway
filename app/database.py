@@ -39,6 +39,7 @@ def init_db(path: Optional[str] = None) -> None:
             # Migration: add extra_headers to providers if missing
             _migrate_providers_extra_headers(conn)
             _migrate_provider_request_options(conn)
+            _migrate_provider_force_chat_completions(conn)
             _remove_legacy_provider_responses_capability(conn)
             _migrate_model_responses_capability(conn)
             _migrate_preprocessors(conn)
@@ -152,6 +153,12 @@ def _migrate_preprocessors(conn: sqlite3.Connection) -> None:
                 conn.execute(f"ALTER TABLE preprocessors ADD COLUMN {col} {ddl}")
             except sqlite3.OperationalError:
                 pass
+
+
+def _migrate_provider_force_chat_completions(conn: sqlite3.Connection) -> None:
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(providers)").fetchall()}
+    if "force_chat_completions" not in existing:
+        conn.execute("ALTER TABLE providers ADD COLUMN force_chat_completions INTEGER NOT NULL DEFAULT 0")
 
 
 def _migrate_image_generation(conn: sqlite3.Connection) -> None:
@@ -318,7 +325,8 @@ CREATE TABLE IF NOT EXISTS providers (
     extra_headers TEXT NOT NULL DEFAULT '{}',
     request_timeout INTEGER NOT NULL DEFAULT 120,
     retry_count INTEGER NOT NULL DEFAULT 0,
-    retry_backoff REAL NOT NULL DEFAULT 0.5
+    retry_backoff REAL NOT NULL DEFAULT 0.5,
+    force_chat_completions INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS provider_models (
@@ -1160,6 +1168,7 @@ def _provider_from_row(row: sqlite3.Row) -> dict:
     p["enabled"] = _to_bool(p["enabled"])
     p["extra_headers"] = _json_loads(p.get("extra_headers", "{}")) or {}
     p.update(_normalize_provider_request_options(p))
+    p["force_chat_completions"] = _to_bool(p.get("force_chat_completions", 0))
     return p
 
 
@@ -1384,13 +1393,13 @@ def add_provider(provider: dict) -> dict:
             db.execute(
                 """
                 INSERT INTO providers
-                    (id, name, provider_type, api_base, api_key, enabled, extra_headers, request_timeout, retry_count, retry_backoff)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (id, name, provider_type, api_base, api_key, enabled, extra_headers, request_timeout, retry_count, retry_backoff, force_chat_completions)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (provider["id"], provider["name"], provider.get("provider_type", "openai"),
                  provider.get("api_base", ""), provider.get("api_key", ""),
                  1 if provider.get("enabled", True) else 0,
-                 extra_headers_json, options["request_timeout"], options["retry_count"], options["retry_backoff"])
+                 extra_headers_json, options["request_timeout"], options["retry_count"], options["retry_backoff"], 1 if provider.get("force_chat_completions", False) else 0)
             )
         except sqlite3.IntegrityError:
             raise ValueError(f"Provider '{provider['id']}' already exists")
@@ -1416,6 +1425,7 @@ def add_provider(provider: dict) -> dict:
         "enabled": provider.get("enabled", True),
         "extra_headers": provider.get("extra_headers", {}),
         **options,
+        "force_chat_completions": bool(provider.get("force_chat_completions", False)),
         "models": [
             {
                 "id": m["id"],
@@ -1434,7 +1444,7 @@ def update_provider(provider_id: str, updates: dict) -> Optional[dict]:
         existing = db.execute("SELECT 1 FROM providers WHERE id = ?", (provider_id,)).fetchone()
         if not existing:
             return None
-        _updatable = {"name", "provider_type", "api_base", "api_key"}
+        _updatable = {"name", "provider_type", "api_base", "api_key", "force_chat_completions"}
         for key in _updatable:
             if key in updates:
                 db.execute(f"UPDATE providers SET {key} = ? WHERE id = ?", (updates[key], provider_id))
