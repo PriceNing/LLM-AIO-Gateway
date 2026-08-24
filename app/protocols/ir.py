@@ -503,7 +503,13 @@ def responses_input_to_ir(
 
 def ir_to_openai_messages(messages: list[InternalMessage]) -> list[dict[str, Any]]:
     result = []
-    for msg in messages or []:
+    # OpenAI-compatible chat templates (notably llama.cpp/Qwen) require all
+    # system messages to precede the conversation. Responses input can carry
+    # historical/developer items in a later position, so project system turns
+    # first while preserving their relative order.
+    ordered_messages = [msg for msg in (messages or []) if msg.role == "system"]
+    ordered_messages.extend(msg for msg in (messages or []) if msg.role != "system")
+    for msg in ordered_messages:
         if msg.role in ("user", "tool") and any(part.kind == "tool_result" for part in msg.parts):
             pending_user_parts = []
             for part in msg.parts:

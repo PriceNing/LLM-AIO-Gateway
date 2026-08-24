@@ -10,6 +10,12 @@ from app.core.policy import prepare_request_policy
 from app.core.policy import RouteTarget, RoutingDecision
 from app.core.policy import fix_tool_args, inject_reasoning_content, request_has_tools, strip_tools
 from app.protocols.ir import ir_to_anthropic_messages, ir_to_openai_messages, openai_messages_to_ir
+from app.core.types import InternalMessage, text_part
+
+
+def test_ir_to_openai_messages_moves_late_system_turns_to_front():
+    messages = [InternalMessage(role="user", parts=[text_part("hi")]), InternalMessage(role="system", parts=[text_part("rules")])]
+    assert [m["role"] for m in ir_to_openai_messages(messages)] == ["system", "user"]
 from app.adapters.anthropic import anthropic_body_from_internal
 from app.adapters.openai import chat_kwargs_from_internal, chat_messages_from_internal
 from app.services.preprocessing import preprocess_messages
