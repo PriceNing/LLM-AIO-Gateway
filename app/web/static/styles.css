@@ -1125,6 +1125,8 @@ a.icon-btn { text-decoration: none; }
   font-size: 11px;
   font-weight: 700;
   letter-spacing: 0.3px;
+  /* Keep short status/type labels (including CJK text) on one line. */
+  white-space: nowrap;
 }
 .badge-ok { background: var(--success-bg); color: var(--success); }
 .badge-fail { background: var(--danger-bg); color: var(--danger); }
