@@ -63,6 +63,10 @@ def test_disable_thinking_when_tools_forced_only_with_tools():
 
     kwargs["tools"] = [{"type": "function", "function": {"name": "run"}}]
     _disable_thinking_when_tools_forced(kwargs)
+    assert kwargs["extra_body"]["thinking"] == {"type": "enabled"}
+
+    kwargs["tool_choice"] = "required"
+    _disable_thinking_when_tools_forced(kwargs)
     assert kwargs["extra_body"]["thinking"] == {"type": "disabled"}
 
 

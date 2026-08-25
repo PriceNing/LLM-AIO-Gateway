@@ -9,6 +9,7 @@ from app.core.types import InternalRequest
 from app.database import parse_model_id
 from app.protocols.ir import ir_to_anthropic_messages
 from app.core.text import strip_billing_header
+from app.config import get_default
 from app.services.logger import get_logger
 
 
@@ -77,9 +78,45 @@ def _build_anthropic_request_body(
 
     extra_headers = provider_info.get("extra_headers", {}) or {}
     thinking = extra_headers.get("thinking")
-    if thinking in ("enabled", "disabled"):
-        req_body["thinking"] = {"type": thinking}
+    if thinking == "disabled":
+        req_body["thinking"] = {"type": "disabled"}
+    elif thinking == "enabled":
+        thinking_config = _enabled_thinking_config(max_tokens, extra_headers)
+        if thinking_config:
+            req_body["thinking"] = thinking_config
+            req_body.pop("temperature", None)
     return req_body
+
+
+def _enabled_thinking_config(max_tokens: int, extra_headers: dict) -> dict | None:
+    try:
+        budget = int(extra_headers.get("thinking_budget_tokens") or get_default("anthropic_thinking_budget_tokens", 1024))
+    except (TypeError, ValueError):
+        budget = 1024
+    budget = max(1024, budget)
+    try:
+        token_limit = int(max_tokens or 0)
+    except (TypeError, ValueError):
+        token_limit = 0
+    if token_limit <= 1024:
+        _app_log.warning(
+            "[anthropic] skipping thinking: max_tokens=%s is too small for budget_tokens>=1024",
+            token_limit,
+        )
+        return None
+    if budget >= token_limit:
+        budget = token_limit - 1
+    return {"type": "enabled", "budget_tokens": budget}
+
+
+def _http_exception_from_upstream(status_code: int, message: str) -> HTTPException:
+    if status_code == 429:
+        mapped = 429
+    elif 400 <= status_code < 500:
+        mapped = status_code
+    else:
+        mapped = 502
+    return HTTPException(status_code=mapped, detail=f"Upstream: {message}")
 
 
 def _anthropic_headers(provider_info: dict) -> dict:
@@ -156,8 +193,11 @@ def _anthropic_response_to_internal(data: dict) -> InternalOutputMessage:
         ))
     text = "\n".join(text_parts)
     reasoning = "\n".join(reasoning_parts)
-    if not text and reasoning:
-        text = reasoning
+    reasoning_signature = ""
+    for block in content_blocks:
+        if isinstance(block, dict) and block.get("type") == "thinking" and block.get("signature"):
+            reasoning_signature = str(block.get("signature") or "")
+            break
     if not text and not tool_calls:
         _app_log.warning(
             "[anthropic_output_adapter] empty output stop_reason=%s content_types=%s raw_keys=%s",
@@ -169,6 +209,7 @@ def _anthropic_response_to_internal(data: dict) -> InternalOutputMessage:
         role="assistant",
         text=text,
         reasoning=reasoning,
+        reasoning_signature=reasoning_signature,
         tool_calls=tool_calls,
         finish_reason=_finish_reason_from_anthropic(data.get("stop_reason", "end_turn")),
         usage={
@@ -242,7 +283,7 @@ async def anthropic_messages_completion(
                 if attempt < retries and _is_retryable_status(resp.status_code):
                     await asyncio.sleep(backoff * (2 ** attempt))
                     continue
-                raise HTTPException(status_code=502, detail=f"Upstream: {_upstream_error_message(resp)}")
+                raise _http_exception_from_upstream(resp.status_code, _upstream_error_message(resp))
             except (httpx.TimeoutException, httpx.TransportError) as exc:
                 last_exc = exc
                 if attempt < retries:

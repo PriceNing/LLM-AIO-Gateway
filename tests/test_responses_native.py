@@ -156,12 +156,49 @@ async def test_unknown_capability_probe_caches_unsupported_on_llamacpp_400(monke
     async def fake_post(provider, internal):
         raise httpx.HTTPStatusError(
             "bad request", request=request,
-            response=httpx.Response(400, text="unsupported", request=request),
+            response=httpx.Response(400, text="/responses endpoint not supported", request=request),
         )
     monkeypatch.setattr("app.router.proxy.post_native_response", fake_post)
     provider = {"id": "llamacpp", "provider_type": "openai"}
     assert await _native_capability_for_request(provider, "qwen") is False
     assert get_model_responses_capability("llamacpp", "qwen")["responses_status"] == "unsupported"
+
+
+@pytest.mark.asyncio
+async def test_unknown_capability_probe_caches_unsupported_on_missing_endpoint_404(monkeypatch):
+    add_provider({
+        "id": "chat-only", "name": "Chat Only", "provider_type": "openai",
+        "api_base": "http://chatonly.invalid/v1", "models": [{"id": "qwen"}],
+    })
+    request = httpx.Request("POST", "http://chatonly.invalid/v1/responses")
+    async def fake_post(provider, internal):
+        raise httpx.HTTPStatusError(
+            "not found", request=request,
+            response=httpx.Response(404, text="unknown endpoint", request=request),
+        )
+    monkeypatch.setattr("app.router.proxy.post_native_response", fake_post)
+    provider = {"id": "chat-only", "provider_type": "openai"}
+    assert await _native_capability_for_request(provider, "qwen") is False
+    assert get_model_responses_capability("chat-only", "qwen")["responses_status"] == "unsupported"
+
+
+@pytest.mark.asyncio
+async def test_generic_responses_400_is_not_cached_as_unsupported(monkeypatch):
+    add_provider({
+        "id": "pixel-400", "name": "Pixel", "provider_type": "openai",
+        "api_base": "http://pixel.invalid/v1", "models": [{"id": "gpt-5.6-luna"}],
+    })
+    request = httpx.Request("POST", "http://pixel.invalid/v1/responses")
+    async def fake_post(provider, internal):
+        raise httpx.HTTPStatusError(
+            "bad request", request=request,
+            response=httpx.Response(400, text="previous_response_id is invalid", request=request),
+        )
+    monkeypatch.setattr("app.router.proxy.post_native_response", fake_post)
+    provider = {"id": "pixel-400", "provider_type": "openai"}
+    assert await _native_capability_for_request(provider, "gpt-5.6-luna") is False
+    capability = get_model_responses_capability("pixel-400", "gpt-5.6-luna") or {}
+    assert capability.get("responses_status") != "unsupported"
 
 
 @pytest.mark.asyncio

@@ -34,6 +34,7 @@ class InternalOutputEvent:
     name: str = ""
     arguments_delta: str = ""
     arguments: str = ""
+    reasoning_signature: str = ""
     usage: dict[str, int] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
     raw: Any = None
@@ -53,6 +54,7 @@ class InternalOutputMessage:
     role: str = "assistant"
     text: str = ""
     reasoning: str = ""
+    reasoning_signature: str = ""
     tool_calls: list[InternalToolCallOutput] = field(default_factory=list)
     finish_reason: str = "stop"
     usage: dict[str, int] = field(default_factory=dict)

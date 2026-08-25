@@ -196,9 +196,22 @@ def _normalize_gpt5_temperature(model: str, kwargs: dict[str, Any]) -> None:
         kwargs["temperature"] = 1
 
 
+def _forced_tool_choice(tool_choice: Any) -> bool:
+    if tool_choice in ("required", "none"):
+        return True
+    if isinstance(tool_choice, dict):
+        choice_type = str(tool_choice.get("type") or "")
+        return choice_type in {"function", "tool", "required", "none"} or bool(tool_choice.get("name") or tool_choice.get("function"))
+    return False
+
+
 def _disable_thinking_when_tools_forced(kwargs: dict[str, Any]) -> None:
-    """DeepSeek rejects forced tool_choice while thinking mode is enabled."""
-    if not kwargs.get("tools"):
+    """DeepSeek historically rejected forced tool_choice while thinking was enabled.
+
+    Official DeepSeek V3.2+ docs allow tools together with thinking. Only disable
+    thinking for an explicitly forced tool_choice, not merely because tools exist.
+    """
+    if not kwargs.get("tools") or not _forced_tool_choice(kwargs.get("tool_choice")):
         return
     extra_body = kwargs.get("extra_body")
     if not isinstance(extra_body, dict):

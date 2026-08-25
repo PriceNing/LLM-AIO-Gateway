@@ -1137,9 +1137,10 @@ async def _probe_model_responses_capability(provider: dict, model: str) -> bool:
     """Probe native Responses support and cache the result per provider/model.
 
     A normal OpenAI-compatible provider is not proof of Responses support.  The
-    probe intentionally requires a valid Responses object; HTTP 4xx responses
-    (including llama.cpp's unsupported endpoint response) are cached as a
-    negative capability, while transient 5xx/network failures remain unknown.
+    probe intentionally requires a valid Responses object.  Explicit protocol
+    rejections (and incomplete 422s) are cached as unsupported.  Generic 400s
+    and transient 5xx/network failures stay unknown so a request-level validation
+    error cannot disable native Responses for hours.
     """
     provider_id = str(provider.get("id") or "")
     probe = responses_to_internal({
@@ -1163,13 +1164,13 @@ async def _probe_model_responses_capability(provider: dict, model: str) -> bool:
     except Exception as exc:
         response = getattr(exc, "response", None)
         status = getattr(exc, "status_code", None) or getattr(response, "status_code", None)
-        # A 400/422 from the probe means this upstream accepted the endpoint
-        # but rejected the minimal Responses protocol request.  For Chat-only
-        # or incomplete Responses proxies this is the practical unsupported
-        # signal.  Other 4xx responses are only negative when the body
-        # explicitly identifies the Responses endpoint/protocol as unsupported.
+        # Incomplete 422s are a practical unsupported signal for Chat-only or
+        # partial Responses proxies.  Generic 400s are not: request-level
+        # validation errors must not be cached as a missing protocol.  Other
+        # 4xx responses are only negative when the body explicitly identifies
+        # the Responses endpoint/protocol as unsupported.
         explicitly_unsupported = _native_error_is_explicitly_unsupported(exc)
-        if status in {400, 422} or explicitly_unsupported:
+        if explicitly_unsupported or status == 422:
             set_model_responses_capability(
                 provider_id, model, status="unsupported",
                 expires_at=_responses_capability_expiry("unsupported"),
@@ -1302,10 +1303,7 @@ async def _native_response_with_fallbacks(internal, *, stream: bool, required_to
         except Exception as exc:
             last_exc = exc
             is_empty_native = bool(getattr(exc, "native_empty_output", False))
-            is_protocol_unsupported = _native_error_is_explicitly_unsupported(exc) or (
-                getattr(exc, "response", None) is not None
-                and getattr(exc.response, "status_code", None) == 400
-            )
+            is_protocol_unsupported = _native_error_is_explicitly_unsupported(exc)
             if is_protocol_unsupported:
                 set_model_responses_capability(provider_id, target.model, status="unsupported", expires_at=_responses_capability_expiry("unsupported"), error=friendly_error_msg(exc))
             else:

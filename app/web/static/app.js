@@ -3390,9 +3390,13 @@ function maskKey(key) {
 
 async function copyText(text) {
     if (navigator.clipboard && navigator.clipboard.writeText) {
-        await navigator.clipboard.writeText(text);
-        toast(t('common.copied'), 'success');
-        return;
+        try {
+            await navigator.clipboard.writeText(text);
+            toast(t('common.copied'), 'success');
+            return;
+        } catch (e) {
+            // HTTP / permission failures still need the textarea fallback.
+        }
     }
     // 非安全上下文（HTTP 远程访问）降级方案
     const ta = document.createElement('textarea');

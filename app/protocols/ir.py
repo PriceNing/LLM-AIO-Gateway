@@ -332,11 +332,23 @@ def _anthropic_content_to_parts(content: Any) -> list[InternalPart]:
                 _anthropic_content_to_parts(block.get("content", "")),
                 raw=dict(block),
             ))
-        elif block_type in ("thinking", "redacted_thinking"):
+        elif block_type == "thinking":
+            extensions = {}
+            if block.get("signature"):
+                extensions["signature"] = block.get("signature")
             parts.append(reasoning_part(
                 block.get("thinking", "") or block.get("text", ""),
                 raw=dict(block),
-                extensions={"redacted": block_type == "redacted_thinking"},
+                extensions=extensions,
+            ))
+        elif block_type == "redacted_thinking":
+            extensions = {"redacted": True}
+            if block.get("data"):
+                extensions["data"] = block.get("data")
+            parts.append(reasoning_part(
+                block.get("thinking", "") or block.get("text", "") or block.get("data", ""),
+                raw=dict(block),
+                extensions=extensions,
             ))
         else:
             parts.append(unknown_part(dict(block)))
@@ -621,7 +633,19 @@ def _parts_to_anthropic_content(parts: list[InternalPart]) -> list[dict[str, Any
         elif part.kind == "tool_result":
             content.append({"type": "tool_result", "tool_use_id": part.tool_call_id, "content": _anthropic_tool_result_content(part.parts)})
         elif part.kind == "reasoning":
-            content.append({"type": "thinking", "thinking": part.text})
+            if part.extensions.get("redacted") or (isinstance(part.raw, dict) and part.raw.get("type") == "redacted_thinking"):
+                data = part.extensions.get("data")
+                if not data and isinstance(part.raw, dict):
+                    data = part.raw.get("data", "")
+                content.append({"type": "redacted_thinking", "data": data or ""})
+            else:
+                block = {"type": "thinking", "thinking": part.text}
+                signature = part.extensions.get("signature")
+                if not signature and isinstance(part.raw, dict):
+                    signature = part.raw.get("signature")
+                if signature:
+                    block["signature"] = signature
+                content.append(block)
         elif part.raw is not None:
             text = _unknown_part_text(part.raw)
             if text:

@@ -1740,18 +1740,22 @@ def test_chat_completions_stream_does_not_fallback_after_output(monkeypatch, tem
     assert calls == [("primary-midfail-model", "primary-stream-midfail")]
 
 
-def test_anthropic_output_uses_reasoning_as_text_when_visible_text_empty():
+def test_anthropic_output_keeps_reasoning_out_of_visible_text():
     from app.adapters.anthropic import _anthropic_response_to_internal
+    from app.protocols.egress import render_anthropic_message
 
     output = _anthropic_response_to_internal({
-        "content": [{"type": "thinking", "thinking": "hidden but useful"}],
+        "content": [{"type": "thinking", "thinking": "hidden but useful", "signature": "sig_1"}],
         "stop_reason": "max_tokens",
         "usage": {"input_tokens": 3, "output_tokens": 5},
     })
 
     assert output.reasoning == "hidden but useful"
-    assert output.text == "hidden but useful"
+    assert output.reasoning_signature == "sig_1"
+    assert output.text == ""
     assert output.finish_reason == "length"
+    rendered = render_anthropic_message(output, model="claude-test")
+    assert rendered["content"][0] == {"type": "thinking", "thinking": "hidden but useful", "signature": "sig_1"}
 
 
 def test_remember_response_chain_key_uses_final_conv_key():

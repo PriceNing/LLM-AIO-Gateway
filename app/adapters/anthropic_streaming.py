@@ -9,6 +9,7 @@ from app.adapters.anthropic import (
     _anthropic_headers,
     _anthropic_message_url,
     _build_anthropic_request_body,
+    _http_exception_from_upstream,
     _is_retryable_status,
     provider_request_timeout,
     provider_retry_backoff,
@@ -101,6 +102,8 @@ async def iter_anthropic_output_events(
                         await asyncio.sleep(backoff * (2 ** attempt))
                         continue
                     raise
+    except HTTPException:
+        raise
     except Exception as exc:
         _app_log.debug("[anthropic_stream_adapter] ERROR provider=%s model=%s error=%s", provider_id, model, friendly_error_msg(exc))
         raise HTTPException(status_code=502, detail=friendly_error_msg(exc)) from exc
@@ -146,7 +149,7 @@ async def _iter_anthropic_stream_once(
                 err_msg = err_data.get("error", {}).get("message", str(err_body)[:300])
             except Exception:
                 err_msg = f"HTTP {resp.status_code}"
-            raise HTTPException(status_code=resp.status_code, detail=f"Upstream {resp.status_code}: {err_msg}")
+            raise _http_exception_from_upstream(resp.status_code, err_msg)
 
         _app_log.debug("[anthropic_stream_adapter] CONNECTED provider=%s model=%s status=%d", provider_id, model, resp.status_code)
 
@@ -187,6 +190,7 @@ async def _iter_anthropic_stream_once(
                     "id": block.get("id", ""),
                     "name": block.get("name", ""),
                     "arguments": "",
+                    "signature": block.get("signature", "") or "",
                 }
                 _app_log.debug("[anthropic_stream_adapter] block_start index=%d type=%s", block_index, block_type)
                 if block_type == "tool_use":
@@ -244,6 +248,15 @@ async def _iter_anthropic_stream_once(
                     if thinking:
                         _app_log.debug("[anthropic_stream_adapter] reasoning_delta index=%d chars=%d", block_index, len(thinking))
                         yield InternalOutputEvent(kind="reasoning_delta", reasoning=thinking, raw=data)
+                elif delta_type == "signature_delta":
+                    signature = delta.get("signature", "") or ""
+                    if signature:
+                        state["signature"] = signature
+                        yield InternalOutputEvent(
+                            kind="reasoning_delta",
+                            reasoning_signature=signature,
+                            raw=data,
+                        )
             elif event_type == "content_block_stop":
                 block_index = int(data.get("index", 0))
                 state = block_states.get(block_index, {})

@@ -31,8 +31,6 @@ def response_to_internal_output(response) -> InternalOutputMessage:
     message = getattr(choice, "message", {})
     content = strip_think_tags(attr(message, "content", "") or "")
     reasoning = attr(message, "reasoning_content", None) or ""
-    if not content and reasoning:
-        content = reasoning
 
     tool_outputs = []
     for tc in attr(message, "tool_calls", None) or []:

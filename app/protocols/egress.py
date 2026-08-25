@@ -133,10 +133,7 @@ async def render_chat_completions_sse(events, *, model: str):
                 }]
             }
         elif event.kind == "message_done":
-            if not has_text and accumulated_reasoning:
-                yield _chat_chunk(chat_id, model, {"content": accumulated_reasoning}, event.finish_reason or "stop")
-            else:
-                yield _chat_chunk(chat_id, model, {}, event.finish_reason or ("tool_calls" if tool_calls else "stop"))
+            yield _chat_chunk(chat_id, model, {}, event.finish_reason or ("tool_calls" if tool_calls else "stop"))
             _app_log.debug(
                 "[egress_chat_stream] DONE model=%s finish_reason=%s text_chars=%d reasoning_chars=%d tool_calls=%d",
                 model,
@@ -373,8 +370,6 @@ async def render_responses_sse(events, *, model: str, previous_response_id: str 
             msg_out["reasoning_content"] = accumulated_reasoning
         yield f"data: {json.dumps({'type': 'response.output_item.done', 'output_index': text_output_index, 'item': msg_out})}\n\n"
         completion_output.append(msg_out)
-    elif accumulated_reasoning:
-        completion_output.append({"type": "message", "id": msg_id, "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": accumulated_reasoning, "annotations": []}]})
 
     for idx in sorted(tool_states):
         state = tool_states[idx]
@@ -425,6 +420,9 @@ async def render_anthropic_messages_sse(events, *, model: str):
 
     text_started = False
     text_index = 0
+    thinking_started = False
+    thinking_index = 0
+    thinking_signature = ""
     next_block_index = 0
     accumulated_text = ""
     accumulated_reasoning = ""
@@ -435,6 +433,11 @@ async def render_anthropic_messages_sse(events, *, model: str):
 
     async for event in events:
         if event.kind == "text_delta" and event.text:
+            if thinking_started:
+                if thinking_signature:
+                    yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': thinking_index, 'delta': {'type': 'signature_delta', 'signature': thinking_signature}})}\n\n"
+                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': thinking_index})}\n\n"
+                thinking_started = False
             if not text_started:
                 text_started = True
                 text_index = next_block_index
@@ -443,7 +446,17 @@ async def render_anthropic_messages_sse(events, *, model: str):
             accumulated_text += event.text
             yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': text_index, 'delta': {'type': 'text_delta', 'text': event.text}})}\n\n"
         elif event.kind == "reasoning_delta":
-            accumulated_reasoning += event.reasoning
+            signature = getattr(event, "reasoning_signature", "") or ""
+            if signature:
+                thinking_signature = signature
+            if event.reasoning:
+                if not thinking_started:
+                    thinking_started = True
+                    thinking_index = next_block_index
+                    next_block_index += 1
+                    yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': thinking_index, 'content_block': {'type': 'thinking', 'thinking': ''}})}\n\n"
+                accumulated_reasoning += event.reasoning
+                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': thinking_index, 'delta': {'type': 'thinking_delta', 'thinking': event.reasoning}})}\n\n"
         elif event.kind == "tool_call_start":
             block_index = next_block_index
             next_block_index += 1
@@ -472,12 +485,11 @@ async def render_anthropic_messages_sse(events, *, model: str):
             _app_log.debug("[egress_messages_stream] message_done finish_reason=%s", finish_reason)
             break
 
+    if thinking_started:
+        if thinking_signature:
+            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': thinking_index, 'delta': {'type': 'signature_delta', 'signature': thinking_signature}})}\n\n"
+        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': thinking_index})}\n\n"
     if text_started:
-        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': text_index})}\n\n"
-    elif accumulated_reasoning and not tool_states:
-        text_index = next_block_index
-        yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': text_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
-        yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': text_index, 'delta': {'type': 'text_delta', 'text': accumulated_reasoning}})}\n\n"
         yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': text_index})}\n\n"
 
     for idx in sorted(tool_states):
@@ -591,6 +603,11 @@ def render_anthropic_message(output: InternalOutputMessage, *, model: str) -> di
         output.usage.get("total_tokens", 0),
     )
     content_blocks = []
+    if output.reasoning:
+        thinking_block = {"type": "thinking", "thinking": output.reasoning}
+        if getattr(output, "reasoning_signature", ""):
+            thinking_block["signature"] = output.reasoning_signature
+        content_blocks.append(thinking_block)
     if output.text:
         content_blocks.append({"type": "text", "text": output.text})
     for tool in output.tool_calls:

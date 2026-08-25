@@ -178,7 +178,7 @@ def test_ir_preserves_anthropic_cache_control_tool_use_tool_result_and_images():
         "system": [{"type": "text", "text": "sys", "cache_control": {"type": "ephemeral"}}],
         "messages": [
             {"role": "assistant", "content": [
-                {"type": "thinking", "thinking": "reason"},
+                {"type": "thinking", "thinking": "reason", "signature": "sig_abc"},
                 {"type": "text", "text": "I will call"},
                 {"type": "tool_use", "id": "toolu_1", "name": "run", "input": {"x": 1}},
             ]},
@@ -194,6 +194,7 @@ def test_ir_preserves_anthropic_cache_control_tool_use_tool_result_and_images():
     user = req.messages[2]
     assert system.parts[0].extensions["cache_control"] == {"type": "ephemeral"}
     assert assistant.parts[0].kind == "reasoning"
+    assert assistant.parts[0].extensions["signature"] == "sig_abc"
     assert assistant.parts[2].kind == "tool_call"
     assert assistant.parts[2].tool_call_id == "toolu_1"
     assert assistant.parts[2].arguments == {"x": 1}
@@ -203,6 +204,7 @@ def test_ir_preserves_anthropic_cache_control_tool_use_tool_result_and_images():
 
     anthropic_messages, system_out = ir_to_anthropic_messages(req.messages)
     assert system_out[0]["cache_control"] == {"type": "ephemeral"}
+    assert anthropic_messages[0]["content"][0] == {"type": "thinking", "thinking": "reason", "signature": "sig_abc"}
     assert anthropic_messages[0]["content"][2]["id"] == "toolu_1"
 
 
