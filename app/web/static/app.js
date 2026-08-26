@@ -377,6 +377,18 @@ zh: {
     'common.close': '关闭',
     'common.yes': '确定',
     'common.no': '取消',
+    'models.addCustom': '添加自定义模型',
+    'models.addCustomTitle': '添加自定义模型',
+    'models.modelId': '模型 ID',
+    'models.modelName': '模型名称',
+    'models.sourceManual': '手动',
+    'models.sourceAuto': '自动',
+    'models.delete': '删除模型',
+    'models.deleteConfirm': '确定要删除模型 {model} 吗？',
+    'models.deleteFail': '删除模型失败',
+    'models.makeManual': '转为手动（不会被刷新删除）',
+    'models.editModel': '编辑模型',
+    'models.saveEdit': '保存',
 },
 
 en: {
@@ -735,6 +747,18 @@ en: {
     'common.close': 'Close',
     'common.yes': 'Yes',
     'common.no': 'No',
+    'models.addCustom': 'Add Custom Model',
+    'models.addCustomTitle': 'Add Custom Model',
+    'models.modelId': 'Model ID',
+    'models.modelName': 'Model Name',
+    'models.sourceManual': 'Manual',
+    'models.sourceAuto': 'Auto',
+    'models.delete': 'Delete Model',
+    'models.deleteConfirm': 'Delete model {model}?',
+    'models.deleteFail': 'Failed to delete model',
+    'models.makeManual': 'Make manual (survives refresh)',
+    'models.editModel': 'Edit Model',
+    'models.saveEdit': 'Save',
 }
 };
 
@@ -1824,6 +1848,7 @@ function renderProviders() {
             '</div>' +
             '<div class="card-actions">' +
                 '<button class="btn btn-secondary btn-sm" onclick="editProvider(\'' + jsEsc(p.id) + '\')">' + t('providers.edit') + '</button>' +
+                '<button class="btn btn-secondary btn-sm" onclick="addCustomModel(\'' + jsEsc(p.id) + '\')">' + t('models.addCustom') + '</button>' +
                 '<button class="btn btn-secondary btn-sm" onclick="refreshProvider(\'' + jsEsc(p.id) + '\')">' + t('providers.refresh') + '</button>' +
                 '<button class="btn btn-secondary btn-sm" onclick="checkProviderHealth(\'' + jsEsc(p.id) + '\')">' + t('providers.health') + '</button>' +
                 '<button class="btn btn-danger btn-sm" onclick="deleteProvider(\'' + jsEsc(p.id) + '\')">' + t('providers.delete') + '</button>' +
@@ -1832,6 +1857,114 @@ function renderProviders() {
     }).join('');
 }
 
+async function deleteProviderModel(providerId, modelId) {
+    if (!confirm(t('models.deleteConfirm', {model: modelId}))) return;
+    try {
+        await api('/admin/providers/' + encodeURIComponent(providerId) +
+                  '/models/' + encodeURIComponent(modelId), { method: 'DELETE' });
+        await Promise.all([loadProviders(), loadModels()]);
+    } catch (e) { toast(t('models.deleteFail') + ': ' + e.message, 'error'); }
+}
+
+function addCustomModel(providerId) {
+    var provider = providers.find(function(item) { return item.id === providerId; });
+    if (!provider) return;
+    document.getElementById('modalContent').innerHTML =
+        '<h2>' + t('models.addCustomTitle') + '</h2>' +
+        '<div class="form-group"><label>' + t('models.modelId') + '</label>' +
+            '<input type="text" id="customModelId" placeholder="gpt-4o-preview-1120"></div>' +
+        '<div class="form-group"><label>' + t('models.modelName') + '</label>' +
+            '<input type="text" id="customModelName" placeholder=""></div>' +
+        '<div class="modal-actions">' +
+            '<button class="btn btn-secondary" onclick="closeModal()">' + t('common.cancel') + '</button>' +
+            '<button class="btn btn-primary" onclick="submitCustomModel(\'' + jsEsc(providerId) + '\')">' + t('common.save') + '</button>' +
+        '</div>';
+    document.getElementById('modal').style.display = 'flex';
+}
+
+async function submitCustomModel(providerId) {
+    var provider = providers.find(function(item) { return item.id === providerId; });
+    if (!provider) return;
+    var idInput = document.getElementById('customModelId');
+    var nameInput = document.getElementById('customModelName');
+    var modelId = (idInput.value || '').trim();
+    if (!modelId) { toast(t('models.modelId'), 'error'); return; }
+    var modelName = (nameInput.value || '').trim() || modelId;
+
+    var existing = (provider.models || []).map(function(m) {
+        return { id: m.id, name: m.name, enabled: m.enabled };
+    });
+    if (existing.some(function(m) { return m.id === modelId; })) {
+        toast(t('models.modelId') + ': ' + modelId, 'error');
+        return;
+    }
+    existing.push({ id: modelId, name: modelName, enabled: true });
+
+    try {
+        await api('/admin/providers/' + encodeURIComponent(providerId), {
+            method: 'PUT',
+            body: JSON.stringify({ models: existing })
+        });
+        closeModal();
+        await Promise.all([loadProviders(), loadModels()]);
+    } catch (e) { toast(t('providers.updateFail') + ': ' + e.message, 'error'); }
+}
+
+function editModel(providerId, modelId) {
+    var m = models.find(function(item) { return item.id === modelId && item.provider === providerId; });
+    if (!m) return;
+    var isManual = m.source === 'manual';
+    var checkbox = '<label><input type="checkbox" id="modelMakeManual" value="1"' +
+        (isManual ? ' checked disabled' : '') + '> ' + t('models.makeManual') + '</label>';
+    document.getElementById('modalContent').innerHTML =
+        '<h2>' + t('models.editModel') + '</h2>' +
+        '<div class="form-group"><label>' + t('models.modelId') + '</label>' +
+            '<input type="text" value="' + escHtml(modelId) + '" disabled></div>' +
+        '<div class="form-group"><label>' + t('models.modelName') + '</label>' +
+            '<input type="text" id="modelEditName" value="' + escHtml(m.name || m.id) + '"></div>' +
+        '<div class="form-group">' + checkbox + '</div>' +
+        '<div class="modal-actions">' +
+            '<button class="btn btn-secondary" onclick="closeModal()">' + t('common.cancel') + '</button>' +
+            '<button class="btn btn-primary" onclick="saveModelEdit(\'' + jsEsc(providerId) + '\', \'' + jsEsc(modelId) + '\')">' + t('models.saveEdit') + '</button>' +
+        '</div>';
+    document.getElementById('modal').style.display = 'flex';
+}
+
+async function saveModelEdit(providerId, modelId) {
+    var m = models.find(function(item) { return item.id === modelId && item.provider === providerId; });
+    if (!m) return;
+    var nameInput = document.getElementById('modelEditName');
+    var makeManualCheckbox = document.getElementById('modelMakeManual');
+    var newName = (nameInput.value || '').trim() || modelId;
+    var makeManual = makeManualCheckbox && makeManualCheckbox.checked && m.source !== 'manual';
+
+    // Build the model update payload: preserve all existing fields, override name/enabled,
+    // and add source: 'manual' only when the checkbox is checked.
+    var provider = providers.find(function(item) { return item.id === providerId; });
+    if (!provider) return;
+    var existing = (provider.models || []).map(function(mm) {
+        var obj = { id: mm.id, name: mm.name, enabled: mm.enabled };
+        if (mm.id === modelId && makeManual) {
+            obj.source = 'manual';
+        }
+        return obj;
+    });
+    // Update the name for the edited model
+    for (var i = 0; i < existing.length; i++) {
+        if (existing[i].id === modelId) {
+            existing[i].name = newName;
+        }
+    }
+
+    try {
+        await api('/admin/providers/' + encodeURIComponent(providerId), {
+            method: 'PUT',
+            body: JSON.stringify({ models: existing })
+        });
+        closeModal();
+        await Promise.all([loadProviders(), loadModels()]);
+    } catch (e) { toast(t('providers.updateFail') + ': ' + e.message, 'error'); }
+}
 function showAddProviderModal() {
     document.getElementById('modalContent').innerHTML = providerFormHtml(t('providers.addTitle'), {}, 'addProvider()');
     document.getElementById('modal').style.display = 'flex';
@@ -2000,14 +2133,19 @@ function renderModels() {
 
         for (var mi = 0; mi < groupModels.length; mi++) {
             var m = groupModels[mi];
+            var isManual = m.source === 'manual';
+            var sourceBadge = '<span class="model-source-badge ' + (isManual ? 'manual' : 'auto') + '">' +
+                (isManual ? t('models.sourceManual') : t('models.sourceAuto')) + '</span>';
             html += '<div class="model-item">' +
                 '<div class="model-info">' +
-                    '<span class="model-name">' + escHtml(m.name || m.id) + '</span>' +
+                    '<span class="model-name">' + escHtml(m.name || m.id) + sourceBadge + '</span>' +
                     '<span class="model-id mono">' + escHtml(m.id) + '</span>' +
                 '</div>' +
                 '<div class="model-actions">' +
                     '<button class="btn btn-secondary btn-sm" onclick="copyText(\'' + jsEsc(m.id) + '\')">' + t('models.copyId') + '</button>' +
+                    '<button class="btn btn-secondary btn-sm" onclick="editModel(\'' + jsEsc(m.provider) + '\', \'' + jsEsc(m.id) + '\')">' + t('common.edit') + '</button>' +
                     '<button class="btn btn-primary btn-sm" onclick="testModel(\'' + jsEsc(m.id) + '\', this)">' + t('models.test') + '</button>' +
+                    '<button class="btn btn-danger btn-sm" onclick="deleteProviderModel(\'' + jsEsc(m.provider) + '\', \'' + jsEsc(m.id) + '\')">' + t('common.delete') + '</button>' +
                 '</div>' +
             '</div>';
         }

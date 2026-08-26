@@ -303,6 +303,7 @@ def get_available_models(provider_id: Optional[str] = None) -> list:
                         "name": model.get("name", model["id"]),
                         "provider": provider["id"],
                         "provider_name": provider["name"],
-                        "provider_type": provider["provider_type"]
+                        "provider_type": provider["provider_type"],
+                        "source": model.get("source", "auto")
                     })
     return models

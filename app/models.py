@@ -2,9 +2,12 @@ from pydantic import BaseModel, Field
 from typing import Optional
 
 class ModelInfo(BaseModel):
-    id: str = Field(pattern=r"^[a-zA-Z0-9._-]+$")
+    # Hidden/preview upstream model ids can contain '/', ':', '@' and spaces,
+    # so only forbid control characters instead of allowlisting a narrow set.
+    id: str = Field(min_length=1, max_length=200, pattern=r"^[^\x00-\x1f]+$")
     name: str
     enabled: bool = True
+    source: Optional[str] = Field(default=None, pattern="^(auto|manual)$")
 
 class ProviderBase(BaseModel):
     id: str = Field(pattern=r"^[a-zA-Z0-9._-]+$")

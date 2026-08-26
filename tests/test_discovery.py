@@ -7,7 +7,13 @@ from app.services.discovery import (
     check_provider_health,
     refresh_provider_models,
 )
-from app.database import add_provider, get_provider, init_db
+from app.database import add_provider, get_provider, get_db, init_db
+
+
+def _set_source(pid, model_id, source):
+    with get_db() as db:
+        db.execute("UPDATE provider_models SET source = ? WHERE provider_id = ? AND model_id = ?",
+                   (source, pid, model_id))
 
 
 @pytest.fixture(autouse=True)
@@ -206,6 +212,10 @@ async def test_refresh_provider_models_replaces_stale_models(monkeypatch):
             {"id": "renamed-model", "name": "Before", "enabled": False},
         ],
     })
+    # Models seeded by add_provider are manual by default (rule 1).
+    # Flip them to auto so they behave like a previous refresh discovered them.
+    _set_source("refresh-sync", "old-model", "auto")
+    _set_source("refresh-sync", "renamed-model", "auto")
 
     async def discover(_provider_id):
         return [

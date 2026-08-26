@@ -122,6 +122,9 @@ async def refresh_provider_models(provider_id: str) -> dict:
             "provider_id": provider_id,
             "discovered": [],
             "count": 0,
+            "added": 0,
+            "updated": 0,
+            "removed": 0,
             "error": str(exc)
         }
 
@@ -134,29 +137,38 @@ async def refresh_provider_models(provider_id: str) -> dict:
         discovered_ids = set(discovered_by_id)
         with get_db() as db:
             existing_rows = db.execute(
-                "SELECT model_id FROM provider_models WHERE provider_id = ?",
+                "SELECT model_id, source FROM provider_models WHERE provider_id = ?",
                 (provider_id,),
             ).fetchall()
             existing_ids = {row["model_id"] for row in existing_rows}
+            # Manual models are user-owned: refresh never deletes them and never
+            # overwrites their display name, even when the same id also appears
+            # upstream. Only auto-discovered rows stay in sync with /models.
+            auto_ids = {
+                row["model_id"]
+                for row in existing_rows
+                if (row["source"] or "auto") == "auto"
+            }
 
-            stale_ids = existing_ids - discovered_ids
+            stale_ids = auto_ids - discovered_ids
             if stale_ids:
                 db.executemany(
-                    "DELETE FROM provider_models WHERE provider_id = ? AND model_id = ?",
+                    "DELETE FROM provider_models WHERE provider_id = ? AND model_id = ? AND source = 'auto'",
                     [(provider_id, model_id) for model_id in stale_ids],
                 )
                 removed = len(stale_ids)
 
             for model_id, model in discovered_by_id.items():
                 if model_id in existing_ids:
-                    db.execute(
-                        "UPDATE provider_models SET model_name = ? WHERE provider_id = ? AND model_id = ?",
+                    cursor = db.execute(
+                        "UPDATE provider_models SET model_name = ? WHERE provider_id = ? AND model_id = ? AND source = 'auto'",
                         (model["name"], provider_id, model_id),
                     )
-                    updated += 1
+                    if cursor.rowcount:
+                        updated += 1
                 else:
                     db.execute(
-                        "INSERT INTO provider_models (provider_id, model_id, model_name, enabled) VALUES (?, ?, ?, 1)",
+                        "INSERT OR IGNORE INTO provider_models (provider_id, model_id, model_name, enabled, source) VALUES (?, ?, ?, 1, 'auto')",
                         (provider_id, model_id, model["name"]),
                     )
                     added += 1

@@ -8,7 +8,7 @@ from fastapi import APIRouter, HTTPException, Header
 from typing import Optional
 from datetime import datetime, timedelta, timezone
 from app.database import (
-    get_providers, get_provider, add_provider, update_provider, delete_provider,
+    get_providers, get_provider, add_provider, update_provider, delete_provider, delete_provider_model,
     get_users, get_user, add_user, update_user, delete_user,
     add_user_api_key, update_user_api_key, delete_user_api_key,
     get_routing_rules, get_routing_rule, add_routing_rule, update_routing_rule, delete_routing_rule,
@@ -78,6 +78,16 @@ async def delete_provider_endpoint(provider_id: str, authorization: Optional[str
     if not delete_provider(provider_id):
         raise HTTPException(status_code=404, detail="Provider not found")
     return {"status": "deleted", "provider_id": provider_id}
+
+
+@router.delete("/providers/{provider_id}/models/{model_id}")
+async def delete_provider_model_endpoint(provider_id: str, model_id: str, authorization: Optional[str] = Header(None)):
+    await require_admin_session(authorization)
+    if not get_provider(provider_id):
+        raise HTTPException(status_code=404, detail="Provider not found")
+    if not delete_provider_model(provider_id, model_id):
+        raise HTTPException(status_code=404, detail="Model not found")
+    return {"status": "deleted", "provider_id": provider_id, "model_id": model_id}
 
 
 @router.post("/providers/{provider_id}/refresh")

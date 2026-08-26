@@ -733,7 +733,26 @@ a.icon-btn { text-decoration: none; }
 }
 .model-item:hover { background: var(--bg-surface-hover); }
 .model-item .model-info { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-.model-item .model-name { font-weight: 600; font-size: 14px; }
+.model-item .model-name { font-weight: 600; font-size: 14px; display: flex; align-items: center; gap: 8px; }
+.model-source-badge {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  padding: 1px 6px;
+  border-radius: 999px;
+  text-transform: uppercase;
+  flex-shrink: 0;
+}
+.model-source-badge.manual {
+  background: rgba(99, 102, 241, 0.16);
+  color: #6366f1;
+  border: 1px solid rgba(99, 102, 241, 0.32);
+}
+.model-source-badge.auto {
+  background: var(--bg-surface-hover);
+  color: var(--text-tertiary);
+  border: 1px solid var(--border-subtle, rgba(128,128,128,0.24));
+}
 .model-item .model-provider {
   font-size: 12px;
   color: var(--text-tertiary);

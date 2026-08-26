@@ -1,0 +1,4 @@
+# Testing (pip install -r requirements-dev.txt)
+pytest>=7.0
+pytest-asyncio>=0.21
+esprima>=4.0

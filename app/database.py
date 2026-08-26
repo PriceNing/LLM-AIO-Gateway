@@ -44,6 +44,7 @@ def init_db(path: Optional[str] = None) -> None:
             _migrate_model_responses_capability(conn)
             _migrate_preprocessors(conn)
             _migrate_image_generation(conn)
+            _migrate_provider_models_source(conn)
             _migrate_request_records_image_generation(conn)
             _migrate_image_generation_stats(conn)
             # Routing and fallback policy migrations.
@@ -153,6 +154,20 @@ def _migrate_preprocessors(conn: sqlite3.Connection) -> None:
                 conn.execute(f"ALTER TABLE preprocessors ADD COLUMN {col} {ddl}")
             except sqlite3.OperationalError:
                 pass
+
+
+def _migrate_provider_models_source(conn: sqlite3.Connection) -> None:
+    """Add the model source column (auto vs manual) for existing databases.
+
+    Existing rows default to 'auto' so refresh keeps its historical behaviour
+    for everything that was discovered from an upstream /models endpoint.
+    """
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(provider_models)").fetchall()}
+    if "source" not in existing:
+        try:
+            conn.execute("ALTER TABLE provider_models ADD COLUMN source TEXT NOT NULL DEFAULT 'auto'")
+        except sqlite3.OperationalError:
+            pass
 
 
 def _migrate_provider_force_chat_completions(conn: sqlite3.Connection) -> None:
@@ -338,6 +353,7 @@ CREATE TABLE IF NOT EXISTS provider_models (
     created_at TEXT NOT NULL DEFAULT '',
     preprocessor TEXT NOT NULL DEFAULT '',
     image_generation TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT 'auto',
     responses_status TEXT NOT NULL DEFAULT 'unknown',
     responses_checked_at TEXT NOT NULL DEFAULT '',
     responses_expires_at TEXT NOT NULL DEFAULT '',
@@ -1174,10 +1190,12 @@ def _provider_from_row(row: sqlite3.Row) -> dict:
 
 def _model_from_row(row: sqlite3.Row) -> dict:
     image_generation = row["image_generation"] if "image_generation" in row.keys() else ""
+    source = (row["source"] if "source" in row.keys() else "") or "auto"
     model = {
         "id": row["model_id"], "name": row["model_name"],
         "enabled": _to_bool(row["enabled"]), "preprocessor": row["preprocessor"] or "",
         "image_generation": bool(image_generation),
+        "source": source,
         "responses_status": row["responses_status"] or "unknown",
         "responses_checked_at": row["responses_checked_at"] or "",
         "responses_expires_at": row["responses_expires_at"] or "",
@@ -1405,7 +1423,7 @@ def add_provider(provider: dict) -> dict:
             raise ValueError(f"Provider '{provider['id']}' already exists")
         for m in provider.get("models", []):
             db.execute(
-                "INSERT OR IGNORE INTO provider_models (provider_id, model_id, model_name, enabled, preprocessor, image_generation) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT OR IGNORE INTO provider_models (provider_id, model_id, model_name, enabled, preprocessor, image_generation, source) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
                     provider["id"],
                     m["id"],
@@ -1413,6 +1431,7 @@ def add_provider(provider: dict) -> dict:
                     1 if m.get("enabled", True) else 0,
                     m.get("preprocessor", ""),
                     "1" if m.get("image_generation") else "",
+                    "manual",
                 )
             )
     options = _normalize_provider_request_options(provider)
@@ -1433,6 +1452,14 @@ def add_provider(provider: dict) -> dict:
                 "enabled": m.get("enabled", True),
                 "preprocessor": m.get("preprocessor", ""),
                 "image_generation": bool(m.get("image_generation")),
+                "source": "manual",
+                "responses_status": "unknown",
+                "responses_checked_at": "",
+                "responses_expires_at": "",
+                "responses_streaming": False,
+                "responses_streaming_status": "unknown",
+                "responses_tool_types": [],
+                "responses_error": "",
             }
             for m in provider.get("models", [])
         ]
@@ -1477,10 +1504,18 @@ def update_provider(provider_id: str, updates: dict) -> Optional[dict]:
                             "UPDATE provider_models SET model_name = ?, enabled = ?, preprocessor = ? WHERE provider_id = ? AND model_id = ?",
                             (m.get("name", m["id"]), 1 if m.get("enabled", True) else 0, m.get("preprocessor", ""), provider_id, m["id"])
                         )
+                    # Explicit opt-in only: the caller must send source="manual"
+                    # to promote an auto-discovered model. Omitting source keeps
+                    # the stored value, so plain edits never flip auto -> manual.
+                    if m.get("source") == "manual":
+                        db.execute(
+                            "UPDATE provider_models SET source = 'manual' WHERE provider_id = ? AND model_id = ?",
+                            (provider_id, m["id"])
+                        )
                 else:
                     db.execute(
-                        "INSERT OR IGNORE INTO provider_models (provider_id, model_id, model_name, enabled, preprocessor, image_generation) VALUES (?, ?, ?, ?, ?, ?)",
-                        (provider_id, m["id"], m.get("name", m["id"]), 1 if m.get("enabled", True) else 0, m.get("preprocessor", ""), "1" if m.get("image_generation") else "")
+                        "INSERT OR IGNORE INTO provider_models (provider_id, model_id, model_name, enabled, preprocessor, image_generation, source) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (provider_id, m["id"], m.get("name", m["id"]), 1 if m.get("enabled", True) else 0, m.get("preprocessor", ""), "1" if m.get("image_generation") else "", "manual")
                     )
         if any(key in updates for key in {"api_base", "api_key", "provider_type", "models"}):
             db.execute("UPDATE provider_models SET responses_status = 'unknown', responses_checked_at = '', responses_expires_at = '', responses_streaming = 0, responses_streaming_status = 'unknown', responses_tool_types = '[]', responses_error = '' WHERE provider_id = ?", (provider_id,))
@@ -1497,6 +1532,21 @@ def update_provider(provider_id: str, updates: dict) -> Optional[dict]:
 def delete_provider(provider_id: str) -> bool:
     with get_db() as db:
         cursor = db.execute("DELETE FROM providers WHERE id = ?", (provider_id,))
+        return cursor.rowcount > 0
+
+
+def delete_provider_model(provider_id: str, model_id: str) -> bool:
+    """Delete a single model row from a provider.
+
+    Works for both auto-discovered and manually added models: a manual model
+    is never removed by refresh, so an explicit delete entry point is the only
+    way to get rid of one.
+    """
+    with get_db() as db:
+        cursor = db.execute(
+            "DELETE FROM provider_models WHERE provider_id = ? AND model_id = ?",
+            (provider_id, model_id),
+        )
         return cursor.rowcount > 0
 
 
