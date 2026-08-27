@@ -6,7 +6,7 @@ from typing import Awaitable, Callable
 from app.database import get_fallback_policies, get_routing_rules, parse_model_id
 from app.core.types import InternalMessage, InternalRequest, reasoning_part
 from app.core.text import mask_key, strip_billing_header
-from app.core.tool_args import sanitize_args
+from app.core.tool_args import coerce_tool_arguments_json, sanitize_args
 from app.services.logger import get_logger
 
 
@@ -121,6 +121,23 @@ def fix_tool_args(request: InternalRequest) -> int:
                     part.arguments = repaired_args
                     part.raw_arguments = json.dumps(repaired_args, ensure_ascii=False)
                     fixed += 1
+            if isinstance(part.raw_arguments, str):
+                coerced = coerce_tool_arguments_json(part.raw_arguments)
+                if coerced != part.raw_arguments:
+                    part.raw_arguments = coerced
+                    try:
+                        part.arguments = json.loads(coerced) if coerced else {}
+                    except json.JSONDecodeError:
+                        part.arguments = {"input": coerced}
+                    fixed += 1
+            elif part.raw_arguments is None and not isinstance(part.arguments, dict):
+                coerced = coerce_tool_arguments_json(part.arguments)
+                part.raw_arguments = coerced
+                try:
+                    part.arguments = json.loads(coerced) if coerced else {}
+                except json.JSONDecodeError:
+                    part.arguments = {}
+                fixed += 1
     return fixed
 
 

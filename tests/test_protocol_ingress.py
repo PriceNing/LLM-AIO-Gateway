@@ -495,6 +495,48 @@ def test_policy_fix_tool_args_repairs_raw_arguments():
     assert chat_messages_from_internal(req)[1]["tool_calls"][0]["function"]["arguments"] == '{"url": ""}'
 
 
+def test_coerce_tool_arguments_json_wraps_invalid_history_for_llamacpp():
+    import json
+    from app.core.tool_args import coerce_tool_arguments_json
+
+    raw = '{"cmd":"node -e \\n      return "";\\n"}'
+    try:
+        json.loads(raw)
+        raise AssertionError("fixture must be invalid JSON")
+    except json.JSONDecodeError:
+        pass
+
+    coerced = coerce_tool_arguments_json(raw)
+    assert json.loads(coerced) == {"input": raw}
+
+    valid = '{"cmd":"echo hi"}'
+    assert coerce_tool_arguments_json(valid) == valid
+    assert coerce_tool_arguments_json({"cmd": "echo hi"}) == '{"cmd": "echo hi"}'
+    assert json.loads(coerce_tool_arguments_json('{"value": NaN}')) == {"input": '{"value": NaN}'}
+
+
+def test_policy_and_openai_projection_repair_invalid_tool_arguments():
+    import json
+    raw = '{"cmd":"node -e \\n      return "";\\n"}'
+    req = responses_to_internal({
+        "model": "llamacpp-linux/Qwen3.8-27B",
+        "input": [
+            {"type": "message", "role": "user", "content": "run tests"},
+            {"type": "function_call", "call_id": "call_broken", "name": "exec_command", "arguments": raw},
+            {"type": "function_call_output", "call_id": "call_broken", "output": "ok"},
+        ],
+    })
+
+    tc_part = next(part for msg in req.messages for part in msg.parts if part.kind == "tool_call")
+    assert tc_part.raw_arguments == raw
+    assert fix_tool_args(req) == 1
+    assert json.loads(tc_part.raw_arguments) == {"input": raw}
+
+    projected = chat_messages_from_internal(req)
+    args = projected[1]["tool_calls"][0]["function"]["arguments"]
+    assert json.loads(args) == {"input": raw}
+
+
 async def _fake_preprocess_request(request, model, provider_id, requested_model):
     request.messages.append(openai_messages_to_ir([{"role": "user", "content": f"request-target={model};requested={requested_model}"}])[0])
     return True

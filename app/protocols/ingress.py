@@ -48,6 +48,105 @@ def _strip_schema_extra_fields(schema: Any) -> Any:
     return cleaned
 
 
+def _chat_function_parameters(schema: dict[str, Any]) -> dict[str, Any]:
+    """Make only the function-schema root Chat-compatible.
+
+    Keep nested JSON Schema semantics intact.  Some OpenAI-compatible
+    providers reject a missing root ``required`` as though it were null, and
+    require the root itself to declare ``type: object`` instead of an
+    ``anyOf``/``oneOf`` of object variants.
+    """
+    cleaned = _strip_schema_extra_fields(copy.deepcopy(schema))
+
+    def resolve_ref(node: dict[str, Any]) -> dict[str, Any] | None:
+        ref = node.get("$ref")
+        if not isinstance(ref, str) or not ref.startswith("#/"):
+            return None
+        target: Any = cleaned
+        for part in ref[2:].split("/"):
+            if not isinstance(target, dict):
+                return None
+            target = target.get(part.replace("~1", "/").replace("~0", "~"))
+        return target if isinstance(target, dict) else None
+
+    def root_properties(node: Any, seen: set[int] | None = None) -> dict[str, Any]:
+        """Collect properties through root combiners without walking property values."""
+        if not isinstance(node, dict):
+            return {}
+        seen = seen or set()
+        marker = id(node)
+        if marker in seen:
+            return {}
+        seen.add(marker)
+
+        properties: dict[str, Any] = {}
+
+        def merge(incoming: dict[str, Any]) -> None:
+            for name, definition in incoming.items():
+                definition = copy.deepcopy(definition)
+                current = properties.get(name)
+                if current is None:
+                    properties[name] = definition
+                elif current != definition:
+                    variants = current.get("anyOf") if isinstance(current, dict) and set(current) == {"anyOf"} else None
+                    if not isinstance(variants, list):
+                        variants = [current]
+                    if definition not in variants:
+                        properties[name] = {"anyOf": [*variants, definition]}
+
+        if isinstance(node.get("properties"), dict):
+            merge(node["properties"])
+        referenced = resolve_ref(node)
+        if referenced is not None:
+            merge(root_properties(referenced, seen))
+        for combiner in ("allOf", "anyOf", "oneOf"):
+            branches = node.get(combiner)
+            if isinstance(branches, list):
+                for branch in branches:
+                    merge(root_properties(branch, seen))
+        return properties
+
+    # A JSON Schema may declare ``type: object`` and still put the actual
+    # variants in a root anyOf/oneOf.  Chat providers validate that union as
+    # the function root and reject it, so root combiners take precedence over
+    # the otherwise-valid object fast path.
+    has_root_union = any(isinstance(cleaned.get(key), list) for key in ("anyOf", "oneOf"))
+    if has_root_union:
+        result = {
+            key: copy.deepcopy(value)
+            for key, value in cleaned.items()
+            if key not in ("type", "properties", "required", "anyOf", "oneOf", "allOf", "additionalProperties")
+        }
+        result.update({"type": "object", "properties": root_properties(cleaned), "required": []})
+        return result
+
+    if cleaned.get("type") == "object" or isinstance(cleaned.get("properties"), dict):
+        cleaned["type"] = "object"
+        if not isinstance(cleaned.get("required"), list):
+            cleaned["required"] = []
+        return cleaned
+
+    # Function arguments must have an object root in Chat Completions.  This
+    # also handles a root $ref/allOf whose referenced schema omits an explicit
+    # object type.
+    properties = root_properties(cleaned)
+    result = {
+        key: copy.deepcopy(value)
+        for key, value in cleaned.items()
+        if key not in ("type", "properties", "required", "$ref", "allOf", "additionalProperties")
+    }
+    result.update({"type": "object", "properties": properties, "required": []})
+    return result
+
+
+def _normalize_chat_tool(tool: dict[str, Any]) -> dict[str, Any]:
+    normalized = copy.deepcopy(tool)
+    function = normalized.get("function")
+    if isinstance(function, dict) and isinstance(function.get("parameters"), dict):
+        function["parameters"] = _chat_function_parameters(function["parameters"])
+    return normalized
+
+
 def _custom_tool_argument_field(tool: dict[str, Any]) -> str:
     name = str(tool.get("name") or "")
     if name == "apply_patch":
@@ -101,11 +200,22 @@ def _responses_custom_tool_to_chat_tool(tool: dict[str, Any], *, override_name: 
 
 def responses_tools_to_chat_tools(tools: list[Any] | None) -> list[dict[str, Any]]:
     converted = []
+    names: set[str] = set()
+
+    def append_unique(tool: dict[str, Any]) -> None:
+        function = tool.get("function") if isinstance(tool.get("function"), dict) else {}
+        name = str(function.get("name") or "")
+        if name and name in names:
+            return
+        if name:
+            names.add(name)
+        converted.append(tool)
+
     for tool in tools or []:
         if not isinstance(tool, dict):
             continue
         if "function" in tool:
-            converted.append(tool)
+            append_unique(_normalize_chat_tool(tool))
             continue
         tool_type = tool.get("type")
         if tool_type == "namespace":
@@ -116,7 +226,7 @@ def responses_tools_to_chat_tools(tools: list[Any] | None) -> list[dict[str, Any
                 sub_type = sub_tool.get("type")
                 sub_name = _namespace_tool_name(namespace, str(sub_tool.get("name") or ""))
                 if sub_type == "function":
-                    converted.append(_responses_function_tool_to_chat_tool(
+                    append_unique(_responses_function_tool_to_chat_tool(
                         sub_tool,
                         override_name=sub_name,
                     ))
@@ -126,16 +236,16 @@ def responses_tools_to_chat_tools(tools: list[Any] | None) -> list[dict[str, Any
                         override_name=sub_name,
                     )
                     if converted_custom:
-                        converted.append(converted_custom)
+                        append_unique(converted_custom)
             continue
         if tool_type == "custom":
             converted_custom = _responses_custom_tool_to_chat_tool(tool)
             if converted_custom:
-                converted.append(converted_custom)
+                append_unique(converted_custom)
             continue
         if tool_type != "function":
             continue
-        converted.append(_responses_function_tool_to_chat_tool(tool))
+        append_unique(_responses_function_tool_to_chat_tool(tool))
     return converted
 
 
@@ -149,7 +259,7 @@ def _responses_function_tool_to_chat_tool(tool: dict[str, Any], *, override_name
         function_fields["name"] = override_name
     params = function_fields.get("parameters")
     if isinstance(params, dict):
-        function_fields["parameters"] = _strip_schema_extra_fields(params)
+        function_fields["parameters"] = _chat_function_parameters(params)
     return {"type": "function", "function": function_fields}
 
 

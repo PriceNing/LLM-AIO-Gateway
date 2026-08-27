@@ -13,6 +13,7 @@ from app.core.types import (
     unknown_part,
 )
 from app.core.text import strip_billing_header
+from app.core.tool_args import coerce_tool_arguments_json
 
 
 def _parse_arguments(raw_arguments: Any) -> Any:
@@ -576,6 +577,7 @@ def ir_to_openai_messages(messages: list[InternalMessage]) -> list[dict[str, Any
                     raw_args = json.dumps(part.arguments if part.arguments is not None else {}, ensure_ascii=False)
                 elif not isinstance(raw_args, str):
                     raw_args = json.dumps(raw_args, ensure_ascii=False)
+                raw_args = coerce_tool_arguments_json(raw_args)
                 tool_calls.append({
                     "id": part.tool_call_id,
                     "type": "function",

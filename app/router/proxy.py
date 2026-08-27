@@ -1962,10 +1962,32 @@ def _stream_event_has_payload(event: InternalOutputEvent) -> bool:
     )
 
 
-def _empty_stream_error(target: RouteTarget, provider_id: str) -> RuntimeError:
-    exc = RuntimeError("upstream stream ended without response output")
+def _placeholder_only_stream_text(text: str) -> bool:
+    """Return whether text is only an upstream placeholder, not useful output."""
+    compact = "".join(str(text or "").split())
+    return bool(compact) and all(char in ".…·。!?！？,，;；:：-_—~～" for char in compact)
+
+
+def _pending_stream_has_usable_payload(events: list[InternalOutputEvent]) -> bool:
+    text = "".join(event.text or "" for event in events if event.kind == "text_delta")
+    if text and not _placeholder_only_stream_text(text):
+        return True
+    return any(
+        _stream_event_has_payload(event) and event.kind != "text_delta"
+        for event in events
+    )
+
+
+def _empty_stream_error(target: RouteTarget, provider_id: str, *, placeholder_only: bool = False) -> RuntimeError:
+    message = (
+        "upstream stream ended with placeholder-only response"
+        if placeholder_only
+        else "upstream stream ended without response output"
+    )
+    exc = RuntimeError(message)
     exc.attempted_model = target.model
     exc.attempted_provider = provider_id or target.provider_id or ""
+    exc.placeholder_only_response = placeholder_only
     return exc
 
 
@@ -1976,6 +1998,7 @@ async def _stream_events_with_fallbacks(internal, *, temperature, max_tokens, lo
     last_exc = None
     index = 0
     fallback_attempts = []
+    degenerate_retries: dict[tuple[str, str], int] = {}
     budget = _lookup_fallback_budget(primary.provider_id, primary.model)
     attempt_timeout = budget.attempt_timeout if budget.matched else None
     if attempt_timeout:
@@ -2038,10 +2061,30 @@ async def _stream_events_with_fallbacks(internal, *, temperature, max_tokens, lo
                     # accounting before the client stream terminates.
                     terminal_event = event
                     continue
-                if _is_client_visible_stream_event(event):
+                if (
+                    not emitted
+                    and event.kind == "text_delta"
+                    and _placeholder_only_stream_text(
+                        "".join(
+                            pending.text or ""
+                            for pending in pending_events
+                            if pending.kind == "text_delta"
+                        ) + (event.text or "")
+                    )
+                ):
+                    # Some compatible upstreams occasionally finish a request
+                    # with only "...".  Hold punctuation-only prefixes until
+                    # substantive output arrives so a degenerate completion
+                    # cannot prematurely terminate a Responses tool turn.
+                    pending_events.append(event)
+                elif _is_client_visible_stream_event(event):
                     if not emitted:
                         for pending in pending_events:
-                            yield pending
+                            if not (
+                                pending.kind == "text_delta"
+                                and _placeholder_only_stream_text(pending.text or "")
+                            ):
+                                yield pending
                         pending_events = []
                     emitted = True
                     yield event
@@ -2049,8 +2092,16 @@ async def _stream_events_with_fallbacks(internal, *, temperature, max_tokens, lo
                     yield event
                 else:
                     pending_events.append(event)
-            if not emitted and not any(_stream_event_has_payload(event) for event in pending_events):
-                raise _empty_stream_error(target, adapter_provider_id or fallback_provider_id or "")
+            if not emitted and not _pending_stream_has_usable_payload(pending_events):
+                placeholder_only = any(
+                    event.kind == "text_delta" and bool(event.text)
+                    for event in pending_events
+                )
+                raise _empty_stream_error(
+                    target,
+                    adapter_provider_id or fallback_provider_id or "",
+                    placeholder_only=placeholder_only,
+                )
             fallback_attempts.append(_fallback_attempt_record(
                 index=index,
                 stage=stage,
@@ -2122,6 +2173,17 @@ async def _stream_events_with_fallbacks(internal, *, temperature, max_tokens, lo
                     trigger,
                 )
                 raise
+            retry_key = (target.provider_id or "", target.model)
+            if index > 0 and getattr(exc, "placeholder_only_response", False) and degenerate_retries.get(retry_key, 0) < 1:
+                degenerate_retries[retry_key] = degenerate_retries.get(retry_key, 0) + 1
+                _app_log.warning(
+                    "[%s fallback.stream.retry] target=%s provider=%s reason=placeholder_only_response retry=%d",
+                    log_label,
+                    target.model,
+                    fallback_provider_id or "-",
+                    degenerate_retries[retry_key],
+                )
+                continue
             if index == 0:
                 decision = apply_fallback_policy(fallback_provider_id, target.model, trigger)
                 if not decision.matched and budget.matched and trigger == "timeout":

@@ -684,7 +684,87 @@ def test_responses_tools_preserve_already_openai_formatted_tools():
     """Test behavior."""
     tools = [{"type": "function", "function": {"name": "f", "parameters": {}}}]
     result = responses_tools_to_chat_tools(tools)
-    assert result == tools
+    assert result == [{
+        "type": "function",
+        "function": {
+            "name": "f",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    }]
+
+
+def test_responses_tools_deduplicate_names_from_body_and_additional_tools():
+    tool = {"type": "function", "name": "load_workspace_dependencies", "parameters": {"type": "object"}}
+    result = responses_tools_to_chat_tools([tool, tool])
+    assert [item["function"]["name"] for item in result] == ["load_workspace_dependencies"]
+
+
+def test_responses_tools_add_empty_required_at_object_root_only():
+    result = responses_tools_to_chat_tools([{
+        "type": "function",
+        "name": "list_resources",
+        "parameters": {
+            "type": "object",
+            "properties": {"cursor": {"anyOf": [{"type": "string"}, {"type": "null"}]}},
+        },
+    }])
+    parameters = result[0]["function"]["parameters"]
+    assert parameters["required"] == []
+    assert "anyOf" in parameters["properties"]["cursor"]
+
+
+def test_responses_tools_merge_root_object_union_without_rewriting_nested_schema():
+    result = responses_tools_to_chat_tools([{
+        "type": "function",
+        "name": "automation_update",
+        "parameters": {
+            "anyOf": [
+                {"type": "object", "properties": {"id": {"type": "string"}}},
+                {"type": "object", "properties": {"mode": {"type": "string"}}},
+            ],
+        },
+    }])
+    parameters = result[0]["function"]["parameters"]
+    assert parameters == {
+        "type": "object",
+        "properties": {"id": {"type": "string"}, "mode": {"type": "string"}},
+        "required": [],
+    }
+
+
+def test_responses_tools_flatten_root_union_even_when_root_is_already_an_object():
+    result = responses_tools_to_chat_tools([{
+        "type": "function",
+        "name": "automation_update",
+        "parameters": {
+            "type": "object",
+            "properties": {"shared": {"type": "string"}},
+            "anyOf": [
+                {"properties": {"id": {"type": "string"}, "mode": {"const": "view"}}},
+                {
+                    "allOf": [{
+                        "type": "object",
+                        "properties": {
+                            "prompt": {
+                                "anyOf": [{"type": "string"}, {"type": "null"}],
+                            },
+                        },
+                    }],
+                },
+            ],
+        },
+    }])
+    parameters = result[0]["function"]["parameters"]
+    assert parameters == {
+        "type": "object",
+        "properties": {
+            "shared": {"type": "string"},
+            "id": {"type": "string"},
+            "mode": {"const": "view"},
+            "prompt": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        },
+        "required": [],
+    }
 
 
 def test_responses_tools_strip_openai_specific_schema_fields():

@@ -1437,6 +1437,105 @@ def test_responses_stream_uses_fallback_on_empty_primary_stream(monkeypatch, tem
     ]
 
 
+def test_responses_stream_retries_placeholder_only_fallback_before_client_output(monkeypatch, temp_db):
+    from app.database import add_fallback_policy, add_routing_rule
+    from app.core.output import InternalOutputEvent
+
+    add_provider({
+        "id": "placeholder-primary", "name": "Placeholder Primary",
+        "provider_type": "openai", "api_base": "https://primary.example/v1",
+        "api_key": "upstream-key", "enabled": True,
+        "models": [{"id": "placeholder-primary-model", "name": "Primary", "enabled": True}],
+    })
+    add_provider({
+        "id": "placeholder-fallback", "name": "Placeholder Fallback",
+        "provider_type": "openai", "api_base": "https://fallback.example/v1",
+        "api_key": "upstream-key", "enabled": True,
+        "models": [{"id": "placeholder-fallback-model", "name": "Fallback", "enabled": True}],
+    })
+    add_routing_rule({
+        "name": "placeholder rule", "enabled": True,
+        "match_model": "placeholder-source", "target_model": "placeholder-primary-model",
+        "target_provider": "placeholder-primary",
+    })
+    add_fallback_policy({
+        "name": "placeholder fallback", "enabled": True,
+        "match_provider": "placeholder-primary", "match_model": "placeholder-primary-model",
+        "chain": [{"model": "placeholder-fallback-model", "provider_id": "placeholder-fallback"}],
+    })
+
+    calls = []
+
+    async def fake_stream_events(**kwargs):
+        calls.append(kwargs["provider_id"])
+        if kwargs["provider_id"] == "placeholder-primary":
+            raise TimeoutError("primary timed out")
+        if calls.count("placeholder-fallback") == 1:
+            yield InternalOutputEvent(kind="message_start", role="assistant")
+            yield InternalOutputEvent(kind="text_delta", text="...")
+            yield InternalOutputEvent(kind="usage", usage={"total_tokens": 2})
+            yield InternalOutputEvent(kind="message_done", finish_reason="stop")
+            return
+        yield InternalOutputEvent(kind="message_start", role="assistant")
+        yield InternalOutputEvent(kind="tool_call_start", tool_call_id="call_retry", name="exec_command")
+        yield InternalOutputEvent(
+            kind="tool_call_arguments_delta", tool_call_id="call_retry",
+            name="exec_command", arguments_delta='{"cmd":"echo ok"}',
+        )
+        yield InternalOutputEvent(kind="tool_call_done", tool_call_id="call_retry", name="exec_command")
+        yield InternalOutputEvent(kind="usage", usage={"total_tokens": 12})
+        yield InternalOutputEvent(kind="message_done", finish_reason="tool_calls")
+
+    monkeypatch.setattr("app.router.proxy.iter_openai_chat_output_events", fake_stream_events)
+
+    with client.stream("POST", "/v1/responses", headers=temp_db["headers"], json={
+        "model": "placeholder-source",
+        "input": [{"type": "message", "role": "user", "content": "continue working"}],
+        "stream": True,
+    }) as response:
+        body = response.read().decode("utf-8")
+
+    assert response.status_code == 200
+    assert '"name": "exec_command"' in body
+    assert '"delta": "..."' not in body
+    assert calls == ["placeholder-primary", "placeholder-fallback", "placeholder-fallback"]
+
+
+def test_responses_stream_drops_placeholder_prefix_when_real_output_follows(monkeypatch, temp_db):
+    from app.database import add_fallback_policy, add_routing_rule
+    from app.core.output import InternalOutputEvent
+
+    add_provider({"id": "prefix-primary", "name": "Prefix Primary", "provider_type": "openai",
+                  "api_base": "https://primary.example/v1", "api_key": "key", "enabled": True,
+                  "models": [{"id": "prefix-model", "name": "Primary", "enabled": True}]})
+    add_provider({"id": "prefix-fallback", "name": "Prefix Fallback", "provider_type": "openai",
+                  "api_base": "https://fallback.example/v1", "api_key": "key", "enabled": True,
+                  "models": [{"id": "prefix-fallback-model", "name": "Fallback", "enabled": True}]})
+    add_routing_rule({"name": "prefix route", "enabled": True, "match_model": "prefix-source",
+                      "target_model": "prefix-model", "target_provider": "prefix-primary"})
+    add_fallback_policy({"name": "prefix fallback", "enabled": True, "match_provider": "prefix-primary",
+                         "match_model": "prefix-model", "chain": [{"model": "prefix-fallback-model",
+                         "provider_id": "prefix-fallback"}]})
+
+    async def fake_stream_events(**kwargs):
+        if kwargs["provider_id"] == "prefix-primary":
+            raise TimeoutError("primary timed out")
+        yield InternalOutputEvent(kind="message_start", role="assistant")
+        yield InternalOutputEvent(kind="text_delta", text="...")
+        yield InternalOutputEvent(kind="text_delta", text="real answer")
+        yield InternalOutputEvent(kind="message_done", finish_reason="stop")
+
+    monkeypatch.setattr("app.router.proxy.iter_openai_chat_output_events", fake_stream_events)
+    with client.stream("POST", "/v1/responses", headers=temp_db["headers"], json={
+        "model": "prefix-source", "input": [{"type": "message", "role": "user", "content": "hi"}],
+        "stream": True,
+    }) as response:
+        body = response.read().decode("utf-8")
+    assert response.status_code == 200
+    assert "real answer" in body
+    assert '"text": "..."' not in body
+
+
 def test_chat_completions_stream_preprocesses_images_for_fallback_target(monkeypatch, temp_db):
     from app.database import add_fallback_policy
     from app.core.output import InternalOutputEvent
