@@ -14,7 +14,7 @@ from app.protocols.ir import ir_to_anthropic_messages
 
 def test_enabled_thinking_includes_budget_and_drops_temperature():
     body = _build_anthropic_request_body(
-        {"extra_headers": {"thinking": "enabled"}},
+        {"provider_options": {"thinking": "enabled"}},
         [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
         {},
         4096,
@@ -27,7 +27,7 @@ def test_enabled_thinking_includes_budget_and_drops_temperature():
 
 def test_enabled_thinking_respects_custom_budget_and_caps_below_max_tokens():
     body = _build_anthropic_request_body(
-        {"extra_headers": {"thinking": "enabled", "thinking_budget_tokens": 8000}},
+        {"provider_options": {"thinking": "enabled", "thinking_budget_tokens": 8000}},
         [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
         {},
         2048,

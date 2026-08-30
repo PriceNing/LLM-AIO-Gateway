@@ -8,7 +8,7 @@ from app.protocols.ingress import (
 )
 from app.core.policy import prepare_request_policy
 from app.core.policy import RouteTarget, RoutingDecision
-from app.core.policy import fix_tool_args, inject_reasoning_content, request_has_tools, strip_tools
+from app.core.policy import has_missing_reasoning_content_for_tool_calls, fix_tool_args, inject_reasoning_content, request_has_tools, strip_tools
 from app.protocols.ir import ir_to_anthropic_messages, ir_to_openai_messages, openai_messages_to_ir, responses_input_to_ir
 from app.core.types import InternalMessage, text_part
 from app.adapters.anthropic import anthropic_body_from_internal
@@ -437,6 +437,25 @@ def test_chat_completions_to_internal_accepts_opencode_image_variants(image_item
     image = req.messages[0].parts[1]
     assert image.kind == "image"
     assert image.source == expected_source
+
+
+def test_thinking_reasoning_requires_real_reasoning_for_every_tool_call():
+    req = responses_to_internal({
+        "model": "gpt-test",
+        "input": [
+            {"type": "function_call", "call_id": "old", "name": "run", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "old", "output": "ok"},
+            {"type": "function_call", "call_id": "new", "name": "run", "arguments": "{}", "reasoning_content": "new reasoning"},
+            {"type": "function_call_output", "call_id": "new", "output": "ok"},
+        ],
+    })
+    assert has_missing_reasoning_content_for_tool_calls(req.messages) is True
+
+    for message in req.messages:
+        if message.role == "assistant" and any(part.tool_call_id == "old" for part in message.parts):
+            message.parts.insert(0, text_part("old reasoning"))
+            message.parts[0].kind = "reasoning"
+    assert has_missing_reasoning_content_for_tool_calls(req.messages) is False
 
 
 def test_policy_inject_reasoning_content_active_tool_segment_only():

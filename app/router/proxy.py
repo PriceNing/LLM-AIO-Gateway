@@ -76,7 +76,7 @@ from app.protocols.ingress import (
     completions_to_internal,
     responses_to_internal,
 )
-from app.core.policy import RouteTarget, apply_fallback_policy, prepare_request_policy
+from app.core.policy import RouteTarget, apply_fallback_policy, has_missing_reasoning_content_for_tool_calls, prepare_request_policy
 from app.adapters.anthropic import (
     anthropic_body_from_internal,
     anthropic_messages_completion_for_internal,
@@ -192,11 +192,11 @@ def _responses_image_generation_tool(body: dict) -> dict | None:
 def _responses_is_system_turn(body: dict) -> bool:
     """Return whether Codex identified this as an app-owned background turn.
 
-    Codex creates auxiliary Responses requests for task titles and other UI
-    metadata.  Their wrapped user prompt can mention image generation even
-    though the request itself must only produce structured metadata.  The
-    client marks these requests with ``thread_source=system``; use that
-    explicit signal instead of guessing from prompt wording or schemas.
+    Codex creates auxiliary Responses requests for task titles, ambient
+    suggestion safety, and other UI metadata.  Their wrapped user prompt can
+    mention image generation even though the request itself must only produce
+    structured metadata.  Honor ``thread_source=system`` and ambient
+    suggestion markers instead of guessing from prompt wording or schemas.
     """
     metadata = body.get("client_metadata")
     if not isinstance(metadata, dict):
@@ -207,10 +207,12 @@ def _responses_is_system_turn(body: dict) -> bool:
             turn_metadata = json.loads(turn_metadata)
         except (TypeError, ValueError):
             return False
-    return bool(
-        isinstance(turn_metadata, dict)
-        and str(turn_metadata.get("thread_source") or "").lower() == "system"
-    )
+    if not isinstance(turn_metadata, dict):
+        return False
+    source = str(turn_metadata.get("thread_source") or "").strip().lower()
+    trigger = str(turn_metadata.get("turn_trigger") or "").strip().lower()
+    request_kind = str(turn_metadata.get("request_kind") or "").strip().lower()
+    return source in {"system", "ambient", "ambient_suggestion_safety"} or trigger.startswith("ambient") or request_kind.startswith("ambient")
 
 
 def _responses_image_prompt(input_data: Any, instructions: Any = "") -> str:
@@ -233,8 +235,8 @@ def _resolved_image_generator(config: dict) -> dict:
                 resolved["api_base"] = image_provider.get("api_base") or ""
             if not resolved.get("api_key"):
                 resolved["api_key"] = image_provider.get("api_key") or ""
-            if not resolved.get("extra_headers"):
-                resolved["extra_headers"] = image_provider.get("extra_headers") or {}
+            if not resolved.get("upstream_headers"):
+                resolved["upstream_headers"] = image_provider.get("upstream_headers") or {}
             resolved["model"] = image_mid.model_name
             resolved["provider_id"] = image_provider.get("id") or image_mid.provider_id
     return resolved
@@ -1193,8 +1195,11 @@ async def _native_capability_for_request(provider: dict | None, model: str) -> b
             return capability.get("responses_error") == _RESPONSES_CAPABILITY_PROBE_MARKER
         if status == "unsupported":
             return False
-    # Unknown/degraded rows deliberately probe immediately; their TTL is a
-    # backoff marker, not permission to send native Responses.
+        if status == "unknown":
+            # A recent real request or capability probe already failed for a
+            # transient/request-specific reason. Honor the transient TTL as a
+            # native retry backoff and use the Chat compatibility path meanwhile.
+            return False
     return await _probe_model_responses_capability(provider, model)
 
 
@@ -1320,7 +1325,11 @@ async def _native_response_with_fallbacks(internal, *, stream: bool, required_to
                     # intentionally inside the exception path: capability
                     # mismatch (where no upstream request was sent) remains
                     # eligible for the configured fallback chain.
-                    if stateful_markers:
+                    provider_bound_markers = [
+                        marker for marker in stateful_markers
+                        if marker == "previous_response_id"
+                    ]
+                    if provider_bound_markers:
                         blocked_targets = candidate_targets(primary, decision.chain)[1:]
                         attempts.extend({
                             "index": blocked_index,
@@ -1338,6 +1347,7 @@ async def _native_response_with_fallbacks(internal, *, stream: bool, required_to
                             fallback_safety_decision="blocked_cross_provider",
                             responses_stateful=True,
                             responses_state_markers=stateful_markers,
+                            responses_provider_bound_markers=provider_bound_markers,
                             stateful_fallback_blocked=True,
                             error_trigger=classify_upstream_error(exc),
                             error_stage="primary",
@@ -1612,18 +1622,44 @@ async def _call_nonstream_target(target: RouteTarget, internal, *, temperature, 
     return output, provider_info, adapter_provider_id
 
 
+def _target_requires_thinking_reasoning(target: RouteTarget) -> bool:
+    provider_info = resolve_provider(target.model, target.provider_id)
+    provider_options = (provider_info or {}).get("provider_options") or {}
+    if isinstance(provider_options, str):
+        try:
+            provider_options = json.loads(provider_options)
+        except (TypeError, ValueError):
+            provider_options = {}
+    if not isinstance(provider_options, dict):
+        return False
+    return provider_options.get("thinking") == "enabled"
+
+
 async def _internal_for_target_attempt(internal, target: RouteTarget, *, is_fallback: bool):
-    if not is_fallback or not has_image_content(internal.messages):
-        return internal
+    attempt = internal
+    copied = False
 
-    if _target_supports_native_vision(target):
-        return internal
+    def _copy_if_needed():
+        nonlocal attempt, copied
+        if not copied:
+            attempt = copy.deepcopy(internal)
+            copied = True
+        return attempt
 
-    if not _target_uses_preprocessor(target):
-        return internal
+    if is_fallback and has_image_content(internal.messages):
+        if not _target_supports_native_vision(target) and _target_uses_preprocessor(target):
+            attempt = _copy_if_needed()
+            await _policy_preprocess_request(attempt, target.model, target.provider_id, target.model)
 
-    attempt = copy.deepcopy(internal)
-    await _policy_preprocess_request(attempt, target.model, target.provider_id, target.model)
+    if _target_requires_thinking_reasoning(target) and has_missing_reasoning_content_for_tool_calls(internal.messages):
+        attempt = _copy_if_needed()
+        attempt.extra["disable_thinking_for_missing_reasoning"] = True
+        _app_log.warning(
+            "[fallback] disabling thinking for target=%s provider=%s because historical tool calls lack reasoning_content",
+            target.model,
+            target.provider_id or "-",
+        )
+
     return attempt
 
 
@@ -1726,14 +1762,17 @@ async def _call_nonstream_with_fallbacks(policy, internal, *, temperature, max_t
         primary.provider_id or "-",
     )
     for index, target in enumerate(targets):
-        internal.target_model = target.model
-        internal.provider_id = target.provider_id
+        attempt_internal = await _internal_for_target_attempt(
+            internal, target, is_fallback=index > 0,
+        )
+        attempt_internal.target_model = target.model
+        attempt_internal.provider_id = target.provider_id
         fallback_provider_id = _fallback_provider_id_for_target(target)
         try:
             output, provider_info, adapter_provider_id = await _await_with_attempt_timeout(
                 _call_nonstream_target(
                     target,
-                    internal,
+                    attempt_internal,
                     temperature=temperature,
                     max_tokens=max_tokens,
                     log_label=log_label,

@@ -129,6 +129,26 @@ async def test_force_chat_completions_skips_responses_probe(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_fresh_unknown_capability_honors_transient_backoff(monkeypatch):
+    add_provider({
+        "id": "native-backoff", "name": "Backoff", "provider_type": "openai",
+        "api_base": "https://backoff.invalid/v1", "models": [{"id": "model"}],
+    })
+    set_model_responses_capability(
+        "native-backoff", "model", status="unknown",
+        expires_at="2999-01-01T00:00:00+00:00",
+        error="recent full request failed",
+    )
+
+    async def fail_probe(*_args, **_kwargs):
+        raise AssertionError("fresh unknown capability must not be probed again")
+
+    monkeypatch.setattr("app.router.proxy._probe_model_responses_capability", fail_probe)
+    provider = {"id": "native-backoff", "provider_type": "openai"}
+    assert await _native_capability_for_request(provider, "model") is False
+
+
+@pytest.mark.asyncio
 async def test_unknown_capability_probe_caches_unsupported_on_incomplete_422(monkeypatch):
     add_provider({
         "id": "compat-proxy", "name": "Compat", "provider_type": "openai",
@@ -631,6 +651,49 @@ async def test_stateful_request_blocks_only_after_primary_native_request_fails(m
         await _native_response_with_fallbacks(internal, stream=False, required_tool_types=set(), stateful_markers=["previous_response_id", "function_call_output"])
     assert raised.value.request_details["fallback_reason"] == "stateful_codex_tools"
     assert raised.value.request_details["stateful_fallback_blocked"] is True
+
+
+@pytest.mark.asyncio
+async def test_explicit_tool_outputs_can_fallback_across_native_providers(monkeypatch):
+    add_provider({"id": "tool-output-primary", "name": "Primary", "provider_type": "openai", "api_base": "https://primary.invalid/v1", "api_key": "key", "models": [{"id": "stateful-model"}]})
+    add_provider({"id": "tool-output-fallback", "name": "Fallback", "provider_type": "openai", "api_base": "https://fallback.invalid/v1", "api_key": "key", "models": [{"id": "fallback-model"}]})
+    set_model_responses_capability("tool-output-primary", "stateful-model", status="supported")
+    set_model_responses_capability("tool-output-fallback", "fallback-model", status="supported")
+    add_fallback_policy({
+        "name": "tool output fallback",
+        "match_provider": "tool-output-primary",
+        "match_model": "stateful-model",
+        "triggers": {"http_4xx": True},
+        "chain": [{"model": "fallback-model", "provider_id": "tool-output-fallback"}],
+    })
+
+    calls = []
+
+    async def fake_post(provider, internal):
+        calls.append(provider["id"])
+        if provider["id"] == "tool-output-primary":
+            request = httpx.Request("POST", "https://primary.invalid/responses")
+            raise httpx.HTTPStatusError("bad request", request=request, response=httpx.Response(400, request=request))
+        return {"object": "response", "id": "resp_fallback", "output": [{"type": "message"}]}
+
+    monkeypatch.setattr("app.router.proxy.post_native_response", fake_post)
+    internal = responses_to_internal({
+        "model": "stateful-model",
+        "input": [
+            {"type": "function_call", "call_id": "call_1", "name": "exec_command", "arguments": '{"cmd":"echo ok"}'},
+            {"type": "function_call_output", "call_id": "call_1", "output": "ok"},
+        ],
+    })
+    internal.provider_id = "tool-output-primary"
+
+    response, _target, provider_id, attempts = await _native_response_with_fallbacks(
+        internal, stream=False, required_tool_types=set(),
+        stateful_markers=["function_call_output"],
+    )
+    assert response["id"] == "resp_fallback"
+    assert provider_id == "tool-output-fallback"
+    assert calls == ["tool-output-primary", "tool-output-fallback"]
+    assert [item["status"] for item in attempts] == ["failed", "success"]
 
 
 def test_stateful_markers_include_previous_response_id_and_not_plain_tools():

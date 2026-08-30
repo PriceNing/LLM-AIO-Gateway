@@ -1,5 +1,7 @@
 import time
 import json
+import traceback
+import re
 
 import anyio
 from fastapi import BackgroundTasks
@@ -126,6 +128,39 @@ def _test_preview(output) -> str:
     return preview[:500]
 
 
+def _test_exception_details(exc: Exception, provider: dict | None = None) -> dict:
+    """Extract actionable upstream diagnostics without exposing credentials."""
+    response = getattr(exc, "response", None)
+    status_code = getattr(exc, "status_code", None) or getattr(response, "status_code", None)
+    response_body = ""
+    if response is not None:
+        try:
+            response_body = response.text if isinstance(response.text, str) else str(response.text)
+        except Exception:
+            try:
+                response_body = str(response.content)
+            except Exception:
+                response_body = ""
+    # LiteLLM often flattens an upstream HTTP error into a plain APIError
+    # string and drops the httpx response object. Preserve that text so WAF
+    # diagnostics such as "error code: 1010" remain visible to operators.
+    exception_text = str(exc)
+    if not response_body:
+        response_body = exception_text
+    if status_code is None:
+        match = re.search(r"\bHTTP(?:/\d(?:\.\d)?)?\s*(\d{3})\b|\bstatus(?:_code)?[=: ]+(\d{3})\b", exception_text, re.I)
+        if match:
+            status_code = int(next(group for group in match.groups() if group))
+    api_base = str((provider or {}).get("api_base") or "").rstrip("/")
+    return {
+        "exception_type": type(exc).__name__,
+        "http_status": status_code,
+        "upstream_url": f"{api_base}/chat/completions" if api_base else "",
+        "upstream_response": response_body[:4000],
+        "traceback": traceback.format_exc(limit=12),
+    }
+
+
 def _model_test_request(model_id: str, provider_id: str) -> InternalRequest:
     mid = parse_model_id(model_id)
     return InternalRequest(
@@ -183,6 +218,8 @@ async def test_model(body: dict, authorization: Optional[str] = Header(None)):
     await require_admin_session(authorization)
     model_id = str(body.get("model_id") or "").strip()
     start_time = time.perf_counter()
+    parsed_model = parse_model_id(model_id)
+    provider_info = resolve_provider(parsed_model.model_name, parsed_model.provider_id) if parsed_model.model_name else None
     try:
         result = await _run_model_test(model_id)
         result["latency_ms"] = _test_latency_ms(start_time)
@@ -190,13 +227,20 @@ async def test_model(body: dict, authorization: Optional[str] = Header(None)):
     except HTTPException:
         raise
     except Exception as exc:
-        _app_log.warning("Model test failed for %s: %s", model_id, exc)
-        return {
+        diagnostics = _test_exception_details(exc, provider_info)
+        _app_log.warning(
+            "Model test failed for %s: type=%s status=%s url=%s body=%s\n%s",
+            model_id, diagnostics["exception_type"], diagnostics["http_status"],
+            diagnostics["upstream_url"], diagnostics["upstream_response"], diagnostics["traceback"],
+        )
+        result = {
             "status": "fail",
             "model": model_id,
             "latency_ms": _test_latency_ms(start_time),
             "error": str(exc)[:500],
         }
+        result.update(diagnostics)
+        return result
 
 
 _PREPROCESSOR_TEST_IMAGE = (
@@ -985,7 +1029,7 @@ def _export_config(include_secrets: bool) -> dict:
     if not include_secrets:
         for p in providers:
             p["api_key"] = ""
-            p.pop("extra_headers", None)
+            p.pop("upstream_headers", None)
         for p in preprocessors.values():
             p["api_key"] = ""
         for generator in image_generators.values():
@@ -1161,6 +1205,18 @@ def _import_provider(entry: dict, mode: str) -> str:
         return "skipped"
     existing = get_provider(pid)
     payload = dict(entry)
+    # Legacy config exports used one mixed ``extra_headers`` object.  Keep
+    # imports backward-compatible while storing the two new concerns apart.
+    legacy_headers = payload.pop("extra_headers", None)
+    if isinstance(legacy_headers, dict):
+        payload.setdefault(
+            "provider_options",
+            {key: value for key, value in legacy_headers.items() if key in {"thinking", "thinking_budget_tokens"}},
+        )
+        payload.setdefault(
+            "upstream_headers",
+            {key: value for key, value in legacy_headers.items() if key not in {"thinking", "thinking_budget_tokens"}},
+        )
     if not payload.get("api_key"):
         payload.pop("api_key", None)
     if mode == "skip" and existing:

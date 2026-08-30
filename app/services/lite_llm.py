@@ -142,18 +142,31 @@ def build_completion_args(model: str, provider_id: Optional[str] = None) -> tupl
             and litellm_model not in litellm.model_cost
             and _model_name_suggests_vision(litellm_model)):
         litellm.model_cost[litellm_model] = {"supports_vision": True}
-    # Per-provider thinking mode: configured via provider.extra_headers.
-    # If not set, no thinking parameter is sent (each provider defaults).
-    extra_headers = provider.get("extra_headers", {}) or {}
-    if isinstance(extra_headers, str):
+    # Provider options affect protocol payloads; upstream headers affect HTTP
+    # transport only. Keep these configuration channels deliberately separate.
+    provider_options = provider.get("provider_options", {}) or {}
+    if isinstance(provider_options, str):
         try:
-            extra_headers = json.loads(extra_headers)
+            provider_options = json.loads(provider_options)
         except (json.JSONDecodeError, TypeError):
-            extra_headers = {}
-    thinking = extra_headers.get("thinking")
+            provider_options = {}
+    thinking = provider_options.get("thinking")
     if thinking in ("enabled", "disabled"):
         params.setdefault("extra_body", {})
         params["extra_body"]["thinking"] = {"type": thinking}
+    upstream_headers = provider.get("upstream_headers", {}) or {}
+    if isinstance(upstream_headers, str):
+        try:
+            upstream_headers = json.loads(upstream_headers)
+        except (json.JSONDecodeError, TypeError):
+            upstream_headers = {}
+    transport_headers = {
+        str(key): str(value)
+        for key, value in upstream_headers.items()
+        if value not in (None, "")
+    }
+    if transport_headers:
+        params["extra_headers"] = transport_headers
     get_logger("app").debug("route model=%s provider_type=%s api_base=%s -> litellm_model=%s",
                            model, provider.get("provider_type"), api_base, litellm_model)
     return litellm_model, params
@@ -203,6 +216,17 @@ def _forced_tool_choice(tool_choice: Any) -> bool:
         choice_type = str(tool_choice.get("type") or "")
         return choice_type in {"function", "tool", "required", "none"} or bool(tool_choice.get("name") or tool_choice.get("function"))
     return False
+
+
+def _disable_thinking_for_missing_reasoning(kwargs: dict[str, Any]) -> None:
+    if not kwargs.pop("disable_thinking_for_missing_reasoning", False):
+        return
+    extra_body = kwargs.get("extra_body")
+    if not isinstance(extra_body, dict):
+        return
+    thinking = extra_body.get("thinking")
+    if isinstance(thinking, dict) and thinking.get("type") == "enabled":
+        extra_body["thinking"] = {"type": "disabled"}
 
 
 def _disable_thinking_when_tools_forced(kwargs: dict[str, Any]) -> None:
@@ -258,6 +282,7 @@ def create_chat_completion(
     litellm_model, extra_params = build_completion_args(model, provider_id)
     kwargs.update(extra_params)
     _normalize_gpt5_temperature(litellm_model, kwargs)
+    _disable_thinking_for_missing_reasoning(kwargs)
     _disable_thinking_when_tools_forced(kwargs)
     messages = _system_messages_first(messages)
     normalize_image_content(messages)
@@ -276,6 +301,7 @@ def create_chat_completion_stream(
     litellm_model, extra_params = build_completion_args(model, provider_id)
     kwargs.update(extra_params)
     _normalize_gpt5_temperature(litellm_model, kwargs)
+    _disable_thinking_for_missing_reasoning(kwargs)
     _disable_thinking_when_tools_forced(kwargs)
     kwargs["stream"] = True
     if "stream_options" not in kwargs:

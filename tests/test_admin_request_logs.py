@@ -204,7 +204,7 @@ def test_export_config_redacts_secrets(temp_db):
     add_provider({
         "id": "p1", "name": "P1", "provider_type": "openai",
         "api_base": "https://api.example.com/v1", "api_key": "secret-key",
-        "enabled": True, "extra_headers": {"X-Foo": "bar"},
+        "enabled": True, "upstream_headers": {"X-Foo": "bar"},
         "models": [{"id": "m1", "name": "M1", "enabled": True}],
     })
     r = client.get("/admin/config/export", headers=temp_db["headers"])
@@ -213,7 +213,7 @@ def test_export_config_redacts_secrets(temp_db):
     assert body["version"] == 1
     assert body["include_secrets"] is False
     assert body["providers"][0]["api_key"] == ""
-    assert body["providers"][0].get("extra_headers") in (None, {})
+    assert body["providers"][0].get("upstream_headers") in (None, {})
 
 
 def test_export_config_includes_secrets(temp_db):

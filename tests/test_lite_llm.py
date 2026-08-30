@@ -4,9 +4,11 @@ Unit tests for liteLLM OpenAI-compatible routing and image normalization helpers
 import pytest
 from app.core.images import extract_image_data_uris, has_image_content, normalize_image_content
 from app.services.lite_llm import (
+    _disable_thinking_for_missing_reasoning,
     _disable_thinking_when_tools_forced,
     _normalize_gpt5_temperature,
     _system_messages_first,
+    build_completion_args,
     get_litellm_model_name,
 )
 
@@ -68,6 +70,37 @@ def test_disable_thinking_when_tools_forced_only_with_tools():
     kwargs["tool_choice"] = "required"
     _disable_thinking_when_tools_forced(kwargs)
     assert kwargs["extra_body"]["thinking"] == {"type": "disabled"}
+
+
+def test_disable_thinking_for_missing_reasoning_only_when_marked():
+    kwargs = {"extra_body": {"thinking": {"type": "enabled"}}}
+    _disable_thinking_for_missing_reasoning(kwargs)
+    assert kwargs["extra_body"]["thinking"] == {"type": "enabled"}
+
+    kwargs["disable_thinking_for_missing_reasoning"] = True
+    _disable_thinking_for_missing_reasoning(kwargs)
+    assert kwargs["extra_body"]["thinking"] == {"type": "disabled"}
+    assert "disable_thinking_for_missing_reasoning" not in kwargs
+
+
+def test_build_completion_args_forwards_only_transport_headers(monkeypatch):
+    provider = {
+        "id": "headers", "provider_type": "openai", "api_base": "https://example.test/v1",
+        "api_key": "test-key", "enabled": True,
+        "provider_options": {
+            "thinking": "enabled",
+            "thinking_budget_tokens": 8000,
+        },
+        "upstream_headers": {
+            "User-Agent": "gateway-test/1.0",
+        },
+    }
+    monkeypatch.setattr("app.services.lite_llm.get_provider", lambda _provider_id: provider)
+
+    _model, params = build_completion_args("test-model", "headers")
+
+    assert params["extra_headers"] == {"User-Agent": "gateway-test/1.0"}
+    assert params["extra_body"] == {"thinking": {"type": "enabled"}}
 
 
 @pytest.mark.parametrize("model", ["gpt-5", "gpt-5-codex", "openai/gpt-5.6"])

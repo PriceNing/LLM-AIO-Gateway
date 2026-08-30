@@ -76,21 +76,21 @@ def _build_anthropic_request_body(
         elif choice_type == "tool" and tool_choice.get("name"):
             req_body["tool_choice"] = {"type": "tool", "name": tool_choice["name"]}
 
-    extra_headers = provider_info.get("extra_headers", {}) or {}
-    thinking = extra_headers.get("thinking")
+    provider_options = provider_info.get("provider_options", {}) or {}
+    thinking = provider_options.get("thinking")
     if thinking == "disabled":
         req_body["thinking"] = {"type": "disabled"}
     elif thinking == "enabled":
-        thinking_config = _enabled_thinking_config(max_tokens, extra_headers)
+        thinking_config = _enabled_thinking_config(max_tokens, provider_options)
         if thinking_config:
             req_body["thinking"] = thinking_config
             req_body.pop("temperature", None)
     return req_body
 
 
-def _enabled_thinking_config(max_tokens: int, extra_headers: dict) -> dict | None:
+def _enabled_thinking_config(max_tokens: int, provider_options: dict) -> dict | None:
     try:
-        budget = int(extra_headers.get("thinking_budget_tokens") or get_default("anthropic_thinking_budget_tokens", 1024))
+        budget = int(provider_options.get("thinking_budget_tokens") or get_default("anthropic_thinking_budget_tokens", 1024))
     except (TypeError, ValueError):
         budget = 1024
     budget = max(1024, budget)

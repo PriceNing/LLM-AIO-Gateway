@@ -206,6 +206,16 @@ def inject_reasoning_content(
     return injected
 
 
+def has_missing_reasoning_content_for_tool_calls(messages: list[InternalMessage]) -> bool:
+    """Whether thinking-mode replay would need reasoning unavailable in history."""
+    return any(
+        message.role == "assistant"
+        and _ir_message_has_tool_calls(message)
+        and not _ir_message_has_reasoning(message)
+        for message in messages
+    )
+
+
 @dataclass(slots=True)
 class RouteTarget:
     model: str

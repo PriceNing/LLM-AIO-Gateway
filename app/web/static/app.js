@@ -117,7 +117,8 @@ zh: {
     'providers.requestTimeout': '请求超时（秒）',
     'providers.retryCount': '重试次数',
     'providers.retryBackoff': '重试退避（秒）',
-    'providers.extraHeaders': '扩展 Headers (JSON)',
+    'providers.providerOptions': '提供商选项 (JSON)',
+    'providers.upstreamHeaders': '上游 HTTP Headers (JSON)',
     'providers.forceChatCompletions': '强制使用 Chat Completions（跳过 Responses 探测）',
     'providers.addFail': '新增失败',
     'providers.updateFail': '更新失败',
@@ -474,7 +475,8 @@ en: {
     'providers.requestTimeout': 'Request Timeout (s)',
     'providers.retryCount': 'Retry Count',
     'providers.retryBackoff': 'Retry Backoff (s)',
-    'providers.extraHeaders': 'Extra Headers (JSON)',
+    'providers.providerOptions': 'Provider Options (JSON)',
+    'providers.upstreamHeaders': 'Upstream HTTP Headers (JSON)',
     'providers.forceChatCompletions': 'Force Chat Completions (skip Responses detection)',
     'providers.addFail': 'Failed to add',
     'providers.updateFail': 'Failed to update',
@@ -787,6 +789,11 @@ Object.assign(I18N.zh, {
     'testResult.provider': '提供商',
     'testResult.preview': '响应预览',
     'testResult.error': '错误',
+    'testResult.exceptionType': '异常类型',
+    'testResult.httpStatus': '上游 HTTP 状态',
+    'testResult.upstreamUrl': '上游 URL',
+    'testResult.upstreamResponse': '上游响应',
+    'testResult.traceback': '详细调用栈',
     'testResult.usage': 'Token 用量',
     'testResult.ok': '可用',
     'testResult.fail': '失败'
@@ -841,6 +848,11 @@ Object.assign(I18N.en, {
     'testResult.provider': 'Provider',
     'testResult.preview': 'Preview',
     'testResult.error': 'Error',
+    'testResult.exceptionType': 'Exception Type',
+    'testResult.httpStatus': 'Upstream HTTP Status',
+    'testResult.upstreamUrl': 'Upstream URL',
+    'testResult.upstreamResponse': 'Upstream Response',
+    'testResult.traceback': 'Traceback',
     'testResult.usage': 'Usage',
     'testResult.ok': 'OK',
     'testResult.fail': 'Failed'
@@ -1862,17 +1874,22 @@ function providerFormHtml(title, provider, submitAction) {
         '</div>' +
         '<div class="form-group"><label><input type="checkbox" id="providerEnabled"' + (provider.enabled === false ? '' : ' checked') + '> ' + t('providers.enabled') + '</label></div>' +
         '<div class="form-group"><label><input type="checkbox" id="providerForceChatCompletions"' + (provider.force_chat_completions ? ' checked' : '') + '> ' + t('providers.forceChatCompletions') + '</label></div>' +
-        '<div class="form-group"><label>' + t('providers.extraHeaders') + '</label>' +
-            '<textarea id="providerExtraHeaders" rows="3" style="font-family:monospace;font-size:12px" placeholder=\'{"thinking": "enabled"}\'>' + escHtml(JSON.stringify(provider.extra_headers || {}, null, 2)) + '</textarea></div>' +
+        '<div class="form-group"><label>' + t('providers.providerOptions') + '</label>' +
+            '<textarea id="providerOptions" rows="3" style="font-family:monospace;font-size:12px" placeholder=\'{"thinking": "enabled"}\'>' + escHtml(JSON.stringify(provider.provider_options || {}, null, 2)) + '</textarea></div>' +
+        '<div class="form-group"><label>' + t('providers.upstreamHeaders') + '</label>' +
+            '<textarea id="providerUpstreamHeaders" rows="3" style="font-family:monospace;font-size:12px" placeholder=\'{"User-Agent": "gateway/1.0"}\'>' + escHtml(JSON.stringify(provider.upstream_headers || {}, null, 2)) + '</textarea></div>' +
         '<div class="form-actions">' +
             '<button class="btn btn-secondary" onclick="closeModal()">' + t('common.cancel') + '</button>' +
             '<button class="btn btn-primary" onclick="' + submitAction + '">' + t('common.save') + '</button></div>';
 }
 
 function readProviderForm() {
-    var eh = document.getElementById('providerExtraHeaders').value.trim();
-    var extraHeaders = {};
-    if (eh) { try { extraHeaders = JSON.parse(eh); } catch(e) { toast('extra_headers JSON invalid: ' + e.message, 'error'); } }
+    var optionsText = document.getElementById('providerOptions').value.trim();
+    var providerOptions = {};
+    if (optionsText) { try { providerOptions = JSON.parse(optionsText); } catch(e) { toast('provider_options JSON invalid: ' + e.message, 'error'); } }
+    var headersText = document.getElementById('providerUpstreamHeaders').value.trim();
+    var upstreamHeaders = {};
+    if (headersText) { try { upstreamHeaders = JSON.parse(headersText); } catch(e) { toast('upstream_headers JSON invalid: ' + e.message, 'error'); } }
     return {
         id: document.getElementById('providerId').value.trim(),
         name: document.getElementById('providerName').value.trim(),
@@ -1880,7 +1897,8 @@ function readProviderForm() {
         api_base: document.getElementById('providerApiBase').value.trim(),
         api_key: document.getElementById('providerApiKey').value.trim(),
         enabled: document.getElementById('providerEnabled').checked,
-        extra_headers: extraHeaders,
+        provider_options: providerOptions,
+        upstream_headers: upstreamHeaders,
         request_timeout: parseInt(document.getElementById('providerRequestTimeout').value, 10) || 120,
         retry_count: parseInt(document.getElementById('providerRetryCount').value, 10) || 0,
         retry_backoff: parseFloat(document.getElementById('providerRetryBackoff').value) || 0
@@ -2495,6 +2513,11 @@ function showTestResult(title, result) {
         detailRow(t('testResult.provider'), result.provider_id || result.provider_type || '-'),
         detailRow(t('testResult.preview'), result.preview || '-'),
         detailRow(t('testResult.error'), result.error || '-'),
+        detailRow(t('testResult.exceptionType'), result.exception_type || '-'),
+        detailRow(t('testResult.httpStatus'), result.http_status == null ? '-' : result.http_status),
+        detailRow(t('testResult.upstreamUrl'), result.upstream_url || '-'),
+        detailRow(t('testResult.upstreamResponse'), result.upstream_response || '-'),
+        detailRow(t('testResult.traceback'), result.traceback || '-'),
         detailRow(t('testResult.usage'), result.usage || {})
     ];
     document.getElementById('modalContent').innerHTML = '<h2>' + escHtml(title) + '</h2>' +

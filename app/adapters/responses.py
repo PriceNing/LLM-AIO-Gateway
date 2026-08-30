@@ -68,9 +68,9 @@ def responses_headers(provider: dict) -> dict[str, str]:
     api_key = provider.get("api_key")
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
-    extra = provider.get("extra_headers") or {}
-    if isinstance(extra, dict):
-        headers.update({str(k): str(v) for k, v in extra.items() if k != "thinking"})
+    upstream_headers = provider.get("upstream_headers") or {}
+    if isinstance(upstream_headers, dict):
+        headers.update({str(k): str(v) for k, v in upstream_headers.items() if v not in (None, "")})
     return headers
 
 

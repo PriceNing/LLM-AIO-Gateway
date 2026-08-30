@@ -544,7 +544,8 @@ async def test_responses_anthropic_stream_uses_internal_events(monkeypatch):
         "provider_type": "anthropic",
         "api_base": "https://ai-pixel.online",
         "api_key": "sk-test",
-        "extra_headers": {},
+        "provider_options": {},
+        "upstream_headers": {},
     }
 
     class FakeStream:

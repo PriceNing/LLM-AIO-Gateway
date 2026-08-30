@@ -36,8 +36,7 @@ def init_db(path: Optional[str] = None) -> None:
             conn.executescript(_SCHEMA)
             # Migration: add created_at to provider_models if missing
             _migrate_provider_models_created_at(conn)
-            # Migration: add extra_headers to providers if missing
-            _migrate_providers_extra_headers(conn)
+            _migrate_provider_options_and_headers(conn)
             _migrate_provider_request_options(conn)
             _migrate_provider_force_chat_completions(conn)
             _remove_legacy_provider_responses_capability(conn)
@@ -62,24 +61,37 @@ def _migrate_provider_models_created_at(conn: sqlite3.Connection) -> None:
             pass  # Column already exists
 
 
-def _migrate_providers_extra_headers(conn: sqlite3.Connection) -> None:
-    """Add extra_headers column to providers if missing, and initialize DeepSeek defaults."""
+def _migrate_provider_options_and_headers(conn: sqlite3.Connection) -> None:
+    """Split legacy mixed provider settings into options and upstream headers."""
     try:
-        conn.execute("ALTER TABLE providers ADD COLUMN extra_headers TEXT NOT NULL DEFAULT '{}'")
+        conn.execute("ALTER TABLE providers ADD COLUMN provider_options TEXT NOT NULL DEFAULT '{}'")
     except sqlite3.OperationalError:
-        pass  # Column already exists
-    # Initialize extra_headers for existing DeepSeek providers that have empty value
+        pass
+    try:
+        conn.execute("ALTER TABLE providers ADD COLUMN upstream_headers TEXT NOT NULL DEFAULT '{}'")
+    except sqlite3.OperationalError:
+        pass
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(providers)").fetchall()}
+    legacy_column = "extra_headers" if "extra_headers" in columns else "'{}'"
     rows = conn.execute(
-        "SELECT id, extra_headers FROM providers WHERE extra_headers IS NULL OR extra_headers = '{}'"
+        f"SELECT id, name, {legacy_column}, provider_options, upstream_headers FROM providers"
     ).fetchall()
     for row in rows:
-        pid = row[0]
-        name_row = conn.execute("SELECT name FROM providers WHERE id = ?", (pid,)).fetchone()
-        provider_name = (name_row[0] if name_row else "").lower()
-        if "deepseek" in pid.lower() or "deepseek" in provider_name:
+        pid, name, legacy_json, options_json, headers_json = row
+        legacy = _json_loads(legacy_json or "{}") or {}
+        options = _json_loads(options_json or "{}") or {}
+        headers = _json_loads(headers_json or "{}") or {}
+        if not options and legacy:
+            options = {key: value for key, value in legacy.items() if key in {"thinking", "thinking_budget_tokens"}}
+        if not headers and legacy:
+            headers = {key: value for key, value in legacy.items() if key not in {"thinking", "thinking_budget_tokens"}}
+        provider_name = str(name or "").lower()
+        if not options and ("deepseek" in pid.lower() or "deepseek" in provider_name):
+            options = {"thinking": "enabled"}
+        if options or headers:
             conn.execute(
-                "UPDATE providers SET extra_headers = ? WHERE id = ?",
-                ('{"thinking": "enabled"}', pid)
+                "UPDATE providers SET provider_options = ?, upstream_headers = ? WHERE id = ?",
+                (json.dumps(options, ensure_ascii=False), json.dumps(headers, ensure_ascii=False), pid),
             )
 
 
@@ -322,7 +334,8 @@ CREATE TABLE IF NOT EXISTS providers (
     api_base TEXT NOT NULL DEFAULT '',
     api_key TEXT NOT NULL DEFAULT '',
     enabled INTEGER NOT NULL DEFAULT 1,
-    extra_headers TEXT NOT NULL DEFAULT '{}',
+    provider_options TEXT NOT NULL DEFAULT '{}',
+    upstream_headers TEXT NOT NULL DEFAULT '{}',
     request_timeout INTEGER NOT NULL DEFAULT 120,
     retry_count INTEGER NOT NULL DEFAULT 0,
     retry_backoff REAL NOT NULL DEFAULT 0.5,
@@ -1166,7 +1179,8 @@ def _normalize_provider_request_options(provider: dict) -> dict:
 def _provider_from_row(row: sqlite3.Row) -> dict:
     p = _row_to_dict(row)
     p["enabled"] = _to_bool(p["enabled"])
-    p["extra_headers"] = _json_loads(p.get("extra_headers", "{}")) or {}
+    p["provider_options"] = _json_loads(p.get("provider_options", "{}")) or {}
+    p["upstream_headers"] = _json_loads(p.get("upstream_headers", "{}")) or {}
     p.update(_normalize_provider_request_options(p))
     p["force_chat_completions"] = _to_bool(p.get("force_chat_completions", 0))
     return p
@@ -1388,18 +1402,19 @@ def update_model_responses_tool_types(provider_id: str, model: str, tool_types: 
 def add_provider(provider: dict) -> dict:
     with get_db() as db:
         try:
-            extra_headers_json = json.dumps(provider.get("extra_headers", {}), ensure_ascii=False)
+            provider_options_json = json.dumps(provider.get("provider_options", {}), ensure_ascii=False)
+            upstream_headers_json = json.dumps(provider.get("upstream_headers", {}), ensure_ascii=False)
             options = _normalize_provider_request_options(provider)
             db.execute(
                 """
                 INSERT INTO providers
-                    (id, name, provider_type, api_base, api_key, enabled, extra_headers, request_timeout, retry_count, retry_backoff, force_chat_completions)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (id, name, provider_type, api_base, api_key, enabled, provider_options, upstream_headers, request_timeout, retry_count, retry_backoff, force_chat_completions)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (provider["id"], provider["name"], provider.get("provider_type", "openai"),
                  provider.get("api_base", ""), provider.get("api_key", ""),
                  1 if provider.get("enabled", True) else 0,
-                 extra_headers_json, options["request_timeout"], options["retry_count"], options["retry_backoff"], 1 if provider.get("force_chat_completions", False) else 0)
+                 provider_options_json, upstream_headers_json, options["request_timeout"], options["retry_count"], options["retry_backoff"], 1 if provider.get("force_chat_completions", False) else 0)
             )
         except sqlite3.IntegrityError:
             raise ValueError(f"Provider '{provider['id']}' already exists")
@@ -1423,7 +1438,8 @@ def add_provider(provider: dict) -> dict:
         "api_base": provider.get("api_base", ""),
         "api_key": provider.get("api_key", ""),
         "enabled": provider.get("enabled", True),
-        "extra_headers": provider.get("extra_headers", {}),
+        "provider_options": provider.get("provider_options", {}),
+        "upstream_headers": provider.get("upstream_headers", {}),
         **options,
         "force_chat_completions": bool(provider.get("force_chat_completions", False)),
         "models": [
@@ -1458,9 +1474,10 @@ def update_provider(provider_id: str, updates: dict) -> Optional[dict]:
             for key, value in options.items():
                 if key in updates:
                     db.execute(f"UPDATE providers SET {key} = ? WHERE id = ?", (value, provider_id))
-        if "extra_headers" in updates:
-            db.execute("UPDATE providers SET extra_headers = ? WHERE id = ?",
-                       (json.dumps(updates["extra_headers"], ensure_ascii=False), provider_id))
+        for key in ("provider_options", "upstream_headers"):
+            if key in updates:
+                db.execute(f"UPDATE providers SET {key} = ? WHERE id = ?",
+                           (json.dumps(updates[key], ensure_ascii=False), provider_id))
         if "enabled" in updates:
             db.execute("UPDATE providers SET enabled = ? WHERE id = ?", (1 if updates["enabled"] else 0, provider_id))
         if "models" in updates:
@@ -1587,7 +1604,8 @@ def find_provider_by_model(model_id: str) -> Optional[dict]:
             return None
         p = _row_to_dict(row)
         p["enabled"] = _to_bool(p["enabled"])
-        p["extra_headers"] = _json_loads(p.get("extra_headers", "{}")) or {}
+        p["provider_options"] = _json_loads(p.get("provider_options", "{}")) or {}
+        p["upstream_headers"] = _json_loads(p.get("upstream_headers", "{}")) or {}
         return p
 
 

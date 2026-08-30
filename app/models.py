@@ -14,7 +14,8 @@ class ProviderBase(BaseModel):
     api_key: str
     enabled: bool = True
     models: list[ModelInfo] = Field(default_factory=list)
-    extra_headers: dict = Field(default_factory=dict)
+    provider_options: dict = Field(default_factory=dict)
+    upstream_headers: dict = Field(default_factory=dict)
     request_timeout: int = Field(default=120, ge=1, le=3600)
     retry_count: int = Field(default=0, ge=0, le=10)
     retry_backoff: float = Field(default=0.5, ge=0, le=60)
@@ -30,7 +31,8 @@ class ProviderUpdate(BaseModel):
     api_key: Optional[str] = None
     enabled: Optional[bool] = None
     models: Optional[list[ModelInfo]] = None
-    extra_headers: Optional[dict] = None
+    provider_options: Optional[dict] = None
+    upstream_headers: Optional[dict] = None
     request_timeout: Optional[int] = Field(default=None, ge=1, le=3600)
     retry_count: Optional[int] = Field(default=None, ge=0, le=10)
     retry_backoff: Optional[float] = Field(default=None, ge=0, le=60)

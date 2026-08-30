@@ -30,6 +30,7 @@ from app.database import (
 from app.protocols.egress import render_response, render_responses_image_generation
 from app.protocols.ingress import responses_to_internal
 from app.core.image_intent import is_image_generation_intent, latest_user_text
+from app.router.proxy import _responses_is_system_turn
 from app.core.image_bridge import (
     GATEWAY_IMAGE_ASSET_MARKER,
     GATEWAY_IMAGE_DISPLAY_CALL_PREFIX,
@@ -386,6 +387,21 @@ async def test_render_responses_image_generation_sse_contains_image_events():
     assert completed_response["output"][0]["type"] == "image_generation_call"
     assert completed_response["output"][0]["status"] == "completed"
     assert completed_response["output"][0]["result"] == "AAAA"
+
+
+def test_codex_ambient_and_system_turns_are_detected():
+    assert _responses_is_system_turn({
+        "client_metadata": {"x-codex-turn-metadata": json.dumps({"thread_source": "system"})},
+    }) is True
+    assert _responses_is_system_turn({
+        "client_metadata": {"x-codex-turn-metadata": json.dumps({
+            "thread_source": "ambient_suggestion_safety",
+            "turn_trigger": "ambient_suggestion_safety",
+        })},
+    }) is True
+    assert _responses_is_system_turn({
+        "client_metadata": {"x-codex-turn-metadata": json.dumps({"thread_source": "user"})},
+    }) is False
 
 
 def test_image_generation_intent_is_conservative():
@@ -1426,6 +1442,48 @@ def test_responses_codex_system_turn_does_not_inject_or_correct_image_bridge(ima
         "text": {"format": {"type": "json_schema", "name": "codex_output_schema"}},
     })
     assert response.status_code == 200
+    assert planner_calls == 1
+    assert IMAGE_BRIDGE_CORRECTION_MARKER not in response.text
+
+
+def test_responses_codex_ambient_safety_turn_does_not_enter_image_bridge(image_app_db, monkeypatch):
+    planner_calls = 0
+
+    async def fake_planner(policy, internal, **kwargs):
+        nonlocal planner_calls
+        planner_calls += 1
+        assert all(tool.name != IMAGE_BRIDGE_TOOL_NAME for tool in internal.tools)
+        assert IMAGE_BRIDGE_MARKER not in (internal.system or "")
+        return InternalOutputMessage(
+            text='{"exclude":[]}',
+            usage={"total_tokens": 3},
+        ), {"id": "chat"}, "chat"
+
+    async def fail_generate(*args, **kwargs):
+        raise AssertionError("ambient safety classification must not invoke the image backend")
+
+    monkeypatch.setattr("app.router.proxy.generate_images", fail_generate)
+    monkeypatch.setattr("app.router.proxy._call_nonstream_with_fallbacks", fake_planner)
+    response = TestClient(app).post("/v1/responses", headers=image_app_db["headers"], json={
+        "model": "chat/chat-model",
+        "input": [{
+            "type": "message", "role": "user", "content": [{
+                "type": "input_text",
+                "text": "Classify these ambient suggestion candidates for policy safety.",
+            }],
+        }],
+        "tools": [{"type": "image_generation", "output_format": "png"}],
+        "tool_choice": "auto",
+        "client_metadata": {
+            "x-codex-turn-metadata": json.dumps({
+                "request_kind": "turn",
+                "thread_source": "ambient_suggestion_safety",
+                "turn_trigger": "ambient_suggestion_safety",
+            }),
+        },
+        "text": {"format": {"type": "json_schema", "name": "codex_output_schema"}},
+    })
+    assert response.status_code == 200, response.text
     assert planner_calls == 1
     assert IMAGE_BRIDGE_CORRECTION_MARKER not in response.text
 

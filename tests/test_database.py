@@ -128,6 +128,53 @@ def test_history_stats_queries_local_day_against_utc_records(monkeypatch):
 # -- Provider CRUD --
 
 
+def test_legacy_extra_headers_migrate_into_separate_provider_fields(tmp_path):
+    import app.database as db_mod
+
+    legacy_path = tmp_path / "legacy-provider-settings.db"
+    with sqlite3.connect(legacy_path) as conn:
+        conn.executescript("""
+            CREATE TABLE providers (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                provider_type TEXT NOT NULL DEFAULT 'openai',
+                api_base TEXT NOT NULL DEFAULT '',
+                api_key TEXT NOT NULL DEFAULT '',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                extra_headers TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE provider_models (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider_id TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                model_name TEXT NOT NULL DEFAULT '',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL DEFAULT '',
+                preprocessor TEXT NOT NULL DEFAULT '',
+                FOREIGN KEY (provider_id) REFERENCES providers(id) ON DELETE CASCADE,
+                UNIQUE(provider_id, model_id)
+            );
+        """)
+        conn.execute(
+            "INSERT INTO providers (id, name, extra_headers) VALUES (?, ?, ?)",
+            ("legacy", "Legacy", '{"thinking":"enabled","User-Agent":"curl/8.0"}'),
+        )
+        conn.execute(
+            "INSERT INTO provider_models (provider_id, model_id, model_name) VALUES (?, ?, ?)",
+            ("legacy", "model", "model"),
+        )
+
+    previous_path, previous_initialized = db_mod.DB_PATH, db_mod._initialized
+    try:
+        db_mod._initialized = False
+        db_mod.init_db(str(legacy_path))
+        provider = db_mod.get_provider("legacy")
+        assert provider["provider_options"] == {"thinking": "enabled"}
+        assert provider["upstream_headers"] == {"User-Agent": "curl/8.0"}
+    finally:
+        db_mod.DB_PATH, db_mod._initialized = previous_path, previous_initialized
+
+
 def test_legacy_provider_responses_columns_are_physically_removed(tmp_path):
     """Existing provider-level capability fields migrate to model-level fields only."""
     import app.database as db_mod
