@@ -245,6 +245,8 @@ def _decode_request_log(entry):
         "image_retried_count", "image_reused_count", "image_completed_count",
         "image_batch_id",
         "responses_mode", "upstream_endpoint",
+        "reasoning_effort", "chat_template_kwargs", "enable_thinking",
+        "tps", "completion_tokens", "duration_ms", "generation_ms",
     ):
         if key in details:
             entry[key] = details[key]

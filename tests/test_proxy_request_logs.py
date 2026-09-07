@@ -183,3 +183,108 @@ def test_request_log_payload_capture_can_be_disabled(temp_db, monkeypatch):
     entry = list_request_logs(limit=1)[0]
     assert entry["request_body"]["_omitted"] is True
     assert entry["response_body"]["_omitted"] is True
+
+
+def test_record_request_log_captures_reasoning_and_tps(temp_db):
+    from app.router.proxy import _record_request_log
+
+    _record_request_log(
+        endpoint="chat_completions",
+        username="alice",
+        api_key_value="sk-test",
+        requested_model="m",
+        final_model="m",
+        final_provider="p",
+        request_body={
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "xhigh",
+            "chat_template_kwargs": {"enable_thinking": True, "reasoning_effort": "xhigh"},
+        },
+        response_body={"choices": []},
+        usage={"output_tokens": 50, "total_tokens": 80},
+        success=True,
+        status="ok",
+        tokens=80,
+        details={"duration_ms": 2000, "completion_tokens": 0, "tps": 0.0},
+    )
+
+    entry = list_request_logs(limit=1)[0]
+    assert entry["details"]["reasoning_effort"] == "xhigh"
+    assert entry["details"]["chat_template_kwargs"] == {
+        "enable_thinking": True,
+        "reasoning_effort": "xhigh",
+    }
+    assert entry["details"]["completion_tokens"] == 50
+    assert entry["details"]["tps"] == 25.0
+    assert entry["reasoning_effort"] == "xhigh"
+    assert entry["tps"] == 25.0
+
+
+def test_record_request_log_infers_enable_thinking_from_reasoning_effort(temp_db):
+    from app.router.proxy import _record_request_log
+
+    _record_request_log(
+        endpoint="chat_completions",
+        username="alice",
+        api_key_value="sk-test",
+        requested_model="m",
+        final_model="m",
+        final_provider="p",
+        request_body={"model": "m", "reasoning_effort": "medium"},
+        response_body={"choices": []},
+        usage={},
+        success=True,
+        status="ok",
+        tokens=0,
+    )
+
+    entry = list_request_logs(limit=1)[0]
+    assert entry["reasoning_effort"] == "medium"
+    assert entry["enable_thinking"] is True
+    assert entry["details"]["enable_thinking"] is True
+
+
+def test_log_request_exposes_thinking_fields_in_stats_detail(temp_db):
+    from app.router.proxy import _log_request, clear_request_log, get_request_log
+
+    clear_request_log()
+    try:
+        _log_request(
+            "alice",
+            "sk-test",
+            "llamacpp-linux/Qwen3.8-27B",
+            "llamacpp-linux",
+            "chat_completions",
+            True,
+            24,
+            details={"reasoning_effort": "medium"},
+        )
+        entry = get_request_log()[0]
+        assert entry["reasoning_effort"] == "medium"
+        assert entry["enable_thinking"] is True
+        assert entry["details"]["enable_thinking"] is True
+    finally:
+        clear_request_log()
+
+
+def test_log_request_maps_responses_nested_reasoning_effort(temp_db):
+    from app.router.proxy import _log_request, _thinking_fields_from_payload, clear_request_log, get_request_log
+
+    clear_request_log()
+    try:
+        _log_request(
+            "alice",
+            "sk-test",
+            "llamacpp-linux/Qwen3.8-27B",
+            "llamacpp-linux",
+            "responses",
+            True,
+            24,
+            details=_thinking_fields_from_payload({"reasoning": {"effort": "low"}}),
+        )
+        entry = get_request_log()[0]
+        assert entry["reasoning_effort"] == "low"
+        assert entry["enable_thinking"] is True
+    finally:
+        clear_request_log()

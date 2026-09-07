@@ -7,6 +7,13 @@ _app_log = get_logger("app")
 from app.protocols.ir import ir_to_openai_messages
 
 
+_OPENAI_COMPAT_REASONING_PARAMS = {
+    "reasoning_effort",
+    "chat_template_kwargs",
+    "enable_thinking",
+}
+
+
 def _chat_tool_choice(tool_choice: Any) -> Any:
     """Project provider-neutral or client-protocol tool_choice to OpenAI Chat shape."""
     if tool_choice is None:
@@ -40,6 +47,13 @@ def chat_messages_from_internal(internal: InternalRequest) -> list[dict[str, Any
 
 def chat_kwargs_from_internal(internal: InternalRequest) -> dict[str, Any]:
     kwargs = dict(internal.extra)
+    reasoning_params = _OPENAI_COMPAT_REASONING_PARAMS.intersection(kwargs)
+    if reasoning_params:
+        allowed = list(kwargs.get("allowed_openai_params") or [])
+        for param in sorted(reasoning_params):
+            if param not in allowed:
+                allowed.append(param)
+        kwargs["allowed_openai_params"] = allowed
     if internal.tools:
         kwargs["tools"] = internal.chat_tools()
     raw_tool_choice = internal.tool_choice if internal.tool_choice is not None else kwargs.get("tool_choice")

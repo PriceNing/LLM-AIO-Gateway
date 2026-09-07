@@ -18,6 +18,35 @@ from app.core.text import strip_billing_header
 _INCOMPLETE_JSON_PREFIXES = ("{", "[", '"')
 
 
+def thinking_fields_from_body(body: dict[str, Any] | None) -> dict[str, Any]:
+    """Whitelist thinking controls from Chat, Completions, Messages, or Responses.
+
+    Chat clients send top-level reasoning_effort. Responses clients such as
+    Codex send nested reasoning.effort. Both must land in InternalRequest.extra
+    and request-log details without leaking the rest of raw_body.
+    """
+    if not isinstance(body, dict):
+        return {}
+    fields: dict[str, Any] = {}
+    for key in ("reasoning_effort", "chat_template_kwargs", "enable_thinking"):
+        if key in body:
+            fields[key] = body[key]
+    reasoning = body.get("reasoning")
+    if isinstance(reasoning, dict) and "reasoning_effort" not in fields:
+        effort = reasoning.get("effort")
+        if effort is not None and effort != "":
+            fields["reasoning_effort"] = effort
+    if "enable_thinking" not in fields:
+        template_kwargs = fields.get("chat_template_kwargs")
+        if isinstance(template_kwargs, dict) and "enable_thinking" in template_kwargs:
+            fields["enable_thinking"] = template_kwargs["enable_thinking"]
+        elif "reasoning_effort" in fields:
+            fields["enable_thinking"] = str(fields["reasoning_effort"]).lower() not in (
+                "", "none", "off", "false", "0"
+            )
+    return fields
+
+
 def _max_tokens_from_body(body: dict[str, Any]) -> int:
     max_tokens = body.get("max_tokens")
     if max_tokens is None:
@@ -366,8 +395,16 @@ def chat_completions_to_internal(body: dict[str, Any]) -> InternalRequest:
     model = body.get("model")
     _app_log.debug("[ingress] chat_completions model=%s stream=%s msgs=%d tools=%s",
                    model, body.get("stream"), len(body.get("messages", [])), bool(body.get("tools")))
-    extra_keys = {"top_p", "presence_penalty", "frequency_penalty", "stop", "response_format", "user"}
+    extra_keys = {
+        "top_p",
+        "presence_penalty",
+        "frequency_penalty",
+        "stop",
+        "response_format",
+        "user",
+    }
     extra = {key: body[key] for key in extra_keys if key in body}
+    extra.update(thinking_fields_from_body(body))
     tool_choice = body.get("tool_choice")
     if tool_choice is not None:
         extra["tool_choice"] = tool_choice
@@ -394,8 +431,18 @@ def completions_to_internal(body: dict[str, Any]) -> InternalRequest:
     prompt = _completion_prompt_to_text(body.get("prompt", ""))
     _app_log.debug("[ingress] completions model=%s stream=%s prompt_len=%d",
                    model, body.get("stream"), len(prompt))
-    extra_keys = {"top_p", "presence_penalty", "frequency_penalty", "stop", "suffix", "echo", "logprobs", "user"}
+    extra_keys = {
+        "top_p",
+        "presence_penalty",
+        "frequency_penalty",
+        "stop",
+        "suffix",
+        "echo",
+        "logprobs",
+        "user",
+    }
     extra = {key: body[key] for key in extra_keys if key in body}
+    extra.update(thinking_fields_from_body(body))
     messages = openai_messages_to_ir([{"role": "user", "content": prompt}])
     return InternalRequest(
         endpoint="completions",
@@ -426,6 +473,11 @@ def anthropic_messages_to_internal(body: dict[str, Any]) -> InternalRequest:
     elif tool_choice == "auto":
         tool_choice = None
 
+    # Preserve optional thinking controls when this endpoint is routed to an
+    # OpenAI-compatible upstream. Responses-style reasoning.effort is mapped
+    # onto reasoning_effort by thinking_fields_from_body().
+    extra = thinking_fields_from_body(body)
+
     return InternalRequest(
         endpoint="messages",
         requested_model=model,
@@ -439,6 +491,7 @@ def anthropic_messages_to_internal(body: dict[str, Any]) -> InternalRequest:
         temperature=_temperature_from_body(body),
         max_tokens=_max_tokens_from_body(body),
         previous_response_id=body.get("previous_response_id") or "",
+        extra=extra,
         raw_body=body,
         metadata={"anthropic_input_count": len(anthropic_messages)},
     )
@@ -457,8 +510,17 @@ def responses_to_internal(body: dict[str, Any]) -> InternalRequest:
 
     # Only Chat-compatible fields go in extra. The full cleaned body is retained
     # separately for a native Responses upstream and must never leak into Chat.
-    extra_keys = {"top_p", "presence_penalty", "frequency_penalty", "stop", "response_format", "user", "parallel_tool_calls"}
+    extra_keys = {
+        "top_p",
+        "presence_penalty",
+        "frequency_penalty",
+        "stop",
+        "response_format",
+        "user",
+        "parallel_tool_calls",
+    }
     extra = {key: body[key] for key in extra_keys if key in body}
+    extra.update(thinking_fields_from_body(body))
 
     if namespace_tools:
         extra["responses_namespace_tools"] = namespace_tools

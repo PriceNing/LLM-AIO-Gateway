@@ -81,6 +81,46 @@ def test_chat_completions_to_internal_normalizes_tools():
     assert req.stream is True
 
 
+def test_chat_completions_preserves_reasoning_parameters_for_openai_adapter():
+    body = {
+        "model": "qwen-test",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "xhigh",
+        "chat_template_kwargs": {"enable_thinking": True, "reasoning_effort": "xhigh"},
+    }
+
+    req = chat_completions_to_internal(body)
+    kwargs = chat_kwargs_from_internal(req)
+
+    assert req.extra["reasoning_effort"] == "xhigh"
+    assert req.extra["chat_template_kwargs"] == {
+        "enable_thinking": True,
+        "reasoning_effort": "xhigh",
+    }
+    assert kwargs["reasoning_effort"] == "xhigh"
+    assert kwargs["chat_template_kwargs"] == {
+        "enable_thinking": True,
+        "reasoning_effort": "xhigh",
+    }
+    assert {"reasoning_effort", "chat_template_kwargs"}.issubset(kwargs["allowed_openai_params"])
+
+
+def test_responses_nested_reasoning_effort_projects_to_openai_adapter():
+    req = responses_to_internal({
+        "model": "qwen-test",
+        "input": "hi",
+        "reasoning": {"effort": "low"},
+    })
+    kwargs = chat_kwargs_from_internal(req)
+
+    assert req.extra["reasoning_effort"] == "low"
+    assert req.extra["enable_thinking"] is True
+    assert kwargs["reasoning_effort"] == "low"
+    assert kwargs["enable_thinking"] is True
+    assert "reasoning_effort" in kwargs["allowed_openai_params"]
+    assert "reasoning" not in kwargs
+
+
 def test_completions_to_internal_wraps_prompt_as_user_message():
     req = completions_to_internal({
         "model": "text-test",
@@ -144,6 +184,35 @@ def test_anthropic_unknown_blocks_project_to_openai_text_placeholders():
         {"type": "text", "text": "Use this"},
         {"type": "text", "text": "[tool_reference: artifact]"},
     ]}
+
+
+def test_anthropic_messages_to_internal_preserves_reasoning_parameters_for_openai_adapter():
+    req = anthropic_messages_to_internal({
+        "model": "openai-test",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "medium",
+        "chat_template_kwargs": {"enable_thinking": True, "reasoning_effort": "medium"},
+        "enable_thinking": False,
+    })
+    kwargs = chat_kwargs_from_internal(req)
+
+    assert req.extra["reasoning_effort"] == "medium"
+    assert req.extra["chat_template_kwargs"] == {
+        "enable_thinking": True,
+        "reasoning_effort": "medium",
+    }
+    assert req.extra["enable_thinking"] is False
+    assert kwargs["reasoning_effort"] == "medium"
+    assert kwargs["chat_template_kwargs"] == {
+        "enable_thinking": True,
+        "reasoning_effort": "medium",
+    }
+    assert kwargs["enable_thinking"] is False
+    assert {
+        "reasoning_effort",
+        "chat_template_kwargs",
+        "enable_thinking",
+    }.issubset(kwargs["allowed_openai_params"])
 
 
 def test_anthropic_messages_to_internal_preserves_any_tool_choice():

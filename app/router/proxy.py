@@ -75,6 +75,7 @@ from app.protocols.ingress import (
     chat_completions_to_internal,
     completions_to_internal,
     responses_to_internal,
+    thinking_fields_from_body,
 )
 from app.core.policy import RouteTarget, apply_fallback_policy, has_missing_reasoning_content_for_tool_calls, prepare_request_policy
 from app.adapters.anthropic import (
@@ -1468,6 +1469,7 @@ def _finalize_success_details(output=None, *, policy=None, extra: dict | None = 
         routing_details_from_policy(policy) if policy is not None else {},
         extra,
     )
+    details.update(_thinking_fields_from_payload(details))
     return apply_outcome_to_details(details, success=True, partial_output=False)
 
 
@@ -1591,6 +1593,7 @@ async def _call_nonstream_target(target: RouteTarget, internal, *, temperature, 
         adapter_provider_id or "-",
         provider_info.get("provider_type") if provider_info else "unknown",
     )
+    started_at = time.monotonic()
     if provider_info and provider_info.get("provider_type") == "anthropic":
         output = await anthropic_messages_completion_for_internal(provider_info, internal)
     else:
@@ -1608,6 +1611,7 @@ async def _call_nonstream_target(target: RouteTarget, internal, *, temperature, 
     _attach_output_request_details(
         output,
         upstream_endpoint=_upstream_endpoint_for_provider(provider_info),
+        duration_ms=max(0, round((time.monotonic() - started_at) * 1000)),
     )
     _app_log.info(
         "[%s upstream.%s.success] target=%s provider=%s tokens=%s text_len=%d tool_calls=%d",
@@ -2290,9 +2294,20 @@ async def _stream_events_with_fallbacks(internal, *, temperature, max_tokens, lo
     raise last_exc or RuntimeError("No routing target available")
 
 
+def _thinking_fields_from_payload(payload: dict | None) -> dict:
+    """Extract thinking controls from a request body or extra dict.
+
+    Pi/OpenAI-compatible clients usually send only reasoning_effort. Persist
+    that as enable_thinking so stats details do not render as undefined.
+    """
+    return thinking_fields_from_body(payload)
+
+
 def _normalized_request_details(endpoint: str, details: dict | None) -> dict:
     """Promote image-generation requests to a stable logging dimension."""
     normalized = dict(details or {})
+    for key, value in _thinking_fields_from_payload(normalized).items():
+        normalized.setdefault(key, value)
     mode = str(normalized.get("responses_mode") or "")
     if (
         normalized.get("request_kind") == "image_generation"
@@ -2413,6 +2428,13 @@ def _log_request(username: str, api_key: str, model: str, provider_id: str,
         "native_failure_reason",
         "native_failure_message",
         "native_attempts",
+        "reasoning_effort",
+        "chat_template_kwargs",
+        "enable_thinking",
+        "tps",
+        "completion_tokens",
+        "duration_ms",
+        "generation_ms",
     ):
         if key in detail:
             entry[key] = detail[key]
@@ -2899,7 +2921,7 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
                     conv_key=conv_key,
                     remember_reasoning_content=_remember_reasoning_content,
                     tool_only_turns=_tool_only_turns,
-                    base_details=routing_details_from_policy(policy),
+                    base_details={**routing_details_from_policy(policy), **_thinking_fields_from_payload(body)},
                 ),
                 media_type="text/event-stream"
             )
@@ -2926,7 +2948,7 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
             _tool_only_turns.reset(conv_key)
 
         rendered = render_chat_completion(output, model=model)
-        success_details = _finalize_success_details(output, policy=policy)
+        success_details = _finalize_success_details(output, policy=policy, extra=_thinking_fields_from_payload(body))
         status = success_details.get("status", "ok")
         tokens = output.usage.get("total_tokens", 0)
         _record_request_log(
@@ -3024,7 +3046,7 @@ async def completions(request: Request, authorization: Optional[str] = Header(No
                     log_request=_log_request,
                     record_request_log=_build_stream_recorder("completions", username, api_key_value, requested_model, body),
                     conv_key=conv_key,
-                    base_details=routing_details_from_policy(policy),
+                    base_details={**routing_details_from_policy(policy), **_thinking_fields_from_payload(body)},
                 ),
                 media_type="text/event-stream"
             )
@@ -3040,7 +3062,7 @@ async def completions(request: Request, authorization: Optional[str] = Header(No
         provider_id = internal.provider_id
         logged_model = _target_model_for_log(RouteTarget(model=model, provider_id=adapter_provider_id or provider_id or ""), adapter_provider_id or provider_id or "")
         rendered = render_completion(output, model=model)
-        success_details = _finalize_success_details(output, policy=policy)
+        success_details = _finalize_success_details(output, policy=policy, extra=_thinking_fields_from_payload(body))
         status = success_details.get("status", "ok")
         tokens = output.usage.get("total_tokens", 0)
         _log_request(username, api_key_value, logged_model, adapter_provider_id or "", "completions", True, tokens, requested_model, details=success_details)
@@ -3155,7 +3177,7 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
                     record_request_log=_build_stream_recorder("messages", username, api_key_value, requested_model, body),
                     conv_key=conv_key,
                     remember_reasoning_content=_remember_reasoning_content,
-                    base_details=routing_details_from_policy(policy),
+                    base_details={**routing_details_from_policy(policy), **_thinking_fields_from_payload(body)},
                 ),
                 media_type="text/event-stream"
             )
@@ -3176,7 +3198,7 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
                           conv_key[:60], len(output.reasoning),
                           output.usage.get("prompt_cache_hit_tokens", 0), output.usage.get("prompt_cache_miss_tokens", 0))
         rendered = render_anthropic_message(output, model=model)
-        success_details = _finalize_success_details(output, policy=policy)
+        success_details = _finalize_success_details(output, policy=policy, extra=_thinking_fields_from_payload(body))
         status = success_details.get("status", "ok")
         tokens = output.usage.get("total_tokens", 0)
         _log_request(username, api_key_value, logged_model, adapter_provider_id, "messages", True, tokens, requested_model, details=success_details)
@@ -4007,7 +4029,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                         provider_id=adapter_provider_id, requested_model=requested_model,
                         log_request=_log_request,
                         record_request_log=_build_stream_recorder("responses", username, api_key_value, requested_model, body),
-                        base_details={**routing_details_from_policy(policy), **_output_request_details(output), "responses_mode": "image_bridge_model_passthrough"},
+                        base_details={**routing_details_from_policy(policy), **_output_request_details(output), **_thinking_fields_from_payload(body), "responses_mode": "image_bridge_model_passthrough"},
                         previous_response_id=previous_response_id, conv_key=conv_key,
                         remember_response_chain_key=_remember_response_chain_key,
                         remember_reasoning_content=_remember_reasoning_content,
@@ -4135,7 +4157,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                     requested_model=requested_model,
                     log_request=_log_request,
                     record_request_log=_build_stream_recorder("responses", username, api_key_value, requested_model, body),
-                    base_details={**routing_details_from_policy(policy), **native_downgrade_details},
+                    base_details={**routing_details_from_policy(policy), **native_downgrade_details, **_thinking_fields_from_payload(body)},
                     previous_response_id=previous_response_id,
                     conv_key=conv_key,
                     remember_response_chain_key=_remember_response_chain_key,
@@ -4167,7 +4189,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
         rendered = render_response(output, model=model, previous_response_id=previous_response_id, response_id=resp_id, extra=internal.extra)
         success_details = _finalize_success_details(
             output, policy=policy,
-            extra={"response_id": resp_id, **native_downgrade_details},
+            extra={"response_id": resp_id, **native_downgrade_details, **_thinking_fields_from_payload(body)},
         )
         status = success_details.get("status", "ok")
         tokens = output.usage.get("total_tokens", 0)
@@ -4423,11 +4445,45 @@ def _record_request_log(
     partial_output=False,
     error_message=None,
     log_id=None,
+    generation_started_at=None,
+    request_started_at=None,
 ):
     capture_payloads = bool(get_default("request_log_capture_payloads", True))
     payload_details = _normalized_request_details(endpoint, details)
+    if isinstance(request_body, dict):
+        payload_details.update(_thinking_fields_from_payload(request_body))
+    if request_started_at is not None:
+        payload_details["duration_ms"] = max(0, round((time.monotonic() - request_started_at) * 1000))
+    if generation_started_at is not None:
+        generation_elapsed = max(0.0, time.monotonic() - generation_started_at)
+        payload_details["generation_ms"] = round(generation_elapsed * 1000)
+        completion_tokens = (
+            usage.get("completion_tokens") or usage.get("output_tokens", 0)
+            if isinstance(usage, dict) else 0
+        )
+        try:
+            completion_tokens = max(0, int(completion_tokens))
+        except (TypeError, ValueError):
+            completion_tokens = 0
+        payload_details["completion_tokens"] = completion_tokens
+        payload_details["tps"] = round(completion_tokens / generation_elapsed, 2) if generation_elapsed > 0 else None
     if usage and 'usage' not in payload_details:
         payload_details['usage'] = usage
+    # Some OpenAI-compatible providers expose output_tokens while the
+    # adapter's normalized completion_tokens is still zero. Prefer the
+    # provider usage value when it is available, including over a stale 0.
+    if isinstance(usage, dict):
+        duration_ms = payload_details.get("generation_ms") or payload_details.get("duration_ms")
+        try:
+            duration_s = max(0.0, int(duration_ms or 0) / 1000)
+            usage_completion_tokens = usage.get("completion_tokens") or usage.get("output_tokens")
+            completion_tokens = max(0, int(usage_completion_tokens or payload_details.get("completion_tokens") or 0))
+        except (TypeError, ValueError):
+            duration_s = 0.0
+            completion_tokens = 0
+        if duration_s > 0 and (usage_completion_tokens or payload_details.get("tps") in (None, 0, 0.0)):
+            payload_details["completion_tokens"] = completion_tokens
+            payload_details["tps"] = round(completion_tokens / duration_s, 2)
     if capture_payloads and streamed_text is not None:
         compact = _compact_text(streamed_text, _STREAMED_TEXT_MAX)
         payload_details['streamed_text'] = compact
@@ -4504,6 +4560,7 @@ def _build_stream_recorder(
     api_key_value,
     requested_model,
     request_body,
+    request_started_at=None,
 ):
     def _record(**payload):
         _record_request_log(
@@ -4513,6 +4570,8 @@ def _build_stream_recorder(
             requested_model=requested_model,
             final_model=payload.get('final_model') or '',
             final_provider=payload.get('final_provider_id') or '',
+            generation_started_at=payload.get('generation_started_at'),
+            request_started_at=payload.get('request_started_at') or request_started_at,
             request_body=request_body,
             response_body=None,
             streamed_text=payload.get('streamed_text'),

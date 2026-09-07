@@ -1,4 +1,5 @@
 import json
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -120,6 +121,8 @@ async def stream_internal_output(
     streamed_tool_calls: list[dict[str, Any]] = []
     current_tool: dict[str, Any] | None = None
     streamed_usage: dict[str, Any] = {}
+    stream_started_at = time.monotonic()
+    first_output_at: float | None = None
     _app_log.debug(
         "[stream_orchestrator] START endpoint=%s provider=%s model=%s requested=%s conv_key=%s previous_response_id=%s",
         endpoint,
@@ -133,6 +136,7 @@ async def stream_internal_output(
     async def metered_events():
         nonlocal total_tokens, final_model, final_provider_id, visible_output_started, stream_details
         nonlocal streamed_text_parts, streamed_reasoning_parts, streamed_tool_calls, current_tool, streamed_usage
+        nonlocal first_output_at
         async for event in record_streaming_events(
             events,
             conv_key=conv_key,
@@ -176,12 +180,16 @@ async def stream_internal_output(
             if event.kind in ("text_delta", "reasoning_delta"):
                 if event.text or event.reasoning:
                     visible_output_started = True
+                    if first_output_at is None:
+                        first_output_at = time.monotonic()
                 if event.kind == "text_delta" and event.text:
                     streamed_text_parts.append(event.text)
                 elif event.kind == "reasoning_delta" and event.reasoning:
                     streamed_reasoning_parts.append(event.reasoning)
             elif event.kind == "tool_call_start":
                 visible_output_started = True
+                if first_output_at is None:
+                    first_output_at = time.monotonic()
                 if event.tool_call_id or event.name:
                     current_tool = {
                         "id": event.tool_call_id or "",
@@ -211,6 +219,8 @@ async def stream_internal_output(
                 current_tool = None
             elif event.kind == "message_done":
                 visible_output_started = True
+                if first_output_at is None:
+                    first_output_at = time.monotonic()
                 if current_tool is not None:
                     streamed_tool_calls.append(current_tool)
                     current_tool = None
@@ -244,6 +254,7 @@ async def stream_internal_output(
             success=True,
             partial_output=False,
         )
+        _attach_stream_performance(success_details, streamed_usage, first_output_at, stream_started_at)
         counters = stats_counters_for_status(success_details.get("status", "ok"))
         log_request(
             username,
@@ -269,6 +280,8 @@ async def stream_internal_output(
             final_model=final_model,
             final_provider_id=final_provider_id,
             visible_output_started=visible_output_started,
+            generation_started_at=first_output_at or stream_started_at,
+            request_started_at=stream_started_at,
         )
         increment_global_stats(
             counters.hard_success,
@@ -300,6 +313,7 @@ async def stream_internal_output(
                 partial_output=visible_output_started,
             )
             cancel_details["status"] = "cancelled"
+            _attach_stream_performance(cancel_details, streamed_usage, first_output_at, stream_started_at)
             logged_model = str(final_model or model or "-")
             logged_provider = str(final_provider_id or provider_id or "")
             _app_log.warning(
@@ -334,6 +348,8 @@ async def stream_internal_output(
                 final_model=logged_model,
                 final_provider_id=logged_provider,
                 visible_output_started=visible_output_started,
+                generation_started_at=first_output_at or stream_started_at,
+                request_started_at=stream_started_at,
                 error_message="client disconnected",
             )
             increment_global_stats(False, cancelled=True)
@@ -363,6 +379,7 @@ async def stream_internal_output(
             success=False,
             partial_output=partial_output,
         )
+        _attach_stream_performance(failure_details, streamed_usage, first_output_at, stream_started_at)
         counters = stats_counters_for_status(failure_details.get("status", "fail"))
         logged_model = str(
             failure_details.get("attempted_model")
@@ -401,6 +418,8 @@ async def stream_internal_output(
             final_model=logged_model,
             final_provider_id=logged_provider,
             visible_output_started=visible_output_started,
+            generation_started_at=first_output_at or stream_started_at,
+            request_started_at=stream_started_at,
             error_message=failure_details.get("error_message"),
         )
         increment_global_stats(
@@ -439,6 +458,8 @@ def _invoke_record_request_log(
     final_provider_id: str,
     visible_output_started: bool,
     error_message: str | None = None,
+    generation_started_at: float | None = None,
+    request_started_at: float | None = None,
 ) -> None:
     if recorder is None:
         return
@@ -456,6 +477,31 @@ def _invoke_record_request_log(
             final_provider_id=final_provider_id,
             partial_output=visible_output_started,
             error_message=error_message,
+            generation_started_at=generation_started_at,
+            request_started_at=request_started_at,
         )
     except Exception as exc:
         _app_log.warning("record_request_log callback failed: %s", exc)
+
+
+def _attach_stream_performance(
+    details: dict[str, Any],
+    usage: dict[str, Any],
+    first_output_at: float | None,
+    stream_started_at: float,
+) -> None:
+    now = time.monotonic()
+    duration_s = max(0.0, now - stream_started_at)
+    generation_s = max(0.0, now - (first_output_at or stream_started_at))
+    details["duration_ms"] = round(duration_s * 1000)
+    details["generation_ms"] = round(generation_s * 1000)
+    try:
+        completion_tokens = max(0, int(
+            (usage or {}).get("completion_tokens")
+            or (usage or {}).get("output_tokens")
+            or 0
+        ))
+    except (TypeError, ValueError):
+        completion_tokens = 0
+    details["completion_tokens"] = completion_tokens
+    details["tps"] = round(completion_tokens / generation_s, 2) if generation_s > 0 else None

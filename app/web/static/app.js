@@ -241,6 +241,12 @@ zh: {
     'stats.routedModel': '路由目标',
     'stats.endpoint': '端点',
     'stats.tokens': 'Tokens',
+    'stats.reasoningEffort': '思考强度',
+    'stats.chatTemplateKwargs': '思考参数',
+    'stats.enableThinking': '启用思考',
+    'stats.completionTokens': '输出 Tokens',
+    'stats.tps': 'TPS',
+    'stats.duration': '耗时',
     'stats.status': '状态',
     'stats.noRecords': '暂无记录',
     'stats.modelDist': '模型用量分布',
@@ -599,6 +605,12 @@ en: {
     'stats.routedModel': 'Routed Target',
     'stats.endpoint': 'Endpoint',
     'stats.tokens': 'Tokens',
+    'stats.reasoningEffort': 'Reasoning Effort',
+    'stats.chatTemplateKwargs': 'Chat Template Kwargs',
+    'stats.enableThinking': 'Enable Thinking',
+    'stats.completionTokens': 'Completion Tokens',
+    'stats.tps': 'TPS',
+    'stats.duration': 'Duration',
     'stats.status': 'Status',
     'stats.noRecords': 'No records',
     'stats.modelDist': 'Model Distribution',
@@ -782,6 +794,13 @@ Object.assign(I18N.zh, {
     'stats.errorMessage': '错误消息',
     'stats.attemptedModel': '尝试模型',
     'stats.attemptedProvider': '尝试提供商',
+    'stats.reasoningEffort': '思考强度',
+    'stats.chatTemplateKwargs': '思考参数',
+    'stats.enableThinking': '启用思考',
+    'stats.completionTokens': '输出 Tokens',
+    'stats.tps': 'TPS',
+    'stats.duration': '耗时',
+    'stats.generationTime': '生成耗时',
     'testResult.title': '测试结果',
     'testResult.status': '状态',
     'testResult.latency': '延迟',
@@ -841,6 +860,13 @@ Object.assign(I18N.en, {
     'stats.errorMessage': 'Error Message',
     'stats.attemptedModel': 'Attempted Model',
     'stats.attemptedProvider': 'Attempted Provider',
+    'stats.reasoningEffort': 'Reasoning Effort',
+    'stats.chatTemplateKwargs': 'Chat Template Kwargs',
+    'stats.enableThinking': 'Enable Thinking',
+    'stats.completionTokens': 'Completion Tokens',
+    'stats.tps': 'TPS',
+    'stats.duration': 'Duration',
+    'stats.generationTime': 'Generation Time',
     'testResult.title': 'Test Result',
     'testResult.status': 'Status',
     'testResult.latency': 'Latency',
@@ -3026,6 +3052,21 @@ function requestKindClass(entry) {
     return entry && entry.request_kind === 'image_generation' ? 'badge-image' : 'badge-endpoint';
 }
 
+function formatTps(value) {
+    if (value === null || value === undefined || value === '') return '-';
+    var n = Number(value);
+    if (!isFinite(n)) return String(value);
+    return n.toFixed(2) + ' tok/s';
+}
+
+function formatDurationMs(value) {
+    if (value === null || value === undefined || value === '') return '-';
+    var n = Number(value);
+    if (!isFinite(n)) return String(value);
+    if (n >= 10000) return (n / 1000).toFixed(1) + 's';
+    return Math.round(n) + 'ms';
+}
+
 function requestStatusClass(entry) {
     if (entry.status === 'rejected') return 'badge-rejected';
     if (entry.status === 'cancelled') return 'badge-cancelled';
@@ -3038,13 +3079,35 @@ function requestStatusClass(entry) {
 function requestDetailValue(value) {
     if (value === true) return 'true';
     if (value === false) return 'false';
-    if (value === null || value === '') return '-';
+    if (value === undefined || value === null || value === '') return '-';
     if (typeof value === 'object') return JSON.stringify(value, null, 2);
     return String(value);
 }
 
 function detailPick(primary, fallback) {
-    return primary === null || primary === '' ? fallback : primary;
+    return primary === undefined || primary === null || primary === '' ? fallback : primary;
+}
+
+function thinkingDetail(entry, details) {
+    details = details || {};
+    var effort = detailPick(entry.reasoning_effort, details.reasoning_effort);
+    var kwargs = detailPick(entry.chat_template_kwargs, details.chat_template_kwargs);
+    var enabled = detailPick(entry.enable_thinking, details.enable_thinking);
+    if (effort === undefined || effort === null || effort === '') {
+        var nested = detailPick(entry.reasoning, details.reasoning);
+        if (nested && typeof nested === 'object') {
+            effort = nested.effort;
+        }
+    }
+    if (enabled === undefined || enabled === null || enabled === '') {
+        if (kwargs && typeof kwargs === 'object' && kwargs.enable_thinking !== undefined) {
+            enabled = kwargs.enable_thinking;
+        } else if (effort !== undefined && effort !== null && effort !== '') {
+            var effortText = String(effort).toLowerCase();
+            enabled = !(effortText === 'none' || effortText === 'off' || effortText === 'false' || effortText === '0');
+        }
+    }
+    return { effort: effort, kwargs: kwargs, enabled: enabled };
 }
 
 function detailRow(label, value) {
@@ -3062,6 +3125,7 @@ function showRequestDetail(index) {
     var modalContent = document.querySelector('.modal-content');
     if (modalContent) modalContent.classList.add('modal-wide');
 
+    var thinking = thinkingDetail(entry, details);
     var basicRows = [
         detailRow(t('stats.status') || 'Status', requestStatusLabel(entry)),
         detailRow(t('stats.time') || 'Time', entry.time),
@@ -3072,7 +3136,14 @@ function showRequestDetail(index) {
         detailRow(t('stats.requestType') || 'Type', requestKindLabel(entry)),
         detailRow(t('stats.upstreamEndpoint') || 'Upstream Endpoint', entry.upstream_endpoint || details.upstream_endpoint),
         detailRow(t('stats.responsesMode') || 'Responses Mode', entry.responses_mode || details.responses_mode),
-        detailRow(t('stats.tokens') || 'Tokens', entry.tokens)
+        detailRow(t('stats.tokens') || 'Tokens', entry.tokens),
+        detailRow(t('stats.reasoningEffort') || 'Reasoning Effort', thinking.effort),
+        detailRow(t('stats.chatTemplateKwargs') || 'Chat Template Kwargs', thinking.kwargs),
+        detailRow(t('stats.enableThinking') || 'Enable Thinking', thinking.enabled),
+        detailRow(t('stats.completionTokens') || 'Completion Tokens', detailPick(entry.completion_tokens, details.completion_tokens)),
+        detailRow(t('stats.tps') || 'TPS', formatTps(detailPick(entry.tps, details.tps))),
+        detailRow(t('stats.duration') || 'Duration', formatDurationMs(detailPick(entry.duration_ms, details.duration_ms))),
+        detailRow(t('stats.generationTime') || 'Generation Time', formatDurationMs(detailPick(entry.generation_ms, details.generation_ms)))
     ];
     var routeRows = [
         detailRow(t('stats.requestedModel') || 'Requested', entry.requested_model || entry.model),
@@ -3569,6 +3640,14 @@ async function showRequestLogDetail(logId) {
         body += detailRow(t('logs.colModel') || 'Model', entry.model);
         body += detailRow(t('logs.colProvider') || 'Provider', entry.provider);
         body += detailRow(t('logs.colTokens') || 'Tokens', entry.tokens);
+        var thinking = thinkingDetail(entry, entry.details || {});
+        body += detailRow(t('stats.reasoningEffort') || 'Reasoning Effort', thinking.effort);
+        body += detailRow(t('stats.chatTemplateKwargs') || 'Chat Template Kwargs', thinking.kwargs);
+        body += detailRow(t('stats.enableThinking') || 'Enable Thinking', thinking.enabled);
+        body += detailRow(t('stats.completionTokens') || 'Completion Tokens', detailPick(entry.details && entry.details.completion_tokens, entry.completion_tokens));
+        body += detailRow(t('stats.tps') || 'TPS', formatTps(detailPick(entry.details && entry.details.tps, entry.tps)));
+        body += detailRow(t('stats.duration') || 'Duration', formatDurationMs(detailPick(entry.details && entry.details.duration_ms, entry.duration_ms)));
+        body += detailRow(t('stats.generationTime') || 'Generation Time', formatDurationMs(detailPick(entry.details && entry.details.generation_ms, entry.generation_ms)));
         body += detailRow(t('logs.colStatus') || 'Status', entry.status);
         body += detailRow(t('logs.colError') || 'Error', entry.error || '-');
         body += '</div>';
