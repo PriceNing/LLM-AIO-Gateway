@@ -691,8 +691,39 @@ def test_toggle_model_preprocessor_rejects_non_boolean_enabled(temp_db):
 
 
 def test_fetch_preprocessor_models_requires_auth():
-    response = client.get("/admin/preprocessors/fetch-models", params={"api_base": "http://x"})
+    response = client.post("/admin/preprocessors/fetch-models", json={"api_base": "http://x"})
     assert response.status_code == 401
+
+
+def test_fetch_preprocessor_models_rejects_metadata_endpoint(temp_db):
+    """云元数据地址不得作为上游（S6）。"""
+    response = client.post(
+        "/admin/preprocessors/fetch-models",
+        json={"api_base": "http://169.254.169.254/latest/meta-data/"},
+        headers=temp_db["headers"],
+    )
+    assert response.status_code == 400
+    assert "blocked" in response.json()["detail"]
+
+
+def test_fetch_preprocessor_models_rejects_non_http_scheme(temp_db):
+    response = client.post(
+        "/admin/preprocessors/fetch-models",
+        json={"api_base": "file:///etc/passwd"},
+        headers=temp_db["headers"],
+    )
+    assert response.status_code == 400
+
+
+def test_fetch_preprocessor_models_allows_private_host_by_default(temp_db):
+    """局域网自建推理服务是正常用法，默认必须继续可用。"""
+    response = client.post(
+        "/admin/preprocessors/fetch-models",
+        json={"api_base": "http://192.168.75.202:8080/v1"},
+        headers=temp_db["headers"],
+    )
+    # 连不上会返回 502，但不能是 400 拒绝。
+    assert response.status_code != 400
 
 
 def test_model_test_requires_auth():
@@ -798,3 +829,145 @@ def test_preprocessor_test_success(temp_db, monkeypatch):
 def test_preprocessor_test_missing_id(temp_db):
     response = client.post("/admin/preprocessors/test", json={}, headers=temp_db["headers"])
     assert response.status_code == 400
+
+
+# -- 密钥脱敏回归（「当前问题.md」S1）--
+
+def _create_secret_provider(headers, provider_id="secret-provider", api_key="sk-upstream-super-secret"):
+    response = client.post("/admin/providers", json={
+        "id": provider_id, "name": "Secret Provider", "provider_type": "openai",
+        "api_base": "https://secret.example/v1", "api_key": api_key,
+        "enabled": True, "models": [{"id": "secret-model", "name": "Secret", "enabled": True}],
+    }, headers=headers)
+    assert response.status_code == 200
+    return response.json()
+
+
+def test_list_providers_never_returns_upstream_api_key(temp_db):
+    from app.database import get_provider
+    headers = temp_db["headers"]
+    _create_secret_provider(headers)
+    data = client.get("/admin/providers", headers=headers).json()
+    entry = next(p for p in data if p["id"] == "secret-provider")
+    assert entry["api_key"] == ""
+    assert entry["has_api_key"] is True
+    # 存储层仍然是真实密钥，代理上游调用不受影响。
+    assert get_provider("secret-provider")["api_key"] == "sk-upstream-super-secret"
+
+
+def test_create_provider_response_is_redacted(temp_db):
+    created = _create_secret_provider(temp_db["headers"])
+    assert created["api_key"] == ""
+    assert created["has_api_key"] is True
+
+
+def test_update_provider_blank_key_keeps_stored_secret(temp_db):
+    from app.database import get_provider
+    headers = temp_db["headers"]
+    _create_secret_provider(headers)
+    response = client.put("/admin/providers/secret-provider", json={
+        "name": "Renamed", "api_key": "",
+    }, headers=headers)
+    assert response.status_code == 200
+    assert response.json()["api_key"] == ""
+    assert get_provider("secret-provider")["api_key"] == "sk-upstream-super-secret"
+    assert get_provider("secret-provider")["name"] == "Renamed"
+
+
+def test_update_provider_new_key_replaces_secret(temp_db):
+    from app.database import get_provider
+    headers = temp_db["headers"]
+    _create_secret_provider(headers)
+    client.put("/admin/providers/secret-provider", json={
+        "api_key": "sk-rotated",
+    }, headers=headers)
+    assert get_provider("secret-provider")["api_key"] == "sk-rotated"
+
+
+def test_list_preprocessors_never_returns_api_key(temp_db):
+    data = client.get("/admin/preprocessors", headers=temp_db["headers"]).json()
+    vision = data["preprocessors"]["vision-model"]
+    assert vision["api_key"] == ""
+    assert vision["has_api_key"] is True
+    assert data["preprocessors"]["disabled-vision"]["has_api_key"] is False
+
+
+def test_update_preprocessor_blank_key_keeps_stored_secret(temp_db):
+    from app.database import get_preprocessors
+    headers = temp_db["headers"]
+    response = client.put("/admin/preprocessors/vision-model", json={
+        "timeout": 45, "api_key": "",
+    }, headers=headers)
+    assert response.status_code == 200
+    assert response.json()["config"]["api_key"] == ""
+    stored = get_preprocessors()["vision-model"]
+    assert stored["api_key"] == "test-key"
+    assert stored["timeout"] == 45
+
+
+# -- 导入路径的上游地址校验（S6 补全）--
+
+def test_config_import_rejects_file_scheme_upstream(temp_db):
+    response = client.post("/admin/config/import", json={
+        "mode": "merge",
+        "providers": [{"id": "evil", "name": "Evil", "provider_type": "openai",
+                       "api_base": "file:///etc/passwd", "api_key": "", "models": []}],
+    }, headers=temp_db["headers"])
+    assert response.status_code == 400
+    assert "providers[0].api_base" in response.json()["detail"]
+
+
+def test_config_import_rejects_metadata_endpoint(temp_db):
+    response = client.post("/admin/config/import", json={
+        "mode": "merge",
+        "providers": [{"id": "evil", "name": "Evil", "provider_type": "openai",
+                       "api_base": "http://169.254.169.254/latest/meta-data/",
+                       "api_key": "", "models": []}],
+    }, headers=temp_db["headers"])
+    assert response.status_code == 400
+
+
+def test_config_import_allows_private_upstream_by_default(temp_db):
+    from app.database import get_provider
+    response = client.post("/admin/config/import", json={
+        "mode": "merge",
+        "providers": [{"id": "lan", "name": "LAN", "provider_type": "openai",
+                       "api_base": "http://192.168.75.202:8080/v1", "api_key": "", "models": []}],
+    }, headers=temp_db["headers"])
+    assert response.status_code == 200
+    assert get_provider("lan") is not None
+
+
+# -- 用户导出与缓存头（S1 补全）--
+
+def test_users_export_omits_client_keys_by_default(temp_db):
+    headers = temp_db["headers"]
+    created = client.post("/admin/users", json={"username": "exporter"}, headers=headers)
+    assert created.status_code == 200
+    client.post("/admin/users/exporter/api-keys", json={"name": "k1"}, headers=headers)
+
+    data = client.get("/admin/users/export", headers=headers).json()
+    keys = data["users"][0]["api_keys"]
+    assert keys
+    assert all(entry["key"] == "" for entry in keys)
+    assert all(entry["key_omitted"] is True for entry in keys)
+    assert data["include_secrets"] is False
+
+
+def test_users_export_can_include_secrets_on_explicit_request(temp_db):
+    headers = temp_db["headers"]
+    client.post("/admin/users", json={"username": "exporter2"}, headers=headers)
+    key = client.post("/admin/users/exporter2/api-keys", json={"name": "k2"}, headers=headers).json()["key"]
+
+    data = client.get("/admin/users/export", params={"include_secrets": "true"}, headers=headers).json()
+    exported = data["users"][0]["api_keys"]
+    assert exported[0]["key"] == key
+    assert data["include_secrets"] is True
+
+
+def test_export_endpoints_are_no_store(temp_db):
+    headers = temp_db["headers"]
+    for path in ("/admin/config/export", "/admin/users/export"):
+        response = client.get(path, headers=headers)
+        assert response.status_code == 200
+        assert response.headers["cache-control"] == "no-store"

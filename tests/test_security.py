@@ -162,3 +162,57 @@ def test_failed_login_identity_cache_is_bounded(monkeypatch):
 
     for identity in identities:
         clear_login_failures(identity)
+
+
+def _freeze_login_clock(monkeypatch, security, value_holder):
+    """把 security 里的时钟源替换成可控值，制造完全相同的时间戳。"""
+    import types
+
+    monkeypatch.setattr(
+        security, "_time",
+        types.SimpleNamespace(monotonic=lambda: value_holder[0]),
+    )
+
+
+def test_login_throttle_keeps_most_recent_under_tied_clock(monkeypatch):
+    """时间戳完全相同时，被驱逐的必须是最旧插入者，而不是 set 迭代顺序的牺牲品。"""
+    from app import security
+
+    frozen = [1000.0]
+    _freeze_login_clock(monkeypatch, security, frozen)
+    monkeypatch.setattr("app.security.get_default", lambda key, fallback=None: {
+        "login_attempt_window_seconds": 60,
+        "login_attempt_limit": 10,
+        "login_lockout_seconds": 30,
+        "login_attempt_max_identities": 100,
+    }.get(key, fallback))
+    security._login_attempts.clear()
+    security._login_blocked_until.clear()
+    security._login_seq.clear()
+
+    identities = [f"tied-login-{index}" for index in range(105)]
+    for identity in identities:
+        record_login_failure(identity)
+
+    active = set(security._login_attempts) | set(security._login_blocked_until)
+    assert len(active) <= 100
+    # 保留的必须是最后插入的 100 个，且最早 5 个被驱逐。
+    assert set(identities[-100:]) <= active
+    assert not (set(identities[:5]) & active)
+    assert identities[-1] in active
+
+    security._login_attempts.clear()
+    security._login_blocked_until.clear()
+    security._login_seq.clear()
+
+
+def test_login_throttle_seq_does_not_leak(monkeypatch):
+    """clear_login_failures 必须同步回收序号表，否则上限判定会漂移。"""
+    from app import security
+
+    identity = "seq-leak-check"
+    record_login_failure(identity)
+    assert identity in security._login_seq
+    clear_login_failures(identity)
+    assert identity not in security._login_seq
+    assert identity not in security._login_attempts

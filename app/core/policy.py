@@ -372,6 +372,8 @@ def apply_fallback_policy(provider_id: str, model: str, trigger: str = "") -> Fa
 def apply_routing_rules(username: str, api_key_value: str, requested_model: str, resolved_model: str) -> RoutingDecision:
     """Apply user-defined routing rules and return a structured decision."""
     rules = get_routing_rules()
+    # 请求模型在本次匹配中不变，只需解析一次（Q8）。
+    mid = parse_model_id(requested_model)
     for rule in rules:
         if not rule.get("enabled", True):
             continue
@@ -384,7 +386,6 @@ def apply_routing_rules(username: str, api_key_value: str, requested_model: str,
         match_model = rule.get("match_model", "")
         if not match_model:
             continue
-        mid = parse_model_id(requested_model)
         match_scope = str(rule.get("match_scope") or "any").lower()
         if match_scope == "unqualified":
             model_matches = not mid.is_composite and wildcard_match(match_model, requested_model)

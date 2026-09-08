@@ -1,3 +1,4 @@
+import asyncio
 import sqlite3
 import json
 import threading
@@ -5,7 +6,8 @@ import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
+from app.config import get_config, get_default
 from app.db import fallback as fallback_db
 from app.db import request_logs as request_logs_db
 from app.db import routing as routing_db
@@ -275,22 +277,109 @@ def _ensure_init() -> None:
         init_db()
 
 
-@contextmanager
-def get_db():
-    """Get a database connection with WAL mode enabled."""
-    _ensure_init()
-    conn = sqlite3.connect(_db_path(), timeout=10)
+# SQLite 连接不能跨线程使用，因此按线程缓存；DB 路径变化时（测试切换
+# 临时库、运行时改配置）自动重建。
+_thread_local = threading.local()
+
+
+def _thread_connection() -> sqlite3.Connection:
+    path = _db_path()
+    conn = getattr(_thread_local, "conn", None)
+    if conn is not None and getattr(_thread_local, "path", None) == path:
+        return conn
+    if conn is not None:
+        with suppress(Exception):
+            conn.close()
+    conn = sqlite3.connect(path, timeout=10)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    _thread_local.conn = conn
+    _thread_local.path = path
+    return conn
+
+
+def _drop_thread_connection() -> None:
+    conn = getattr(_thread_local, "conn", None)
+    if conn is not None:
+        with suppress(Exception):
+            conn.close()
+    _thread_local.conn = None
+    _thread_local.path = None
+    _thread_local.depth = 0
+
+
+def close_thread_connection() -> None:
+    """Release this thread's cached connection. Used on worker shutdown and in tests."""
+    _drop_thread_connection()
+
+
+def _current_task_token():
+    """当前任务标识；无运行循环时返回 None（同步调用路径）。"""
+    try:
+        task = asyncio.current_task()
+    except RuntimeError:
+        return None
+    return id(task) if task is not None else None
+
+
+def run_storage_maintenance() -> dict:
+    """Trim request logs and drop expired history records.
+
+    以前每写一条请求日志就同步执行一次 trim，把全表扫描式删除放到了写路径上
+    （P7）；同时 ``request_records`` 没有任何保留策略（Q4）。两者统一交给
+    后台周期任务处理。
+    """
+    keep = max(1, int(get_default("request_log_max", 200)))
+    trimmed = trim_request_logs(keep)
+    retention_days = 30
+    try:
+        retention_days = int(get_config().config.get("logging", {}).get("retention_days", 30))
+    except (TypeError, ValueError, AttributeError):
+        retention_days = 30
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=max(1, retention_days))).strftime("%Y-%m-%d %H:%M:%S")
+    purged = delete_request_records_before(cutoff)
+    return {"logs_trimmed": trimmed, "records_purged": purged, "log_keep": keep, "cutoff": cutoff}
+
+
+@contextmanager
+def get_db():
+    """Yield the per-thread connection, reusing it across requests.
+
+    以前每个数据库操作都新建连接并重设 PRAGMA；复用连接可去掉这部分固定开销（P1）。
+
+    注意：复用后“同一线程内不得在 ``with get_db()`` 块里 await”成为硬约束：
+    一旦 await，同线程的另一个任务会拿到同一个未提交的事务。重入检测按任务
+    隔离，违反时直接报错而不是静默串事务。
+    """
+    _ensure_init()
+    if getattr(_thread_local, "depth", 0):
+        current = _current_task_token()
+        owner = getattr(_thread_local, "owner", None)
+        if owner is not None and current is not None and owner != current:
+            raise RuntimeError(
+                "get_db() cannot be re-entered by a different task: "
+                "the outer block awaited while holding the thread connection, "
+                "which would share one uncommitted transaction across tasks"
+            )
+        yield _thread_local.conn
+        return
+
+    conn = _thread_connection()
+    _thread_local.depth = 1
+    _thread_local.owner = _current_task_token()
     try:
         yield conn
         conn.commit()
     except Exception:
-        conn.rollback()
+        with suppress(Exception):
+            conn.rollback()
+        # 连接可能已失效（文件被替换/线程退出），丢弃后下次重建。
+        _drop_thread_connection()
         raise
     finally:
-        conn.close()
+        _thread_local.depth = 0
+        _thread_local.owner = None
 
 
 # -- Schema --
@@ -436,6 +525,11 @@ CREATE TABLE IF NOT EXISTS request_records (
     image_bytes INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_req_ts ON request_records(timestamp);
+-- 历史统计会按 model / username 分组；缺索引时 SQLite 退化为临时 B 树（P6）。
+CREATE INDEX IF NOT EXISTS idx_req_ts_model ON request_records(timestamp, model);
+CREATE INDEX IF NOT EXISTS idx_req_ts_user ON request_records(timestamp, username);
+-- user_api_keys 按 username 关联查询时避免全表扫描（P6）。
+CREATE INDEX IF NOT EXISTS idx_user_api_keys_username ON user_api_keys(username);
 CREATE TABLE IF NOT EXISTS request_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp TEXT NOT NULL,
@@ -907,36 +1001,14 @@ def _zero_pad_timeline(rows, from_ts, to_ts, granularity, model_bucket_rows):
 
 
 def get_history_stats(from_ts: str, to_ts: str, granularity: str = "day") -> dict:
-    """Aggregate historical stats by granularity. Returns timeline + model breakdown."""
+    """Aggregate historical stats by granularity. Returns timeline + model breakdown.
+
+    按秒 ``GROUP BY timestamp`` 的分组基数≈行数（实测 5,044 行里 4,847 个不同
+    时间戳），聚合几乎无效。因此只保留一次 ``timestamp, model`` 扫描，时间线、
+    model 分布、趋势矩阵全部由它在 Python 侧分桶派生（P4/P5）。
+    """
     from_query, to_query, _, _ = _history_query_bounds(from_ts, to_ts)
     with get_db() as db:
-        # Timeline: total calls, failures, tokens per bucket
-        rows = db.execute("""
-            SELECT timestamp,
-                   COUNT(*) AS total,
-                   SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) AS failed,
-                   SUM(tokens) AS tokens,
-                   SUM(CASE WHEN request_kind = 'image_generation' THEN 1 ELSE 0 END) AS image_calls,
-                   SUM(CASE WHEN request_kind = 'image_generation' AND success = 0 THEN 1 ELSE 0 END) AS image_failed,
-                   SUM(image_count) AS images,
-                   SUM(image_bytes) AS image_bytes
-            FROM request_records
-            WHERE timestamp >= ? AND timestamp <= ?
-            GROUP BY timestamp
-            ORDER BY timestamp
-        """, (from_query, to_query)).fetchall()
-
-        # Model breakdown for the period
-        model_rows = db.execute("""
-            SELECT model, COUNT(*) AS total,
-                   SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) AS failed,
-                   SUM(tokens) AS tokens
-            FROM request_records
-            WHERE timestamp >= ? AND timestamp <= ?
-            GROUP BY model
-            ORDER BY total DESC
-        """, (from_query, to_query)).fetchall()
-
         # User breakdown for the period
         user_rows = db.execute("""
             SELECT username, COUNT(*) AS total,
@@ -948,11 +1020,17 @@ def get_history_stats(from_ts: str, to_ts: str, granularity: str = "day") -> dic
             ORDER BY total DESC
         """, (from_query, to_query)).fetchall()
 
-        # Per-model per-bucket breakdown for trend chart
+        # Single scan: per (timestamp, model) counters feed timeline, model totals
+        # and the per-model trend matrix.
         model_bucket_rows = db.execute("""
             SELECT timestamp, model,
                    COUNT(*) AS total,
-                   SUM(tokens) AS tokens
+                   SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) AS failed,
+                   SUM(tokens) AS tokens,
+                   SUM(CASE WHEN request_kind = 'image_generation' THEN 1 ELSE 0 END) AS image_calls,
+                   SUM(CASE WHEN request_kind = 'image_generation' AND success = 0 THEN 1 ELSE 0 END) AS image_failed,
+                   SUM(image_count) AS images,
+                   SUM(image_bytes) AS image_bytes
             FROM request_records
             WHERE timestamp >= ? AND timestamp <= ?
             GROUP BY timestamp, model
@@ -960,8 +1038,11 @@ def get_history_stats(from_ts: str, to_ts: str, granularity: str = "day") -> dic
         """, (from_query, to_query)).fetchall()
 
     bucket_rows = {}
-    for row in rows:
+    bucket_model_rows = {}
+    model_totals: dict[str, dict[str, int]] = {}
+    for row in model_bucket_rows:
         bucket = _bucket_for_timestamp(row["timestamp"], granularity)
+
         current = bucket_rows.setdefault(bucket, {
             "bucket": bucket, "total": 0, "failed": 0, "tokens": 0,
             "image_calls": 0, "image_failed": 0, "images": 0, "image_bytes": 0,
@@ -974,13 +1055,19 @@ def get_history_stats(from_ts: str, to_ts: str, granularity: str = "day") -> dic
         current["images"] += row["images"] or 0
         current["image_bytes"] += row["image_bytes"] or 0
 
-    bucket_model_rows = {}
-    for row in model_bucket_rows:
-        bucket = _bucket_for_timestamp(row["timestamp"], granularity)
         key = (bucket, row["model"])
-        current = bucket_model_rows.setdefault(key, {"bucket": bucket, "model": row["model"], "total": 0, "tokens": 0})
-        current["total"] += row["total"] or 0
-        current["tokens"] += row["tokens"] or 0
+        model_cell = bucket_model_rows.setdefault(
+            key, {"bucket": bucket, "model": row["model"], "total": 0, "failed": 0, "tokens": 0}
+        )
+        model_cell["total"] += row["total"] or 0
+        model_cell["tokens"] += row["tokens"] or 0
+
+        totals = model_totals.setdefault(
+            row["model"], {"model": row["model"], "total": 0, "failed": 0, "tokens": 0}
+        )
+        totals["total"] += row["total"] or 0
+        totals["failed"] += row["failed"] or 0
+        totals["tokens"] += row["tokens"] or 0
 
     rows = [bucket_rows[key] for key in sorted(bucket_rows)]
     model_bucket_rows = [bucket_model_rows[key] for key in sorted(bucket_model_rows)]
@@ -1013,7 +1100,7 @@ def get_history_stats(from_ts: str, to_ts: str, granularity: str = "day") -> dic
 
     models = [
         {"model": r["model"], "total": r["total"], "failed": r["failed"], "tokens": r["tokens"]}
-        for r in model_rows
+        for r in sorted(model_totals.values(), key=lambda item: (-item["total"], item["model"]))
     ]
     users = [
         {"username": r["username"], "total": r["total"], "failed": r["failed"], "tokens": r["tokens"]}

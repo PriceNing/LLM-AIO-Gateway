@@ -1,3 +1,4 @@
+from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -59,3 +60,18 @@ class InternalOutputMessage:
     finish_reason: str = "stop"
     usage: dict[str, int] = field(default_factory=dict)
     raw: Any = None
+
+
+async def aclose_async_iterator(iterator) -> None:
+    """Deterministically close an async iterator, never masking the caller's error.
+
+    上游流适配器内部用 ``async with client.stream(...)`` 持有连接；只有生成器
+    被真正关闭时 ``__aexit__`` 才会执行。依赖 GC 与 finalizer 的时机不是释放
+    保证，因此所有提前放弃迭代的路径（超时、回退、客户端断开）都应显式关闭
+    （见「当前问题.md」S5）。
+    """
+    aclose = getattr(iterator, "aclose", None)
+    if not callable(aclose):
+        return
+    with suppress(Exception):
+        await aclose()

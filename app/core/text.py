@@ -1,5 +1,7 @@
 import re
 
+from app.services.logger import get_request_id
+
 
 _BILLING_HEADER_RE = re.compile(r'^\s*x-anthropic-billing-header:.*(?:\r?\n)?', re.IGNORECASE | re.MULTILINE)
 _UPSTREAM_ERROR_MAP = [
@@ -33,18 +35,45 @@ def strip_billing_header(text):
     return _BILLING_HEADER_RE.sub('', text).strip()
 
 
+# 未命中映射表时的兜底消息。上游原文绝不进入客户端响应：原文可能包含
+# 上游 URL、内部路径、供应商响应体甚至凭据片段（见「当前问题.md」S2）。
+_GENERIC_UPSTREAM_FAILURE = "Upstream request failed. Please retry later or contact the administrator."
+
+
+def _with_trace_hint(message: str) -> str:
+    """Append the current request id so support can correlate the client error
+    with the full upstream detail that stays in the server-side error log."""
+    rid = get_request_id()
+    return f"{message} (request_id: {rid})" if rid else message
+
+
 def friendly_error_msg(e: Exception) -> str:
+    """Return a client-safe message for an upstream failure.
+
+    The raw upstream text is intentionally NOT included. Callers that need it
+    for logs must use ``error_detail_for_log`` (or ``str(exc)``) instead.
+    """
     msg = str(e)
+    lowered = msg.lower()
     for pattern, friendly in _UPSTREAM_ERROR_MAP:
-        if pattern in msg:
-            return f"{friendly} (original: {msg[:120]})"
-    return msg
+        if pattern.lower() in lowered:
+            return _with_trace_hint(friendly)
+    return _with_trace_hint(_GENERIC_UPSTREAM_FAILURE)
+
+
+def error_detail_for_log(e: BaseException, *, max_chars: int = 2000) -> str:
+    """Full upstream error text for server-side logging only."""
+    return str(e)[:max_chars]
 
 
 def mask_key(key: str) -> str:
-    if len(key) <= 8:
-        return key
-    return key[:4] + "..." + key[-4:]
+    """Always redact: short secrets are masked too, never echoed verbatim."""
+    text = str(key or "")
+    if not text:
+        return ""
+    if len(text) <= 8:
+        return "*" * len(text)
+    return text[:4] + "..." + text[-4:]
 
 
 def message_text(content) -> str:

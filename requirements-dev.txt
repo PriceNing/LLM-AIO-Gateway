@@ -1,0 +1,5 @@
+# 测试与开发依赖（运行时依赖见 requirements.txt）
+-r requirements.txt
+
+pytest>=9.0,<10
+pytest-asyncio>=1.3,<2

@@ -4,7 +4,7 @@ import pytest
 from app.core.policy import wildcard_match as _wildcard_match
 from app.core.policy import normalize_messages
 from app.core.policy import inject_reasoning_content
-from app.core.text import friendly_error_msg as _friendly_error_msg
+from app.core.text import error_detail_for_log, friendly_error_msg as _friendly_error_msg, mask_key
 from app.core.text import mask_key as _mask_key
 from app.core.text import strip_billing_header as _strip_billing_header
 from app.core.text import message_text as _message_text
@@ -548,11 +548,11 @@ def test_mask_key_normal():
 
 
 def test_mask_key_short():
-    assert _mask_key("short") == "short"
+    assert _mask_key("short") == "*****"
 
 
 def test_mask_key_exact_eight():
-    assert _mask_key("12345678") == "12345678"
+    assert _mask_key("12345678") == "********"
 
 
 # Test section
@@ -817,20 +817,44 @@ def test_responses_tools_empty_list():
 def test_friendly_error_msg_content_moderation():
     e = Exception("litellm.APIConnectionError: OpenAIException - output new_sensitive (1027)")
     result = _friendly_error_msg(e)
-    assert "" in result
-    assert "output new_sensitive" in result
+    assert "Content blocked by upstream safety policy on output" in result
+    # 客户端消息不得携带上游原文（S2）。
+    assert "new_sensitive" not in result
+    assert "litellm" not in result
 
 
 def test_friendly_error_msg_no_image_support():
     e = Exception("No endpoints found that support image input")
     result = _friendly_error_msg(e)
-    assert "" in result
+    assert "This model does not support image input" in result
 
 
-def test_friendly_error_msg_unmapped_is_preserved():
-    e = Exception("Some unknown error message")
+def test_friendly_error_msg_unmapped_is_redacted():
+    """Unmapped upstream failures must not echo raw detail to the client."""
+    e = Exception("Some unknown error message at https://internal-upstream/v1?key=secret")
     result = _friendly_error_msg(e)
-    assert result == "Some unknown error message"
+    assert result.startswith("Upstream request failed.")
+    assert "Some unknown error message" not in result
+    assert "internal-upstream" not in result
+
+
+def test_friendly_error_msg_is_case_insensitive():
+    e = Exception("NO ENDPOINTS FOUND THAT SUPPORT IMAGE INPUT")
+    assert "does not support image input" in _friendly_error_msg(e)
+
+
+def test_error_detail_for_log_preserves_raw_text():
+    """The full upstream text stays available for server-side logging."""
+    raw = "litellm.APIConnectionError: output new_sensitive (1027)"
+    assert error_detail_for_log(Exception(raw)) == raw
+    assert error_detail_for_log(Exception("x" * 300), max_chars=10) == "x" * 10
+
+
+def test_mask_key_never_echoes_short_secret():
+    assert mask_key("sk-aio-abcdefghijklmnopqrstuvwxyz1234567890AB") == "sk-a...90AB"
+    assert mask_key("short123") == "********"
+    assert mask_key("abc") == "***"
+    assert mask_key("") == ""
 
 
 # Test section

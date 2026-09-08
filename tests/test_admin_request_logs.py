@@ -401,17 +401,33 @@ def test_export_import_roundtrip(temp_db):
     assert summary["routing_rules"]["skipped"] == 1
 
 
-def test_export_users_includes_api_keys(temp_db):
+def test_export_users_redacts_api_keys_by_default(temp_db):
+    """导出默认不得携带可用凭据；需要时必须显式请求（S1）。
+
+    导入侧对空 key 会安全跳过（_import_user_api_key 返回 "skipped"），
+    因此默认导出的备份仍可用于恢复非凭据部分。
+    """
     add_user({"username": "bob", "display_name": "Bob", "enabled": True})
     key = add_user_api_key("bob", "work", ["p1/m1"])
-    r = client.get("/admin/users/export", headers=temp_db["headers"])
-    assert r.status_code == 200
-    body = r.json()
+
+    body = client.get("/admin/users/export", headers=temp_db["headers"]).json()
     assert body["version"] == 1
+    assert body["include_secrets"] is False
     user = body["users"][0]
     assert user["username"] == "bob"
-    assert user["api_keys"][0]["key"] == key["key"]
+    assert user["api_keys"][0]["key"] == ""
+    assert user["api_keys"][0]["key_omitted"] is True
     assert user["api_keys"][0]["allowed_models"] == ["p1/m1"]
+
+
+def test_export_users_with_secrets_keeps_keys(temp_db):
+    add_user({"username": "carol", "display_name": "Carol", "enabled": True})
+    key = add_user_api_key("carol", "work", ["p1/m1"])
+    body = client.get(
+        "/admin/users/export", params={"include_secrets": "true"}, headers=temp_db["headers"]
+    ).json()
+    assert body["include_secrets"] is True
+    assert body["users"][0]["api_keys"][0]["key"] == key["key"]
 
 
 def test_import_users_creates_user_and_preserves_api_key(temp_db):

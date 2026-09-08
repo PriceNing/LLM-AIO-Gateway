@@ -1,5 +1,7 @@
 import sys
 import io
+import asyncio
+import contextlib
 import time
 # Windows cmd.exe uses GBK by default, which can't encode emoji (e.g. OK).
 # Reconfigure stdout/stderr to UTF-8 so diagnostic prints don't crash.
@@ -17,6 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from app import __version__
 from app.config import load_config, get_config
+from app.core.body_limit import RequestBodyLimitMiddleware
 from app.services.logger import get_logger, init_logging, set_request_id, generate_request_id
 from app.router import admin, auth, proxy
 
@@ -58,21 +61,63 @@ class RequestIdMiddleware(BaseHTTPMiddleware):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    from app.database import init_db
+    from app.database import init_db, run_storage_maintenance, close_thread_connection
     cfg = load_config()
     db_path = cfg.config.get("database", "data.db")
     init_db(db_path)
 
     init_logging(cfg.config.get("logging"))
-    yield
+
+    logger = get_logger("app")
+    stop_maintenance = asyncio.Event()
+
+    async def _maintenance_loop():
+        """周期裁剪请求日志并清理过期历史记录（P7/Q4）。"""
+        interval = 60
+        try:
+            interval = int(cfg.config.get("defaults", {}).get("storage_maintenance_interval_seconds", 60))
+        except (AttributeError, TypeError, ValueError):
+            interval = 60
+        interval = max(5, interval)
+        while not stop_maintenance.is_set():
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(stop_maintenance.wait(), timeout=interval)
+            if stop_maintenance.is_set():
+                break
+            try:
+                result = await asyncio.to_thread(run_storage_maintenance)
+                logger.debug("[storage.maintenance] %s", result)
+            except Exception as exc:
+                logger.warning("[storage.maintenance] failed: %s", exc)
+
+    maintenance_task = asyncio.create_task(_maintenance_loop())
+    try:
+        yield
+    finally:
+        stop_maintenance.set()
+        maintenance_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await maintenance_task
+        # 后台线程与主线程缓存的 SQLite 连接需显式释放（Q7）。
+        from app.security import stop_session_cleanup
+        stop_session_cleanup()
+        from app.services.http_pool import aclose_shared_clients
+        await aclose_shared_clients()
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(close_thread_connection)
+        close_thread_connection()
 
 
 app = FastAPI(title="LLM AIO Gateway", version=__version__, lifespan=lifespan)
 
+app.add_middleware(RequestBodyLimitMiddleware)
 app.add_middleware(RequestIdMiddleware)
+# 默认仍为 "*" 以免破坏既有部署；生产环境应在 config.json 的
+# cors_allow_origins 里填写具体来源（S9）。
+_cors_origins = get_config().config.get("cors_allow_origins") or ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # TODO: restrict in production
+    allow_origins=[str(origin) for origin in _cors_origins],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],

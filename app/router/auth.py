@@ -1,4 +1,5 @@
 import asyncio
+import threading
 from fastapi import APIRouter, Header, HTTPException, Request
 from typing import Optional
 from app import __version__
@@ -15,6 +16,9 @@ from app.security import (
 )
 
 router = APIRouter()
+
+# 初始化只发生一次，用进程内串行即可；会话与登录限流本身也是进程内状态。
+_setup_lock = threading.Lock()
 
 
 def get_bearer_token(authorization: Optional[str]) -> str:
@@ -44,15 +48,18 @@ async def auth_status():
 
 @router.post("/setup")
 async def setup_admin(payload: dict):
-    if get_admins():
-        raise HTTPException(status_code=409, detail="Admin already initialized")
     username = payload.get("username", "").strip()
     password = payload.get("password", "")
     display_name = payload.get("display_name", username)
     if not username or not password:
         raise HTTPException(status_code=400, detail="username and password are required")
+    # 先在线程里算 PBKDF2，再把“检查 + 写入”放进同一把锁，避免两个并发
+    # 首次请求都通过 get_admins() 判断（L2）。
     password_hash = await asyncio.to_thread(hash_password, password)
-    add_admin(username, password_hash, display_name)
+    with _setup_lock:
+        if get_admins():
+            raise HTTPException(status_code=409, detail="Admin already initialized")
+        add_admin(username, password_hash, display_name)
     token = create_session(username)
     return {"token": token, "username": username, "display_name": display_name}
 

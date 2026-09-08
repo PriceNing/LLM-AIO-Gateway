@@ -14,11 +14,14 @@ from app.core.images import has_image_content, normalize_image_content
 # Several OpenAI-compatible providers return reasoning_content, but some liteLLM
 # versions do not include it on Message/Delta. The policy layer needs the field
 # for multi-turn reasoning continuity.
+_PATCH_STATE = {"fields": False, "converter": False}
+
 try:
     for _model in (Message, Delta):
         if "reasoning_content" not in _model.model_fields:
             _model.model_fields["reasoning_content"] = Field(default=None)
             _model.model_rebuild(force=True)
+    _PATCH_STATE["fields"] = all("reasoning_content" in m.model_fields for m in (Message, Delta))
 except Exception:
     logging.getLogger("llmgw.app").warning(
         "liteLLM compatibility patch for reasoning_content fields failed"
@@ -62,10 +65,38 @@ try:
         return result
 
     _litellm_utils.convert_to_model_response_object = _patched_convert
+    _PATCH_STATE["converter"] = (
+        getattr(_litellm_utils, "convert_to_model_response_object", None) is _patched_convert
+    )
 except Exception:
     logging.getLogger("llmgw.app").warning(
         "liteLLM compatibility patch for preserving reasoning_content failed"
     )
+
+
+def compatibility_patch_status() -> dict:
+    """Report whether the liteLLM compatibility patches are still in place.
+
+    补丁依赖 litellm 内部函数名，升级后可能静默失效导致 reasoning_content
+    丢失、多轮 thinking 断裂，因此必须可观测（Q3）。
+    """
+    return dict(_PATCH_STATE)
+
+
+def _log_compatibility_patch_state() -> None:
+    logger = logging.getLogger("llmgw.app")
+    if _PATCH_STATE["fields"] and _PATCH_STATE["converter"]:
+        logger.debug("liteLLM compatibility patches active")
+        return
+    logger.warning(
+        "liteLLM compatibility patches INCOMPLETE: %s; reasoning_content continuity "
+        "and prompt-cache usage may be dropped. litellm version=%s",
+        _PATCH_STATE,
+        getattr(litellm, "__version__", "unknown"),
+    )
+
+
+_log_compatibility_patch_state()
 
 litellm.drop_params = False  # Allow provider-specific params like DeepSeek's 'thinking'
 litellm.add_function_to_prompt = False

@@ -16,11 +16,11 @@ from fastapi.responses import FileResponse, StreamingResponse
 from app.database import (
     get_providers, find_user_by_api_key,
     increment_global_stats, increment_image_generation_stats, increment_user_usage, get_db,
-    parse_model_id, add_request_record, add_request_log, update_request_log, trim_request_logs, get_enabled_preprocessor,
+    parse_model_id, add_request_record, add_request_log, update_request_log, get_enabled_preprocessor,
     get_enabled_image_generator, get_model_image_generation,
     get_model_responses_capability, set_model_responses_capability, update_model_responses_capability, update_model_responses_tool_types,
 )
-from app.core.text import friendly_error_msg, mask_key
+from app.core.text import friendly_error_msg, error_detail_for_log, mask_key
 from app.core.image_intent import is_image_generation_intent, latest_user_text
 from app.core.image_bridge import (
     GATEWAY_IMAGE_ASSET_MARKER,
@@ -56,7 +56,12 @@ from app.core.outcome import (
     stats_counters_for_status,
     is_client_disconnect_error,
 )
-from app.core.output import InternalOutputEvent, InternalOutputMessage, InternalToolCallOutput
+from app.core.output import (
+    InternalOutputEvent,
+    InternalOutputMessage,
+    InternalToolCallOutput,
+    aclose_async_iterator,
+)
 from app.core.types import InternalMessage, append_system_text, prepend_system_text, text_part, tool_call_part, tool_result_part
 
 from app.core.state import (
@@ -512,7 +517,7 @@ async def _execute_image_invocations(
             )
             _app_log.warning(
                 "[responses image_generation.item_done] batch=%s index=%d total=%d status=failed duration_ms=%d error=%s",
-                batch_id, index + 1, len(invocations), outcome.duration_ms, friendly_error_msg(exc),
+                batch_id, index + 1, len(invocations), outcome.duration_ms, error_detail_for_log(exc),
             )
         outcomes[index] = outcome
         if progress is not None:
@@ -1099,7 +1104,7 @@ def _native_downgrade_details(exc: Exception, attempts: list[dict] | None = None
         "native_attempted": True,
         "native_failure_endpoint": "responses",
         "native_failure_reason": classify_upstream_error(exc),
-        "native_failure_message": friendly_error_msg(exc),
+        "native_failure_message": error_detail_for_log(exc),
     }
     request_details = getattr(exc, "request_details", None)
     if isinstance(request_details, dict):
@@ -1177,7 +1182,7 @@ async def _probe_model_responses_capability(provider: dict, model: str) -> bool:
             set_model_responses_capability(
                 provider_id, model, status="unsupported",
                 expires_at=_responses_capability_expiry("unsupported"),
-                error=friendly_error_msg(exc),
+                error=error_detail_for_log(exc),
             )
         return False
 
@@ -1311,10 +1316,10 @@ async def _native_response_with_fallbacks(internal, *, stream: bool, required_to
             is_empty_native = bool(getattr(exc, "native_empty_output", False))
             is_protocol_unsupported = _native_error_is_explicitly_unsupported(exc)
             if is_protocol_unsupported:
-                set_model_responses_capability(provider_id, target.model, status="unsupported", expires_at=_responses_capability_expiry("unsupported"), error=friendly_error_msg(exc))
+                set_model_responses_capability(provider_id, target.model, status="unsupported", expires_at=_responses_capability_expiry("unsupported"), error=error_detail_for_log(exc))
             else:
                 _mark_model_responses_unknown(provider_id, target.model, exc)
-            attempts.append({"index": index, "stage": "primary" if index == 0 else "fallback", "target": target.model, "provider_id": provider_id, "status": "failed", "trigger": classify_upstream_error(exc), "error": friendly_error_msg(exc)})
+            attempts.append({"index": index, "stage": "primary" if index == 0 else "fallback", "target": target.model, "provider_id": provider_id, "status": "failed", "trigger": classify_upstream_error(exc), "error": error_detail_for_log(exc)})
             if index == 0:
                 decision = apply_fallback_policy(provider_id, target.model, classify_upstream_error(exc))
                 if is_empty_native and not decision.matched:
@@ -1389,7 +1394,7 @@ def _request_details_from_exception(exc: Exception, **defaults) -> dict:
         if key not in details and value is not None:
             details[key] = value
     details.setdefault("status", "fail")
-    details.setdefault("error_message", friendly_error_msg(exc))
+    details.setdefault("error_message", error_detail_for_log(exc))
     return details
 
 
@@ -1406,7 +1411,7 @@ def _fallback_attempt_record(*, index: int, stage: str, target: RouteTarget, pro
     if trigger:
         record["trigger"] = trigger
     if error is not None:
-        record["error_message"] = friendly_error_msg(error)
+        record["error_message"] = error_detail_for_log(error)
     return record
 
 
@@ -1702,41 +1707,45 @@ async def _await_with_attempt_timeout(awaitable, *, timeout_s: int | None, targe
 
 async def _iter_events_with_first_output_timeout(events, *, timeout_s: int | None, target: RouteTarget, provider_id: str):
     """Yield stream events; enforce timeout only until first client-visible output."""
-    if not timeout_s or timeout_s <= 0:
-        async for event in events:
-            yield event
-        return
+    agen = events if hasattr(events, "__anext__") else events.__aiter__()
+    try:
+        if not timeout_s or timeout_s <= 0:
+            async for event in agen:
+                yield event
+            return
 
-    agen = events.__aiter__()
-    emitted = False
-    deadline = time.monotonic() + float(timeout_s)
-    while True:
-        try:
-            if not emitted:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise _attempt_timeout_error(timeout_s, target, provider_id)
-                with anyio.fail_after(remaining):
+        emitted = False
+        deadline = time.monotonic() + float(timeout_s)
+        while True:
+            try:
+                if not emitted:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise _attempt_timeout_error(timeout_s, target, provider_id)
+                    with anyio.fail_after(remaining):
+                        event = await agen.__anext__()
+                else:
                     event = await agen.__anext__()
-            else:
-                event = await agen.__anext__()
-        except StopAsyncIteration:
-            break
-        except TimeoutError as exc:
-            if emitted:
-                raise
-            _app_log.warning(
-                "[fallback.attempt_timeout] stage=stream_first_output target=%s provider=%s timeout_s=%d",
-                target.model,
-                provider_id or "-",
-                timeout_s,
-            )
-            if isinstance(exc, TimeoutError) and "fallback attempt timeout" in str(exc):
-                raise
-            raise _attempt_timeout_error(timeout_s, target, provider_id) from exc
-        if _is_client_visible_stream_event(event):
-            emitted = True
-        yield event
+            except StopAsyncIteration:
+                break
+            except TimeoutError as exc:
+                if emitted:
+                    raise
+                _app_log.warning(
+                    "[fallback.attempt_timeout] stage=stream_first_output target=%s provider=%s timeout_s=%d",
+                    target.model,
+                    provider_id or "-",
+                    timeout_s,
+                )
+                if isinstance(exc, TimeoutError) and "fallback attempt timeout" in str(exc):
+                    raise
+                raise _attempt_timeout_error(timeout_s, target, provider_id) from exc
+            if _is_client_visible_stream_event(event):
+                emitted = True
+            yield event
+    finally:
+        # 超时、异常与上层提前丢弃都必须关闭上游，否则 HTTP 连接只能等 GC。
+        await aclose_async_iterator(agen)
 
 
 async def _call_nonstream_with_fallbacks(policy, internal, *, temperature, max_tokens, log_label: str):
@@ -1819,7 +1828,7 @@ async def _call_nonstream_with_fallbacks(policy, internal, *, temperature, max_t
                 target.model,
                 _fallback_provider_id_for_target(target) or "-",
                 trigger,
-                friendly_error_msg(exc),
+                error_detail_for_log(exc),
             )
             decision = apply_fallback_policy(fallback_provider_id, target.model, trigger)
             # Proactive attempt_timeout should still use the matched policy chain even if
@@ -1838,7 +1847,7 @@ async def _call_nonstream_with_fallbacks(policy, internal, *, temperature, max_t
                     fallback_status="no_policy",
                     fallback_reason=decision.reason,
                     fallback_attempts=fallback_attempts,
-                    error_message=friendly_error_msg(exc),
+                    error_message=error_detail_for_log(exc),
                 )
                 _app_log.info(
                     "[%s fallback.decision] matched=False source=%s provider=%s trigger=%s reason=%s",
@@ -1876,7 +1885,7 @@ async def _call_nonstream_with_fallbacks(policy, internal, *, temperature, max_t
                 index,
                 target.model,
                 target.provider_id or "-",
-                friendly_error_msg(last_exc) if last_exc else "",
+                error_detail_for_log(last_exc) if last_exc else "",
             )
             output, provider_info, adapter_provider_id = await _await_with_attempt_timeout(
                 _call_nonstream_target(
@@ -1930,7 +1939,7 @@ async def _call_nonstream_with_fallbacks(policy, internal, *, temperature, max_t
                 error_stage="fallback",
                 fallback_status="attempt_failed",
                 fallback_attempts=fallback_attempts,
-                error_message=friendly_error_msg(exc),
+                error_message=error_detail_for_log(exc),
             )
             _app_log.warning(
                 "[%s fallback.attempt.failed] index=%d target=%s provider=%s trigger=%s error=%s",
@@ -1939,7 +1948,7 @@ async def _call_nonstream_with_fallbacks(policy, internal, *, temperature, max_t
                 target.model,
                 target.provider_id or "-",
                 trigger,
-                friendly_error_msg(exc),
+                error_detail_for_log(exc),
             )
     _app_log.error(
         "[%s fallback.exhausted] primary=%s provider=%s candidates=%d error=%s",
@@ -1947,7 +1956,7 @@ async def _call_nonstream_with_fallbacks(policy, internal, *, temperature, max_t
         primary.model,
         primary.provider_id or "-",
         max(len(targets) - 1, 0),
-        friendly_error_msg(last_exc) if last_exc else "no target available",
+        error_detail_for_log(last_exc) if last_exc else "no target available",
     )
     if last_exc is not None:
         _attach_request_details(last_exc, fallback_status="exhausted", fallback_reason="all fallback targets failed", fallback_attempts=fallback_attempts)
@@ -2065,6 +2074,8 @@ async def _stream_events_with_fallbacks(internal, *, temperature, max_tokens, lo
         emitted = False
         pending_events = []
         terminal_event = None
+        events = None
+        timed_events = None
         try:
             events, provider_info, adapter_provider_id = _stream_events_for_target(
                 target,
@@ -2191,7 +2202,7 @@ async def _stream_events_with_fallbacks(internal, *, temperature, max_tokens, lo
                 fallback_provider_id or "-",
                 trigger,
                 emitted,
-                friendly_error_msg(exc),
+                error_detail_for_log(exc),
             )
             if emitted:
                 _attach_request_details(
@@ -2206,7 +2217,7 @@ async def _stream_events_with_fallbacks(internal, *, temperature, max_tokens, lo
                     fallback_status="skipped",
                     fallback_reason="client_output_started",
                     fallback_attempts=fallback_attempts,
-                    error_message=friendly_error_msg(exc),
+                    error_message=error_detail_for_log(exc),
                 )
                 _app_log.info(
                     "[%s fallback.stream.skipped] target=%s provider=%s trigger=%s reason=client_output_started",
@@ -2244,7 +2255,7 @@ async def _stream_events_with_fallbacks(internal, *, temperature, max_tokens, lo
                         fallback_status="no_policy",
                         fallback_reason=decision.reason,
                         fallback_attempts=fallback_attempts,
-                        error_message=friendly_error_msg(exc),
+                        error_message=error_detail_for_log(exc),
                     )
                     _app_log.info(
                         "[%s fallback.stream.decision] matched=False source=%s provider=%s trigger=%s reason=%s",
@@ -2278,8 +2289,13 @@ async def _stream_events_with_fallbacks(internal, *, temperature, max_tokens, lo
                     index,
                     next_target.model,
                     next_target.provider_id or "-",
-                    friendly_error_msg(last_exc),
+                    error_detail_for_log(last_exc),
                 )
+        finally:
+            # 本轮无论成功、失败还是被上层提前丢弃，都必须释放上游流；
+            # 否则被下一轮覆盖的旧生成器只能等 GC 才关闭（S5）。
+            # timed_events 的 finally 会级联关闭它包裹的 events，无需重复关闭。
+            await aclose_async_iterator(timed_events)
 
     _app_log.error(
         "[%s fallback.stream.exhausted] primary=%s provider=%s candidates=%d error=%s",
@@ -2287,7 +2303,7 @@ async def _stream_events_with_fallbacks(internal, *, temperature, max_tokens, lo
         primary.model,
         primary.provider_id or "-",
         max(len(targets) - 1, 0),
-        friendly_error_msg(last_exc) if last_exc else "no target available",
+        error_detail_for_log(last_exc) if last_exc else "no target available",
     )
     if last_exc is not None:
         _attach_request_details(last_exc, fallback_status="exhausted", fallback_reason="all fallback targets failed", fallback_attempts=fallback_attempts)
@@ -2345,7 +2361,7 @@ def _record_image_generation_failure(
                 "responses_mode", "image_generation"
             ),
             "upstream_endpoint": "images/generations",
-            "error_message": friendly_error_msg(exc),
+            "error_message": error_detail_for_log(exc),
         },
     )
     final_model = str(details.get("attempted_model") or model or requested_model)
@@ -2359,7 +2375,7 @@ def _record_image_generation_failure(
         requested_model=requested_model, final_model=final_model,
         final_provider=final_provider, request_body=request_body,
         success=False, status="fail", tokens=0, details=details,
-        error_message=friendly_error_msg(exc),
+        error_message=error_detail_for_log(exc),
         log_id=request_log_id,
     )
     _record_success_metrics(username, api_key_value, 0, "fail")
@@ -2655,7 +2671,7 @@ def get_timeline_model_data() -> dict:
 
 
 def verify_api_key(
-    authorization: Optional[str] = Header(None),
+    authorization: Optional[str] = None,
     *,
     endpoint: str = "",
     requested_model: str = "",
@@ -2686,6 +2702,22 @@ def verify_api_key(
 
     _reject("Invalid API key", api_key_value=token)
     raise HTTPException(status_code=401, detail="Invalid API key")  # unreachable, for type checkers
+
+async def verify_api_key_async(
+    authorization: Optional[str],
+    *,
+    endpoint: str = "",
+    requested_model: str = "",
+) -> tuple[dict, dict]:
+    """Run the credential lookup off the event loop.
+
+    认证是每请求必经的同步 SQLite 查询，留在事件循环里会把所有开流请求
+    排在它后面（见「当前问题.md」P1）。
+    """
+    return await anyio.to_thread.run_sync(
+        partial(verify_api_key, authorization, endpoint=endpoint, requested_model=requested_model)
+    )
+
 
 def allowed_models_for(user: dict, api_key: dict) -> list:
     # Only key-level allowed_models matters. User is just enable/disable.
@@ -2859,7 +2891,7 @@ def _model_should_advertise_vision(provider: dict, model: dict) -> bool:
 
 @router.post("/chat/completions")
 async def chat_completions(request: Request, authorization: Optional[str] = Header(None)):
-    user, api_key = verify_api_key(authorization, endpoint="chat_completions")
+    user, api_key = await verify_api_key_async(authorization, endpoint="chat_completions")
 
     body = await request.json()
     internal = chat_completions_to_internal(body)
@@ -2980,16 +3012,18 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
             final_provider=details.get("attempted_provider") or provider_id or "",
             request_body=body, response_body=None,
             success=False, status=details.get("status", "fail"),
-            tokens=0, details=details, error_message=friendly_error_msg(e),
+            tokens=0, details=details, error_message=error_detail_for_log(e),
         )
         increment_global_stats(success=False)
         if username != "legacy":
             increment_user_usage(username, api_key_value, False, 0)
+        # 客户端只拿到安全消息，上游原文必须先落日志，否则无法回溯。
+        _error_log.error("[chat_completions] FAILED: %s", error_detail_for_log(e))
         raise HTTPException(status_code=500, detail=friendly_error_msg(e))
 
 @router.post("/completions")
 async def completions(request: Request, authorization: Optional[str] = Header(None)):
-    user, api_key = verify_api_key(authorization, endpoint="completions")
+    user, api_key = await verify_api_key_async(authorization, endpoint="completions")
 
     body = await request.json()
     internal = completions_to_internal(body)
@@ -3091,7 +3125,7 @@ async def completions(request: Request, authorization: Optional[str] = Header(No
             final_provider=details.get("attempted_provider") or provider_id or "",
             request_body=body, response_body=None,
             success=False, status=details.get("status", "fail"),
-            tokens=0, details=details, error_message=friendly_error_msg(e),
+            tokens=0, details=details, error_message=error_detail_for_log(e),
         )
         increment_global_stats(success=False)
         if username != "legacy":
@@ -3101,7 +3135,7 @@ async def completions(request: Request, authorization: Optional[str] = Header(No
 
 @router.post("/messages")
 async def anthropic_messages(request: Request, authorization: Optional[str] = Header(None)):
-    user, api_key = verify_api_key(authorization, endpoint="messages")
+    user, api_key = await verify_api_key_async(authorization, endpoint="messages")
 
     body = await request.json()
     model = body.get("model")
@@ -3227,7 +3261,7 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
             final_provider=details.get("attempted_provider") or adapter_provider_id or "",
             request_body=body, response_body=None,
             success=False, status=details.get("status", "fail"),
-            tokens=0, details=details, error_message=friendly_error_msg(e),
+            tokens=0, details=details, error_message=error_detail_for_log(e),
         )
         increment_global_stats(success=False)
         if username != "legacy":
@@ -3238,7 +3272,7 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
 
 @router.post("/responses")
 async def responses_endpoint(request: Request, authorization: Optional[str] = Header(None)):
-    user, api_key = verify_api_key(authorization, endpoint="responses")
+    user, api_key = await verify_api_key_async(authorization, endpoint="responses")
 
     body = await request.json()
     # Read the hidden manifest before display follow-up sanitization replaces
@@ -4241,7 +4275,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
             final_provider=details.get("attempted_provider") or provider_for_log(provider_info, provider_id),
             request_body=body, response_body=None,
             success=False, status=details.get("status", "fail"),
-            tokens=0, details=details, error_message=friendly_error_msg(e),
+            tokens=0, details=details, error_message=error_detail_for_log(e),
             log_id=image_request_log_id or None,
         )
         increment_global_stats(success=False, stateful_fallback_blocked=bool(details.get("stateful_fallback_blocked")))
@@ -4252,7 +4286,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
 
 
 async def _images_generation_request(request: Request, authorization: Optional[str]):
-    user, api_key = verify_api_key(authorization, endpoint="images_generations")
+    user, api_key = await verify_api_key_async(authorization, endpoint="images_generations")
     body = await request.json()
     requested_model = str(body.get("model") or "")
     prompt = str(body.get("prompt") or "").strip()
@@ -4297,16 +4331,17 @@ async def _images_generation_request(request: Request, authorization: Optional[s
             "upstream_endpoint": "images/generations", "image_model": image_model,
             "image_backend_provider": image_provider_id, "image_backend_model": image_model,
             "image_backend_type": str(generator.get("backend_type") or ""), "image_fallback_status": "unused",
-            "image_count": 0, "image_bytes": 0, "error_message": friendly_error_msg(exc),
+            "image_count": 0, "image_bytes": 0, "error_message": error_detail_for_log(exc),
         }
         _log_request(username, api_key_value, image_model, image_provider_id, "images_generations", False, 0, requested_model, details=details)
         _record_request_log(
             endpoint="images_generations", username=username, api_key_value=api_key_value,
             requested_model=requested_model, final_model=image_model,
             final_provider=image_provider_id, request_body=body, success=False,
-            status="fail", tokens=0, details=details, error_message=friendly_error_msg(exc),
+            status="fail", tokens=0, details=details, error_message=error_detail_for_log(exc),
         )
         _record_success_metrics(username, api_key_value, 0, "fail")
+        _error_log.error("[images_generations] FAILED: %s", error_detail_for_log(exc))
         raise HTTPException(status_code=502, detail=friendly_error_msg(exc)) from exc
     data = [{"b64_json": item.data_uri.split(",", 1)[1], "mime_type": item.mime_type} for item in results]
     details = {"request_kind": "image_generation", "responses_mode": "image_generation", "upstream_endpoint": "images/generations", "image_model": image_model, "image_backend_provider": image_provider_id, "image_backend_model": image_model, "image_backend_type": str(generator.get("backend_type") or ""), "image_fallback_status": "unused", "image_count": len(results), "image_bytes": image_results_bytes(results)}
@@ -4548,10 +4583,8 @@ def _record_request_log(
     except Exception as exc:
         _app_log.warning('add_request_log failed: %s', exc)
         written_id = int(log_id or 0)
-    try:
-        trim_request_logs(get_default('request_log_max', 500))
-    except Exception as exc:
-        _app_log.warning('trim_request_logs failed: %s', exc)
+    # 裁剪与过期清理已移到后台周期任务（run_storage_maintenance），
+    # 不再把全表扫描式 DELETE 放在每个请求的写路径上（P7）。
     return written_id
 
 def _build_stream_recorder(

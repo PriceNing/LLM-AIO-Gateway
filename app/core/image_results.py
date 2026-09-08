@@ -16,6 +16,10 @@ from PIL import Image, ImageOps
 
 from app.adapters.imagegen import ImageGenerationResult
 from app.config import get_config, get_default
+from app.services.logger import get_logger
+
+
+_app_log = get_logger("app")
 
 
 _TOKEN_RE = re.compile(r"^[0-9a-f]{32}$")
@@ -27,6 +31,11 @@ _MIME_EXTENSIONS = {
     "image/gif": "gif",
 }
 _lock = threading.Lock()
+
+
+def _note_cleanup_failure(action: str, path, exc: OSError) -> None:
+    """清理属于尽力而为，但失败必须可观测（Q6）。"""
+    _app_log.debug("[image_results] %s failed for %s: %s", action, getattr(path, "name", path), exc)
 
 
 @dataclass(frozen=True)
@@ -124,13 +133,14 @@ def _cleanup(directory: Path, *, now: float, preserve: set[Path] | None = None) 
             continue
         try:
             modified = path.stat().st_mtime
-        except OSError:
+        except OSError as exc:
+            _note_cleanup_failure("stat", path, exc)
             continue
         if path not in preserve and now - modified > ttl_seconds:
             try:
                 path.unlink()
-            except OSError:
-                pass
+            except OSError as exc:
+                _note_cleanup_failure("unlink", path, exc)
             continue
         artifacts.append((modified, path))
     artifacts.sort(key=lambda item: (item[1] in preserve, item[0]), reverse=True)
@@ -138,8 +148,8 @@ def _cleanup(directory: Path, *, now: float, preserve: set[Path] | None = None) 
     for _, path in artifacts[keep_count:]:
         try:
             path.unlink()
-        except OSError:
-            pass
+        except OSError as exc:
+            _note_cleanup_failure("evict", path, exc)
 
 
 def store_image_results(
@@ -162,8 +172,8 @@ def store_image_results(
             for item in stored:
                 try:
                     item.path.unlink(missing_ok=True)
-                except OSError:
-                    pass
+                except OSError as exc:
+                    _note_cleanup_failure("rollback", item.path, exc)
             raise
     return stored
 
@@ -174,8 +184,8 @@ def remove_stored_image_results(results: list[StoredImageResult]) -> None:
         for result in results:
             try:
                 result.path.unlink(missing_ok=True)
-            except OSError:
-                pass
+            except OSError as exc:
+                _note_cleanup_failure("remove", result.path, exc)
 
 
 def generation_results_from_stored(

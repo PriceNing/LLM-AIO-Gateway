@@ -293,6 +293,7 @@ zh: {
     'preprocessors.modelPlaceholder': '例如 Qwen-VL',
     'preprocessors.apiKey': 'API Key',
     'preprocessors.apiKeyPlaceholder': '视觉模型 API Key（可选）',
+    'secrets.keepBlank': '已保存，留空则保持不变',
     'preprocessors.timeout': '超时时间（秒）',
     'preprocessors.maxImages': '最大图片数',
     'preprocessors.maxTokens': '最大 Token 数',
@@ -658,6 +659,7 @@ en: {
     'preprocessors.modelPlaceholder': 'e.g. Qwen-VL',
     'preprocessors.apiKey': 'API Key',
     'preprocessors.apiKeyPlaceholder': 'Vision model API Key (optional)',
+    'secrets.keepBlank': 'Saved. Leave blank to keep unchanged',
     'preprocessors.timeout': 'Timeout (seconds)',
     'preprocessors.maxImages': 'Max Images',
     'preprocessors.maxTokens': 'Max Tokens',
@@ -1889,7 +1891,7 @@ function providerFormHtml(title, provider, submitAction) {
         '<div class="form-group"><label>' + t('providers.apiBase') + '</label>' +
             '<input type="text" id="providerApiBase" value="' + escHtml(provider.api_base || '') + '" placeholder="https://api.openai.com/v1"></div>' +
         '<div class="form-group"><label>' + t('providers.apiKey') + '</label>' +
-            '<input type="password" id="providerApiKey" value="' + escHtml(provider.api_key || '') + '"></div>' +
+            '<input type="password" id="providerApiKey" value="" placeholder="' + (provider.has_api_key ? t('secrets.keepBlank') : '') + '"></div>' +
         '<div class="form-row">' +
             '<div class="form-group"><label>' + t('providers.requestTimeout') + '</label>' +
                 '<input type="number" id="providerRequestTimeout" value="' + escHtml(provider.request_timeout || 120) + '" min="1" max="3600"></div>' +
@@ -2470,7 +2472,7 @@ function preprocessorFormHtml(title, preprocessor, submitAction) {
         '<div class="form-group"><label>' + t('preprocessors.apiBase') + '</label>' +
             '<input type="text" id="prepApiBase" value="' + escHtml(preprocessor.api_base || '') + '" placeholder="' + t('preprocessors.apiBasePlaceholder') + '"></div>' +
         '<div class="form-group"><label>' + t('preprocessors.apiKey') + '</label>' +
-            '<input type="password" id="prepApiKey" value="' + escHtml(preprocessor.api_key || '') + '" placeholder="' + t('preprocessors.apiKeyPlaceholder') + '"></div>' +
+            '<input type="password" id="prepApiKey" value="" placeholder="' + (preprocessor.has_api_key ? t('secrets.keepBlank') : t('preprocessors.apiKeyPlaceholder')) + '"></div>' +
         '<div class="form-group"><label>' + t('preprocessors.model') + '</label>' +
             '<div class="input-row">' +
             '<input type="text" id="prepModel" list="prepModelList" value="' + escHtml(preprocessor.model || '') + '" placeholder="' + t('preprocessors.modelPlaceholder') + '" style="flex:1" autocomplete="off">' +
@@ -2497,7 +2499,7 @@ async function fetchPreprocessorModels() {
     if (!apiBase) { toast(t('preprocessors.needApiBase'), 'error'); return; }
     var btn = event.target; btn.disabled = true; btn.textContent = '...';
     try {
-        var data = await api('/admin/preprocessors/fetch-models?api_base=' + encodeURIComponent(apiBase) + '&api_key=' + encodeURIComponent(apiKey));
+        var data = await api('/admin/preprocessors/fetch-models', { method: 'POST', body: JSON.stringify({ api_base: apiBase, api_key: apiKey }) });
         var models = data.models || [];
         var dl = document.getElementById('prepModelList');
         dl.innerHTML = models.map(function(m) { return '<option value="' + escHtml(m) + '">'; }).join('');
@@ -3897,7 +3899,10 @@ async function downloadJson(endpoint, filenamePrefix, successKey, failKey) {
 }
 
 async function exportUsers() {
-    await downloadJson('/admin/users/export', 'llm-aio-users', 'config.usersExported', 'config.usersExportFail');
+    // 默认不导出可用凭据；与 config 导出共用同一个显式开关。
+    var box = document.getElementById('exportIncludeSecrets');
+    var include = box ? box.checked : false;
+    await downloadJson('/admin/users/export?include_secrets=' + (include ? 'true' : 'false'), 'llm-aio-users', 'config.usersExported', 'config.usersExportFail');
 }
 
 async function importUsers() {

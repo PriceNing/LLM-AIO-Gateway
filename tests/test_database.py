@@ -690,3 +690,109 @@ def test_delete_preprocessor_config():
     upsert_preprocessor("vision-a", {"api_base": "http://a", "model": "va"})
     assert delete_preprocessor("vision-a") is True
     assert delete_preprocessor("vision-a") is False
+
+
+# -- 线程内连接复用的事务边界守卫（P1）--
+
+@pytest.mark.asyncio
+async def test_get_db_reentry_from_another_task_raises():
+    """外层在 with get_db() 内 await 时，另一个任务不得复用同一连接。"""
+    import asyncio
+
+    from app import database
+    entered = asyncio.Event()
+    caught = []
+
+    async def outer():
+        with database.get_db() as db:
+            db.execute("SELECT 1").fetchall()
+            entered.set()
+            await asyncio.sleep(0.2)  # 违规用法：持有连接时让出事件循环
+
+    async def inner():
+        await entered.wait()
+        try:
+            with database.get_db() as db:
+                db.execute("SELECT 1").fetchall()
+        except RuntimeError as exc:
+            caught.append(str(exc))
+
+    await asyncio.gather(outer(), inner())
+
+    assert len(caught) == 1
+    assert "different task" in caught[0]
+
+
+@pytest.mark.asyncio
+async def test_same_task_nested_get_db_is_allowed():
+    """同一任务内的真嵌套应复用外层连接，不报错也不提前提交。"""
+    with get_db() as outer_db:
+        with get_db() as inner_db:
+            assert inner_db is outer_db
+
+
+def test_sequential_get_db_calls_reuse_connection():
+    """连续调用不应因守卫而失败，且连接被真正复用。"""
+    with get_db() as first:
+        first.execute("SELECT 1").fetchall()
+    with get_db() as second:
+        second.execute("SELECT 1").fetchall()
+    assert first is second
+
+
+# -- 历史统计单次扫描的一致性护栏（P4/P5）--
+
+def _seed_history_for_aggregation():
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    # 2 次 model-a（1 成 1 败），1 次 model-b，2 次生图（1 成 1 败，含张数与字节）
+    add_request_record("model-a", "alice", True, tokens=100)
+    add_request_record("model-a", "alice", False, tokens=0)
+    add_request_record("model-b", "bob", True, tokens=50)
+    add_request_record("model-a", "bob", True, tokens=10,
+                       request_kind="image_generation", image_model="img-1", image_count=2, image_bytes=4096)
+    add_request_record("model-b", "alice", False, tokens=0,
+                       request_kind="image_generation", image_model="img-1", image_count=1, image_bytes=1024)
+    return now
+
+
+def test_history_stats_single_scan_aggregations_stay_consistent():
+    _seed_history_for_aggregation()
+    stats = get_history_stats("2000-01-01 00:00:00", "2999-12-31 23:59:59", "day")
+    timeline = stats["timeline"]
+    models = {m["model"]: m for m in stats["models"]}
+
+    # 时间线总量必须等于写入的行数与令牌数，证明按 bucket 合并没有丢行。
+    assert sum(timeline["total"]) == 5
+    assert sum(timeline["failed"]) == 2
+    assert sum(timeline["tokens"]) == 160
+
+    # image 维度来自同一行集合，不能因合并扫描而丢失。
+    assert sum(timeline["image_calls"]) == 2
+    assert sum(timeline["image_failed"]) == 1
+    assert sum(timeline["images"]) == 3
+    assert sum(timeline["image_bytes"]) == 5120
+
+    # model 分布与时间线共享同一份扫描结果。
+    assert models["model-a"]["total"] == 3
+    assert models["model-a"]["failed"] == 1
+    assert models["model-a"]["tokens"] == 110
+    assert models["model-b"]["total"] == 2
+    assert models["model-b"]["failed"] == 1
+    assert sum(m["total"] for m in stats["models"]) == 5
+
+    # 用户维度独立查询仍与总量对齐。
+    assert sum(u["total"] for u in stats["users"]) == 5
+
+    # 趋势矩阵：每个模型的列数与时间线标签一致，且总和等于总请求数。
+    matrix = stats["timeline_models"]
+    assert all(len(series) == len(matrix["labels"]) for series in matrix["calls"])
+    assert sum(sum(series) for series in matrix["calls"]) == 5
+
+
+def test_history_stats_model_ordering_is_stable_by_volume_then_name():
+    _seed_history_for_aggregation()
+    stats = get_history_stats("2000-01-01 00:00:00", "2999-12-31 23:59:59", "day")
+    names = [m["model"] for m in stats["models"]]
+    totals = [m["total"] for m in stats["models"]]
+    assert totals == sorted(totals, reverse=True)
+    assert names[0] == "model-a"

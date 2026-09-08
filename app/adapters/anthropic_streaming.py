@@ -16,8 +16,9 @@ from app.adapters.anthropic import (
     provider_retry_count,
 )
 from app.core.output import InternalOutputEvent
-from app.core.text import friendly_error_msg
+from app.core.text import error_detail_for_log, friendly_error_msg
 from app.services.logger import get_logger
+from app.services.http_pool import shared_client
 
 
 _app_log = get_logger("app")
@@ -72,7 +73,7 @@ async def iter_anthropic_output_events(
     backoff = provider_retry_backoff(provider_info)
 
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with shared_client(provider_info.get("api_base") or "", timeout) as client:
             for attempt in range(retries + 1):
                 try:
                     async for event in _iter_anthropic_stream_once(
@@ -105,7 +106,7 @@ async def iter_anthropic_output_events(
     except HTTPException:
         raise
     except Exception as exc:
-        _app_log.debug("[anthropic_stream_adapter] ERROR provider=%s model=%s error=%s", provider_id, model, friendly_error_msg(exc))
+        _app_log.debug("[anthropic_stream_adapter] ERROR provider=%s model=%s error=%s", provider_id, model, error_detail_for_log(exc))
         raise HTTPException(status_code=502, detail=friendly_error_msg(exc)) from exc
 
     _app_log.debug(

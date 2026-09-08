@@ -71,7 +71,7 @@ def test_expected_http_routes_are_registered():
         ("GET", "/admin/preprocessors"),
         ("PUT", "/admin/preprocessors/{preprocessor_id}"),
         ("DELETE", "/admin/preprocessors/{preprocessor_id}"),
-        ("GET", "/admin/preprocessors/fetch-models"),
+        ("POST", "/admin/preprocessors/fetch-models"),
         ("PUT", "/admin/models/preprocessor"),
         ("GET", "/admin/image-generation"),
         ("POST", "/admin/image-generation/test"),

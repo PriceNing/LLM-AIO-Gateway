@@ -11,6 +11,8 @@ def default_config() -> dict:
         "reload": False,
         "database": "data.db",
         "image_result_dir": "generated_images",
+        # 生产环境请改为具体来源列表，例如 ["https://gateway.example.com"]。
+        "cors_allow_origins": ["*"],
         "logging": {
             "enabled": True,
             "level": "INFO",
@@ -21,14 +23,17 @@ def default_config() -> dict:
         "defaults": {
             "max_tokens": 16384,
             "temperature": 0.7,
+            "max_request_body_bytes": 33554432,
             "tool_only_limit": 20,
             "min_image_max_tokens": 2000,
+            "litellm_request_timeout": 120,
             "session_ttl_hours": 12,
             "login_attempt_limit": 10,
             "login_attempt_window_seconds": 300,
             "login_lockout_seconds": 900,
             "login_attempt_max_identities": 10000,
             "request_log_max": 200,
+            "storage_maintenance_interval_seconds": 60,
             "request_log_capture_payloads": True,
             "request_log_redact_fields": [
                 "api_key", "authorization", "cookie", "password", "secret", "token"
@@ -53,6 +58,8 @@ def default_config() -> dict:
             "image_generation_batch_timeout_seconds": 2400,
             "image_generation_result_max_bytes": 26214400,
             "image_download_allow_private_hosts": False,
+            # 局域网自建推理服务是正常用法，默认放行私网上游；元数据地址始终禁止。
+            "allow_private_upstream_hosts": True,
             "image_generation_idempotency_ttl_seconds": 300,
             "image_generation_idempotency_max_entries": 64,
             "responses_capability_supported_ttl": 604800,

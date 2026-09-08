@@ -5,9 +5,9 @@ has hosted/Codex tool item types that cannot be represented by Chat Completions.
 """
 from typing import Any
 
-import httpx
 
 from app.database import parse_model_id
+from app.services.http_pool import shared_client
 
 
 def split_sse_frame(buffer: bytes) -> tuple[bytes, bytes] | None:
@@ -84,7 +84,7 @@ def native_responses_body(internal, *, stream: bool | None = None) -> dict[str, 
 
 async def post_native_response(provider: dict, internal) -> dict[str, Any]:
     timeout = max(1, int(provider.get("request_timeout") or 120))
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with shared_client(provider.get("api_base", ""), timeout) as client:
         response = await client.post(responses_url(provider.get("api_base", "")), headers=responses_headers(provider), json=native_responses_body(internal, stream=False))
         response.raise_for_status()
         payload = response.json()
@@ -95,7 +95,7 @@ async def post_native_response(provider: dict, internal) -> dict[str, Any]:
 
 async def stream_native_response(provider: dict, internal):
     timeout = max(1, int(provider.get("request_timeout") or 120))
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with shared_client(provider.get("api_base", ""), timeout) as client:
         async with client.stream("POST", responses_url(provider.get("api_base", "")), headers=responses_headers(provider), json=native_responses_body(internal, stream=True)) as response:
             response.raise_for_status()
             async for chunk in response.aiter_raw():

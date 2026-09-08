@@ -2,8 +2,10 @@ import json
 import time
 import uuid
 from collections.abc import Awaitable, Callable
+from functools import partial
 from typing import Any
 
+import anyio
 import asyncio
 
 from app.core.outcome import (
@@ -11,7 +13,7 @@ from app.core.outcome import (
     is_client_disconnect_error,
     stats_counters_for_status,
 )
-from app.core.output import InternalOutputEvent
+from app.core.output import InternalOutputEvent, aclose_async_iterator
 from app.core.text import friendly_error_msg
 from app.database import increment_global_stats, increment_user_usage
 from app.protocols.egress import (
@@ -230,19 +232,21 @@ async def stream_internal_output(
     if endpoint == "responses" and remember_response_chain_key is not None and conv_key:
         remember_response_chain_key(response_id, conv_key)
 
+    upstream_events = metered_events()
+
     try:
         if endpoint == "chat_completions":
-            async for line in render_chat_completions_sse(metered_events(), model=model):
+            async for line in render_chat_completions_sse(upstream_events, model=model):
                 yield line
         elif endpoint == "completions":
-            async for line in render_completions_sse(metered_events(), model=model):
+            async for line in render_completions_sse(upstream_events, model=model):
                 yield line
         elif endpoint == "messages":
-            async for line in render_anthropic_messages_sse(metered_events(), model=model):
+            async for line in render_anthropic_messages_sse(upstream_events, model=model):
                 yield line
         elif endpoint == "responses":
             async for line in render_responses_sse(
-                metered_events(),
+                upstream_events,
                 model=model,
                 previous_response_id=previous_response_id,
                 response_id=response_id,
@@ -267,7 +271,7 @@ async def stream_internal_output(
             requested_model,
             details=success_details,
         )
-        _invoke_record_request_log(
+        await _invoke_record_request_log(
             record_request_log,
             success=counters.hard_success,
             status=success_details.get("status", "ok"),
@@ -335,7 +339,7 @@ async def stream_internal_output(
                 requested_model,
                 details=cancel_details,
             )
-            _invoke_record_request_log(
+            await _invoke_record_request_log(
                 record_request_log,
                 success=False,
                 status="cancelled",
@@ -405,7 +409,7 @@ async def stream_internal_output(
             requested_model,
             details=failure_details,
         )
-        _invoke_record_request_log(
+        await _invoke_record_request_log(
             record_request_log,
             success=False,
             status=failure_details.get("status", "fail"),
@@ -441,9 +445,14 @@ async def stream_internal_output(
         else:
             yield f"data: {json.dumps({'error': {'message': error_msg, 'type': 'server_error'}})}\n\n"
             yield "data: [DONE]\n\n"
+    finally:
+        # 无论正常结束、报错还是客户端断开，都要关闭渲染链与上游流，
+        # 避免上游 HTTP 连接只能等 GC 才释放（S5）。
+        await aclose_async_iterator(upstream_events)
+        await aclose_async_iterator(events)
 
 
-def _invoke_record_request_log(
+async def _invoke_record_request_log(
     recorder: RequestDetailRecorder | None,
     *,
     success: bool,
@@ -464,7 +473,9 @@ def _invoke_record_request_log(
     if recorder is None:
         return
     try:
-        recorder(
+        # 请求日志包含完整 payload，是每请求最重的同步写入，必须离开事件循环（P1）。
+        await anyio.to_thread.run_sync(partial(
+            recorder,
             success=success,
             status=status,
             tokens=tokens,
@@ -479,7 +490,7 @@ def _invoke_record_request_log(
             error_message=error_message,
             generation_started_at=generation_started_at,
             request_started_at=request_started_at,
-        )
+        ))
     except Exception as exc:
         _app_log.warning("record_request_log callback failed: %s", exc)
 

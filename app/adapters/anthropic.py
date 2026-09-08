@@ -9,6 +9,7 @@ from app.core.types import InternalRequest
 from app.database import parse_model_id
 from app.protocols.ir import ir_to_anthropic_messages
 from app.core.text import strip_billing_header
+from app.services.http_pool import shared_client
 from app.config import get_default
 from app.services.logger import get_logger
 
@@ -270,7 +271,7 @@ async def anthropic_messages_completion(
     retries = provider_retry_count(provider_info)
     backoff = provider_retry_backoff(provider_info)
     last_exc = None
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with shared_client(provider_info.get("api_base") or "", timeout) as client:
         for attempt in range(retries + 1):
             try:
                 resp = await client.post(

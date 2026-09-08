@@ -7,6 +7,7 @@ import anyio
 from fastapi import BackgroundTasks
 import httpx
 from fastapi import APIRouter, HTTPException, Header
+from fastapi.responses import JSONResponse
 from typing import Optional
 from datetime import datetime, timedelta, timezone
 from app.database import (
@@ -47,10 +48,53 @@ router = APIRouter()
 _app_log = get_logger("app")
 
 
+def _redact_secret(entry: dict | None) -> dict:
+    """Strip a stored secret from an admin read response.
+
+    Mirrors the convention already used by ``/admin/image-generation``: the
+    client gets ``has_api_key`` instead of the value, and an empty ``api_key``
+    on write means "keep what is stored" (see ``_preserve_secret_if_blank``).
+    """
+    if not isinstance(entry, dict):
+        return entry
+    redacted = dict(entry)
+    redacted["has_api_key"] = bool(redacted.get("api_key"))
+    redacted["api_key"] = ""
+    return redacted
+
+
+def _preserve_secret_if_blank(payload: dict, existing: dict | None) -> dict:
+    """Drop a blank api_key from an update payload so the stored value survives."""
+    if payload.get("api_key"):
+        return payload
+    if existing and existing.get("api_key"):
+        payload = dict(payload)
+        payload.pop("api_key", None)
+    return payload
+
+
+async def _validated_upstream(url: str, *, field: str = "api_base", required: bool = True) -> str:
+    """Reject non-http(s) schemes and metadata endpoints supplied by the caller.
+
+    ``required=False`` 用于保存类端点：空的 api_base 属于“尚未配置”，由各端点
+    自己的必填校验处理，不在这里拦截。
+    """
+    from app.services.url_guard import UnsafeUpstreamURL, validate_upstream_url_async
+
+    if not str(url or "").strip():
+        if not required:
+            return ""
+        raise HTTPException(status_code=400, detail=f"{field} is required")
+    try:
+        return await validate_upstream_url_async(str(url), field=field)
+    except UnsafeUpstreamURL as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.get("/providers")
 async def list_providers(authorization: Optional[str] = Header(None)):
     await require_admin_session(authorization)
-    return get_providers()
+    return [_redact_secret(p) for p in get_providers()]
 
 
 @router.post("/providers")
@@ -59,8 +103,9 @@ async def create_provider(provider: ProviderCreate, background_tasks: Background
     existing = get_provider(provider.id)
     if existing:
         raise HTTPException(status_code=400, detail="Provider with this ID already exists")
+    await _validated_upstream(provider.api_base, required=False)
     created = add_provider(provider.model_dump())
-    return created
+    return _redact_secret(created)
 
 
 @router.put("/providers/{provider_id}")
@@ -70,8 +115,11 @@ async def update_provider_endpoint(provider_id: str, updates: ProviderUpdate, au
     if not existing:
         raise HTTPException(status_code=404, detail="Provider not found")
     update_data = {k: v for k, v in updates.model_dump().items() if v is not None}
+    update_data = _preserve_secret_if_blank(update_data, existing)
+    if "api_base" in update_data:
+        await _validated_upstream(update_data["api_base"], required=False)
     updated = update_provider(provider_id, update_data)
-    return updated
+    return _redact_secret(updated)
 
 
 @router.delete("/providers/{provider_id}")
@@ -656,18 +704,22 @@ async def list_preprocessors(authorization: Optional[str] = Header(None)):
         ).fetchall()
         models = [{"model_id": f"{r['provider_id']}/{r['model_id']}", "provider_id": r["provider_id"],
                     "provider_name": r["provider_name"], "preprocessor": bool(r["preprocessor"])} for r in rows]
-    return {"preprocessors": preprocessors, "models": models}
+    return {"preprocessors": {k: _redact_secret(v) for k, v in preprocessors.items()}, "models": models}
 
 
 @router.put("/preprocessors/{preprocessor_id}")
 async def update_preprocessor(preprocessor_id: str, config: dict, authorization: Optional[str] = Header(None)):
     await require_admin_session(authorization)
+    existing = get_preprocessors().get(preprocessor_id)
+    config = _preserve_secret_if_blank(dict(config or {}), existing)
+    if config.get("api_base"):
+        await _validated_upstream(str(config["api_base"]), required=False)
     try:
         current = upsert_preprocessor(preprocessor_id, config)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     current.pop("id", None)
-    return {"id": preprocessor_id, "config": current}
+    return {"id": preprocessor_id, "config": _redact_secret(current)}
 
 
 @router.delete("/preprocessors/{preprocessor_id}")
@@ -678,15 +730,22 @@ async def delete_preprocessor(preprocessor_id: str, authorization: Optional[str]
     raise HTTPException(status_code=404, detail="Preprocessor not found")
 
 
-@router.get("/preprocessors/fetch-models")
-async def fetch_preprocessor_models(api_base: str, api_key: str = "",
-                                     authorization: Optional[str] = Header(None)):
-    """Fetch available models from a vision model server."""
+@router.post("/preprocessors/fetch-models")
+async def fetch_preprocessor_models(body: dict,
+                                    authorization: Optional[str] = Header(None)):
+    """Fetch available models from a vision model server.
+
+    地址与凭据改走请求体：GET query 会被前置代理与访问日志长期留存（S6）。
+    """
     await require_admin_session(authorization)
     from app.services.discovery import model_list_urls, auth_headers
     import httpx
+    body = dict(body or {})
+    api_base = await _validated_upstream(str(body.get("api_base") or ""))
+    api_key = str(body.get("api_key") or "")
     urls = model_list_urls(api_base, "openai")
     headers_list = auth_headers(api_key, "openai")
+    last_error = ""
     async with httpx.AsyncClient(timeout=10) as client:
         for url in urls:
             for h in headers_list:
@@ -696,8 +755,10 @@ async def fetch_preprocessor_models(api_base: str, api_key: str = "",
                     data = resp.json()
                     models = data.get("data") or data.get("models") or []
                     return {"models": [m.get("id") or m.get("name", "?") for m in models if isinstance(m, dict)]}
-                except Exception:
-                    continue  # skip model that failed to fetch
+                except Exception as exc:
+                    last_error = f"{type(exc).__name__}: {exc}"
+                    continue  # 尝试下一个 URL/凭据组合
+    _app_log.warning("[preprocessors.fetch-models] %s failed: %s", api_base, last_error or "unknown")
     raise HTTPException(status_code=502, detail="Failed to fetch models from server")
 
 
@@ -758,10 +819,7 @@ async def list_image_generation(authorization: Optional[str] = Header(None)):
     providers = {}
     for model in models:
         providers.setdefault(model["provider_id"], {"id": model["provider_id"], "name": model["provider_name"], "models": []})["models"].append(model)
-    generators = get_image_generators()
-    for generator in generators.values():
-        generator["has_api_key"] = bool(generator.get("api_key"))
-        generator["api_key"] = ""
+    generators = {gid: _redact_secret(g) for gid, g in get_image_generators().items()}
     return {"generators": generators, "models": models, "providers": list(providers.values())}
 
 
@@ -783,7 +841,7 @@ async def list_comfyui_workflows(body: dict, authorization: Optional[str] = Head
     body = dict(body or {})
     try:
         workflows = await list_saved_workflows(
-            str(body.get("api_base") or ""),
+            await _validated_upstream(str(body.get("api_base") or "")),
             api_key=str(body.get("api_key") or ""),
             timeout=int(body.get("timeout") or 30),
         )
@@ -799,7 +857,7 @@ async def load_comfyui_workflow(body: dict, authorization: Optional[str] = Heade
     body = dict(body or {})
     try:
         workflow = await load_saved_workflow(
-            str(body.get("api_base") or ""),
+            await _validated_upstream(str(body.get("api_base") or "")),
             str(body.get("workflow_name") or ""),
             api_key=str(body.get("api_key") or ""),
             timeout=int(body.get("timeout") or 30),
@@ -881,7 +939,7 @@ async def update_image_generation(generator_id: str, config: dict, authorization
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     current.pop("id", None)
-    return {"id": generator_id, "config": current}
+    return {"id": generator_id, "config": _redact_secret(current)}
 
 
 @router.delete("/image-generation/{generator_id}")
@@ -1022,6 +1080,11 @@ _IMPORT_MODES = {"skip", "replace", "merge"}
 _USER_EXPORT_VERSION = 1
 
 
+def _no_store(payload: dict) -> JSONResponse:
+    """导出文件可能含可用凭据：禁止浏览器与中间代理缓存。"""
+    return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+
 def _export_config(include_secrets: bool) -> dict:
     providers = get_providers()
     preprocessors = get_preprocessors()
@@ -1046,18 +1109,30 @@ def _export_config(include_secrets: bool) -> dict:
     }
 
 
-def _export_users() -> dict:
+def _export_users(include_secrets: bool = False) -> dict:
+    users = get_users()
+    if not include_secrets:
+        # 与 config/export 保持一致：默认不导出可用凭据。导入时空 key 会被
+        # 安全跳过（_import_user_api_key 返回 "skipped"），不会破坏恢复流程。
+        for user in users:
+            for entry in user.get("api_keys", []) or []:
+                entry["key"] = ""
+                entry["key_omitted"] = True
     return {
         "version": _USER_EXPORT_VERSION,
         "exported_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "users": get_users(),
+        "include_secrets": bool(include_secrets),
+        "users": users,
     }
 
 
 @router.get("/users/export")
-async def export_users_endpoint(authorization: Optional[str] = Header(None)):
+async def export_users_endpoint(
+    include_secrets: bool = False,
+    authorization: Optional[str] = Header(None),
+):
     await require_admin_session(authorization)
-    return _export_users()
+    return _no_store(_export_users(bool(include_secrets)))
 
 
 def _validate_users_payload(payload) -> list:
@@ -1159,7 +1234,7 @@ async def export_config_endpoint(
     authorization: Optional[str] = Header(None),
 ):
     await require_admin_session(authorization)
-    return _export_config(bool(include_secrets))
+    return _no_store(_export_config(bool(include_secrets)))
 
 
 def _validate_config_payload(payload) -> tuple[list, dict, dict, list, list]:
@@ -1176,6 +1251,7 @@ def _validate_config_payload(payload) -> tuple[list, dict, dict, list, list]:
         raise HTTPException(status_code=400, detail="preprocessors must be an object")
     if not isinstance(image_generators, dict):
         raise HTTPException(status_code=400, detail="image_generators must be an object")
+    _validate_imported_upstream_urls(providers, preprocessors, image_generators)
     if not isinstance(routing, list):
         raise HTTPException(status_code=400, detail="routing_rules must be a list")
     if not isinstance(fallbacks, list):
@@ -1196,6 +1272,34 @@ def _validate_config_payload(payload) -> tuple[list, dict, dict, list, list]:
         if not str(generator_id or "").strip() or not isinstance(config, dict):
             raise HTTPException(status_code=400, detail="image_generators must map ids to objects")
     return providers, preprocessors, image_generators, routing, fallbacks
+
+
+def _validate_imported_upstream_urls(providers, preprocessors, image_generators) -> None:
+    """导入路径不得绕过保存时的上游地址校验（S6）。
+
+    否则一份恶意导出文件可以把 file:// 或云元数据地址写进 providers，
+    之后由健康检查、模型发现或代理请求直接发起。
+    """
+    from app.services.url_guard import UnsafeUpstreamURL, validate_upstream_url
+
+    def check(value, field: str) -> None:
+        base = str(value or "")
+        if not base.strip():
+            return
+        try:
+            validate_upstream_url(base, field=field)
+        except UnsafeUpstreamURL as exc:
+            raise HTTPException(status_code=400, detail=f"{field}: {exc}") from exc
+
+    for index, entry in enumerate(providers or []):
+        if isinstance(entry, dict):
+            check(entry.get("api_base"), f"providers[{index}].api_base")
+    for pid, config in (preprocessors or {}).items():
+        if isinstance(config, dict):
+            check(config.get("api_base"), f"preprocessors[{pid}].api_base")
+    for gid, config in (image_generators or {}).items():
+        if isinstance(config, dict):
+            check(config.get("api_base"), f"image_generators[{gid}].api_base")
 
 
 def _import_provider(entry: dict, mode: str) -> str:

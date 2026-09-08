@@ -15,6 +15,25 @@ _login_attempts: dict[str, list[float]] = {}
 _login_blocked_until: dict[str, float] = {}
 _login_attempts_lock = threading.Lock()
 _login_last_prune = 0.0
+# 同一时间刻度内入定的身份时间戳完全相同，仅按时间排序会退化为 set 的
+# 迭代顺序（受哈希扰动影响），导致“刚记录的身份”反而被当成最旧删除。
+# 用单调序号做 tie-break，保证保留的总是最近更新的身份。
+_login_seq: dict[str, int] = {}
+_login_next_seq = 0
+
+
+def _note_login_touch_locked(identity: str) -> None:
+    global _login_next_seq
+    _login_next_seq += 1
+    _login_seq[identity] = _login_next_seq
+
+
+def _login_rank_locked(identity: str) -> tuple[float, int]:
+    last_seen = max(
+        _login_attempts.get(identity, [0.0])[-1],
+        _login_blocked_until.get(identity, 0.0),
+    )
+    return (last_seen, _login_seq.get(identity, 0))
 
 
 def _prune_login_throttle_locked(now: float, window: int, max_identities: int) -> None:
@@ -27,9 +46,11 @@ def _prune_login_throttle_locked(now: float, window: int, max_identities: int) -
                 _login_attempts[identity] = recent
             else:
                 _login_attempts.pop(identity, None)
+                _login_seq.pop(identity, None)
         for identity, blocked_until in list(_login_blocked_until.items()):
             if blocked_until <= now:
                 _login_blocked_until.pop(identity, None)
+                _login_seq.pop(identity, None)
         _login_last_prune = now
 
     # An identity moves from attempts to blocked state, so these mappings are
@@ -38,16 +59,11 @@ def _prune_login_throttle_locked(now: float, window: int, max_identities: int) -
     if overflow <= 0:
         return
     identities = set(_login_attempts) | set(_login_blocked_until)
-    oldest = sorted(
-        identities,
-        key=lambda identity: max(
-            _login_attempts.get(identity, [0.0])[-1],
-            _login_blocked_until.get(identity, 0.0),
-        ),
-    )
+    oldest = sorted(identities, key=_login_rank_locked)
     for identity in oldest[:overflow]:
         _login_attempts.pop(identity, None)
         _login_blocked_until.pop(identity, None)
+        _login_seq.pop(identity, None)
 
 
 def hash_password(password: str, salt: Optional[str] = None) -> str:
@@ -127,9 +143,11 @@ def record_login_failure(identity: str) -> int:
         recent = [value for value in _login_attempts.get(identity, []) if now - value <= window]
         recent.append(now)
         _login_attempts[identity] = recent
+        _note_login_touch_locked(identity)
         if len(recent) >= limit:
             _login_attempts.pop(identity, None)
             _login_blocked_until[identity] = now + lockout
+            _note_login_touch_locked(identity)
             _prune_login_throttle_locked(now, window, max_identities)
             return lockout
         _prune_login_throttle_locked(now, window, max_identities)
@@ -140,9 +158,7 @@ def clear_login_failures(identity: str) -> None:
     with _login_attempts_lock:
         _login_attempts.pop(identity, None)
         _login_blocked_until.pop(identity, None)
-
-
-_stop_cleanup = threading.Event()
+        _login_seq.pop(identity, None)
 
 
 def _cleanup_expired_sessions() -> None:
@@ -154,10 +170,23 @@ def _cleanup_expired_sessions() -> None:
                 expired = [t for t, s in _sessions.items() if s["expires_at"] < now]
                 for t in expired:
                     _sessions.pop(t, None)
-        except Exception:
-            pass  # cleanup is best-effort
+        except Exception as exc:  # 清理是尽力而为，但失败必须可见
+            import logging
+            logging.getLogger("llmgw.app").warning("[sessions.cleanup] failed: %s", exc)
         _stop_cleanup.wait(300)  # Every 5 minutes
+
+
+_stop_cleanup = threading.Event()
 
 
 _cleanup_thread = threading.Thread(target=_cleanup_expired_sessions, daemon=True)
 _cleanup_thread.start()
+
+
+def stop_session_cleanup(timeout: float = 1.0) -> bool:
+    """Stop the background session-cleanup thread. Returns True when it exited."""
+    _stop_cleanup.set()
+    if not _cleanup_thread.is_alive():
+        return True
+    _cleanup_thread.join(timeout=timeout)
+    return not _cleanup_thread.is_alive()

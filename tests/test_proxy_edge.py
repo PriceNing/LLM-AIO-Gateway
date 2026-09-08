@@ -146,7 +146,8 @@ def test_fix_tool_args_replaces_undefined():
 
 def test_mask_key():
     assert _mask_key("sk-aio-abcdefghijklmnopqrstuvwxyz1234567890AB") == "sk-a...90AB"
-    assert _mask_key("short") == "short"
+    # 短密钥同样不得回显原文（S10）。
+    assert _mask_key("short") == "*****"
 
 
 # -- Responses input conversion --
@@ -537,7 +538,6 @@ async def test_anthropic_adapter_model_extraction():
 @pytest.mark.asyncio
 async def test_responses_anthropic_stream_uses_internal_events(monkeypatch):
     from app.adapters import anthropic_streaming
-    import types
 
     provider = {
         "id": "pixel-api",
@@ -583,7 +583,7 @@ async def test_responses_anthropic_stream_uses_internal_events(monkeypatch):
             self.called = {"args": args, "kwargs": kwargs}
             return FakeStream()
 
-    monkeypatch.setattr(anthropic_streaming, "httpx", types.SimpleNamespace(AsyncClient=FakeClient))
+    monkeypatch.setattr(anthropic_streaming, "shared_client", lambda *args, **kwargs: FakeClient())
 
     from app.adapters.anthropic_streaming import iter_anthropic_output_events
     from app.protocols.egress import render_responses_sse
@@ -610,7 +610,6 @@ async def test_responses_anthropic_stream_uses_internal_events(monkeypatch):
 async def test_anthropic_stream_usage_accepts_openai_compatible_keys(monkeypatch):
     from app.adapters import anthropic_streaming
     from app.adapters.anthropic_streaming import iter_anthropic_output_events
-    import types
 
     class FakeStream:
         status_code = 200
@@ -642,7 +641,7 @@ async def test_anthropic_stream_usage_accepts_openai_compatible_keys(monkeypatch
         def stream(self, *args, **kwargs):
             return FakeStream()
 
-    monkeypatch.setattr(anthropic_streaming, "httpx", types.SimpleNamespace(AsyncClient=FakeClient))
+    monkeypatch.setattr(anthropic_streaming, "shared_client", lambda *args, **kwargs: FakeClient())
 
     usage_events = []
     async for event in iter_anthropic_output_events(
@@ -817,7 +816,6 @@ async def test_anthropic_messages_sse_includes_input_tokens():
 async def test_anthropic_stream_accumulates_tool_delta_without_block_start(monkeypatch):
     from app.adapters import anthropic_streaming
     from app.adapters.anthropic_streaming import iter_anthropic_output_events
-    import types
 
     class FakeStream:
         status_code = 200
@@ -853,7 +851,7 @@ async def test_anthropic_stream_accumulates_tool_delta_without_block_start(monke
         def stream(self, *args, **kwargs):
             return FakeStream()
 
-    monkeypatch.setattr(anthropic_streaming, "httpx", types.SimpleNamespace(AsyncClient=FakeClient))
+    monkeypatch.setattr(anthropic_streaming, "shared_client", lambda *args, **kwargs: FakeClient())
 
     seen = []
     async for event in iter_anthropic_output_events(
@@ -873,7 +871,6 @@ async def test_anthropic_stream_accumulates_tool_delta_without_block_start(monke
 async def test_anthropic_stream_raises_on_upstream_error_event(monkeypatch):
     from app.adapters import anthropic_streaming
     from app.adapters.anthropic_streaming import iter_anthropic_output_events
-    import types
 
     class FakeStream:
         status_code = 200
@@ -901,7 +898,7 @@ async def test_anthropic_stream_raises_on_upstream_error_event(monkeypatch):
         def stream(self, *args, **kwargs):
             return FakeStream()
 
-    monkeypatch.setattr(anthropic_streaming, "httpx", types.SimpleNamespace(AsyncClient=FakeClient))
+    monkeypatch.setattr(anthropic_streaming, "shared_client", lambda *args, **kwargs: FakeClient())
 
     with pytest.raises(Exception, match="bad stream"):
         async for _ in iter_anthropic_output_events(
@@ -1836,7 +1833,10 @@ def test_chat_completions_stream_does_not_fallback_after_output(monkeypatch, tem
 
     assert response.status_code == 200
     assert "partial primary" in body
-    assert "primary failed after output" in body
+    # 输出已开始后必须报错而非混入第二个模型；错误帧只携带客户端安全消息，
+    # 上游/内部原文不再回显（S2）。
+    assert '"server_error"' in body
+    assert "primary failed after output" not in body
     assert calls == [("primary-midfail-model", "primary-stream-midfail")]
 
 

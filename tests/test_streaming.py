@@ -526,3 +526,221 @@ async def test_stream_internal_output_records_tool_arguments_for_request_log():
     assert recorded["streamed_tool_calls"] == [
         {"id": "call_1", "name": "lookup", "arguments": '{"q":"x"}'}
     ]
+
+
+# -- 流桥取消与背压（「当前问题.md」S3/P2/P3）--
+
+import asyncio as _asyncio
+
+
+def test_iter_stream_async_does_not_use_thread_async_exceptions():
+    """取消必须协作式完成，不得向工作线程注入异步异常。
+
+    在 AST 层面检查，避免因文档措辞提及 API 名而误判。
+    """
+    import ast
+    import inspect
+    import pathlib
+
+    path = pathlib.Path(inspect.getsourcefile(__import__("app.adapters.streaming", fromlist=["*"])))
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    banned_calls = {"PyThreadState_SetAsyncExc", "pythonapi"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            assert not any(a.name == "ctypes" for a in node.names), "不得重新引入 ctypes"
+        if isinstance(node, ast.Attribute):
+            assert node.attr not in banned_calls, f"检测到禁止的线程注入调用：{node.attr}"
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            assert node.value not in banned_calls
+
+
+@pytest.mark.asyncio
+async def test_iter_stream_async_closes_upstream_on_early_consumer_exit():
+    closed = []
+
+    def stream():
+        try:
+            for i in range(100):
+                yield i
+        finally:
+            closed.append(True)
+
+    got = []
+    async for chunk in iter_stream_async(stream, poll_interval=0.005):
+        got.append(chunk)
+        if len(got) == 2:
+            break
+
+    for _ in range(200):
+        if closed:
+            break
+        await _asyncio.sleep(0.01)
+
+    assert got == [0, 1]
+    assert closed == [True]
+
+
+@pytest.mark.asyncio
+async def test_iter_stream_async_applies_backpressure_to_producer():
+    produced = []
+
+    def stream():
+        for i in range(10):
+            produced.append(i)
+            yield i
+
+    agen = iter_stream_async(stream, maxsize=1, poll_interval=0.005)
+    assert await agen.__anext__() == 0
+    await _asyncio.sleep(0.1)
+    # 有界缓冲生效：未被消费时生产者不得一次性跑完全部 chunk。
+    assert len(produced) <= 3
+    await agen.aclose()
+
+
+@pytest.mark.asyncio
+async def test_iter_stream_async_propagates_upstream_error():
+    def stream():
+        yield "ok"
+        raise RuntimeError("upstream broke")
+
+    received = []
+    with pytest.raises(RuntimeError, match="upstream broke"):
+        async for chunk in iter_stream_async(stream):
+            received.append(chunk)
+    assert received == ["ok"]
+
+
+@pytest.mark.asyncio
+async def test_producer_is_backpressured_when_consumer_never_reads():
+    """消费者不读就关闭时，生产者必须被背压+取消拦住，不能跑完整流。
+
+    新投递架构下挂死已从结构上消除：消费者不依赖哨兵送达，而是靠
+    producer_done + 队列排空收尾；生产者则在 chunk 边界检查 cancel。
+    """
+    produced = []
+
+    def stream():
+        for index in range(10000):
+            produced.append(index)
+            yield index
+
+    agen = iter_stream_async(stream, maxsize=2, poll_interval=0.005)
+    await agen.aclose()
+    await _asyncio.sleep(0.3)
+
+    assert len(produced) < 200, f"生产者未被背压/取消拦住，已产出 {len(produced)} 个 chunk"
+
+
+@pytest.mark.asyncio
+async def test_consumer_exits_without_sentinel_via_producer_done():
+    """上游报错且哨兵未能送达时，消费者仍须报错退出而非永久等待。"""
+    import app.adapters.streaming as module
+
+    def stream():
+        yield "a"
+        raise RuntimeError("boom without sentinel")
+
+    received = []
+    with pytest.raises(RuntimeError, match="boom without sentinel"):
+        async for chunk in iter_stream_async(stream, poll_interval=0.005):
+            received.append(chunk)
+    assert received == ["a"]
+
+
+# -- 上游流确定性关闭（「当前问题.md」S5）--
+
+@pytest.mark.asyncio
+async def test_first_output_timeout_closes_upstream_generator():
+    """超时进入回退时，必须关闭被丢弃的上游流。"""
+    from app.core.policy import RouteTarget
+    from app.router.proxy import _iter_events_with_first_output_timeout
+
+    closed = []
+
+    async def upstream():
+        try:
+            yield InternalOutputEvent(kind="usage", usage={})  # 非可见事件，不解除超时
+            await _asyncio.sleep(3600)
+        finally:
+            closed.append(True)
+
+    with pytest.raises(TimeoutError, match="fallback attempt timeout"):
+        async for _ in _iter_events_with_first_output_timeout(
+            upstream(),
+            timeout_s=1,
+            target=RouteTarget(model="m", provider_id="p"),
+            provider_id="p",
+        ):
+            pass
+
+    assert closed == [True]
+
+
+@pytest.mark.asyncio
+async def test_stream_internal_output_closes_upstream_on_early_exit():
+    """客户端提前断开（上层 aclose 响应流）时，上游流必须被关闭。"""
+    closed = []
+
+    async def events():
+        try:
+            for i in range(50):
+                yield InternalOutputEvent(kind="text_delta", text=f"t{i}")
+        finally:
+            closed.append(True)
+
+    response = stream_internal_output(
+        events=events(),
+        endpoint="chat_completions",
+        model="m",
+        username="u",
+        api_key_value="k",
+        provider_id="p",
+        requested_model="m",
+        log_request=lambda *args, **kwargs: None,
+    )
+    seen = 0
+    async for _ in response:
+        seen += 1
+        if seen >= 2:
+            break
+    await response.aclose()
+    await _asyncio.sleep(0)
+
+    assert seen == 2
+    assert closed == [True]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_streams_do_not_leak_worker_threads():
+    """协作式取消必须能并发收尾：无线程滞留、无死锁。"""
+    import threading
+    import time as _time
+
+    def make_stream():
+        def stream():
+            for i in range(500):
+                yield i
+        return stream
+
+    baseline = threading.active_count()
+
+    async def consume_half():
+        seen = 0
+        async for _ in iter_stream_async(make_stream(), poll_interval=0.002):
+            seen += 1
+            if seen >= 3:
+                break
+        return seen
+
+    results = await _asyncio.wait_for(
+        _asyncio.gather(*(consume_half() for _ in range(20))),
+        timeout=30,
+    )
+    assert results == [3] * 20
+
+    deadline = _time.monotonic() + 10
+    while _time.monotonic() < deadline and threading.active_count() > baseline:
+        await _asyncio.sleep(0.05)
+    assert threading.active_count() <= baseline, (
+        f"流工作线程未回收：baseline={baseline}, now={threading.active_count()}"
+    )

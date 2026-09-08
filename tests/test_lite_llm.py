@@ -258,3 +258,14 @@ def test_normalize_image_content_mixed_data_uri_and_image_url():
     image_urls = [p.get("image_url", {}).get("url") for p in parts if p.get("type") == "image_url"]
     assert f"data:image/png;base64,{_IMG1}" in image_urls
     assert "https://example.com/existing.jpg" in image_urls
+
+
+def test_compatibility_patches_are_active():
+    """补丁依赖 litellm 内部实现；升级后失效必须被测试捕获（Q3）。"""
+    from app.services.lite_llm import compatibility_patch_status
+
+    status = compatibility_patch_status()
+    assert status == {"fields": True, "converter": True}, (
+        f"liteLLM 兼容补丁未完全生效：{status}。"
+        "reasoning_content 与 prompt cache 统计会在多轮工具调用中丢失。"
+    )
