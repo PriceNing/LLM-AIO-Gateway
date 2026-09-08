@@ -65,6 +65,8 @@ def default_config() -> dict:
             "responses_capability_supported_ttl": 604800,
             "responses_capability_unsupported_ttl": 21600,
             "responses_capability_transient_ttl": 300,
+            "responses_capability_probe_timeout": 8,
+            "responses_capability_probe_max_output_tokens": 16,
             "anthropic_thinking_budget_tokens": 1024,
         }
     }

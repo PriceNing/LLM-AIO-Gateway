@@ -850,6 +850,18 @@ def test_error_detail_for_log_preserves_raw_text():
     assert error_detail_for_log(Exception("x" * 300), max_chars=10) == "x" * 10
 
 
+def test_error_detail_for_log_includes_http_response_body():
+    request = __import__("httpx").Request("POST", "https://example.test/v1/responses")
+    error = __import__("httpx").HTTPStatusError(
+        "Client error '400 Bad Request' for url 'https://example.test/v1/responses'",
+        request=request,
+        response=__import__("httpx").Response(400, text="No tool output found for function call fc_c_1.", request=request),
+    )
+    detail = error_detail_for_log(error)
+    assert "400 Bad Request" in detail
+    assert "No tool output found for function call fc_c_1." in detail
+
+
 def test_mask_key_never_echoes_short_secret():
     assert mask_key("sk-aio-abcdefghijklmnopqrstuvwxyz1234567890AB") == "sk-a...90AB"
     assert mask_key("short123") == "********"

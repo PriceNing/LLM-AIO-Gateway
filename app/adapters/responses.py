@@ -82,11 +82,27 @@ def native_responses_body(internal, *, stream: bool | None = None) -> dict[str, 
     return body
 
 
+async def _raise_for_status_with_body(response) -> None:
+    """Raise HTTPStatusError only after the error body is available for logs."""
+    if response.status_code < 400:
+        return
+    try:
+        if not getattr(response, "_content", False) and hasattr(response, "aread"):
+            await response.aread()
+    except Exception:
+        pass
+    response.raise_for_status()
+
+
+def _request_timeout(provider: dict) -> int:
+    return max(1, int(provider.get("request_timeout") or 120))
+
+
 async def post_native_response(provider: dict, internal) -> dict[str, Any]:
-    timeout = max(1, int(provider.get("request_timeout") or 120))
+    timeout = _request_timeout(provider)
     async with shared_client(provider.get("api_base", ""), timeout) as client:
         response = await client.post(responses_url(provider.get("api_base", "")), headers=responses_headers(provider), json=native_responses_body(internal, stream=False))
-        response.raise_for_status()
+        await _raise_for_status_with_body(response)
         payload = response.json()
     if not isinstance(payload, dict) or payload.get("object") != "response":
         raise RuntimeError("upstream returned a non-Responses payload")
@@ -94,10 +110,10 @@ async def post_native_response(provider: dict, internal) -> dict[str, Any]:
 
 
 async def stream_native_response(provider: dict, internal):
-    timeout = max(1, int(provider.get("request_timeout") or 120))
+    timeout = _request_timeout(provider)
     async with shared_client(provider.get("api_base", ""), timeout) as client:
         async with client.stream("POST", responses_url(provider.get("api_base", "")), headers=responses_headers(provider), json=native_responses_body(internal, stream=True)) as response:
-            response.raise_for_status()
+            await _raise_for_status_with_body(response)
             async for chunk in response.aiter_raw():
                 # Preserve the upstream event framing byte-for-byte.
                 yield chunk

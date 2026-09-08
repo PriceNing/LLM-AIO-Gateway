@@ -63,7 +63,17 @@ def friendly_error_msg(e: Exception) -> str:
 
 def error_detail_for_log(e: BaseException, *, max_chars: int = 2000) -> str:
     """Full upstream error text for server-side logging only."""
-    return str(e)[:max_chars]
+    parts = [str(e)]
+    response = getattr(e, "response", None)
+    body = ""
+    if response is not None:
+        try:
+            body = (getattr(response, "text", None) or "").strip()
+        except Exception:
+            body = ""
+    if body and body not in parts[0]:
+        parts.append(body)
+    return " | ".join(part for part in parts if part)[:max_chars]
 
 
 def mask_key(key: str) -> str:

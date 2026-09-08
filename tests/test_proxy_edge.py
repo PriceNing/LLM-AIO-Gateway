@@ -1143,6 +1143,75 @@ def test_responses_allows_alias_when_route_target_is_allowed(monkeypatch, temp_d
     assert called == {"model": "PixelAPI/gpt-5.5", "provider_id": "PixelAPI"}
 
 
+def test_responses_unpaired_tool_call_does_not_downgrade_to_chat(monkeypatch, temp_db):
+    add_provider({
+        "id": "pixel",
+        "name": "Pixel",
+        "provider_type": "openai",
+        "api_base": "https://pixel.example/v1",
+        "api_key": "upstream-key",
+        "enabled": True,
+        "models": [{"id": "gpt-5.6-terra", "name": "terra", "enabled": True}],
+    })
+    from app.database import set_model_responses_capability
+    set_model_responses_capability("pixel", "gpt-5.6-terra", status="unsupported", expires_at="2999-01-01T00:00:00+00:00")
+
+    def fail_chat(**_kwargs):
+        raise AssertionError("unpaired tool history must not fall through to Chat")
+
+    monkeypatch.setattr("app.router.proxy.create_chat_completion", fail_chat)
+
+    response = client.post("/v1/responses", headers=temp_db["headers"], json={
+        "model": "gpt-5.6-terra",
+        "tools": [{"type": "function", "name": "exec_command", "parameters": {"type": "object"}}],
+        "input": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "continue"}]},
+            {"type": "function_call", "call_id": "fc_c_1", "name": "exec_command", "arguments": "{}"},
+        ],
+    })
+    assert response.status_code == 400
+    assert "tool calls without matching outputs" in response.json()["detail"]
+
+
+def test_responses_unpaired_tool_call_after_native_failure_is_still_400(monkeypatch, temp_db):
+    add_provider({
+        "id": "pixel",
+        "name": "Pixel",
+        "provider_type": "openai",
+        "api_base": "https://pixel.example/v1",
+        "api_key": "upstream-key",
+        "enabled": True,
+        "models": [{"id": "gpt-5.6-terra", "name": "terra", "enabled": True}],
+    })
+    from app.database import set_model_responses_capability
+    set_model_responses_capability("pixel", "gpt-5.6-terra", status="supported", expires_at="2999-01-01T00:00:00+00:00")
+
+    async def fail_native(provider, internal):
+        request = __import__("httpx").Request("POST", "https://pixel.example/v1/responses")
+        raise __import__("httpx").HTTPStatusError(
+            "bad request",
+            request=request,
+            response=__import__("httpx").Response(400, text="No tool output found for function call fc_c_1.", request=request),
+        )
+
+    def fail_chat(**_kwargs):
+        raise AssertionError("unpaired tool history must not fall through to Chat")
+
+    monkeypatch.setattr("app.router.proxy.post_native_response", fail_native)
+    monkeypatch.setattr("app.router.proxy.create_chat_completion", fail_chat)
+
+    response = client.post("/v1/responses", headers=temp_db["headers"], json={
+        "model": "gpt-5.6-terra",
+        "tools": [{"type": "function", "name": "exec_command", "parameters": {"type": "object"}}],
+        "input": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "continue"}]},
+            {"type": "function_call", "call_id": "fc_c_1", "name": "exec_command", "arguments": "{}"},
+        ],
+    })
+    assert response.status_code == 400
+    assert "tool calls without matching outputs" in response.json()["detail"]
+
+
 def test_completions_openai_provider_uses_ir_chat_adapter(monkeypatch, temp_db):
     add_provider({
         "id": "openai-text",

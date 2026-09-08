@@ -891,7 +891,13 @@ def _responses_required_tool_types(body: dict) -> set[str]:
 
 
 def _responses_stateful_tool_markers(body: dict) -> list[str]:
-    """Identify prior Responses tool/agent state that cannot cross providers safely."""
+    """Collect prior Responses tool/agent markers for logging and fallback policy.
+
+    Only ``previous_response_id`` is provider-bound and blocks cross-provider
+    native fallback. Explicit tool outputs remain eligible so a failed primary
+    can still reach another native-capable target; dialect incompatibilities
+    are filtered separately.
+    """
     input_data = body.get("input")
     found = []
     if body.get("previous_response_id"):
@@ -972,6 +978,79 @@ def _native_sse_payload_has_output(payload: dict | None) -> bool:
     return False
 
 
+def _native_sse_error_message(payload: dict | None) -> str | None:
+    """Return a message for Responses SSE error payloads, including typeless ``event: error`` frames."""
+    if not isinstance(payload, dict):
+        return None
+    event_type = str(payload.get("type") or "")
+    error = payload.get("error")
+    # OpenAI uses type=error. Some proxies emit ``event: error`` with only an
+    # ``error`` object and no type. Ignore response.* frames that happen to
+    # contain an error key.
+    if event_type not in {"", "error"}:
+        return None
+    if event_type == "" and not isinstance(error, dict):
+        return None
+    if isinstance(error, dict):
+        return str(error.get("message") or error.get("type") or error)
+    if error:
+        return str(error)
+    if event_type == "error":
+        return str(payload.get("message") or "native Responses stream error")
+    return None
+
+
+def _native_cross_provider_incompatible_reasons(body: dict | None) -> list[str]:
+    """Shapes that commonly 400 when a Codex native body is forwarded to another vendor."""
+    if not isinstance(body, dict):
+        return []
+    reasons: list[str] = []
+    input_data = body.get("input")
+    call_ids: set[str] = set()
+    output_ids: set[str] = set()
+    if isinstance(input_data, list):
+        for item in input_data:
+            if not isinstance(item, dict):
+                continue
+            item_type = str(item.get("type") or "")
+            if item_type in {"function_call", "custom_tool_call"}:
+                call_id = str(item.get("call_id") or item.get("id") or "")
+                if call_id:
+                    call_ids.add(call_id)
+            elif item_type in {"function_call_output", "custom_tool_call_output"}:
+                call_id = str(item.get("call_id") or "")
+                if call_id:
+                    output_ids.add(call_id)
+    if call_ids - output_ids:
+        reasons.append("unpaired_tool_call")
+    reasoning = body.get("reasoning")
+    if isinstance(reasoning, dict) and reasoning.get("encrypted_content") and "encrypted_reasoning" not in reasons:
+        reasons.append("encrypted_reasoning")
+    return reasons
+
+
+def _responses_incomplete_tool_history(body: dict | None) -> bool:
+    """True when Responses input has tool calls without matching outputs.
+
+    Chat Completions cannot repair that shape. Downgrading it only repeats the
+    same 400 across fallback providers.
+    """
+    return "unpaired_tool_call" in _native_cross_provider_incompatible_reasons(body)
+
+
+def _incomplete_tool_history_http_error(exc: Exception | None = None) -> HTTPException:
+    error = HTTPException(
+        status_code=400,
+        detail="Responses request has tool calls without matching outputs; Chat compatibility cannot repair this.",
+    )
+    if exc is not None:
+        error.__cause__ = exc
+        existing = getattr(exc, "request_details", None)
+        if isinstance(existing, dict):
+            error.request_details = existing
+    return error
+
+
 def _native_empty_output_error(response: dict | None = None) -> _EmptyNativeResponsesError:
     error = _EmptyNativeResponsesError("native Responses completed without client-visible output")
     _attach_request_details(
@@ -990,10 +1069,15 @@ async def _native_responses_stream_with_accounting(events, *, username, api_key_
     failed = False
     saw_output = False
     upstream_endpoint = "responses"
+    terminal_error = None
     try:
         async for frame in iter_sse_frames(events):
             payload = sse_payload(frame)
             saw_output = saw_output or _native_sse_payload_has_output(payload)
+            sse_error = _native_sse_error_message(payload)
+            if sse_error:
+                failed = True
+                terminal_error = sse_error
             if payload and payload.get("type") in {"response.completed", "response.failed", "response.incomplete"}:
                 response_body = payload.get("response")
                 terminal_error = payload.get("error") or (response_body or {}).get("error")
@@ -1039,10 +1123,23 @@ async def _native_responses_stream_with_accounting(events, *, username, api_key_
             details.update({"native_empty_output": True, "native_failure_reason": "empty_completed_response"})
         elif failed and response_body:
             details.update({"status": "partial", "partial_output": True})
-        details = apply_outcome_to_details(details, success=success, partial_output=bool(response_body) and failed)
+        elif saw_output and not response_body and not client_disconnected:
+            details.update({"status": "partial", "partial_output": True, "native_failure_reason": "missing_completed_event"})
+        details = apply_outcome_to_details(
+            details,
+            success=success,
+            partial_output=bool(saw_output and (failed or not response_body)),
+        )
         _log_request(username, api_key_value, model, provider_id, "responses", success, tokens, requested_model, details=details)
         status = details.get("status", "ok" if success else "fail")
-        error_text = str(locals().get("terminal_error") or "native Responses stream did not complete") if not success else ""
+        if success:
+            error_text = ""
+        elif terminal_error:
+            error_text = str(terminal_error)
+        elif saw_output:
+            error_text = "native Responses stream ended after client-visible output without a completed event"
+        else:
+            error_text = "native Responses stream did not complete"
         _record_request_log(endpoint="responses", username=username, api_key_value=api_key_value, requested_model=requested_model, final_model=model, final_provider=provider_id, request_body=request_body, response_body=response_body, success=success, status=status, tokens=tokens, usage=usage, details=details, error_message=error_text)
         _record_success_metrics(username, api_key_value, tokens, status)
 
@@ -1155,11 +1252,14 @@ async def _probe_model_responses_capability(provider: dict, model: str) -> bool:
         "model": model,
         "input": "capability probe",
         "stream": False,
+        "max_output_tokens": max(1, int(get_default("responses_capability_probe_max_output_tokens", 16))),
     })
     probe.target_model = model
     probe.provider_id = provider_id
     try:
-        payload = await post_native_response(provider, probe)
+        probe_provider = dict(provider)
+        probe_provider["request_timeout"] = max(1, int(get_default("responses_capability_probe_timeout", 8)))
+        payload = await post_native_response(probe_provider, probe)
         supported = isinstance(payload, dict) and payload.get("object") == "response"
         if supported:
             set_model_responses_capability(
@@ -1184,6 +1284,8 @@ async def _probe_model_responses_capability(provider: dict, model: str) -> bool:
                 expires_at=_responses_capability_expiry("unsupported"),
                 error=error_detail_for_log(exc),
             )
+        else:
+            _mark_model_responses_unknown(provider_id, model, exc)
         return False
 
 
@@ -1243,6 +1345,11 @@ async def _wait_for_native_response_output(events) -> bytes:
             if saw_output:
                 return buffered
             if payload:
+                sse_error = _native_sse_error_message(payload)
+                if sse_error:
+                    error = RuntimeError(sse_error)
+                    _attach_request_details(error, native_failure_reason="sse_error")
+                    raise error
                 event_type = str(payload.get("type") or "")
                 if event_type in {"response.failed", "response.incomplete"}:
                     error = RuntimeError("native Responses stream ended unsuccessfully")
@@ -1286,6 +1393,21 @@ async def _native_response_with_fallbacks(internal, *, stream: bool, required_to
             attempts.append({"index": index, "stage": "primary" if index == 0 else "fallback", "target": target.model, "provider_id": target.provider_id, "status": "skipped", "reason": "capability_mismatch"})
             index += 1
             continue
+        if index > 0:
+            native_body = (internal.metadata.get("responses_native") or {}).get("request_body") or internal.raw_body
+            incompatible = _native_cross_provider_incompatible_reasons(native_body)
+            if incompatible:
+                attempts.append({
+                    "index": index,
+                    "stage": "fallback",
+                    "target": target.model,
+                    "provider_id": target.provider_id,
+                    "status": "skipped",
+                    "reason": "native_dialect_incompatible",
+                    "incompatible": incompatible,
+                })
+                index += 1
+                continue
         attempt = copy.deepcopy(internal)
         attempt.target_model, attempt.provider_id = target.model, provider_id
         try:
@@ -2040,6 +2162,7 @@ def _empty_stream_error(target: RouteTarget, provider_id: str, *, placeholder_on
     exc.attempted_model = target.model
     exc.attempted_provider = provider_id or target.provider_id or ""
     exc.placeholder_only_response = placeholder_only
+    exc.empty_stream_response = not placeholder_only
     return exc
 
 
@@ -2228,13 +2351,18 @@ async def _stream_events_with_fallbacks(internal, *, temperature, max_tokens, lo
                 )
                 raise
             retry_key = (target.provider_id or "", target.model)
-            if index > 0 and getattr(exc, "placeholder_only_response", False) and degenerate_retries.get(retry_key, 0) < 1:
+            empty_or_placeholder = (
+                getattr(exc, "placeholder_only_response", False)
+                or getattr(exc, "empty_stream_response", False)
+            )
+            if index > 0 and empty_or_placeholder and degenerate_retries.get(retry_key, 0) < 1:
                 degenerate_retries[retry_key] = degenerate_retries.get(retry_key, 0) + 1
                 _app_log.warning(
-                    "[%s fallback.stream.retry] target=%s provider=%s reason=placeholder_only_response retry=%d",
+                    "[%s fallback.stream.retry] target=%s provider=%s reason=%s retry=%d",
                     log_label,
                     target.model,
                     fallback_provider_id or "-",
+                    "placeholder_only_response" if getattr(exc, "placeholder_only_response", False) else "empty_stream",
                     degenerate_retries[retry_key],
                 )
                 continue
@@ -4147,6 +4275,21 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
             except Exception as native_error:
                 native_attempts = list(getattr(native_error, "request_details", {}).get("fallback_attempts", []) or [])
                 client_owned_tools = _responses_client_owned_tool_markers(body)
+                if _responses_incomplete_tool_history(body):
+                    # Chat Completions cannot invent missing tool outputs.
+                    # Downgrading this shape only repeats the same 400 across
+                    # every fallback provider.
+                    _attach_request_details(
+                        native_error,
+                        fallback_status="skipped",
+                        fallback_reason="incomplete_tool_history",
+                        responses_mode="native",
+                    )
+                    _app_log.warning(
+                        "[responses native fallback] refusing Chat downgrade for incomplete tool history: %s",
+                        native_error,
+                    )
+                    raise _incomplete_tool_history_http_error(native_error)
                 if native_required or client_owned_tools:
                     # Codex custom/namespace tools and other native-only
                     # features must not silently fall back to Chat.  The Chat
@@ -4159,6 +4302,9 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                     raise
                 _app_log.warning("[responses native fallback] no native target succeeded; downgrading basic request: %s", native_error)
                 native_downgrade_details = _native_downgrade_details(native_error, native_attempts)
+
+        if _responses_incomplete_tool_history(body):
+            raise _incomplete_tool_history_http_error()
 
         # The initial minimal policy deliberately leaves a native payload untouched.
         # Once native dispatch is ruled out, run the full IR policy required by the

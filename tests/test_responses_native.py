@@ -222,6 +222,44 @@ async def test_generic_responses_400_is_not_cached_as_unsupported(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_generic_probe_400_writes_transient_unknown_backoff(monkeypatch):
+    add_provider({
+        "id": "pixel-400", "name": "Pixel", "provider_type": "openai",
+        "api_base": "http://pixel.invalid/v1", "models": [{"id": "gpt-5.6-luna"}],
+    })
+    request = httpx.Request("POST", "http://pixel.invalid/v1/responses")
+    async def fake_post(provider, internal):
+        raise httpx.HTTPStatusError(
+            "bad request", request=request,
+            response=httpx.Response(400, text="previous_response_id is invalid", request=request),
+        )
+    monkeypatch.setattr("app.router.proxy.post_native_response", fake_post)
+    provider = {"id": "pixel-400", "provider_type": "openai"}
+    assert await _native_capability_for_request(provider, "gpt-5.6-luna") is False
+    capability = get_model_responses_capability("pixel-400", "gpt-5.6-luna")
+    assert capability["responses_status"] == "unknown"
+    assert capability["responses_expires_at"]
+
+
+@pytest.mark.asyncio
+async def test_capability_probe_uses_short_timeout_and_output_limit(monkeypatch):
+    seen = {}
+
+    async def fake_post(provider, internal):
+        seen["timeout"] = provider.get("request_timeout")
+        seen["body"] = native_responses_body(internal)
+        return {"object": "response", "id": "resp_probe", "output": [{"type": "message"}]}
+
+    monkeypatch.setattr("app.router.proxy.post_native_response", fake_post)
+    provider = {"id": "pixel", "provider_type": "openai", "request_timeout": 120}
+    from app.router.proxy import _probe_model_responses_capability
+    assert await _probe_model_responses_capability(provider, "gpt-5.6-terra") is True
+    assert seen["timeout"] == 8
+    assert seen["body"]["max_output_tokens"] == 16
+    assert seen["body"]["input"] == "capability probe"
+
+
+@pytest.mark.asyncio
 async def test_real_native_request_promotes_unknown_model_without_background_probe(monkeypatch):
     add_provider({
         "id": "pixel", "name": "Pixel", "provider_type": "openai",
@@ -727,3 +765,66 @@ def test_responses_compatibility_accepts_client_metadata_and_hosted_tools():
         "model": "x", "input": "hello", "client_metadata": {"client": "codex"},
         "tools": [{"type": "web_search"}],
     }) == []
+
+
+def test_cross_provider_skips_unpaired_tool_calls_but_not_paired_outputs():
+    from app.router.proxy import _native_cross_provider_incompatible_reasons
+    unpaired = {
+        "input": [{"type": "function_call", "call_id": "fc_c_1", "name": "exec_command", "arguments": "{}"}],
+    }
+    paired = {
+        "input": [
+            {"type": "function_call", "call_id": "call_1", "name": "exec_command", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "ok"},
+        ],
+    }
+    assert "unpaired_tool_call" in _native_cross_provider_incompatible_reasons(unpaired)
+    assert _native_cross_provider_incompatible_reasons(paired) == []
+    assert _native_cross_provider_incompatible_reasons({
+        "tools": [{"type": "namespace", "name": "shell"}],
+        "input": [{"type": "message", "role": "user", "content": "hi"}],
+    }) == []
+
+
+@pytest.mark.asyncio
+async def test_unpaired_tool_call_skips_cross_provider_native_fallback(monkeypatch):
+    add_provider({"id": "tool-output-primary", "name": "Primary", "provider_type": "openai", "api_base": "https://primary.invalid/v1", "api_key": "key", "models": [{"id": "stateful-model"}]})
+    add_provider({"id": "tool-output-fallback", "name": "Fallback", "provider_type": "openai", "api_base": "https://fallback.invalid/v1", "api_key": "key", "models": [{"id": "fallback-model"}]})
+    set_model_responses_capability("tool-output-primary", "stateful-model", status="supported")
+    set_model_responses_capability("tool-output-fallback", "fallback-model", status="supported")
+    add_fallback_policy({
+        "name": "tool output fallback",
+        "match_provider": "tool-output-primary",
+        "match_model": "stateful-model",
+        "triggers": {"http_4xx": True},
+        "chain": [{"model": "fallback-model", "provider_id": "tool-output-fallback"}],
+    })
+    calls = []
+
+    async def fake_post(provider, internal):
+        calls.append(provider["id"])
+        request = httpx.Request("POST", "https://primary.invalid/responses")
+        raise httpx.HTTPStatusError("bad request", request=request, response=httpx.Response(400, request=request))
+
+    monkeypatch.setattr("app.router.proxy.post_native_response", fake_post)
+    internal = responses_to_internal({
+        "model": "stateful-model",
+        "input": [{"type": "function_call", "call_id": "fc_c_1", "name": "exec_command", "arguments": "{}"}],
+    })
+    internal.provider_id = "tool-output-primary"
+    with pytest.raises(httpx.HTTPStatusError):
+        await _native_response_with_fallbacks(
+            internal, stream=False, required_tool_types=set(),
+            stateful_markers=[],
+        )
+    assert calls == ["tool-output-primary"]
+
+
+@pytest.mark.asyncio
+async def test_typeless_sse_error_event_fails_before_fallback_wait():
+    async def events():
+        yield b": keepalive\n\n"
+        yield b'event: error\ndata: {"error":{"type":"upstream_error","message":"Upstream service temporarily unavailable"}}\n\n'
+
+    with pytest.raises(RuntimeError, match="Upstream service temporarily unavailable"):
+        await _wait_for_native_response_output(events())
