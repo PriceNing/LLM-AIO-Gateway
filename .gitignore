@@ -30,6 +30,8 @@ generated_images/
 
 # Project-local notes (not for distribution)
 AGENTS.md
+.prod-server.local.md
+生产服务器更新规则.md
 使用说明书.md
 CLAUDE.md
 opencode-fix.md

@@ -176,10 +176,17 @@ curl http://localhost:8000/v1/responses \
   "username": "",
   "api_key_pattern": "",
   "match_model": "MiniMax-M2*",
+  "match_scope": "any",
   "target_model": "target-model",
   "target_provider": "target-provider"
 }
 ```
+
+`match_scope` 控制请求模型 ID 的匹配形式：
+
+- `any`（默认）：宽泛匹配，简单别名也会命中 `provider/model` 复合请求的模型段。
+- `unqualified`：仅匹配不含 `/` 的简单模型名。
+- `qualified`：仅匹配 `provider/model` 复合请求。
 
 路由规则只描述主动路由。被动 fallback 在 `fallback_policies` 中单独配置：根据路由后的 provider/model 和 `timeout`、`connection_error`、`http_429`、`http_5xx` 等失败类型匹配，再依次尝试 fallback 链。管理面板提供独立编辑器，无需在路由规则里手写 JSON。
 
@@ -189,7 +196,7 @@ curl http://localhost:8000/v1/responses \
 
 ## 配置
 
-`config.json` 保存服务级配置，修改后需要重启服务。
+`config.json` 保存服务级配置，修改后需要重启服务。完整可选项见 `config.example.json` 中的 `defaults` 块。
 
 重要默认项：
 
@@ -197,20 +204,53 @@ curl http://localhost:8000/v1/responses \
 |---|---:|---|
 | `max_tokens` | 16384 | 客户端未传 `max_tokens` 和 `max_completion_tokens` 时使用。 |
 | `temperature` | 0.7 | 默认温度。 |
+| `max_request_body_bytes` | 33554432 | 入站请求体大小上限（32 MiB）；超出返回 413。 |
+| `litellm_request_timeout` | 120 | liteLLM 上游调用超时。 |
 | `tool_only_limit` | 20 | 工具调用循环断路器阈值。 |
 | `min_image_max_tokens` | 2000 | 含图片请求的最小 max tokens。 |
+| `session_ttl_hours` | 12 | 管理员会话有效期。 |
+| `login_attempt_limit` | 10 | 管理员登录身份校验失败上限。 |
+| `login_attempt_window_seconds` | 300 | 登录限流统计窗口。 |
+| `login_lockout_seconds` | 900 | 锁定后的恢复时间。 |
+| `login_attempt_max_identities` | 10000 | 登录限流状态最多保留的身份数量。 |
+| `request_log_max` | 200 | 内存中滚动请求日志条数。 |
+| `storage_maintenance_interval_seconds` | 60 | 后台存储清理间隔。 |
+| `request_log_capture_payloads` | true | 是否保存请求和响应正文；关闭后只记录元数据。 |
+| `request_log_redact_fields` | `[api_key, authorization, ...]` | 请求/响应日志脱敏字段列表。 |
 | `reasoning_cache_ttl` | 1800 | reasoning 缓存 TTL，单位秒。 |
 | `reasoning_cache_max_size` | 1000 | reasoning 缓存容量。 |
 | `tool_only_turns_ttl` | 600 | 工具调用计数 TTL，单位秒。 |
 | `tool_only_turns_max_size` | 2000 | 工具调用计数容量。 |
 | `image_cache_max_size` | 500 | 图片描述缓存容量。 |
-| `request_log_capture_payloads` | true | 是否保存请求和响应正文；关闭后只记录元数据。 |
-| `login_attempt_max_identities` | 10000 | 管理员登录限流状态最多保留的身份数量。 |
 | `image_result_ttl_seconds` | 86400 | 生图原图的保留时间。 |
+| `image_result_max_files` | 500 | 原图目录保留的最大文件数。 |
+| `image_preview_enabled` | true | 是否生成内联缩略图。 |
+| `image_preview_max_dimension` | 1280 | 缩略图最长边。 |
+| `image_preview_max_source_pixels` | 40000000 | 缩略图源图最大像素。 |
+| `image_preview_quality` | 82 | JPEG 压缩质量。 |
 | `image_preview_max_bytes` | 800000 | 单张内联缩略图的目标字节上限。 |
+| `image_preview_inline_limit` | 4 | 单次响应内联缩略图的最大张数。 |
+| `image_generation_max_retries` | 2 | 生图后端重试次数。 |
+| `image_generation_retry_base_seconds` | 1.0 | 生图重试退避基数。 |
+| `image_generation_max_retry_delay_seconds` | 30.0 | 生图重试退避上限。 |
 | `image_generation_batch_concurrency` | 1 | 单个生图批次的并发数。 |
+| `image_generation_batch_timeout_seconds` | 2400 | 生图批次总等待时间。 |
 | `image_generation_result_max_bytes` | 26214400 | 单张上游图像的最大字节数。 |
 | `image_download_allow_private_hosts` | false | 是否允许从私网地址下载上游返回的图像 URL。 |
+| `allow_private_upstream_hosts` | true | 是否允许私网上游地址（元数据地址始终拒绝）。 |
+| `image_generation_idempotency_ttl_seconds` | 300 | 生图幂等键保留时间。 |
+| `image_generation_idempotency_max_entries` | 64 | 生图幂等键最大条数。 |
+| `responses_capability_supported_ttl` | 604800 | 原生 Responses 能力探测阳性缓存 TTL。 |
+| `responses_capability_unsupported_ttl` | 21600 | 原生 Responses 能力探测阴性缓存 TTL。 |
+| `responses_capability_transient_ttl` | 300 | 原生 Responses 能力探测临时失败缓存 TTL。 |
+| `anthropic_thinking_budget_tokens` | 1024 | Anthropic thinking 模式预算。 |
+
+## 安全与限流
+
+- 入站请求体受 `RequestBodyLimitMiddleware` 限制（`max_request_body_bytes`）。
+- 上游 URL 通过 `app/services/url_guard.py` 验证：拒绝非 http(s)、云元数据地址与保留 IP 段；私网放行由 `allow_private_upstream_hosts` 控制。
+- 管理员登录走 `app/security.py` 的登录限流（`login_attempt_*`）。
+- Anthropic 与原生 Responses 适配器复用 `app/services/http_pool.py` 维护的共享 HTTP 连接池。
 
 ## 架构摘要
 
@@ -219,10 +259,14 @@ curl http://localhost:8000/v1/responses \
   -> 协议入口
   -> 内部 IR
   -> 共享策略层（RoutingDecision、预处理、reasoning、工具修复）
-  -> OpenAI/liteLLM 适配器或 direct Anthropic 适配器
-  -> 内部输出
+  -> 适配器选择：
+       - OpenAI 兼容提供商：原生 Responses 或 Chat Completions
+       - Anthropic 兼容提供商：direct Anthropic Messages
+  -> 内部输出 / 输出事件
   -> 协议出口
 ```
+
+OpenAI 兼容提供商默认走 Chat Completions；仅在原生 Responses 能力探测缓存命中（且未在请求中被工具不兼容、缺少 `previous_response_id` 等原因击穿）时才会尝试 `/responses` 原生路径，否则降级到 Chat 路径。Anthropic 兼容提供商始终从 IR 投影为 Anthropic Messages 请求体。
 
 端点特有的协议细节只保留在 ingress/egress。路由、预处理、reasoning 缓存、工具修复和适配器选择都基于统一内部格式运行。
 
@@ -230,19 +274,32 @@ curl http://localhost:8000/v1/responses \
 
 | 模块 | 职责 |
 |---|---|
-| `app/router/proxy.py` | FastAPI 端点、鉴权、provider 解析、adapter 调度、非流式请求统计。 |
+| `app/router/proxy.py` | FastAPI 端点、鉴权、provider 解析、adapter 调度、非流式请求统计、原生 Responses 能力探测与降级。 |
 | `app/protocols/ingress.py` | `/chat/completions`、`/completions`、`/messages`、`/responses` 请求体转换为内部 IR。 |
 | `app/core/policy.py` | 路由决策、消息规范化、预处理挂钩、reasoning 注入、工具参数修复、tool-only 限制。 |
 | `app/core/state.py` | TTL cache、reasoning cache、tool-only counter、response chain cache。 |
 | `app/core/streaming.py` | 流式事件计量、reasoning 存储、tool-only 计数、流式错误渲染和统计回调。 |
+| `app/core/body_limit.py` | `RequestBodyLimitMiddleware`，限制入站请求体大小（默认 32 MiB）。 |
 | `app/core/images.py` | data URI 图片提取、图片内容检测和 OpenAI 图像内容归一化。 |
-| `app/adapters/imagegen.py` | OpenAI Images 兼容生图后端、参数兼容、重试和结果下载。 |
+| `app/core/image_intent.py` | 生图意图判断（`is_image_generation_intent`、`latest_user_text`）。 |
 | `app/core/image_bridge.py` | Codex `/responses` 生图工具发现、调用解析与素材交接。 |
 | `app/core/image_results.py` | 原图存储、缩略图压缩和安全下载令牌。 |
 | `app/core/image_batch.py` | 生图批次的并发协调和短期幂等复用。 |
-| `app/adapters/` | 将内部请求投递给 OpenAI/liteLLM 或 direct Anthropic Messages，并转回内部输出事件。 |
+| `app/core/outcome.py` | 请求终态划分（ok / degraded / partial / fail / rejected / cancelled）与统计计数。 |
+| `app/adapters/openai.py` | 内部请求 -> OpenAI Chat 参数。 |
+| `app/adapters/openai_streaming.py` | OpenAI/liteLLM 流式 chunk -> 内部输出事件。 |
+| `app/adapters/anthropic.py` | 内部请求 -> 原生 Anthropic Messages 调用 -> 内部输出。 |
+| `app/adapters/anthropic_streaming.py` | Anthropic SSE -> 内部输出事件。 |
+| `app/adapters/responses.py` | 内部请求 -> 原生 OpenAI Responses 调用与 SSE 透传。 |
+| `app/adapters/imagegen.py` | OpenAI Images 兼容生图后端、参数兼容、重试和结果下载。 |
+| `app/adapters/comfyui.py` | ComfyUI 适配器。 |
 | `app/protocols/egress.py` | 将内部输出渲染回 Chat、Completions、Messages、Responses 协议。 |
 | `app/services/lite_llm.py` | 仅作为 OpenAI 兼容上游的 liteLLM wrapper 和最小 reasoning 兼容补丁。 |
+| `app/services/http_pool.py` | Anthropic 与原生 Responses 适配器复用的共享 HTTP 连接池。 |
+| `app/services/url_guard.py` | 上游 URL 校验（SSRF / 云元数据地址保护）。 |
+| `app/db/routing.py` | 路由规则的迁移与 CRUD。 |
+| `app/db/fallback.py` | fallback 策略的迁移与 CRUD（含 `attempt_timeout`）。 |
+| `app/db/request_logs.py` | 请求日志 CRUD、输出/错误透出。 |
 
 ## 测试
 
@@ -250,7 +307,7 @@ curl http://localhost:8000/v1/responses \
 pytest tests/ -q
 ```
 
-当前预期结果：`603 passed`。
+当前预期结果：`745 passed`。
 
 真实烟测建议：
 

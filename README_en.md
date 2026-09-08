@@ -176,10 +176,17 @@ Rule structure:
   "username": "",
   "api_key_pattern": "",
   "match_model": "MiniMax-M2*",
+  "match_scope": "any",
   "target_model": "target-model",
   "target_provider": "target-provider"
 }
 ```
+
+`match_scope` controls which form of the requested model ID the rule matches:
+
+- `any` (default): match the requested model as-is; a simple alias also matches the model component of a composite `provider/model` request.
+- `unqualified`: match only simple model names (no `/` in the requested model).
+- `qualified`: match only composite `provider/model` requests.
 
 Routing rules only describe active routing. Passive fallback is configured separately in `fallback_policies`: match the routed provider/model plus a failure trigger such as `timeout`, `connection_error`, `http_429`, or `http_5xx`, then try the configured fallback chain. The admin UI provides a dedicated fallback policy editor, so users do not need to write JSON in a routing rule.
 
@@ -187,7 +194,7 @@ The admin API includes `POST /admin/routing-rules/dry-run` to inspect which acti
 
 ## Configuration
 
-`config.json` contains server-level settings. Changes require a service restart.
+`config.json` contains server-level settings. Changes require a service restart. The complete set of options lives in the `defaults` block of `config.example.json`.
 
 Important defaults:
 
@@ -195,20 +202,53 @@ Important defaults:
 |---|---:|---|
 | `max_tokens` | 16384 | Used when the client omits `max_tokens` and `max_completion_tokens`. |
 | `temperature` | 0.7 | Default temperature. |
+| `max_request_body_bytes` | 33554432 | Inbound request body limit (32 MiB); larger bodies return 413. |
+| `litellm_request_timeout` | 120 | liteLLM upstream call timeout. |
 | `tool_only_limit` | 20 | Tool-only loop circuit breaker threshold. |
 | `min_image_max_tokens` | 2000 | Minimum max tokens for requests containing images. |
+| `session_ttl_hours` | 12 | Admin session lifetime. |
+| `login_attempt_limit` | 10 | Failed admin-login attempts before lockout. |
+| `login_attempt_window_seconds` | 300 | Window used to count login attempts. |
+| `login_lockout_seconds` | 900 | Lockout duration after exceeding the attempt limit. |
+| `login_attempt_max_identities` | 10000 | Maximum number of admin-login throttle identities retained in memory. |
+| `request_log_max` | 200 | Rolling request-log entries kept in memory. |
+| `storage_maintenance_interval_seconds` | 60 | Background storage cleanup interval. |
+| `request_log_capture_payloads` | true | Store request/response bodies; disable to retain metadata only. |
+| `request_log_redact_fields` | `[api_key, authorization, ...]` | Redacted fields when capturing request/response bodies. |
 | `reasoning_cache_ttl` | 1800 | Reasoning cache TTL in seconds. |
 | `reasoning_cache_max_size` | 1000 | Reasoning cache capacity. |
 | `tool_only_turns_ttl` | 600 | Tool-only counter TTL in seconds. |
 | `tool_only_turns_max_size` | 2000 | Tool-only counter capacity. |
 | `image_cache_max_size` | 500 | Image description cache capacity. |
-| `request_log_capture_payloads` | true | Store request/response bodies; disable to retain metadata only. |
-| `login_attempt_max_identities` | 10000 | Maximum number of admin-login throttle identities retained in memory. |
 | `image_result_ttl_seconds` | 86400 | Retention time for generated originals. |
+| `image_result_max_files` | 500 | Maximum files retained in the original-image directory. |
+| `image_preview_enabled` | true | Generate inline preview thumbnails. |
+| `image_preview_max_dimension` | 1280 | Longest edge of generated previews. |
+| `image_preview_max_source_pixels` | 40000000 | Maximum source pixels accepted when downscaling. |
+| `image_preview_quality` | 82 | JPEG quality for previews. |
 | `image_preview_max_bytes` | 800000 | Target byte limit for each inline preview. |
+| `image_preview_inline_limit` | 4 | Maximum inline previews attached to one response. |
+| `image_generation_max_retries` | 2 | Retries against the image backend. |
+| `image_generation_retry_base_seconds` | 1.0 | Base backoff between image-generation retries. |
+| `image_generation_max_retry_delay_seconds` | 30.0 | Maximum backoff between image-generation retries. |
 | `image_generation_batch_concurrency` | 1 | Concurrency within one image batch. |
+| `image_generation_batch_timeout_seconds` | 2400 | Total wait time for one image batch. |
 | `image_generation_result_max_bytes` | 26214400 | Maximum bytes accepted for one upstream image. |
 | `image_download_allow_private_hosts` | false | Allow image-result URL downloads from private networks. |
+| `allow_private_upstream_hosts` | true | Allow private upstream addresses (cloud metadata endpoints are always blocked). |
+| `image_generation_idempotency_ttl_seconds` | 300 | TTL of image-generation idempotency keys. |
+| `image_generation_idempotency_max_entries` | 64 | Maximum image-generation idempotency keys. |
+| `responses_capability_supported_ttl` | 604800 | Positive native-Responses capability probe cache TTL. |
+| `responses_capability_unsupported_ttl` | 21600 | Negative native-Responses capability probe cache TTL. |
+| `responses_capability_transient_ttl` | 300 | Transient native-Responses capability probe cache TTL. |
+| `anthropic_thinking_budget_tokens` | 1024 | Anthropic extended-thinking budget. |
+
+## Safety And Limits
+
+- Inbound bodies are capped by `RequestBodyLimitMiddleware` (`max_request_body_bytes`).
+- Upstream URLs pass through `app/services/url_guard.py`: non-http(s), cloud metadata, and reserved IP ranges are rejected; private networks are governed by `allow_private_upstream_hosts`.
+- Admin login throttling lives in `app/security.py` and is tuned by `login_attempt_*`.
+- The Anthropic and native Responses adapters reuse the shared HTTP connection pool in `app/services/http_pool.py`.
 
 ## Architecture Summary
 
@@ -217,10 +257,14 @@ Client endpoint
   -> protocol ingress
   -> internal IR
   -> shared policy layer (RoutingDecision, preprocessing, reasoning, tool repair)
-  -> OpenAI/liteLLM adapter or direct Anthropic adapter
-  -> internal output
+  -> adapter selection:
+       - OpenAI-compatible providers: native Responses or Chat Completions
+       - Anthropic-compatible providers: direct Anthropic Messages
+  -> internal output / output events
   -> protocol egress
 ```
+
+OpenAI-compatible providers default to Chat Completions. The native `/responses` path is only attempted when the capability probe cache allows it and no Codex-owned tool/state marker forces Chat compatibility; otherwise the gateway falls back to the Chat path. Anthropic-compatible providers always project from the IR to native Anthropic Messages.
 
 This design keeps endpoint-specific protocol details at ingress/egress while routing, preprocessing, reasoning cache, tool repair, and adapter selection operate on one internal format.
 
@@ -228,19 +272,32 @@ Main code boundaries:
 
 | Module | Responsibility |
 |---|---|
-| `app/router/proxy.py` | FastAPI endpoints, auth, provider resolution, adapter dispatch, non-streaming request stats. |
+| `app/router/proxy.py` | FastAPI endpoints, auth, provider resolution, adapter dispatch, non-streaming request stats, native Responses capability probing and downgrade. |
 | `app/protocols/ingress.py` | Converts `/chat/completions`, `/completions`, `/messages`, and `/responses` request bodies into internal IR. |
 | `app/core/policy.py` | Routing decisions, message normalization, preprocessing hook, reasoning injection, tool argument repair, tool-only limit. |
 | `app/core/state.py` | TTL caches, reasoning cache, tool-only counter, response-chain cache. |
 | `app/core/streaming.py` | Streaming event metering, reasoning storage, tool-only counting, stream error rendering, stats callback. |
+| `app/core/body_limit.py` | `RequestBodyLimitMiddleware` capping inbound request bodies (default 32 MiB). |
 | `app/core/images.py` | Data URI extraction, image-content detection, and OpenAI image-content normalization. |
-| `app/adapters/imagegen.py` | OpenAI Images-compatible backends, parameter compatibility, retries, and result downloads. |
+| `app/core/image_intent.py` | Image-generation intent check (`is_image_generation_intent`, `latest_user_text`). |
 | `app/core/image_bridge.py` | Codex `/responses` image-tool discovery, invocation parsing, and asset handoff. |
 | `app/core/image_results.py` | Original storage, preview compression, and capability-token downloads. |
 | `app/core/image_batch.py` | Image batch coordination and short-lived idempotent reuse. |
-| `app/adapters/` | Sends internal requests to OpenAI/liteLLM or direct Anthropic Messages and converts responses to internal output/events. |
+| `app/core/outcome.py` | Request status (ok / degraded / partial / fail / rejected / cancelled) and stats counters. |
+| `app/adapters/openai.py` | Internal request -> OpenAI chat kwargs. |
+| `app/adapters/openai_streaming.py` | OpenAI/liteLLM chunks -> internal output events. |
+| `app/adapters/anthropic.py` | Internal request -> direct Anthropic Messages call -> internal output. |
+| `app/adapters/anthropic_streaming.py` | Anthropic SSE -> internal output events. |
+| `app/adapters/responses.py` | Internal request -> native OpenAI Responses call and SSE pass-through. |
+| `app/adapters/imagegen.py` | OpenAI Images-compatible backends, parameter compatibility, retries, and result downloads. |
+| `app/adapters/comfyui.py` | ComfyUI adapter. |
 | `app/protocols/egress.py` | Renders internal output back into Chat, Completions, Messages, and Responses protocols. |
 | `app/services/lite_llm.py` | OpenAI-compatible liteLLM wrapper only, plus minimal reasoning compatibility patches. |
+| `app/services/http_pool.py` | Shared HTTP connection pool reused by the Anthropic and native Responses adapters. |
+| `app/services/url_guard.py` | Upstream URL validation (SSRF / cloud-metadata protection). |
+| `app/db/routing.py` | Routing-rule migrations and CRUD helpers. |
+| `app/db/fallback.py` | Fallback-policy migrations and CRUD helpers (including `attempt_timeout`). |
+| `app/db/request_logs.py` | Request-log CRUD and inspection helpers. |
 
 ## Testing
 
@@ -248,7 +305,7 @@ Main code boundaries:
 pytest tests/ -q
 ```
 
-Expected current result: `603 passed`.
+Expected current result: `745 passed`.
 
 Live smoke matrix:
 
