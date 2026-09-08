@@ -5,9 +5,12 @@ All notable changes to LLM AIO Gateway will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.10.0] - 2026-09-08
 
 ### Added
+- Request body size limit (default 32 MiB, configurable) to prevent oversized JSON bodies from exhausting gateway memory.
+- Shared upstream connection pool: Anthropic and native Responses adapters reuse TCP/TLS connections to direct upstreams; reference counting keeps in-flight streaming responses alive.
+- Upstream URL validation (SSRF guard) rejecting non-http(s) schemes, cloud metadata endpoints, and reserved addresses; private addresses allowed by default for self-hosted inference.
 - Codex-compatible image generation through `/responses` and `/images/generations`, with batch execution, short-lived originals, compressed previews, idempotent retries, and image statistics.
 - Configurable request-log payload capture and structured secret redaction.
 - Admin login attempt throttling and image-result download network/size safeguards.
