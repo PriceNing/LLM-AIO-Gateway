@@ -305,60 +305,110 @@ async def stream_internal_output(
         )
     except BaseException as exc:
         if is_client_disconnect_error(exc):
-            cancel_details = apply_outcome_to_details(
-                {
-                    **stream_details,
-                    "stream": True,
-                    "client_disconnected": True,
-                    "error_message": "client disconnected",
-                    "status": "cancelled",
-                },
-                success=False,
-                partial_output=visible_output_started,
-            )
-            cancel_details["status"] = "cancelled"
-            _attach_stream_performance(cancel_details, streamed_usage, first_output_at, stream_started_at)
+            closed_after_output = bool(streamed_tool_calls)
             logged_model = str(final_model or model or "-")
             logged_provider = str(final_provider_id or provider_id or "")
-            _app_log.warning(
-                "[%s_stream.cancelled] provider=%s model=%s partial=%s tokens=%d",
-                endpoint,
-                logged_provider or "-",
-                logged_model,
-                visible_output_started,
-                total_tokens,
-            )
-            log_request(
-                username,
-                api_key_value,
-                logged_model,
-                logged_provider,
-                endpoint,
-                False,
-                total_tokens,
-                requested_model,
-                details=cancel_details,
-            )
-            await _invoke_record_request_log(
-                record_request_log,
-                success=False,
-                status="cancelled",
-                tokens=total_tokens,
-                details=cancel_details,
-                streamed_text_parts=streamed_text_parts,
-                streamed_reasoning_parts=streamed_reasoning_parts,
-                streamed_tool_calls=streamed_tool_calls,
-                streamed_usage=streamed_usage,
-                final_model=logged_model,
-                final_provider_id=logged_provider,
-                visible_output_started=visible_output_started,
-                generation_started_at=first_output_at or stream_started_at,
-                request_started_at=stream_started_at,
-                error_message="client disconnected",
-            )
-            increment_global_stats(False, cancelled=True)
-            if username != "legacy":
-                increment_user_usage(username, api_key_value, False, 0)
+            if closed_after_output:
+                success_details = apply_outcome_to_details(
+                    {
+                        **stream_details,
+                        "stream": True,
+                        "client_disconnected": True,
+                        "stream_closed_after_output": True,
+                    },
+                    success=True,
+                    partial_output=False,
+                )
+                _attach_stream_performance(success_details, streamed_usage, first_output_at, stream_started_at)
+                counters = stats_counters_for_status(success_details.get("status", "ok"))
+                log_request(
+                    username,
+                    api_key_value,
+                    logged_model,
+                    logged_provider,
+                    endpoint,
+                    counters.hard_success,
+                    total_tokens,
+                    requested_model,
+                    details=success_details,
+                )
+                await _invoke_record_request_log(
+                    record_request_log,
+                    success=counters.hard_success,
+                    status=success_details.get("status", "ok"),
+                    tokens=total_tokens,
+                    details=success_details,
+                    streamed_text_parts=streamed_text_parts,
+                    streamed_reasoning_parts=streamed_reasoning_parts,
+                    streamed_tool_calls=streamed_tool_calls,
+                    streamed_usage=streamed_usage,
+                    final_model=logged_model,
+                    final_provider_id=logged_provider,
+                    visible_output_started=visible_output_started,
+                    generation_started_at=first_output_at or stream_started_at,
+                    request_started_at=stream_started_at,
+                )
+                increment_global_stats(
+                    counters.hard_success,
+                    degraded=counters.degraded,
+                    rejected=counters.rejected,
+                    cancelled=counters.cancelled,
+                )
+                if username != "legacy":
+                    increment_user_usage(username, api_key_value, counters.hard_success, total_tokens)
+            else:
+                cancel_details = apply_outcome_to_details(
+                    {
+                        **stream_details,
+                        "stream": True,
+                        "client_disconnected": True,
+                        "error_message": "client disconnected",
+                        "status": "cancelled",
+                    },
+                    success=False,
+                    partial_output=visible_output_started,
+                )
+                cancel_details["status"] = "cancelled"
+                _attach_stream_performance(cancel_details, streamed_usage, first_output_at, stream_started_at)
+                _app_log.warning(
+                    "[%s_stream.cancelled] provider=%s model=%s partial=%s tokens=%d",
+                    endpoint,
+                    logged_provider or "-",
+                    logged_model,
+                    visible_output_started,
+                    total_tokens,
+                )
+                log_request(
+                    username,
+                    api_key_value,
+                    logged_model,
+                    logged_provider,
+                    endpoint,
+                    False,
+                    total_tokens,
+                    requested_model,
+                    details=cancel_details,
+                )
+                await _invoke_record_request_log(
+                    record_request_log,
+                    success=False,
+                    status="cancelled",
+                    tokens=total_tokens,
+                    details=cancel_details,
+                    streamed_text_parts=streamed_text_parts,
+                    streamed_reasoning_parts=streamed_reasoning_parts,
+                    streamed_tool_calls=streamed_tool_calls,
+                    streamed_usage=streamed_usage,
+                    final_model=logged_model,
+                    final_provider_id=logged_provider,
+                    visible_output_started=visible_output_started,
+                    generation_started_at=first_output_at or stream_started_at,
+                    request_started_at=stream_started_at,
+                    error_message="client disconnected",
+                )
+                increment_global_stats(False, cancelled=True)
+                if username != "legacy":
+                    increment_user_usage(username, api_key_value, False, 0)
             if tool_only_turns is not None and conv_key:
                 tool_only_turns.reset(conv_key)
             if isinstance(exc, Exception) and not isinstance(exc, asyncio.CancelledError):

@@ -402,6 +402,12 @@ def test_codex_ambient_and_system_turns_are_detected():
     assert _responses_is_system_turn({
         "client_metadata": {"x-codex-turn-metadata": json.dumps({"thread_source": "user"})},
     }) is False
+    assert _responses_is_system_turn({
+        "client_metadata": {"x-codex-turn-metadata": json.dumps({
+            "thread_source": "thread_title",
+            "turn_trigger": "thread_title",
+        })},
+    }) is True
 
 
 def test_image_generation_intent_is_conservative():
@@ -1612,6 +1618,43 @@ def test_responses_explicit_image_words_require_model_tool_call(image_app_db, mo
     assert response.status_code == 200
     assert response.json()["output"][0]["type"] == "message"
     assert list_request_logs(limit=1)[0]["request_kind"] == "text_generation"
+
+
+def test_codex_thread_title_hello_does_not_force_image_bridge(image_app_db, monkeypatch):
+    planner_calls = []
+
+    async def fake_planner(*args, **kwargs):
+        planner_calls.append(kwargs.get("log_label"))
+        return InternalOutputMessage(text="打招呼", usage={"total_tokens": 3}), {"id": "chat"}, "chat"
+
+    async def fail_generate(*args, **kwargs):
+        raise AssertionError("a greeting must not invoke the image backend")
+
+    monkeypatch.setattr("app.router.proxy.generate_images", fail_generate)
+    monkeypatch.setattr("app.router.proxy._call_nonstream_with_fallbacks", fake_planner)
+    title_prompt = (
+        "Generate a concise UI title (up to 36 characters) for this task.\n"
+        "User prompt:\n你好"
+    )
+    response = TestClient(app).post("/v1/responses", headers=image_app_db["headers"], json={
+        "model": "chat/chat-model",
+        "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": title_prompt}]}],
+        "tools": [{"type": "image_generation", "output_format": "png"}],
+        "tool_choice": "auto",
+        "client_metadata": {
+            "x-codex-turn-metadata": json.dumps({
+                "request_kind": "turn",
+                "thread_source": "thread_title",
+                "turn_trigger": "thread_title",
+            }),
+        },
+    })
+    assert response.status_code == 200, response.text
+    assert "did not invoke the image-generation tool" not in response.text
+    assert all(label != "responses.image_bridge.correction" for label in planner_calls)
+    log = list_request_logs(limit=1)[0]
+    assert log["status"] in {"ok", "degraded"}
+    assert log["request_kind"] != "image_generation"
 
 
 def test_responses_image_tool_declaration_alone_does_not_generate(image_app_db, monkeypatch):

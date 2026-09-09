@@ -24,7 +24,7 @@
         <div class="auth-panel glass">
             <div class="logo">&#9883;</div>
             <h1 data-i18n="auth.title">LLM AIO Gateway</h1>
-            <p class="subtitle" id="authHint" data-i18n="auth.hint">登录后管理用户、模型和调用 Key。</p>
+            <p class="subtitle" id="authHint" data-i18n="auth.hint">登录后管理用户、模型和调用密钥。</p>
             <div class="form-group">
                 <label data-i18n="auth.username">管理员账号</label>
                 <input type="text" id="adminUsername" autocomplete="username" onkeydown="if(event.key==='Enter')submitAuth()">
@@ -72,7 +72,7 @@
                     <span class="nav-icon">&#128257;</span><span data-i18n="nav.routing">路由规则</span>
                 </button>
                 <button class="nav-btn" onclick="showSection('fallbacks', event)" data-section="fallbacks">
-                    <span class="nav-icon">&#128737;</span><span data-i18n="nav.fallbacks">Fallback Policies</span>
+                    <span class="nav-icon">&#128737;</span><span data-i18n="nav.fallbacks">回退策略</span>
                 </button>
                 <button class="nav-btn" onclick="showSection('preprocessors', event)" data-section="preprocessors">
                     <span class="nav-icon">&#127918;</span><span data-i18n="nav.preprocessors">视觉模型注入</span>
@@ -131,7 +131,7 @@
                     <div class="section-header">
                         <h2 data-i18n="routing.title">路由规则</h2>
                         <div class="section-actions">
-                            <button class="btn btn-secondary" onclick="showRoutingDryRunModal()" data-i18n="routing.dryRun">Dry Run</button>
+                            <button class="btn btn-secondary" onclick="showRoutingDryRunModal()" data-i18n="routing.dryRun">试运行</button>
                             <button class="btn btn-primary" onclick="showAddRoutingRuleModal()" data-i18n="routing.add">新增规则</button>
                         </div>
                     </div>
@@ -141,8 +141,8 @@
                 <!-- Fallback Policies -->
                 <div id="fallbacks-section" class="section" style="display:none;">
                     <div class="section-header">
-                        <h2 data-i18n="fallbacks.title">Fallback Policies</h2>
-                        <button class="btn btn-primary" onclick="showAddFallbackPolicyModal()" data-i18n="fallbacks.add">Add Policy</button>
+                        <h2 data-i18n="fallbacks.title">回退策略</h2>
+                        <button class="btn btn-primary" onclick="showAddFallbackPolicyModal()" data-i18n="fallbacks.add">新增策略</button>
                     </div>
                     <div id="fallbackPoliciesList" class="routing-list"></div>
                 </div>
@@ -223,10 +223,10 @@
                     <div class="config-grid">
                         <div class="config-card glass">
                             <h3 data-i18n="config.exportTitle">导出配置</h3>
-                            <p class="muted" data-i18n="config.exportHint">生成 providers / routing rules / fallback policies 的 JSON 备份。</p>
+                            <p class="muted" data-i18n="config.exportHint">生成提供商 / 路由规则 / 回退策略的 JSON 备份。</p>
                             <div class="form-row">
                                 <label class="checkbox">
-                                    <input type="checkbox" id="exportIncludeSecrets"> <span data-i18n="config.includeSecrets">包含 api_key（明文）</span>
+                                    <input type="checkbox" id="exportIncludeSecrets"> <span data-i18n="config.includeSecrets">含密钥（明文）</span>
                                 </label>
                             </div>
                             <div class="form-row">
@@ -235,16 +235,16 @@
                         </div>
                         <div class="config-card glass">
                             <h3 data-i18n="config.importTitle">导入配置</h3>
-                            <p class="muted" data-i18n="config.importHint">上传之前导出的 JSON 文件，可选择 skip / replace / merge 冲突策略。</p>
+                            <p class="muted" data-i18n="config.importHint">上传之前导出的 JSON 文件，可选择跳过 / 覆盖 / 合并冲突策略。</p>
                             <div class="form-row">
                                 <input type="file" id="configFileInput" accept="application/json,.json">
                             </div>
                             <div class="form-row">
                                 <label data-i18n="config.mode">冲突策略</label>
                                 <select id="configImportMode" class="select-input">
-                                    <option value="skip" data-i18n="config.modeSkip">skip (保留现有)</option>
-                                    <option value="replace" data-i18n="config.modeReplace">replace (覆盖)</option>
-                                    <option value="merge" data-i18n="config.modeMerge">merge (仅更新非空字段)</option>
+                                    <option value="skip" data-i18n="config.modeSkip">跳过（保留现有）</option>
+                                    <option value="replace" data-i18n="config.modeReplace">覆盖</option>
+                                    <option value="merge" data-i18n="config.modeMerge">合并（仅更新非空字段）</option>
                                 </select>
                             </div>
                             <div class="form-row">
@@ -254,23 +254,23 @@
                         </div>
                         <div class="config-card glass">
                             <h3 data-i18n="config.exportUsersTitle">导出用户</h3>
-                            <p class="muted" data-i18n="config.exportUsersHint">单独导出用户管理中的用户和 API Key，方便迁移到另一台机器。</p>
+                            <p class="muted" data-i18n="config.exportUsersHint">单独导出用户和调用密钥，方便迁移到另一台机器。</p>
                             <div class="form-row">
                                 <button class="btn btn-primary" onclick="exportUsers()" data-i18n="config.exportUsers">下载用户 JSON</button>
                             </div>
                         </div>
                         <div class="config-card glass">
                             <h3 data-i18n="config.importUsersTitle">导入用户</h3>
-                            <p class="muted" data-i18n="config.importUsersHint">上传用户 JSON，可选择 skip / replace / merge 冲突策略。</p>
+                            <p class="muted" data-i18n="config.importUsersHint">上传用户 JSON，可选择跳过 / 覆盖 / 合并冲突策略。</p>
                             <div class="form-row">
                                 <input type="file" id="usersFileInput" accept="application/json,.json">
                             </div>
                             <div class="form-row">
                                 <label data-i18n="config.mode">冲突策略</label>
                                 <select id="usersImportMode" class="select-input">
-                                    <option value="skip" data-i18n="config.modeSkip">skip (保留现有)</option>
-                                    <option value="replace" data-i18n="config.modeReplace">replace (覆盖)</option>
-                                    <option value="merge" data-i18n="config.modeMerge">merge (仅更新非空字段)</option>
+                                    <option value="skip" data-i18n="config.modeSkip">跳过（保留现有）</option>
+                                    <option value="replace" data-i18n="config.modeReplace">覆盖</option>
+                                    <option value="merge" data-i18n="config.modeMerge">合并（仅更新非空字段）</option>
                                 </select>
                             </div>
                             <div class="form-row">
@@ -292,7 +292,7 @@
         </div>
     </div>
 
-    <script src="app.js?v=20260907-responses-thinking"></script>
+    <script src="app.js?v=20260909-status-i18n"></script>
     <script src="js/routing-tools.js"></script>
 </body>
 </html>

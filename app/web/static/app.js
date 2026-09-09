@@ -24,7 +24,7 @@ window._systemLogMeta = null;
 const I18N = {
 zh: {
     'auth.title': 'LLM AIO Gateway',
-    'auth.hint': '登录后管理用户、模型和调用 Key。',
+    'auth.hint': '登录后管理用户、模型和调用密钥。',
     'auth.hintSetup': '首次使用，请创建第一个管理员账号。',
     'auth.username': '管理员账号',
     'auth.password': '密码',
@@ -38,7 +38,7 @@ zh: {
     'nav.providers': '提供商',
     'nav.models': '模型管理',
     'nav.routing': '路由规则',
-    'nav.fallbacks': 'Fallback 策略',
+    'nav.fallbacks': '回退策略',
     'nav.stats': '统计',
     'nav.preprocessors': '视觉模型注入',
     'nav.imageGeneration': '图像生成',
@@ -61,7 +61,7 @@ zh: {
 
     'users.title': '用户管理',
     'users.add': '新增用户',
-    'users.empty': '暂无用户。创建用户后，为其生成调用 API Key 并授权模型。',
+    'users.empty': '暂无用户。创建用户后，为其生成调用密钥并授权模型。',
     'users.enabled': '启用',
     'users.disabled': '禁用',
     'users.allModels': '全部模型',
@@ -79,19 +79,19 @@ zh: {
     'users.updateFail': '更新用户失败',
     'users.deleteConfirm': '确定要删除这个用户吗？',
     'users.deleteFail': '删除用户失败',
-    'users.keyTitle': '生成调用 API Key',
+    'users.keyTitle': '生成调用密钥',
     'users.keyName': '名称',
     'users.keyGenerate': '生成',
     'users.keyFail': '生成 Key 失败',
-    'users.keyCopied': 'API Key 已生成并复制到剪贴板。',
-    'users.keyDeleteConfirm': '确定要删除这个 API Key 吗？',
+    'users.keyCopied': '调用密钥已生成并复制到剪贴板。',
+    'users.keyDeleteConfirm': '确定要删除这个调用密钥吗？',
     'users.keyDeleteFail': '删除 Key 失败',
     'users.keyEdit': '编辑',
-    'users.keyEditTitle': '编辑 API Key',
+    'users.keyEditTitle': '编辑调用密钥',
     'users.keyUpdateFail': '更新 Key 失败',
     'users.calls': '调用',
     'users.failed': '失败',
-    'users.tokens': 'Tokens',
+    'users.tokens': 'Token 数',
 
     'providers.title': '提供商列表',
     'providers.add': '新增提供商',
@@ -113,12 +113,12 @@ zh: {
     'providers.typeOpenAI': 'OpenAI 兼容',
     'providers.typeAnthropic': 'Anthropic 兼容',
     'providers.apiBase': 'API Base URL',
-    'providers.apiKey': '上游 API Key',
+    'providers.apiKey': '上游密钥',
     'providers.requestTimeout': '请求超时（秒）',
     'providers.retryCount': '重试次数',
     'providers.retryBackoff': '重试退避（秒）',
     'providers.providerOptions': '提供商选项 (JSON)',
-    'providers.upstreamHeaders': '上游 HTTP Headers (JSON)',
+    'providers.upstreamHeaders': '上游 HTTP 请求头（JSON）',
     'providers.forceChatCompletions': '强制使用 Chat Completions（跳过 Responses 探测）',
     'providers.addFail': '新增失败',
     'providers.updateFail': '更新失败',
@@ -168,32 +168,32 @@ zh: {
     'routing.deleteFail': '删除规则失败',
     'routing.enabled': '启用',
     'routing.disabled': '禁用',
-    'routing.dryRun': 'Dry Run',
-    'routing.dryRunTitle': '路由 Dry Run',
+    'routing.dryRun': '试运行',
+    'routing.dryRunTitle': '路由试运行',
     'routing.dryRunUser': '用户名（可选）',
-    'routing.dryRunKey': 'API Key 或匹配片段（可选）',
+    'routing.dryRunKey': '调用密钥或匹配片段（可选）',
     'routing.dryRunModel': '请求模型',
     'routing.dryRunResolvedModel': '解析后模型（可选）',
     'routing.dryRunSubmit': '运行',
-    'routing.dryRunFail': '路由 Dry Run 失败',
+    'routing.dryRunFail': '路由试运行失败',
     'routing.dryRunNoModel': '请输入请求模型',
     'routing.dryRunMatched': '命中规则',
     'routing.dryRunNoMatch': '未命中规则',
     'routing.dryRunProvider': '目标提供商',
     'routing.dryRunEffective': '最终路由',
     'routing.dryRunReason': '原因',
-    'routing.dryRunFallback': 'Fallback 预览',
+    'routing.dryRunFallback': '回退预览',
 
-    'fallbacks.title': 'Fallback 策略',
+    'fallbacks.title': '回退策略',
     'fallbacks.add': '新增策略',
-    'fallbacks.empty': '暂无 Fallback 策略',
-    'fallbacks.addTitle': '新增 Fallback 策略',
-    'fallbacks.editTitle': '编辑 Fallback 策略',
+    'fallbacks.empty': '暂无回退策略',
+    'fallbacks.addTitle': '新增回退策略',
+    'fallbacks.editTitle': '编辑回退策略',
     'fallbacks.name': '策略名称',
     'fallbacks.matchProvider': '匹配提供商',
     'fallbacks.matchModel': '匹配模型',
     'fallbacks.triggers': '触发条件',
-    'fallbacks.chain': 'Fallback 链',
+    'fallbacks.chain': '回退链',
     'fallbacks.addTarget': '添加目标',
     'fallbacks.timeout': '超时',
     'fallbacks.attemptTimeout': '尝试超时（秒）',
@@ -202,11 +202,11 @@ zh: {
     'fallbacks.http429': 'HTTP 429',
     'fallbacks.http5xx': 'HTTP 5xx',
     'fallbacks.http4xx': 'HTTP 4xx',
-    'fallbacks.loadFail': '加载 Fallback 策略失败',
-    'fallbacks.addFail': '新增 Fallback 策略失败',
-    'fallbacks.updateFail': '更新 Fallback 策略失败',
-    'fallbacks.deleteFail': '删除 Fallback 策略失败',
-    'fallbacks.deleteConfirm': '确定要删除这条 Fallback 策略吗？',
+    'fallbacks.loadFail': '加载回退策略失败',
+    'fallbacks.addFail': '新增回退策略失败',
+    'fallbacks.updateFail': '更新回退策略失败',
+    'fallbacks.deleteFail': '删除回退策略失败',
+    'fallbacks.deleteConfirm': '确定要删除这条回退策略吗？',
     'fallbacks.save': '保存',
     'fallbacks.cancel': '取消',
     'fallbacks.enabled': '启用',
@@ -230,7 +230,7 @@ zh: {
     'stats.reset': '上次重置',
     'stats.autoRefresh': '每5秒自动刷新',
     'stats.resetBtn': '清空统计数据',
-    'stats.resetConfirm': '确定要清空所有统计数据吗？\n\n此操作将重置：\n- 全局调用计数\n- 所有用户/API Key 用量统计\n- 实时请求日志\n\n此操作不可撤销。',
+    'stats.resetConfirm': '确定要清空所有统计数据吗？\n\n此操作将重置：\n- 全局调用计数\n- 所有用户/调用密钥用量统计\n- 实时请求日志\n\n此操作不可撤销。',
     'stats.resetFail': '清空失败',
     'stats.realtime': '实时请求日志',
     'stats.time': '时间',
@@ -240,11 +240,11 @@ zh: {
     'stats.requestedModel': '请求模型',
     'stats.routedModel': '路由目标',
     'stats.endpoint': '端点',
-    'stats.tokens': 'Tokens',
+    'stats.tokens': 'Token 数',
     'stats.reasoningEffort': '思考强度',
     'stats.chatTemplateKwargs': '思考参数',
     'stats.enableThinking': '启用思考',
-    'stats.completionTokens': '输出 Tokens',
+    'stats.completionTokens': '输出 Token 数',
     'stats.tps': 'TPS',
     'stats.duration': '耗时',
     'stats.status': '状态',
@@ -268,7 +268,7 @@ zh: {
     'stats.query': '查询',
     'stats.periodSummary': '时段汇总',
     'stats.periodCalls': '调用次数',
-    'stats.periodTokens': '总 Tokens',
+    'stats.periodTokens': '总 Token 数',
     'stats.periodSuccessRate': '成功率',
     'stats.modelBreakdown': '模型用量明细',
     'stats.userBreakdown': '用户用量明细',
@@ -291,8 +291,8 @@ zh: {
     'preprocessors.apiBasePlaceholder': '例如 http://localhost:8001',
     'preprocessors.model': '模型名称',
     'preprocessors.modelPlaceholder': '例如 Qwen-VL',
-    'preprocessors.apiKey': 'API Key',
-    'preprocessors.apiKeyPlaceholder': '视觉模型 API Key（可选）',
+    'preprocessors.apiKey': '密钥',
+    'preprocessors.apiKeyPlaceholder': '视觉模型密钥（可选）',
     'secrets.keepBlank': '已保存，留空则保持不变',
     'preprocessors.timeout': '超时时间（秒）',
     'preprocessors.maxImages': '最大图片数',
@@ -337,7 +337,7 @@ zh: {
     'imageGeneration.providerModel': '提供商模型',
     'imageGeneration.selectModel': '请选择提供商模型',
     'imageGeneration.apiBase': 'API Base URL',
-    'imageGeneration.apiKey': 'API Key',
+    'imageGeneration.apiKey': '密钥',
     'imageGeneration.model': '模型名称',
     'imageGeneration.comfyBase': 'ComfyUI Base URL',
     'imageGeneration.workflow': 'API 格式工作流 JSON',
@@ -359,7 +359,7 @@ zh: {
     'imageGeneration.negativePrompt': '负向提示词（可选）',
     'imageGeneration.width': '宽度（可选）',
     'imageGeneration.height': '高度（可选）',
-    'imageGeneration.seed': 'Seed（可选）',
+    'imageGeneration.seed': '随机种子（可选）',
     'imageGeneration.steps': '采样步数（可选）',
     'imageGeneration.cfg': 'CFG（可选）',
     'imageGeneration.batchSize': '批量数量（可选）',
@@ -757,31 +757,33 @@ en: {
 Object.assign(I18N.zh, {
     'stats.details': '详情',
     'stats.requestDetails': '请求详情',
-    'stats.statusOk': 'OK',
-    'stats.statusFail': 'FAIL',
-    'stats.statusPartial': 'PARTIAL',
-    'stats.statusDegraded': 'DEGRADED',
-    'stats.statusRejected': 'REJECTED',
-    'stats.statusCancelled': 'CANCELLED',
+    'stats.statusOk': '成功',
+    'stats.statusFail': '失败',
+    'stats.statusPartial': '部分成功',
+    'stats.statusDegraded': '降级',
+    'stats.statusRejected': '拒绝',
+    'stats.statusCancelled': '已取消',
+    'stats.statusClientDisconnected': '客户端断开',
+    'stats.clientDisconnected': '客户端断开',
     'stats.basicInfo': '基础信息',
-    'stats.routingInfo': '路由 / Fallback',
+    'stats.routingInfo': '路由 / 回退',
     'stats.errorInfo': '错误信息',
     'stats.fullTime': '完整时间',
     'stats.provider': '提供商',
     'stats.stream': '流式请求',
     'stats.partialOutput': '已输出部分内容',
-    'stats.fallbackStatus': 'Fallback 状态',
-    'stats.fallbackReason': 'Fallback 原因',
-    'stats.fallbackAttempts': 'Fallback 链路',
+    'stats.fallbackStatus': '回退状态',
+    'stats.fallbackReason': '回退原因',
+    'stats.fallbackAttempts': '回退链路',
     'stats.fallbackAttempt': '节点',
     'stats.fallbackAttemptStarted': '尝试中',
     'stats.fallbackAttemptSuccess': '成功',
     'stats.fallbackAttemptFailed': '失败',
     'stats.responsesStateful': 'Responses 状态会话',
     'stats.responsesStateMarkers': '状态标记',
-    'stats.fallbackSafetyDecision': 'Fallback 安全决策',
-    'stats.statefulFallbackBlocked': '已阻止跨提供商 Fallback',
-    'stats.statefulFallbackBlockedCalls': '状态会话 Fallback 阻止次数',
+    'stats.fallbackSafetyDecision': '回退安全决策',
+    'stats.statefulFallbackBlocked': '已阻止跨提供商回退',
+    'stats.statefulFallbackBlockedCalls': '状态会话回退阻止次数',
     'stats.routingMatched': '命中路由',
     'stats.routingRule': '路由规则',
     'stats.routingReason': '路由原因',
@@ -799,7 +801,7 @@ Object.assign(I18N.zh, {
     'stats.reasoningEffort': '思考强度',
     'stats.chatTemplateKwargs': '思考参数',
     'stats.enableThinking': '启用思考',
-    'stats.completionTokens': '输出 Tokens',
+    'stats.completionTokens': '输出 Token 数',
     'stats.tps': 'TPS',
     'stats.duration': '耗时',
     'stats.generationTime': '生成耗时',
@@ -829,6 +831,8 @@ Object.assign(I18N.en, {
     'stats.statusDegraded': 'DEGRADED',
     'stats.statusRejected': 'REJECTED',
     'stats.statusCancelled': 'CANCELLED',
+    'stats.statusClientDisconnected': 'CLIENT DISCONNECTED',
+    'stats.clientDisconnected': 'Client disconnected',
     'stats.basicInfo': 'Basic',
     'stats.routingInfo': 'Routing / Fallback',
     'stats.errorInfo': 'Error',
@@ -3035,12 +3039,25 @@ function _buildRealtimePanel(stats) {
     return { activeModels: activeModels, hasData: hasData, tableHTML: tableHTML };
 }
 
+function requestWasClientDisconnected(entry) {
+    var details = (entry && entry.details) || {};
+    return !!(entry && (entry.client_disconnected || details.client_disconnected));
+}
+
 function requestStatusLabel(entry) {
+    if (!entry) return '-';
     if (entry.status === 'rejected') return t('stats.statusRejected') || 'REJECTED';
-    if (entry.status === 'cancelled') return t('stats.statusCancelled') || 'CANCELLED';
+    if (entry.status === 'cancelled') {
+        if (requestWasClientDisconnected(entry)) {
+            return t('stats.statusClientDisconnected') || t('stats.statusCancelled') || 'CANCELLED';
+        }
+        return t('stats.statusCancelled') || 'CANCELLED';
+    }
     if (entry.status === 'partial' || entry.partial_output) return t('stats.statusPartial') || 'PARTIAL';
     if (entry.status === 'degraded') return t('stats.statusDegraded') || 'DEGRADED';
-    if (entry.success === false || entry.status === 'fail') return t('stats.statusFail') || 'FAIL';
+    if (entry.status === 'fail' || entry.success === false) return t('stats.statusFail') || 'FAIL';
+    if (entry.status === 'ok' || entry.success === true) return t('stats.statusOk') || 'OK';
+    if (entry.status) return String(entry.status);
     return t('stats.statusOk') || 'OK';
 }
 
@@ -3130,6 +3147,7 @@ function showRequestDetail(index) {
     var thinking = thinkingDetail(entry, details);
     var basicRows = [
         detailRow(t('stats.status') || 'Status', requestStatusLabel(entry)),
+        detailRow(t('stats.clientDisconnected') || 'Client Disconnected', requestWasClientDisconnected(entry)),
         detailRow(t('stats.time') || 'Time', entry.time),
         detailRow(t('stats.fullTime') || 'Full Time', entry.full_time),
         detailRow(t('stats.client') || 'Client', entry.username),
@@ -3596,12 +3614,7 @@ function renderRequestLogs(data) {
             : (entry.status === 'rejected' ? 'badge-rejected'
             : (entry.status === 'cancelled' ? 'badge-cancelled'
             : (entry.status === 'partial' ? 'badge-partial' : 'badge-fail'))));
-        var statusLabel = entry.status === 'degraded' ? (t('stats.statusDegraded') || 'DEGRADED')
-            : (entry.status === 'rejected' ? (t('stats.statusRejected') || 'REJECTED')
-            : (entry.status === 'cancelled' ? (t('stats.statusCancelled') || 'CANCELLED')
-            : (entry.status === 'partial' ? (t('stats.statusPartial') || 'PARTIAL')
-            : (entry.status === 'ok' ? (t('stats.statusOk') || 'OK')
-            : (entry.status || '-')))));
+        var statusLabel = requestStatusLabel(entry);
         tableHTML += '<tr>';
         tableHTML += '<td class="mono">' + escHtml(ts) + '</td>';
         tableHTML += '<td><span class="badge ' + requestKindClass(entry) + '">' + escHtml(requestKindLabel(entry)) + '</span></td>';
@@ -3650,7 +3663,8 @@ async function showRequestLogDetail(logId) {
         body += detailRow(t('stats.tps') || 'TPS', formatTps(detailPick(entry.details && entry.details.tps, entry.tps)));
         body += detailRow(t('stats.duration') || 'Duration', formatDurationMs(detailPick(entry.details && entry.details.duration_ms, entry.duration_ms)));
         body += detailRow(t('stats.generationTime') || 'Generation Time', formatDurationMs(detailPick(entry.details && entry.details.generation_ms, entry.generation_ms)));
-        body += detailRow(t('logs.colStatus') || 'Status', entry.status);
+        body += detailRow(t('logs.colStatus') || 'Status', requestStatusLabel(entry));
+        body += detailRow(t('stats.clientDisconnected') || 'Client Disconnected', requestWasClientDisconnected(entry));
         body += detailRow(t('logs.colError') || 'Error', entry.error || '-');
         body += '</div>';
         if (entry.request_kind === 'image_generation') {
@@ -3949,9 +3963,9 @@ Object.assign(I18N.zh, {
     'logs.colUser': '用户',
     'logs.colModel': '模型',
     'logs.colStatus': '状态',
-    'logs.colTokens': 'Tokens',
+    'logs.colTokens': 'Token 数',
     'logs.colActions': '操作',
-    'logs.colProvider': 'Provider',
+    'logs.colProvider': '提供商',
     'logs.colError': '错误',
     'logs.viewDetail': '查看详情',
     'logs.delete': '删除',
@@ -4003,36 +4017,36 @@ Object.assign(I18N.zh, {
     'systemLogs.channel.request': '请求调试日志',
     'config.title': '配置导入/导出',
     'config.exportTitle': '导出配置',
-    'config.exportHint': '生成 providers / routing rules / fallback policies 的 JSON 备份。',
-    'config.includeSecrets': '含 api_key（明文）',
+    'config.exportHint': '生成提供商 / 路由规则 / 回退策略的 JSON 备份。',
+    'config.includeSecrets': '含密钥（明文）',
     'config.export': '下载 JSON',
     'config.exported': '已导出',
     'config.exportFail': '导出失败',
     'config.importTitle': '导入配置',
-    'config.importHint': '上传之前导出的 JSON 文件，可选择 skip / replace / merge 冲突策略。',
+    'config.importHint': '上传之前导出的 JSON 文件，可选择跳过 / 覆盖 / 合并冲突策略。',
     'config.mode': '冲突策略',
-    'config.modeSkip': 'skip (保留现有)',
-    'config.modeReplace': 'replace (覆盖)',
-    'config.modeMerge': 'merge (仅更新非空字段)',
+    'config.modeSkip': '跳过（保留现有）',
+    'config.modeReplace': '覆盖',
+    'config.modeMerge': '合并（仅更新非空字段）',
     'config.import': '导入',
     'config.chooseFile': '请选择 JSON 文件',
     'config.imported': '导入完成',
     'config.importFail': '导入失败',
-    'config.resultProviders': 'Providers:',
-    'config.resultRouting': 'Routing rules:',
-    'config.resultFallbacks': 'Fallback policies:',
+    'config.resultProviders': '提供商:',
+    'config.resultRouting': '路由规则:',
+    'config.resultFallbacks': '回退策略:',
     'config.exportUsersTitle': '导出用户',
-    'config.exportUsersHint': '单独导出用户和 API Key，方便迁移到另一台机器。',
+    'config.exportUsersHint': '单独导出用户和调用密钥，方便迁移到另一台机器。',
     'config.exportUsers': '下载用户 JSON',
     'config.importUsersTitle': '导入用户',
-    'config.importUsersHint': '上传用户 JSON，可选择 skip / replace / merge 冲突策略。',
+    'config.importUsersHint': '上传用户 JSON，可选择跳过 / 覆盖 / 合并冲突策略。',
     'config.importUsers': '导入用户',
     'config.usersExported': '用户已导出',
     'config.usersExportFail': '用户导出失败',
     'config.usersImported': '用户导入完成',
     'config.usersImportFail': '用户导入失败',
     'config.resultUsers': '用户:',
-    'config.resultApiKeys': 'API Keys:'
+    'config.resultApiKeys': 'API 密钥:'
 });
 
 Object.assign(I18N.en, {

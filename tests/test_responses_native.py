@@ -828,3 +828,117 @@ async def test_typeless_sse_error_event_fails_before_fallback_wait():
 
     with pytest.raises(RuntimeError, match="Upstream service temporarily unavailable"):
         await _wait_for_native_response_output(events())
+
+
+@pytest.mark.asyncio
+async def test_native_stream_accounting_copies_thinking_fields(monkeypatch):
+    from app.router.proxy import clear_request_log, get_request_log
+
+    add_provider({
+        "id": "pixel", "name": "Pixel", "provider_type": "openai",
+        "api_base": "https://pixel.invalid/v1", "api_key": "key",
+        "models": [{"id": "gpt-5.6-luna"}],
+    })
+    recorded = {}
+
+    def fake_record(**kwargs):
+        recorded.update(kwargs)
+        return 1
+
+    monkeypatch.setattr("app.router.proxy._record_success_metrics", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("app.router.proxy._record_request_log", fake_record)
+    clear_request_log()
+    try:
+        async def events():
+            yield b'data: {"type":"response.output_item.done","item":{"type":"message"}}\n\n'
+            yield b'data: {"type":"response.completed","response":{"id":"resp_1","output":[{"type":"message"}],"usage":{"total_tokens":12,"output_tokens":8}}}\n\n'
+
+        async for _frame in _native_responses_stream_with_accounting(
+            events(), username="u", api_key_value="k", model="pixel/gpt-5.6-luna",
+            provider_id="pixel", requested_model="pixel/gpt-5.6-luna", policy=None,
+            request_body={"model": "pixel/gpt-5.6-luna", "reasoning": {"effort": "medium"}},
+        ):
+            pass
+        entry = get_request_log()[0]
+        assert entry["reasoning_effort"] == "medium"
+        assert entry["enable_thinking"] is True
+        assert entry["details"]["reasoning_effort"] == "medium"
+        assert entry["details"]["stream"] is True
+        assert entry["duration_ms"] is not None
+        assert recorded["stream"] is True
+        assert recorded["details"]["reasoning_effort"] == "medium"
+        assert recorded["details"]["completion_tokens"] == 8
+    finally:
+        clear_request_log()
+
+
+@pytest.mark.asyncio
+async def test_native_stream_client_disconnect_is_cancelled_with_thinking(monkeypatch):
+    from app.router.proxy import clear_request_log, get_request_log
+    from starlette.requests import ClientDisconnect
+
+    recorded = {}
+
+    def fake_record(**kwargs):
+        recorded.update(kwargs)
+        return 1
+
+    monkeypatch.setattr("app.router.proxy._record_success_metrics", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("app.router.proxy._record_request_log", fake_record)
+    clear_request_log()
+    try:
+        async def events():
+            yield b'data: {"type":"response.output_item.done","item":{"type":"message"}}\n\n'
+            raise ClientDisconnect()
+
+        with pytest.raises(ClientDisconnect):
+            async for _frame in _native_responses_stream_with_accounting(
+                events(), username="u", api_key_value="k", model="pixel/gpt-5.6-luna",
+                provider_id="pixel", requested_model="pixel/gpt-5.6-luna", policy=None,
+                request_body={"model": "pixel/gpt-5.6-luna", "reasoning": {"effort": "xhigh"}},
+            ):
+                pass
+        entry = get_request_log()[0]
+        assert entry["status"] == "ok"
+        assert entry["client_disconnected"] is True
+        assert entry["details"]["stream_closed_after_output"] is True
+        assert entry["reasoning_effort"] == "xhigh"
+        assert recorded["status"] == "ok"
+        assert recorded["error_message"] in ("", None)
+        assert recorded["details"]["reasoning_effort"] == "xhigh"
+    finally:
+        clear_request_log()
+
+
+@pytest.mark.asyncio
+async def test_native_stream_mid_delta_disconnect_stays_cancelled(monkeypatch):
+    from app.router.proxy import clear_request_log, get_request_log
+    from starlette.requests import ClientDisconnect
+
+    recorded = {}
+
+    def fake_record(**kwargs):
+        recorded.update(kwargs)
+        return 1
+
+    monkeypatch.setattr("app.router.proxy._record_success_metrics", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("app.router.proxy._record_request_log", fake_record)
+    clear_request_log()
+    try:
+        async def events():
+            yield b'data: {"type":"response.output_text.delta","delta":"hi"}\n\n'
+            raise ClientDisconnect()
+
+        with pytest.raises(ClientDisconnect):
+            async for _frame in _native_responses_stream_with_accounting(
+                events(), username="u", api_key_value="k", model="pixel/gpt-5.6-luna",
+                provider_id="pixel", requested_model="pixel/gpt-5.6-luna", policy=None,
+                request_body={"model": "pixel/gpt-5.6-luna", "reasoning": {"effort": "medium"}},
+            ):
+                pass
+        entry = get_request_log()[0]
+        assert entry["status"] == "cancelled"
+        assert recorded["status"] == "cancelled"
+        assert recorded["details"].get("stream_closed_after_output") is not True
+    finally:
+        clear_request_log()

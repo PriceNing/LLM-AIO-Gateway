@@ -74,7 +74,7 @@ from app.core.state import (
     remember_response_chain_key as _remember_response_chain_key,
     tool_only_turns as _tool_only_turns,
 )
-from app.core.streaming import stream_internal_output as _stream_internal_output
+from app.core.streaming import stream_internal_output as _stream_internal_output, _attach_stream_performance
 from app.protocols.ingress import (
     anthropic_messages_to_internal,
     chat_completions_to_internal,
@@ -218,7 +218,13 @@ def _responses_is_system_turn(body: dict) -> bool:
     source = str(turn_metadata.get("thread_source") or "").strip().lower()
     trigger = str(turn_metadata.get("turn_trigger") or "").strip().lower()
     request_kind = str(turn_metadata.get("request_kind") or "").strip().lower()
-    return source in {"system", "ambient", "ambient_suggestion_safety"} or trigger.startswith("ambient") or request_kind.startswith("ambient")
+    return (
+        source in {"system", "ambient", "ambient_suggestion_safety", "thread_title"}
+        or trigger.startswith("ambient")
+        or trigger in {"thread_title"}
+        or request_kind.startswith("ambient")
+        or request_kind in {"thread_title"}
+    )
 
 
 def _responses_image_prompt(input_data: Any, instructions: Any = "") -> str:
@@ -939,6 +945,17 @@ class _EmptyNativeResponsesError(RuntimeError):
     native_empty_output = True
 
 
+def _native_completed_output_item(item: dict | None) -> bool:
+    """True when a Responses output item is a finished client-visible turn."""
+    if not isinstance(item, dict):
+        return False
+    item_type = str(item.get("type") or "")
+    return item_type in {
+        "message", "function_call", "custom_tool_call",
+        "computer_call", "image_generation_call", "output_text",
+    } or item_type.endswith("_call")
+
+
 def _native_response_has_output(response: dict | None) -> bool:
     """Return whether a completed Responses payload contains usable output items."""
     if not isinstance(response, dict):
@@ -1068,12 +1085,18 @@ async def _native_responses_stream_with_accounting(events, *, username, api_key_
     response_body = None
     failed = False
     saw_output = False
+    completed_output_item = False
     upstream_endpoint = "responses"
     terminal_error = None
+    stream_started_at = time.monotonic()
+    first_output_at = None
     try:
         async for frame in iter_sse_frames(events):
             payload = sse_payload(frame)
-            saw_output = saw_output or _native_sse_payload_has_output(payload)
+            has_output = _native_sse_payload_has_output(payload)
+            if has_output and first_output_at is None:
+                first_output_at = time.monotonic()
+            saw_output = saw_output or has_output
             sse_error = _native_sse_error_message(payload)
             if sse_error:
                 failed = True
@@ -1097,7 +1120,10 @@ async def _native_responses_stream_with_accounting(events, *, username, api_key_
                         expires_at=_responses_capability_expiry("supported"),
                     )
             if payload and payload.get("type") == "response.output_item.done":
-                observed = _observed_response_tool_types({"output": [payload.get("item") or {}]})
+                item = payload.get("item") or {}
+                if _native_completed_output_item(item):
+                    completed_output_item = True
+                observed = _observed_response_tool_types({"output": [item]})
                 if observed:
                     capability = get_model_responses_capability(provider_id, model) or {}
                     update_model_responses_tool_types(provider_id, model, list(set(capability.get("responses_tool_types") or []) | observed))
@@ -1109,16 +1135,31 @@ async def _native_responses_stream_with_accounting(events, *, username, api_key_
     finally:
         usage = (response_body or {}).get("usage") or {}
         tokens = usage.get("total_tokens") or 0
-        success = bool(response_body) and not failed and saw_output
+        client_disconnected = locals().get("client_disconnected", False)
+        # Codex closes the SSE after a completed tool/message item and then
+        # continues with a follow-up request. That is a finished turn, not a
+        # user cancel.
+        closed_after_output = bool(client_disconnected and completed_output_item and not terminal_error)
+        if closed_after_output:
+            failed = False
+        success = (bool(response_body) and not failed and saw_output) or closed_after_output
         response_id = (response_body or {}).get("id")
         if success and response_id and remember_response_chain_key and conv_key:
             remember_response_chain_key(response_id, conv_key)
-        client_disconnected = locals().get("client_disconnected", False)
-        details = {**routing_details_from_policy(policy), "responses_mode": "native", "upstream_endpoint": upstream_endpoint, "stream": True, "fallback_attempts": fallback_attempts or []}
+        details = {
+            **routing_details_from_policy(policy),
+            **_thinking_fields_from_payload(request_body if isinstance(request_body, dict) else {}),
+            "responses_mode": "native",
+            "upstream_endpoint": upstream_endpoint,
+            "stream": True,
+            "fallback_attempts": fallback_attempts or [],
+        }
         if len(fallback_attempts or []) > 1:
             details.update({"fallback_status": "used", "attempt_index": len(fallback_attempts) - 1})
-        if client_disconnected:
-            details.update({"status": "cancelled", "client_disconnected": True})
+        if closed_after_output:
+            details.update({"client_disconnected": True, "stream_closed_after_output": True})
+        elif client_disconnected:
+            details.update({"status": "cancelled", "client_disconnected": True, "error_message": "client disconnected"})
         elif not saw_output and response_body and not client_disconnected:
             details.update({"native_empty_output": True, "native_failure_reason": "empty_completed_response"})
         elif failed and response_body:
@@ -1128,19 +1169,40 @@ async def _native_responses_stream_with_accounting(events, *, username, api_key_
         details = apply_outcome_to_details(
             details,
             success=success,
-            partial_output=bool(saw_output and (failed or not response_body)),
+            partial_output=bool(not closed_after_output and saw_output and (failed or not response_body)),
         )
+        _attach_stream_performance(details, usage, first_output_at, stream_started_at)
         _log_request(username, api_key_value, model, provider_id, "responses", success, tokens, requested_model, details=details)
         status = details.get("status", "ok" if success else "fail")
         if success:
             error_text = ""
+        elif client_disconnected:
+            error_text = "client disconnected"
         elif terminal_error:
             error_text = str(terminal_error)
         elif saw_output:
             error_text = "native Responses stream ended after client-visible output without a completed event"
         else:
             error_text = "native Responses stream did not complete"
-        _record_request_log(endpoint="responses", username=username, api_key_value=api_key_value, requested_model=requested_model, final_model=model, final_provider=provider_id, request_body=request_body, response_body=response_body, success=success, status=status, tokens=tokens, usage=usage, details=details, error_message=error_text)
+        _record_request_log(
+            endpoint="responses",
+            username=username,
+            api_key_value=api_key_value,
+            requested_model=requested_model,
+            final_model=model,
+            final_provider=provider_id,
+            request_body=request_body,
+            response_body=response_body,
+            success=success,
+            status=status,
+            tokens=tokens,
+            usage=usage,
+            details=details,
+            error_message=error_text,
+            stream=True,
+            request_started_at=stream_started_at,
+            generation_started_at=first_output_at or stream_started_at,
+        )
         _record_success_metrics(username, api_key_value, tokens, status)
 
 
@@ -4266,7 +4328,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                 if observed:
                     capability = get_model_responses_capability(adapter_provider_id, model) or {}
                     update_model_responses_tool_types(adapter_provider_id, model, list(set(capability.get("responses_tool_types") or []) | observed))
-                native_details = apply_outcome_to_details({**routing_details_from_policy(policy), "responses_mode": "native", "upstream_endpoint": "responses", "fallback_attempts": native_attempts}, success=True)
+                native_details = apply_outcome_to_details({**routing_details_from_policy(policy), **_thinking_fields_from_payload(body), "responses_mode": "native", "upstream_endpoint": "responses", "fallback_attempts": native_attempts}, success=True)
                 status = native_details.get("status", "ok")
                 _log_request(username, api_key_value, model, adapter_provider_id, "responses", True, tokens, requested_model, details=native_details)
                 _record_request_log(endpoint="responses", username=username, api_key_value=api_key_value, requested_model=requested_model, final_model=model, final_provider=adapter_provider_id, request_body=body, response_body=rendered, success=True, status=status, tokens=tokens, usage=usage, details=native_details)

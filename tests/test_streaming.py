@@ -483,6 +483,52 @@ async def test_stream_internal_output_marks_client_disconnect_as_cancelled(monke
 
 
 @pytest.mark.asyncio
+async def test_stream_internal_output_tool_turn_disconnect_is_ok(monkeypatch):
+    logged = {}
+    counters = {"ok": 0, "cancelled": 0}
+
+    def fake_log(user, key, model, provider, endpoint, success, tokens, requested, **kwargs):
+        logged["success"] = success
+        logged["details"] = kwargs.get("details") or {}
+
+    def fake_increment(success, *, degraded=False, rejected=False, cancelled=False):
+        if cancelled:
+            counters["cancelled"] += 1
+        elif success:
+            counters["ok"] += 1
+
+    monkeypatch.setattr("app.core.streaming.increment_global_stats", fake_increment)
+    monkeypatch.setattr("app.core.streaming.increment_user_usage", lambda *a, **k: None)
+
+    class ClientDisconnect(Exception):
+        pass
+
+    async def _events():
+        yield InternalOutputEvent(kind="tool_call_start", tool_call_id="call_1", name="exec_command")
+        yield InternalOutputEvent(kind="tool_call_done", tool_call_id="call_1", name="exec_command", arguments="{}")
+        raise ClientDisconnect("client disconnected")
+
+    async for _line in stream_internal_output(
+        events=_events(),
+        endpoint="chat_completions",
+        model="m",
+        username="u",
+        api_key_value="k",
+        provider_id="p",
+        requested_model="m",
+        log_request=fake_log,
+        conv_key="conv-tool-close",
+    ):
+        pass
+
+    assert logged["success"] is True
+    assert logged["details"]["status"] == "ok"
+    assert logged["details"]["stream_closed_after_output"] is True
+    assert counters["ok"] == 1
+    assert counters["cancelled"] == 0
+
+
+@pytest.mark.asyncio
 async def test_stream_internal_output_records_tool_arguments_for_request_log():
     recorded = {}
 

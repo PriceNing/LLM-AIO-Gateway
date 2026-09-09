@@ -8,13 +8,32 @@ from typing import Any
 
 _CN_IMAGE_WORDS = ("图片", "图像", "照片", "插画", "海报", "头像", "壁纸", "素材")
 _CN_ACTION_WORDS = ("生成", "画", "绘制", "制作", "创建", "做一张", "出图", "生图")
-_EN_IMAGE_WORDS = (
-    "image", "picture", "photo", "illustration", "poster",
-    "wallpaper", "avatar", "art", "asset", "assets",
-    "visual asset", "visuals", "texture", "textures", "variant",
-    "variants",
-)
 _EN_ACTION_RE = re.compile(r"\b(?:generate|generated|draw|create|make|render|illustrate)\b", re.IGNORECASE)
+_EN_IMAGE_RE = re.compile(
+    r"\b(?:images?|pictures?|photos?|illustrations?|posters?|wallpapers?|avatars?|art|assets?|visuals?|textures?|variants?)\b"
+    r"|\bvisual\s+assets?\b",
+    re.IGNORECASE,
+)
+_HARNESS_WRAPPER_TAGS = (
+    "environment_context",
+    "thread_title",
+    "agent_skills",
+    "permissions_instructions",
+    "skills_instructions",
+    "collaboration_mode",
+)
+_HARNESS_WRAPPER_TAG_RE = "|".join(_HARNESS_WRAPPER_TAGS)
+_WRAPPED_USER_PROMPT_RE = re.compile(
+    r"(?im)^(?:#{1,6}\s*)?(?:User\s+(?:prompt|message|input)|用户(?:提示|输入)|Prompt)\s*[:：]?\s*"
+)
+_LEADING_HARNESS_WRAPPER_RE = re.compile(
+    rf"^(?:<({_HARNESS_WRAPPER_TAG_RE})\b[^>]*>[\s\S]*?</\1>\s*)+",
+    re.IGNORECASE,
+)
+_PSEUDO_USER_WRAPPER_RE = re.compile(
+    rf"^(?:<({_HARNESS_WRAPPER_TAG_RE})\b[^>]*>[\s\S]*?</\1>\s*)+$",
+    re.IGNORECASE,
+)
 _NEGATED_IMAGE_REQUEST_RE = re.compile(
     r"(?:不要|无需|不需要|禁止|别)\s*(?:生成|画|绘制|制作|创建|生图)|"
     r"(?:不要|无需|不需要|禁止|别).{0,12}(?:调用|使用|进入|触发).{0,12}(?:图像生成|图片生成|生图)(?:功能|工具|服务)?|"
@@ -57,6 +76,23 @@ def _text_from_item(item: Any) -> str:
     return ""
 
 
+def _unwrap_harness_text(text: str) -> str:
+    """Keep only the user payload after Codex title/metadata markers."""
+    if not text:
+        return ""
+    stripped = _LEADING_HARNESS_WRAPPER_RE.sub("", text).strip()
+    parts = _WRAPPED_USER_PROMPT_RE.split(stripped)
+    if len(parts) > 1:
+        return parts[-1].strip()
+    return stripped
+
+
+def _is_pseudo_user_wrapper(text: str) -> bool:
+    """True when a role=user item is only a Codex XML envelope."""
+    stripped = (text or "").strip()
+    return bool(stripped) and bool(_PSEUDO_USER_WRAPPER_RE.fullmatch(stripped))
+
+
 def latest_user_text(input_data: Any) -> str:
     """Return only the latest explicit user input, excluding tool output.
 
@@ -65,7 +101,7 @@ def latest_user_text(input_data: Any) -> str:
     an image-generation intent on later agent turns.
     """
     if isinstance(input_data, str):
-        return input_data.strip()
+        return _unwrap_harness_text(input_data)
     if not isinstance(input_data, list):
         return ""
     for item in reversed(input_data):
@@ -76,8 +112,11 @@ def latest_user_text(input_data: Any) -> str:
             not item.get("role") and item_type in {"input_text", "input_message"}
         ):
             text = _text_from_item(item)
-            if text:
-                return text
+            if not text or _is_pseudo_user_wrapper(text):
+                continue
+            unwrapped = _unwrap_harness_text(text)
+            if unwrapped:
+                return unwrapped
     return ""
 
 
@@ -91,7 +130,6 @@ def is_image_generation_intent(input_data: Any, instructions: Any = "") -> bool:
         return False
     if _NEGATED_IMAGE_REQUEST_RE.search(text) or _IMAGE_DISCUSSION_RE.search(text):
         return False
-    lowered = text.lower()
     if (
         any(action in text for action in _CN_ACTION_WORDS)
         and (any(word in text for word in _CN_IMAGE_WORDS) or _CN_STANDALONE_IMAGE_RE.search(text))
@@ -99,6 +137,6 @@ def is_image_generation_intent(input_data: Any, instructions: Any = "") -> bool:
         return True
     return bool(
         _EN_ACTION_RE.search(text)
-        and any(word in lowered for word in _EN_IMAGE_WORDS)
+        and _EN_IMAGE_RE.search(text)
         and not _IMAGE_UI_COMPONENT_RE.search(text)
     )
