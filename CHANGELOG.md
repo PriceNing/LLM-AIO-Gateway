@@ -5,6 +5,19 @@ All notable changes to LLM AIO Gateway will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.2] - 2026-09-08
+
+### Added
+- Streaming performance metrics: request logs now record time-to-first-token (TTFT) and streaming generation duration for upstream performance visibility.
+
+### Changed
+- Image-intent detection strips Codex XML envelopes (`<environment_context>`, `<thread_title>`, etc.) to correctly identify real user image intent.
+- Responses `thread_title` turns are recognized as system turns so title-generation and other meta requests no longer trigger the image bridge.
+- Admin UI Chinese localization: unified UI copy (Fallback policies, Dry Run, API Key, etc.) into Chinese.
+
+### Fixed
+- Plural image-intent keywords (posters/images/avatars) now match correctly, restoring image generation for plural requests.
+
 ## [0.10.1] - 2026-09-08
 
 ### Fixed
