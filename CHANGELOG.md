@@ -5,6 +5,15 @@ All notable changes to LLM AIO Gateway will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.3] - 2026-09-08
+
+### Added
+- Tool-history sanitization: removes malformed tool-call/tool-result pairs that strict Chat upstreams reject.
+- Same-target first-byte retry: on a first-byte upstream failure (e.g. connection error), retry the same target once before falling back.
+
+### Changed
+- Connection-error classification walks the exception chain to detect real connection errors (httpx.ConnectError / NetworkError / ConnectionError), avoiding misclassifying generic RuntimeError as retryable.
+
 ## [0.10.2] - 2026-09-08
 
 ### Added
