@@ -838,6 +838,27 @@ def test_friendly_error_msg_unmapped_is_redacted():
     assert "internal-upstream" not in result
 
 
+def test_friendly_error_msg_timeout_is_client_safe():
+    result = _friendly_error_msg(TimeoutError("Request timed out contacting https://api.minimaxi.com/anthropic"))
+    assert result.startswith("Upstream request timed out")
+    assert "minimaxi" not in result
+
+
+def test_friendly_error_msg_balance_is_client_safe():
+    result = _friendly_error_msg(Exception("account balance is exhausted at https://api.example/v1"))
+    assert result.startswith("Upstream account balance is exhausted.")
+    assert "api.example" not in result
+
+
+def test_friendly_error_msg_rate_limit_quota_is_not_balance():
+    from fastapi import HTTPException
+
+    result = _friendly_error_msg(
+        HTTPException(status_code=429, detail="Rate limit quota exceeded for this minute")
+    )
+    assert result.startswith("Upstream rate limited")
+
+
 def test_friendly_error_msg_is_case_insensitive():
     e = Exception("NO ENDPOINTS FOUND THAT SUPPORT IMAGE INPUT")
     assert "does not support image input" in _friendly_error_msg(e)

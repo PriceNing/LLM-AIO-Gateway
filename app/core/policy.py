@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import Awaitable, Callable
 
 from app.database import get_fallback_policies, get_routing_rules, parse_model_id
-from app.core.types import InternalMessage, InternalRequest, reasoning_part
+from app.core.types import InternalMessage, InternalPart, InternalRequest, reasoning_part
 from app.core.text import mask_key, strip_billing_header
 from app.core.tool_args import coerce_tool_arguments_json, sanitize_args
 from app.services.logger import get_logger
@@ -88,6 +88,18 @@ def _ir_tool_call_ids(message: InternalMessage) -> list[str]:
     return [part.tool_call_id for part in message.parts if part.kind == "tool_call" and part.tool_call_id]
 
 
+def _ir_tool_result_ids(message: InternalMessage) -> list[str]:
+    return [part.tool_call_id for part in message.parts if part.kind == "tool_result" and part.tool_call_id]
+
+
+def _ir_message_has_payload(message: InternalMessage) -> bool:
+    return any(
+        part.kind != "reasoning"
+        and (part.kind != "text" or bool((part.text or "").strip()))
+        for part in message.parts
+    )
+
+
 def request_has_tools(request: InternalRequest) -> bool:
     return bool(request.tools or request.extra.get("tools"))
 
@@ -139,6 +151,96 @@ def fix_tool_args(request: InternalRequest) -> int:
                     part.arguments = {}
                 fixed += 1
     return fixed
+
+
+def sanitize_tool_history(messages: list[InternalMessage]) -> int:
+    """Remove malformed tool-call/result pairs that strict Chat upstreams reject."""
+    if not messages:
+        return 0
+
+    cleaned: list[InternalMessage] = []
+    removed = 0
+    index = 0
+
+    while index < len(messages):
+        message = messages[index]
+        tool_call_parts = (
+            [part for part in message.parts if part.kind == "tool_call"]
+            if message.role == "assistant"
+            else []
+        )
+
+        if tool_call_parts:
+            call_ids = [part.tool_call_id for part in tool_call_parts if part.tool_call_id]
+            response_messages: list[InternalMessage] = []
+            result_ids: list[str] = []
+            next_index = index + 1
+            while next_index < len(messages):
+                candidate = messages[next_index]
+                candidate_result_ids = _ir_tool_result_ids(candidate)
+                if not candidate_result_ids:
+                    break
+                response_messages.append(candidate)
+                result_ids.extend(candidate_result_ids)
+                next_index += 1
+
+            available_ids = set(result_ids)
+            accepted_ids = {call_id for call_id in call_ids if call_id in available_ids}
+            kept_call_ids: set[str] = set()
+
+            def _keep_tool_call(part: InternalPart) -> bool:
+                if part.kind != "tool_call":
+                    return True
+                call_id = part.tool_call_id
+                if call_id not in accepted_ids or call_id in kept_call_ids:
+                    return False
+                kept_call_ids.add(call_id)
+                return True
+
+            message.parts = [part for part in message.parts if _keep_tool_call(part)]
+            removed += len(tool_call_parts) - len(kept_call_ids)
+
+            if _ir_message_has_payload(message):
+                cleaned.append(message)
+            else:
+                removed += 1
+
+            if response_messages:
+                kept_result_ids: set[str] = set()
+                for response_message in response_messages:
+                    kept_parts: list[InternalPart] = []
+                    for part in response_message.parts:
+                        if part.kind != "tool_result":
+                            kept_parts.append(part)
+                            continue
+                        result_id = part.tool_call_id
+                        if result_id in accepted_ids and result_id not in kept_result_ids:
+                            kept_result_ids.add(result_id)
+                            kept_parts.append(part)
+                        else:
+                            removed += 1
+                    response_message.parts = kept_parts
+                    if response_message.parts:
+                        cleaned.append(response_message)
+
+            index = next_index
+            continue
+
+        if message.role == "tool" or any(part.kind == "tool_result" for part in message.parts):
+            kept_parts = [part for part in message.parts if part.kind != "tool_result"]
+            removed += len(message.parts) - len(kept_parts)
+            message.parts = kept_parts
+            if message.parts:
+                cleaned.append(message)
+            index += 1
+            continue
+
+        cleaned.append(message)
+        index += 1
+
+    if removed:
+        messages[:] = cleaned
+    return removed
 
 
 def _replace_undefined_values(value):
@@ -509,6 +611,13 @@ async def prepare_request_policy(
         injected = inject_reasoning_content(request.messages, cached_rc, tool_map)
 
     if apply_ir_transforms:
+        repaired_tool_history = sanitize_tool_history(request.messages)
+        if repaired_tool_history:
+            _app_log.warning(
+                "[%s TOOL_HISTORY] removed=%d malformed_tool_items",
+                log_label,
+                repaired_tool_history,
+            )
         fix_tool_args(request)
 
     limited = False

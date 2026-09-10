@@ -8,6 +8,7 @@ from app.services.routing_targets import (
     adapter_provider_id,
     candidate_targets,
     classify_upstream_error,
+    is_same_target_retryable,
     provider_for_log,
 )
 
@@ -178,3 +179,25 @@ def test_classify_unknown_string_falls_back_to_connection_error():
 
 def test_classify_empty_message():
     assert classify_upstream_error(RuntimeError("")) == "connection_error"
+
+
+def test_classify_wrapped_httpx_timeout_as_timeout():
+    wrapped = HTTPException(status_code=502, detail="Upstream request failed.")
+    wrapped.__cause__ = httpx.TimeoutException("read timeout")
+    assert classify_upstream_error(wrapped) == "timeout"
+
+
+def test_classify_wrapped_connect_error_as_connection_error():
+    wrapped = HTTPException(status_code=502, detail="Upstream request failed.")
+    wrapped.__cause__ = httpx.ConnectError("refused")
+    assert classify_upstream_error(wrapped) == "connection_error"
+
+
+def test_same_target_retryable_timeout_and_5xx():
+    assert is_same_target_retryable(TimeoutError("timed out"))
+    assert is_same_target_retryable(HTTPException(status_code=502))
+    assert is_same_target_retryable(HTTPException(status_code=429))
+    assert is_same_target_retryable(httpx.ConnectError("refused"))
+    assert not is_same_target_retryable(RuntimeError("primary unavailable"))
+    assert not is_same_target_retryable(HTTPException(status_code=400))
+    assert not is_same_target_retryable(TimeoutError("fallback attempt timeout after 60s"))

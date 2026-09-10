@@ -549,20 +549,45 @@ def ir_to_openai_messages(messages: list[InternalMessage]) -> list[dict[str, Any
             system_contents.append(_parts_to_openai_content(msg.parts))
     if system_contents:
         result.append({"role": "system", "content": _merge_openai_system_contents(system_contents)})
-    for msg in conversation:
+    index = 0
+    while index < len(conversation):
+        msg = conversation[index]
         if msg.role in ("user", "tool") and any(part.kind == "tool_result" for part in msg.parts):
-            pending_user_parts = []
-            for part in msg.parts:
-                if part.kind == "tool_result":
-                    if pending_user_parts:
-                        result.append({"role": "user", "content": _parts_to_openai_content(pending_user_parts)})
-                        pending_user_parts = []
-                    content = _parts_to_openai_content(part.parts)
-                    result.append({"role": "tool", "tool_call_id": part.tool_call_id, "content": content or "(tool output)"})
-                elif msg.role == "user":
-                    pending_user_parts.append(part)
-            if pending_user_parts:
-                result.append({"role": "user", "content": _parts_to_openai_content(pending_user_parts)})
+            response_start = index
+            response_messages = []
+            while index < len(conversation):
+                candidate = conversation[index]
+                if candidate.role not in ("user", "tool") or not any(part.kind == "tool_result" for part in candidate.parts):
+                    break
+                response_messages.append(candidate)
+                index += 1
+
+            tool_results = [
+                part
+                for response_message in response_messages
+                for part in response_message.parts
+                if part.kind == "tool_result"
+            ]
+            if response_start > 0:
+                previous = conversation[response_start - 1]
+                if previous.role == "assistant":
+                    call_order = {
+                        part.tool_call_id: position
+                        for position, part in enumerate(previous.parts)
+                        if part.kind == "tool_call" and part.tool_call_id
+                    }
+                    if call_order:
+                        tool_results.sort(key=lambda part: call_order.get(part.tool_call_id, len(call_order)))
+
+            for part in tool_results:
+                content = _parts_to_openai_content(part.parts)
+                result.append({"role": "tool", "tool_call_id": part.tool_call_id, "content": content or "(tool output)"})
+            for response_message in response_messages:
+                if response_message.role != "user":
+                    continue
+                pending_user_parts = [part for part in response_message.parts if part.kind != "tool_result"]
+                if pending_user_parts:
+                    result.append({"role": "user", "content": _parts_to_openai_content(pending_user_parts)})
             continue
 
         out = {"role": msg.role}
@@ -592,6 +617,7 @@ def ir_to_openai_messages(messages: list[InternalMessage]) -> list[dict[str, Any
         if reasoning:
             out["reasoning_content"] = reasoning
         result.append(out)
+        index += 1
     return result
 
 

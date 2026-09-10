@@ -105,6 +105,8 @@ async def iter_anthropic_output_events(
                     raise
     except HTTPException:
         raise
+    except (httpx.TimeoutException, TimeoutError, httpx.TransportError):
+        raise
     except Exception as exc:
         _app_log.debug("[anthropic_stream_adapter] ERROR provider=%s model=%s error=%s", provider_id, model, error_detail_for_log(exc))
         raise HTTPException(status_code=502, detail=friendly_error_msg(exc)) from exc

@@ -1,5 +1,7 @@
 import re
 
+import httpx
+
 from app.services.logger import get_request_id
 
 
@@ -38,6 +40,26 @@ def strip_billing_header(text):
 # 未命中映射表时的兜底消息。上游原文绝不进入客户端响应：原文可能包含
 # 上游 URL、内部路径、供应商响应体甚至凭据片段（见「当前问题.md」S2）。
 _GENERIC_UPSTREAM_FAILURE = "Upstream request failed. Please retry later or contact the administrator."
+_TIMEOUT_FAILURE = "Upstream request timed out. Please retry."
+_RATE_LIMIT_FAILURE = "Upstream rate limited the request. Please retry later."
+_BALANCE_FAILURE = "Upstream account balance is exhausted."
+_CONNECTION_FAILURE = "Unable to reach the upstream provider. Please retry later."
+_BALANCE_FAILURE_MARKERS = (
+    "insufficient balance",
+    "insufficient credit",
+    "insufficient funds",
+    "insufficient_quota",
+    "account balance",
+    "credit balance",
+    "balance is too low",
+    "balance is low",
+    "balance exhausted",
+    "exceeded your current quota",
+    "arrears",
+    "欠费",
+    "余额不足",
+    "额度不足",
+)
 
 
 def _with_trace_hint(message: str) -> str:
@@ -53,12 +75,31 @@ def friendly_error_msg(e: Exception) -> str:
     The raw upstream text is intentionally NOT included. Callers that need it
     for logs must use ``error_detail_for_log`` (or ``str(exc)``) instead.
     """
+    # Local import: routing_targets imports core.policy, which imports this module.
+    from app.services.routing_targets import classify_upstream_error
+
     msg = str(e)
     lowered = msg.lower()
     for pattern, friendly in _UPSTREAM_ERROR_MAP:
         if pattern.lower() in lowered:
             return _with_trace_hint(friendly)
+    if any(marker in lowered for marker in _BALANCE_FAILURE_MARKERS):
+        return _with_trace_hint(_BALANCE_FAILURE)
+    trigger = classify_upstream_error(e)
+    if trigger == "timeout":
+        return _with_trace_hint(_TIMEOUT_FAILURE)
+    if trigger == "http_429":
+        return _with_trace_hint(_RATE_LIMIT_FAILURE)
+    if trigger == "connection_error" and _looks_like_connection_error(e, lowered):
+        return _with_trace_hint(_CONNECTION_FAILURE)
     return _with_trace_hint(_GENERIC_UPSTREAM_FAILURE)
+
+
+def _looks_like_connection_error(exc: Exception, lowered: str) -> bool:
+    if isinstance(exc, (httpx.ConnectError, httpx.NetworkError, ConnectionError)):
+        return True
+    tokens = ("connection", "connect", "tls", "ssl", "eof", "reset", "refused", "unreachable", "无法连接")
+    return any(token in lowered for token in tokens)
 
 
 def error_detail_for_log(e: BaseException, *, max_chars: int = 2000) -> str:

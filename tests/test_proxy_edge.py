@@ -912,6 +912,43 @@ async def test_anthropic_stream_raises_on_upstream_error_event(monkeypatch):
             pass
 
 
+@pytest.mark.asyncio
+async def test_anthropic_stream_preserves_timeout_exception(monkeypatch):
+    from app.adapters import anthropic_streaming
+    from app.adapters.anthropic_streaming import iter_anthropic_output_events
+    import httpx
+
+    class FakeStream:
+        async def __aenter__(self):
+            raise httpx.TimeoutException("read timeout")
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeClient:
+        def stream(self, *args, **kwargs):
+            return FakeStream()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(anthropic_streaming, "shared_client", lambda *args, **kwargs: FakeClient())
+
+    with pytest.raises(httpx.TimeoutException):
+        async for _ in iter_anthropic_output_events(
+            provider_info={"id": "anth", "api_base": "https://anth.example", "api_key": "key"},
+            messages=[{"role": "user", "content": "hi"}],
+            body={},
+            max_tokens=16,
+            temperature=0.7,
+            model="claude-test",
+        ):
+            pass
+
+
 def test_ir_projects_openai_system_to_anthropic_system_without_duplication():
     messages = [
         {"role": "system", "content": "You are helpful."},
@@ -1078,6 +1115,72 @@ def test_root_proxy_aliases_are_registered_and_callable(monkeypatch, temp_db):
     })
     assert responses.status_code == 200
     assert responses.json()["output"][0]["content"][0]["text"] == "alias ok"
+
+
+def test_chat_completions_repairs_partial_tool_history_for_deepseek(monkeypatch, temp_db):
+    add_provider({
+        "id": "deepseek",
+        "name": "DeepSeek",
+        "provider_type": "openai",
+        "api_base": "https://api.deepseek.com/v1",
+        "api_key": "upstream-key",
+        "enabled": True,
+        "models": [{"id": "deepseek-chat", "name": "DeepSeek Chat", "enabled": True}],
+    })
+
+    captured = {}
+
+    def fake_chat_completion(**kwargs):
+        messages = kwargs["messages"]
+        captured["messages"] = messages
+
+        # Reproduce the strict OpenAI-compatible validation used by DeepSeek.
+        for index, message in enumerate(messages):
+            if message.get("role") != "assistant" or not message.get("tool_calls"):
+                continue
+            expected_ids = [call["id"] for call in message["tool_calls"]]
+            response_ids = []
+            cursor = index + 1
+            while cursor < len(messages) and messages[cursor].get("role") == "tool":
+                response_ids.append(messages[cursor].get("tool_call_id"))
+                cursor += 1
+            assert response_ids == expected_ids
+
+        class Message:
+            content = "ok"
+            reasoning_content = None
+            tool_calls = []
+
+        class Choice:
+            message = Message()
+            finish_reason = "stop"
+
+        class Response:
+            choices = [Choice()]
+            usage = {"total_tokens": 3}
+
+        return Response()
+
+    monkeypatch.setattr("app.router.proxy.create_chat_completion", fake_chat_completion)
+
+    response = client.post("/v1/chat/completions", headers=temp_db["headers"], json={
+        "model": "deepseek/deepseek-chat",
+        "messages": [
+            {"role": "user", "content": "start"},
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "run", "arguments": "{}"}},
+                {"id": "call_2", "type": "function", "function": {"name": "run", "arguments": "{}"}},
+            ]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+            {"role": "user", "content": "continue"},
+        ],
+    })
+
+    assert response.status_code == 200
+    projected = captured["messages"]
+    assert [message["role"] for message in projected] == ["user", "assistant", "tool", "user"]
+    assert [call["id"] for call in projected[1]["tool_calls"]] == ["call_1"]
+    assert projected[2]["tool_call_id"] == "call_1"
 
 
 def test_responses_allows_alias_when_route_target_is_allowed(monkeypatch, temp_db):
@@ -1849,6 +1952,164 @@ def test_chat_completions_stream_logs_fallback_target_model(monkeypatch, temp_db
     assert "fallback stream response" in body
     assert logged[-1][:5] == ("fallback-stream-log-ok/fallback-stream-log-model", "fallback-stream-log-ok", "chat_completions", True, "stream-log-source")
     assert [item["status"] for item in logged[-1][5]["fallback_attempts"]] == ["failed", "success"]
+
+
+def test_chat_completions_stream_retries_same_target_on_first_byte_timeout(monkeypatch, temp_db):
+    from app.core.output import InternalOutputEvent
+    add_provider({
+        "id": "flaky-stream",
+        "name": "Flaky Stream",
+        "provider_type": "openai",
+        "api_base": "https://flaky-stream.example/v1",
+        "api_key": "upstream-key",
+        "enabled": True,
+        "models": [{"id": "flaky-model", "name": "Flaky", "enabled": True}],
+    })
+
+    calls = []
+
+    async def fake_stream_events(**kwargs):
+        calls.append(kwargs["provider_id"])
+        if len(calls) == 1:
+            raise TimeoutError("primary timed out before first byte")
+        yield InternalOutputEvent(kind="message_start", role="assistant")
+        yield InternalOutputEvent(kind="text_delta", text="retried stream response")
+        yield InternalOutputEvent(kind="usage", usage={"total_tokens": 9})
+        yield InternalOutputEvent(kind="message_done", finish_reason="stop")
+
+    monkeypatch.setattr("app.router.proxy.iter_openai_chat_output_events", fake_stream_events)
+
+    with client.stream("POST", "/v1/chat/completions", headers=temp_db["headers"], json={
+        "model": "flaky-stream/flaky-model",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": True,
+    }) as response:
+        body = response.read().decode("utf-8")
+
+    assert response.status_code == 200
+    assert "retried stream response" in body
+    assert calls == ["flaky-stream", "flaky-stream"]
+
+
+def test_chat_completions_stream_retries_wrapped_anthropic_timeout(monkeypatch, temp_db):
+    from app.core.output import InternalOutputEvent
+    from fastapi import HTTPException
+    import httpx
+
+    add_provider({
+        "id": "minimax-stream",
+        "name": "MiniMax Stream",
+        "provider_type": "anthropic",
+        "api_base": "https://api.minimaxi.example/anthropic",
+        "api_key": "upstream-key",
+        "enabled": True,
+        "models": [{"id": "MiniMax-M3", "name": "MiniMax", "enabled": True}],
+    })
+
+    calls = []
+
+    async def fake_anthropic_stream(**kwargs):
+        calls.append(kwargs["provider_info"]["id"])
+        if len(calls) == 1:
+            wrapped = HTTPException(status_code=502, detail="Upstream request failed.")
+            wrapped.__cause__ = httpx.TimeoutException("read timeout")
+            raise wrapped
+        yield InternalOutputEvent(kind="message_start", role="assistant")
+        yield InternalOutputEvent(kind="text_delta", text="minimax retry ok")
+        yield InternalOutputEvent(kind="message_done", finish_reason="stop")
+
+    monkeypatch.setattr("app.router.proxy.iter_anthropic_output_events", fake_anthropic_stream)
+
+    with client.stream("POST", "/v1/chat/completions", headers=temp_db["headers"], json={
+        "model": "minimax-stream/MiniMax-M3",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": True,
+    }) as response:
+        body = response.read().decode("utf-8")
+
+    assert response.status_code == 200
+    assert "minimax retry ok" in body
+    assert calls == ["minimax-stream", "minimax-stream"]
+
+
+def test_chat_completions_nonstream_retries_same_target_on_timeout(monkeypatch, temp_db):
+    add_provider({
+        "id": "flaky-primary",
+        "name": "Flaky Primary",
+        "provider_type": "openai",
+        "api_base": "https://flaky-primary.example/v1",
+        "api_key": "upstream-key",
+        "enabled": True,
+        "models": [{"id": "flaky-model", "name": "Flaky", "enabled": True}],
+    })
+
+    calls = []
+
+    def fake_chat_completion(**kwargs):
+        calls.append(kwargs["provider_id"])
+        if len(calls) == 1:
+            raise TimeoutError("primary timed out")
+
+        class Message:
+            content = "retried nonstream response"
+            reasoning_content = None
+            tool_calls = []
+
+        class Choice:
+            message = Message()
+            finish_reason = "stop"
+
+        class Response:
+            choices = [Choice()]
+            usage = {"total_tokens": 5}
+
+        return Response()
+
+    monkeypatch.setattr("app.router.proxy.create_chat_completion", fake_chat_completion)
+
+    response = client.post("/v1/chat/completions", headers=temp_db["headers"], json={
+        "model": "flaky-primary/flaky-model",
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "retried nonstream response"
+    assert calls == ["flaky-primary", "flaky-primary"]
+
+
+def test_stream_same_target_retry_can_be_disabled(monkeypatch, temp_db):
+    """same_target_retry_limit=0 must leave the pre-existing fallback behaviour intact."""
+    from app.core.output import InternalOutputEvent
+
+    add_provider({
+        "id": "no-retry-stream", "name": "No Retry Stream", "provider_type": "openai",
+        "api_base": "https://no-retry.example/v1", "api_key": "k", "enabled": True,
+        "models": [{"id": "no-retry-model", "name": "M", "enabled": True}],
+    })
+
+    calls = []
+
+    async def fake_stream_events(**kwargs):
+        calls.append(kwargs["provider_id"])
+        if len(calls) == 1:
+            raise TimeoutError("primary timed out")
+        yield InternalOutputEvent(kind="message_start", role="assistant")
+        yield InternalOutputEvent(kind="text_delta", text="should not be reached")
+        yield InternalOutputEvent(kind="message_done", finish_reason="stop")
+
+    monkeypatch.setattr("app.router.proxy.get_default",
+                        lambda key, fallback=None: 0 if key == "same_target_retry_limit" else fallback)
+    monkeypatch.setattr("app.router.proxy.iter_openai_chat_output_events", fake_stream_events)
+
+    with client.stream("POST", "/v1/chat/completions", headers=temp_db["headers"], json={
+        "model": "no-retry-stream/no-retry-model",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": True,
+    }) as response:
+        body = response.read().decode("utf-8")
+
+    assert calls == ["no-retry-stream"]
+    assert "should not be reached" not in body
 
 
 def test_chat_completions_stream_does_not_fallback_after_output(monkeypatch, temp_db):

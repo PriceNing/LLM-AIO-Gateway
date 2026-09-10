@@ -8,9 +8,9 @@ from app.protocols.ingress import (
 )
 from app.core.policy import prepare_request_policy
 from app.core.policy import RouteTarget, RoutingDecision
-from app.core.policy import has_missing_reasoning_content_for_tool_calls, fix_tool_args, inject_reasoning_content, request_has_tools, strip_tools
-from app.protocols.ir import ir_to_anthropic_messages, ir_to_openai_messages, openai_messages_to_ir, responses_input_to_ir
-from app.core.types import InternalMessage, text_part
+from app.core.policy import has_missing_reasoning_content_for_tool_calls, fix_tool_args, inject_reasoning_content, request_has_tools, sanitize_tool_history, strip_tools
+from app.protocols.ir import anthropic_messages_to_ir, ir_to_anthropic_messages, ir_to_openai_messages, openai_messages_to_ir, responses_input_to_ir
+from app.core.types import InternalMessage, text_part, tool_call_part, tool_result_part
 from app.adapters.anthropic import anthropic_body_from_internal
 from app.adapters.openai import chat_kwargs_from_internal, chat_messages_from_internal
 from app.services.preprocessing import preprocess_messages
@@ -31,6 +31,123 @@ def test_ir_to_openai_messages_collapses_multiple_system_turns():
     projected = ir_to_openai_messages(messages)
     assert [m["role"] for m in projected] == ["system", "user"]
     assert projected[0]["content"] == "base\n\nextra"
+
+
+def test_ir_to_openai_messages_places_tool_results_before_user_text():
+    messages = anthropic_messages_to_ir([
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "call_1", "name": "run", "input": {}},
+        ]},
+        {"role": "user", "content": [
+            {"type": "text", "text": "The command finished."},
+            {"type": "tool_result", "tool_use_id": "call_1", "content": "ok"},
+        ]},
+    ])
+
+    projected = ir_to_openai_messages(messages)
+
+    assert [message["role"] for message in projected] == ["assistant", "tool", "user"]
+    assert projected[1]["tool_call_id"] == "call_1"
+    assert projected[2]["content"] == "The command finished."
+
+
+def test_ir_to_openai_messages_groups_consecutive_tool_results_before_user_text():
+    messages = [
+        InternalMessage(role="assistant", parts=[
+            tool_call_part("call_1", "run", {}),
+            tool_call_part("call_2", "run", {}),
+        ]),
+        InternalMessage(role="user", parts=[
+            text_part("Both commands finished."),
+            tool_result_part("call_1", [text_part("one")]),
+        ]),
+        InternalMessage(role="tool", parts=[
+            tool_result_part("call_2", [text_part("two")]),
+        ]),
+    ]
+
+    projected = ir_to_openai_messages(messages)
+
+    assert [message["role"] for message in projected] == ["assistant", "tool", "tool", "user"]
+    assert [message["tool_call_id"] for message in projected[1:3]] == ["call_1", "call_2"]
+    assert projected[3]["content"] == "Both commands finished."
+
+
+def test_ir_to_openai_messages_reorders_tool_results_to_tool_call_order():
+    messages = [
+        InternalMessage(role="assistant", parts=[
+            tool_call_part("call_1", "run", {}),
+            tool_call_part("call_2", "run", {}),
+        ]),
+        InternalMessage(role="tool", parts=[
+            tool_result_part("call_2", [text_part("two")]),
+            tool_result_part("call_1", [text_part("one")]),
+        ]),
+    ]
+
+    projected = ir_to_openai_messages(messages)
+
+    assert [message["role"] for message in projected] == ["assistant", "tool", "tool"]
+    assert [message["tool_call_id"] for message in projected[1:]] == ["call_1", "call_2"]
+
+
+def test_sanitize_tool_history_keeps_only_paired_parallel_calls():
+    messages = openai_messages_to_ir([
+        {"role": "user", "content": "start"},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "call_1", "type": "function", "function": {"name": "run", "arguments": "{}"}},
+            {"id": "call_2", "type": "function", "function": {"name": "run", "arguments": "{}"}},
+        ]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+        {"role": "assistant", "content": "done"},
+    ])
+
+    assert sanitize_tool_history(messages) == 1
+
+    projected = ir_to_openai_messages(messages)
+    assert [message["role"] for message in projected] == ["user", "assistant", "tool", "assistant"]
+    assert [call["id"] for call in projected[1]["tool_calls"]] == ["call_1"]
+    assert projected[2]["tool_call_id"] == "call_1"
+
+
+def test_sanitize_tool_history_preserves_assistant_text_and_drops_orphan_results():
+    messages = openai_messages_to_ir([
+        {"role": "user", "content": "start"},
+        {"role": "assistant", "content": "I could not run that.", "tool_calls": [
+            {"id": "call_missing", "type": "function", "function": {"name": "run", "arguments": "{}"}},
+        ]},
+        {"role": "user", "content": "continue"},
+    ])
+
+    assert sanitize_tool_history(messages) == 1
+
+    projected = ir_to_openai_messages(messages)
+    assert [message["role"] for message in projected] == ["user", "assistant", "user"]
+    assert projected[1]["content"] == "I could not run that."
+    assert "tool_calls" not in projected[1]
+
+
+def test_sanitize_tool_history_drops_orphan_tool_message():
+    messages = openai_messages_to_ir([
+        {"role": "user", "content": "start"},
+        {"role": "tool", "tool_call_id": "call_missing", "content": "late"},
+        {"role": "user", "content": "continue"},
+    ])
+
+    assert sanitize_tool_history(messages) == 1
+    assert [message["role"] for message in ir_to_openai_messages(messages)] == ["user", "user"]
+
+
+def test_sanitize_tool_history_drops_tool_call_without_id():
+    messages = openai_messages_to_ir([
+        {"role": "user", "content": "start"},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "", "type": "function", "function": {"name": "run", "arguments": "{}"}},
+        ]},
+    ])
+
+    assert sanitize_tool_history(messages) == 2
+    assert [message["role"] for message in ir_to_openai_messages(messages)] == ["user"]
 
 
 def test_responses_input_merges_instructions_and_developer_into_one_system():

@@ -102,7 +102,7 @@ from app.protocols.egress import (
 )
 from app.services.lite_llm import create_chat_completion
 from app.services.preprocessing import has_image_content, preprocess_messages
-from app.services.routing_targets import candidate_targets, classify_upstream_error, provider_for_log, resolve_provider
+from app.services.routing_targets import candidate_targets, classify_upstream_error, is_same_target_retryable, provider_for_log, resolve_provider
 from app.services.logger import get_logger
 from app.config import get_default
 
@@ -1861,6 +1861,14 @@ def _fallback_provider_id_for_target(target: RouteTarget) -> str:
     return provider_for_log(provider_info, target.provider_id)
 
 
+def _same_target_retry_limit() -> int:
+    """Extra in-place attempts for a transient first-byte failure on one target."""
+    try:
+        return max(0, min(3, int(get_default("same_target_retry_limit", 1))))
+    except (TypeError, ValueError):
+        return 1
+
+
 def _lookup_fallback_budget(provider_id: str, model: str):
     """Return matched fallback decision for proactive attempt timeout (ignore trigger filter)."""
     return apply_fallback_policy(provider_id, model, trigger="")
@@ -1940,6 +1948,7 @@ async def _call_nonstream_with_fallbacks(policy, internal, *, temperature, max_t
     primary = RouteTarget(model=primary.model, provider_id=_fallback_provider_id_for_target(primary))
     targets = [primary]
     fallback_attempts = []
+    same_target_retries: dict[tuple[str, str], int] = {}
     budget = _lookup_fallback_budget(primary.provider_id, primary.model)
     attempt_timeout = budget.attempt_timeout if budget.matched else None
     if attempt_timeout:
@@ -1958,9 +1967,14 @@ async def _call_nonstream_with_fallbacks(policy, internal, *, temperature, max_t
         primary.model,
         primary.provider_id or "-",
     )
-    for index, target in enumerate(targets):
+    # The primary target may be retried in place; fallback targets keep the
+    # dedicated loop below so stage/index accounting stays unchanged.
+    retry_primary = True
+    while retry_primary:
+        retry_primary = False
+        target = primary
         attempt_internal = await _internal_for_target_attempt(
-            internal, target, is_fallback=index > 0,
+            internal, target, is_fallback=False,
         )
         attempt_internal.target_model = target.model
         attempt_internal.provider_id = target.provider_id
@@ -1980,7 +1994,7 @@ async def _call_nonstream_with_fallbacks(policy, internal, *, temperature, max_t
                 provider_id=fallback_provider_id,
             )
             fallback_attempts.append(_fallback_attempt_record(
-                index=index,
+                index=0,
                 stage="primary",
                 target=target,
                 provider_id=fallback_provider_id,
@@ -1989,7 +2003,7 @@ async def _call_nonstream_with_fallbacks(policy, internal, *, temperature, max_t
             _attach_output_request_details(
                 output,
                 fallback_status="unused",
-                attempt_index=index,
+                attempt_index=0,
                 fallback_attempts=fallback_attempts,
                 upstream_endpoint=_upstream_endpoint_for_provider(provider_info),
             )
@@ -1998,7 +2012,7 @@ async def _call_nonstream_with_fallbacks(policy, internal, *, temperature, max_t
             last_exc = exc
             trigger = classify_upstream_error(exc)
             fallback_attempts.append(_fallback_attempt_record(
-                index=index,
+                index=0,
                 stage="primary",
                 target=target,
                 provider_id=fallback_provider_id,
@@ -2014,6 +2028,21 @@ async def _call_nonstream_with_fallbacks(policy, internal, *, temperature, max_t
                 trigger,
                 error_detail_for_log(exc),
             )
+            retry_key = (target.provider_id or "", target.model)
+            retry_limit = _same_target_retry_limit()
+            if is_same_target_retryable(exc, trigger) and same_target_retries.get(retry_key, 0) < retry_limit:
+                same_target_retries[retry_key] = same_target_retries.get(retry_key, 0) + 1
+                _app_log.warning(
+                    "[%s upstream.retry] target=%s provider=%s trigger=%s retry=%d/%d",
+                    log_label,
+                    target.model,
+                    fallback_provider_id or "-",
+                    trigger,
+                    same_target_retries[retry_key],
+                    retry_limit,
+                )
+                retry_primary = True
+                continue
             decision = apply_fallback_policy(fallback_provider_id, target.model, trigger)
             # Proactive attempt_timeout should still use the matched policy chain even if
             # the "timeout" trigger checkbox is off (the budget itself implies timeout switching).
@@ -2236,6 +2265,7 @@ async def _stream_events_with_fallbacks(internal, *, temperature, max_tokens, lo
     index = 0
     fallback_attempts = []
     degenerate_retries: dict[tuple[str, str], int] = {}
+    same_target_retries: dict[tuple[str, str], int] = {}
     budget = _lookup_fallback_budget(primary.provider_id, primary.model)
     attempt_timeout = budget.attempt_timeout if budget.matched else None
     if attempt_timeout:
@@ -2426,6 +2456,23 @@ async def _stream_events_with_fallbacks(internal, *, temperature, max_tokens, lo
                     fallback_provider_id or "-",
                     "placeholder_only_response" if getattr(exc, "placeholder_only_response", False) else "empty_stream",
                     degenerate_retries[retry_key],
+                )
+                continue
+            retry_limit = _same_target_retry_limit()
+            if (
+                not emitted
+                and is_same_target_retryable(exc, trigger)
+                and same_target_retries.get(retry_key, 0) < retry_limit
+            ):
+                same_target_retries[retry_key] = same_target_retries.get(retry_key, 0) + 1
+                _app_log.warning(
+                    "[%s stream.retry] target=%s provider=%s trigger=%s retry=%d/%d",
+                    log_label,
+                    target.model,
+                    fallback_provider_id or "-",
+                    trigger,
+                    same_target_retries[retry_key],
+                    retry_limit,
                 )
                 continue
             if index == 0:

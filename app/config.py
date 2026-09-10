@@ -27,6 +27,7 @@ def default_config() -> dict:
             "tool_only_limit": 20,
             "min_image_max_tokens": 2000,
             "litellm_request_timeout": 120,
+            "same_target_retry_limit": 1,
             "session_ttl_hours": 12,
             "login_attempt_limit": 10,
             "login_attempt_window_seconds": 300,
