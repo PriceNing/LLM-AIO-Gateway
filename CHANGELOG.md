@@ -5,6 +5,17 @@ All notable changes to LLM AIO Gateway will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] - 2026-09-08
+
+### Changed
+- Comprehensive hardening and fixes across the gateway based on code review, covering the protocol layer, database, proxy orchestration, and image pipeline.
+- Database migration idempotency fixed to avoid re-execution or inconsistent state.
+- Admin pagination interaction and request-log statistics corrected for accurate, consistent data.
+- Tightened protocol boundary handling (OpenAI/Anthropic/Responses) for more robust cross-protocol conversion.
+
+### Added
+- Extensive regression tests (test_database_admin_fixes / test_protocol_adapter_fixes / test_proxy_image_fixes) strengthening coverage of protocol adapters, database management, and the image pipeline.
+
 ## [0.10.3] - 2026-09-08
 
 ### Added
