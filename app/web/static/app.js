@@ -1918,10 +1918,16 @@ function providerFormHtml(title, provider, submitAction) {
 function readProviderForm() {
     var optionsText = document.getElementById('providerOptions').value.trim();
     var providerOptions = {};
-    if (optionsText) { try { providerOptions = JSON.parse(optionsText); } catch(e) { toast('provider_options JSON invalid: ' + e.message, 'error'); } }
+    if (optionsText) {
+        try { providerOptions = JSON.parse(optionsText); }
+        catch(e) { toast('provider_options JSON invalid: ' + e.message, 'error'); return null; }
+    }
     var headersText = document.getElementById('providerUpstreamHeaders').value.trim();
     var upstreamHeaders = {};
-    if (headersText) { try { upstreamHeaders = JSON.parse(headersText); } catch(e) { toast('upstream_headers JSON invalid: ' + e.message, 'error'); } }
+    if (headersText) {
+        try { upstreamHeaders = JSON.parse(headersText); }
+        catch(e) { toast('upstream_headers JSON invalid: ' + e.message, 'error'); return null; }
+    }
     return {
         id: document.getElementById('providerId').value.trim(),
         name: document.getElementById('providerName').value.trim(),
@@ -1940,7 +1946,9 @@ function readProviderForm() {
 
 async function addProvider() {
     try {
-        await api('/admin/providers', { method: 'POST', body: JSON.stringify(Object.assign({}, readProviderForm(), { models: [] })) });
+        var form = readProviderForm();
+        if (!form) return; // JSON 解析失败已提示，绝不能拿空对象覆盖提交
+        await api('/admin/providers', { method: 'POST', body: JSON.stringify(Object.assign({}, form, { models: [] })) });
         closeModal();
         loadProviders();
     } catch (e) { toast(t('providers.addFail') + ': ' + e.message, 'error'); }
@@ -1955,7 +1963,9 @@ function editProvider(id) {
 
 async function updateProvider(id) {
     try {
-        await api('/admin/providers/' + encodeURIComponent(id), { method: 'PUT', body: JSON.stringify(readProviderForm()) });
+        var form = readProviderForm();
+        if (!form) return; // JSON 解析失败已提示，绝不能拿空对象覆盖已保存配置
+        await api('/admin/providers/' + encodeURIComponent(id), { method: 'PUT', body: JSON.stringify(form) });
         closeModal();
         loadProviders();
     } catch (e) { toast(t('providers.updateFail') + ': ' + e.message, 'error'); }
@@ -3561,9 +3571,16 @@ function jsEsc(value) {
 /* ════════════════════════════════ Request Logs ════════════════════════════════ */
 
 var _logFilterTimer = null;
+var _requestLogPage = 0;
+var _requestLogPageSize = 50;
 function onLogFilterInput() {
     if (_logFilterTimer) clearTimeout(_logFilterTimer);
-    _logFilterTimer = setTimeout(loadRequestLogs, 350);
+    _logFilterTimer = setTimeout(function() { _requestLogPage = 0; loadRequestLogs(); }, 350);
+}
+
+function gotoRequestLogPage(page) {
+    _requestLogPage = Math.max(0, page);
+    loadRequestLogs();
 }
 
 async function loadRequestLogs() {
@@ -3578,6 +3595,8 @@ async function loadRequestLogs() {
         if (endpoint) params.push('endpoint=' + encodeURIComponent(endpoint));
         if (username) params.push('username=' + encodeURIComponent(username));
         if (status) params.push('status=' + encodeURIComponent(status));
+        params.push('limit=' + _requestLogPageSize);
+        params.push('offset=' + (_requestLogPage * _requestLogPageSize));
         var url = '/admin/request-logs';
         if (params.length) url += '?' + params.join('&');
         var data = await api(url);
@@ -3629,7 +3648,19 @@ function renderRequestLogs(data) {
     });
     tableHTML += '</tbody></table></div>';
     var summary = '<div class="history-summary"><span class="history-stat"><strong>' + total + '</strong> ' + escHtml(t('logs.total') || 'total') + '</span></div>';
-    container.innerHTML = summary + tableHTML;
+    var pagination = '';
+    if (total > _requestLogPageSize || _requestLogPage > 0) {
+        var first = _requestLogPage * _requestLogPageSize + 1;
+        var last = Math.min(total, first + items.length - 1);
+        var pageCount = Math.max(1, Math.ceil(total / _requestLogPageSize));
+        if (_requestLogPage >= pageCount) { _requestLogPage = pageCount - 1; }
+        pagination = '<div class="history-summary" style="gap:8px">';
+        pagination += '<button class="btn btn-secondary" ' + (_requestLogPage <= 0 ? 'disabled' : 'onclick="gotoRequestLogPage(' + (_requestLogPage - 1) + ')"') + '>&laquo; ' + escHtml(t('common.prev') || 'Prev') + '</button>';
+        pagination += '<span class="history-stat">' + first + '-' + last + ' / ' + total + '</span>';
+        pagination += '<button class="btn btn-secondary" ' + (_requestLogPage >= pageCount - 1 ? 'disabled' : 'onclick="gotoRequestLogPage(' + (_requestLogPage + 1) + ')"') + '>' + escHtml(t('common.next') || 'Next') + ' &raquo;</button>';
+        pagination += '</div>';
+    }
+    container.innerHTML = summary + tableHTML + pagination;
 }
 
 async function showRequestLogDetail(logId) {

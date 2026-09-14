@@ -88,6 +88,7 @@ All proxy endpoints are available at both root and `/v1` paths.
 | `POST /v1/messages` | Anthropic Messages | Claude Code-compatible Messages API, tools, streaming, images. |
 | `POST /v1/responses` or `/responses` | OpenAI Responses | Codex-compatible Responses API, tools, streaming, previous response IDs. |
 | `POST /v1/images/generations` or `/images/generations` | OpenAI Images | Sends OpenAI Images-compatible requests to the globally configured image backend. |
+| `GET /v1/image-results/{token}` or `/image-results/{token}` | Image result download | Downloads a short-lived generated original via its unguessable capability token. |
 | `GET /v1/models` | OpenAI Models | Lists models allowed for the caller's API key. |
 
 ### Chat Completions Example
@@ -204,6 +205,7 @@ Important defaults:
 | `temperature` | 0.7 | Default temperature. |
 | `max_request_body_bytes` | 33554432 | Inbound request body limit (32 MiB); larger bodies return 413. |
 | `litellm_request_timeout` | 120 | liteLLM upstream call timeout. |
+| `same_target_retry_limit` | 1 | In-place retries for a transient first-byte failure on the same target (0–3). |
 | `tool_only_limit` | 20 | Tool-only loop circuit breaker threshold. |
 | `min_image_max_tokens` | 2000 | Minimum max tokens for requests containing images. |
 | `session_ttl_hours` | 12 | Admin session lifetime. |
@@ -241,6 +243,8 @@ Important defaults:
 | `responses_capability_supported_ttl` | 604800 | Positive native-Responses capability probe cache TTL. |
 | `responses_capability_unsupported_ttl` | 21600 | Negative native-Responses capability probe cache TTL. |
 | `responses_capability_transient_ttl` | 300 | Transient native-Responses capability probe cache TTL. |
+| `responses_capability_probe_timeout` | 8 | Request timeout (seconds) for native-Responses capability probes. |
+| `responses_capability_probe_max_output_tokens` | 16 | max_output_tokens used by native-Responses capability probes. |
 | `anthropic_thinking_budget_tokens` | 1024 | Anthropic extended-thinking budget. |
 
 ## Safety And Limits
@@ -305,7 +309,7 @@ Main code boundaries:
 pytest tests/ -q
 ```
 
-Expected current result: `745 passed`.
+Expected current result: `823 passed`.
 
 Live smoke matrix:
 

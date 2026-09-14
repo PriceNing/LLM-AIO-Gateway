@@ -33,6 +33,21 @@ def _tool_call_to_dict(tool_call) -> dict:
     return data
 
 
+def _infer_tool_index(tc_dict: dict, tool_states: dict[int, dict]) -> int:
+    """部分 OpenAI 兼容上游的流式 tool_calls 不带 index。
+
+    若全部默认 0，多个并行工具调用会被合并串参；这里按 id 归属推断：
+    已知 id 匹配现有状态则沿用；新 id 开新下标；无 id 则延续最后一个。
+    """
+    tc_id = str(tc_dict.get("id") or "")
+    if tc_id:
+        for idx, state in tool_states.items():
+            if state.get("id") == tc_id:
+                return idx
+        return (max(tool_states) + 1) if tool_states else 0
+    return max(tool_states) if tool_states else 0
+
+
 async def iter_openai_chat_output_events(
     *,
     model,
@@ -181,7 +196,7 @@ async def _events_from_openai_chunk(chunk, *, model, tool_states: dict[int, dict
                 _tool_log.debug("[openai_stream_adapter] raw tool_calls count=%d model=%s", len(tool_calls), model)
                 for tc in tool_calls:
                     tc_dict = _tool_call_to_dict(tc)
-                    idx = int(tc_dict.get("index", 0))
+                    idx = int(tc_dict.get("index", 0)) if "index" in tc_dict else _infer_tool_index(tc_dict, tool_states)
                     if idx < 0:
                         _tool_log.debug("[openai_stream_adapter] FILTERED spurious: id=%s idx=%s", tc_dict.get("id"), idx)
                         continue

@@ -27,7 +27,11 @@ def usage_dict(response) -> dict:
 
 
 def response_to_internal_output(response) -> InternalOutputMessage:
-    choice = response.choices[0]
+    choices = getattr(response, "choices", None) or []
+    if not choices:
+        # 个别上游在内容过滤/异常时返回空 choices，直接下标会得到 500 IndexError。
+        raise ValueError("Upstream returned an empty choices list")
+    choice = choices[0]
     message = getattr(choice, "message", {})
     content = strip_think_tags(attr(message, "content", "") or "")
     reasoning = attr(message, "reasoning_content", None) or ""
@@ -105,4 +109,7 @@ def tool_arguments_to_input(arguments: str):
     try:
         return json.loads(arguments) if arguments else {}
     except json.JSONDecodeError:
+        # 模型产出的参数不可解析时降级为空对象，但必须留痕，否则客户端拿到缺参的
+        # 工具调用且无从排查。
+        _tool_log.warning("[output_adapter] tool arguments not valid JSON, replaced with {} (chars=%d)", len(arguments or ""))
         return {}

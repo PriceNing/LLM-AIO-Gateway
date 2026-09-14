@@ -74,7 +74,12 @@ def _migrate_provider_options_and_headers(conn: sqlite3.Connection) -> None:
     except sqlite3.OperationalError:
         pass
     columns = {row[1] for row in conn.execute("PRAGMA table_info(providers)").fetchall()}
-    legacy_column = "extra_headers" if "extra_headers" in columns else "'{}'"
+    if "extra_headers" not in columns:
+        # 旧列已删除 = 迁移已完成。绝不能每次启动都重新推导，否则管理员
+        # 有意清空的 provider_options/upstream_headers 会被旧列或 deepseek
+        # 默认值悄悄恢复（非幂等迁移覆盖用户配置）。
+        return
+    legacy_column = "extra_headers"
     rows = conn.execute(
         f"SELECT id, name, {legacy_column}, provider_options, upstream_headers FROM providers"
     ).fetchall()
@@ -95,6 +100,11 @@ def _migrate_provider_options_and_headers(conn: sqlite3.Connection) -> None:
                 "UPDATE providers SET provider_options = ?, upstream_headers = ? WHERE id = ?",
                 (json.dumps(options, ensure_ascii=False), json.dumps(headers, ensure_ascii=False), pid),
             )
+    # 迁移完成后删除旧列，保证后续启动不再重新推导（SQLite >= 3.35 支持 DROP COLUMN）。
+    try:
+        conn.execute("ALTER TABLE providers DROP COLUMN extra_headers")
+    except sqlite3.OperationalError:
+        pass
 
 
 def _migrate_provider_request_options(conn: sqlite3.Connection) -> None:
@@ -328,9 +338,14 @@ def run_storage_maintenance() -> dict:
 
     以前每写一条请求日志就同步执行一次 trim，把全表扫描式删除放到了写路径上
     （P7）；同时 ``request_records`` 没有任何保留策略（Q4）。两者统一交给
-    后台周期任务处理。
+    后台周期任务处理。删除按小批次分事务提交，避免长写事务持锁期间
+    阻塞事件循环上的其他写入（SQLite 单写者 + busy timeout 10s）。
     """
-    keep = max(1, int(get_default("request_log_max", 200)))
+    try:
+        keep = int(get_default("request_log_max", 200))
+    except (TypeError, ValueError):
+        keep = 200
+    # keep <= 0 视为禁用裁剪（而不是强制保留 1 条）；trim 内部对 <=0 直接返回。
     trimmed = trim_request_logs(keep)
     retention_days = 30
     try:
@@ -371,11 +386,13 @@ def get_db():
     try:
         yield conn
         conn.commit()
-    except Exception:
+    except Exception as exc:
         with suppress(Exception):
             conn.rollback()
-        # 连接可能已失效（文件被替换/线程退出），丢弃后下次重建。
-        _drop_thread_connection()
+        # 仅在连接本身可能已失效（文件被替换/磁盘错误）时丢弃重建；
+        # 业务异常（如 ValueError("Admin already exists")）不必付出重建开销。
+        if isinstance(exc, sqlite3.Error):
+            _drop_thread_connection()
         raise
     finally:
         _thread_local.depth = 0
@@ -726,11 +743,13 @@ def add_admin(username: str, password_hash: str, display_name: str = "") -> dict
 
 def update_admin_password(username: str, password_hash: str) -> bool:
     with get_db() as db:
-        db.execute(
+        cursor = db.execute(
             "UPDATE admins SET password_hash = ? WHERE username = ?",
             (password_hash, username)
         )
-        return db.total_changes > 0
+        # total_changes 是连接生命周期累计值（连接按线程复用），恒为 True；
+        # 必须用本次语句的 rowcount 判断是否真的更新了行。
+        return cursor.rowcount > 0
 
 
 # -- Users --
@@ -912,13 +931,6 @@ def add_request_record(
             ),
         )
 
-
-_HISTORY_GRANULARITY = {
-    "hour":  "%Y-%m-%d %H:00",
-    "day":   "%Y-%m-%d",
-    "week":  "%Y-%W",
-    "month": "%Y-%m",
-}
 
 _HISTORY_DELTA = {"hour": timedelta(hours=1), "day": timedelta(days=1),
                    "week": timedelta(weeks=1), "month": timedelta(days=31)}
@@ -1119,10 +1131,22 @@ def get_history_stats(from_ts: str, to_ts: str, granularity: str = "day") -> dic
 
 
 def delete_request_records_before(ts: str) -> int:
-    """Delete request records older than ts. Returns number of deleted rows."""
-    with get_db() as db:
-        cursor = db.execute("DELETE FROM request_records WHERE timestamp < ?", (ts,))
-        return cursor.rowcount
+    """Delete request records older than ts. Returns number of deleted rows.
+
+    分批删除，每批独立事务提交，避免长写事务阻塞事件循环上的其他写入。
+    """
+    deleted = 0
+    while True:
+        with get_db() as db:
+            cursor = db.execute(
+                "DELETE FROM request_records WHERE rowid IN ("
+                "SELECT rowid FROM request_records WHERE timestamp < ? LIMIT 500)",
+                (ts,),
+            )
+            batch = cursor.rowcount
+        deleted += max(0, batch)
+        if batch < 500:
+            return deleted
 
 
 def increment_user_usage(username: str, api_key_value: str, success: bool, tokens: int = 0) -> None:
@@ -1571,16 +1595,21 @@ def update_provider(provider_id: str, updates: dict) -> Optional[dict]:
             existing_ids = {m["model_id"] for m in db.execute("SELECT model_id FROM provider_models WHERE provider_id = ?", (provider_id,)).fetchall()}
             for m in updates["models"]:
                 if m["id"] in existing_ids:
-                    if "image_generation" in m:
-                        db.execute(
-                            "UPDATE provider_models SET model_name = ?, enabled = ?, preprocessor = ?, image_generation = ? WHERE provider_id = ? AND model_id = ?",
-                            (m.get("name", m["id"]), 1 if m.get("enabled", True) else 0, m.get("preprocessor", ""), "1" if m.get("image_generation") else "", provider_id, m["id"])
-                        )
-                    else:
-                        db.execute(
-                            "UPDATE provider_models SET model_name = ?, enabled = ?, preprocessor = ? WHERE provider_id = ? AND model_id = ?",
-                            (m.get("name", m["id"]), 1 if m.get("enabled", True) else 0, m.get("preprocessor", ""), provider_id, m["id"])
-                        )
+                    # preprocessor / image_generation 是管理员在专门端点配置的标记，
+                    # 载荷里没带（或为 None，如经 Pydantic ModelInfo 剥离）时绝不能覆写，
+                    # 否则保存 provider 会静默清空所有模型的配置。
+                    sets = ["model_name = ?", "enabled = ?"]
+                    params: list = [m.get("name", m["id"]), 1 if m.get("enabled", True) else 0]
+                    if m.get("preprocessor") is not None:
+                        sets.append("preprocessor = ?")
+                        params.append(m.get("preprocessor") or "")
+                    if m.get("image_generation") is not None:
+                        sets.append("image_generation = ?")
+                        params.append("1" if m.get("image_generation") else "")
+                    db.execute(
+                        f"UPDATE provider_models SET {', '.join(sets)} WHERE provider_id = ? AND model_id = ?",
+                        (*params, provider_id, m["id"]),
+                    )
                 else:
                     db.execute(
                         "INSERT OR IGNORE INTO provider_models (provider_id, model_id, model_name, enabled, preprocessor, image_generation) VALUES (?, ?, ?, ?, ?, ?)",

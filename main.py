@@ -89,6 +89,13 @@ async def lifespan(app: FastAPI):
                 logger.debug("[storage.maintenance] %s", result)
             except Exception as exc:
                 logger.warning("[storage.maintenance] failed: %s", exc)
+            try:
+                # 日志保留清理也要周期性执行，否则长驻进程只在启动时清一次，
+                # logs/ 会无限增长。
+                from app.services.logger import cleanup_old_logs
+                await asyncio.to_thread(cleanup_old_logs)
+            except Exception as exc:
+                logger.warning("[storage.maintenance] log cleanup failed: %s", exc)
 
     maintenance_task = asyncio.create_task(_maintenance_loop())
     try:

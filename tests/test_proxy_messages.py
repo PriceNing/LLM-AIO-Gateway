@@ -639,8 +639,9 @@ def test_responses_input_ir_preserves_function_call_reasoning():
     assert result[1].get("reasoning_content") == "Need to search"
 
 
-def test_responses_input_ir_treats_assistant_text_before_function_call_as_reasoning():
-    """Test behavior."""
+def test_responses_input_ir_keeps_assistant_text_before_function_call_as_content():
+    """function_call 前的 assistant 可见正文必须保留为 content，
+    改写成 reasoning_content 会在多数 OpenAI 兼容上游丢失正文。"""
     result = ir_to_openai_messages(responses_input_to_ir([
         {"type": "message", "role": "user", "content": "Search"},
         {"type": "message", "role": "assistant", "content": "Let me check."},
@@ -649,8 +650,8 @@ def test_responses_input_ir_treats_assistant_text_before_function_call_as_reason
     assert len(result) == 2
     assert result[1]["role"] == "assistant"
     assert result[1]["tool_calls"][0]["id"] == "c1"
-    assert result[1]["content"] is None
-    assert result[1]["reasoning_content"] == "Let me check."
+    assert result[1]["content"] == "Let me check."
+    assert result[1].get("reasoning_content") is None
 
 
 def test_responses_input_ir_backfills_function_call_output_reasoning_to_assistant():

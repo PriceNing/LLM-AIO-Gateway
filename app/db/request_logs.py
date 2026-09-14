@@ -209,17 +209,24 @@ def clear_request_logs(get_db):
 def trim_request_logs(get_db, keep):
     if not keep or keep <= 0:
         return 0
-    with get_db() as db:
-        cursor = db.execute(
-            """
-            DELETE FROM request_logs
-            WHERE id NOT IN (
-                SELECT id FROM request_logs ORDER BY id DESC LIMIT ?
+    # 分批删除，每批独立事务提交，避免一次性全表扫描式长写事务
+    # 持锁阻塞事件循环上的其他写入。
+    deleted = 0
+    while True:
+        with get_db() as db:
+            cursor = db.execute(
+                """
+                DELETE FROM request_logs
+                WHERE id IN (
+                    SELECT id FROM request_logs ORDER BY id DESC LIMIT 500 OFFSET ?
+                )
+                """,
+                (int(keep),),
             )
-            """,
-            (int(keep),),
-        )
-        return cursor.rowcount
+            batch = cursor.rowcount
+        deleted += max(0, batch)
+        if batch < 500:
+            return deleted
 
 
 def _decode_request_log(entry):

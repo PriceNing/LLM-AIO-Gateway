@@ -27,11 +27,15 @@ class RequestBodyTooLarge(Exception):
 
 
 def max_request_body_bytes() -> int:
-    """Resolve the configured limit, clamped to a sane range."""
+    """Resolve the configured limit; <=0 disables the cap entirely."""
     try:
         configured = int(get_default("max_request_body_bytes", DEFAULT_MAX_REQUEST_BODY_BYTES))
     except (TypeError, ValueError):
         configured = DEFAULT_MAX_REQUEST_BODY_BYTES
+    if configured <= 0:
+        # 0/负数 = 显式禁用限制；以前的 max(1024, x) 会把它变成 1KB 上限，
+        # 导致所有 POST 全部 413，与用户意图相反。
+        return 0
     return max(1024, configured)
 
 
@@ -72,6 +76,9 @@ class RequestBodyLimitMiddleware:
             return
 
         limit = max_request_body_bytes()
+        if limit <= 0:
+            await self.app(scope, receive, send)
+            return
         declared = _declared_length(scope)
         if declared is not None and declared > limit:
             await _oversized_response(limit)(scope, receive, send)

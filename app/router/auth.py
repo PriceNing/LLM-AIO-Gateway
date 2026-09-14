@@ -48,9 +48,15 @@ async def auth_status():
 
 @router.post("/setup")
 async def setup_admin(payload: dict):
-    username = payload.get("username", "").strip()
-    password = payload.get("password", "")
-    display_name = payload.get("display_name", username)
+    username = payload.get("username")
+    password = payload.get("password")
+    # JSON 传 null/数字时 .strip()/.encode() 会抛 AttributeError → 500，先做类型校验。
+    if not isinstance(username, str) or not isinstance(password, str):
+        raise HTTPException(status_code=400, detail="username and password must be strings")
+    username = username.strip()
+    display_name = payload.get("display_name")
+    if not isinstance(display_name, str) or not display_name:
+        display_name = username
     if not username or not password:
         raise HTTPException(status_code=400, detail="username and password are required")
     # 先在线程里算 PBKDF2，再把“检查 + 写入”放进同一把锁，避免两个并发
@@ -66,8 +72,11 @@ async def setup_admin(payload: dict):
 
 @router.post("/login")
 async def login(payload: dict, request: Request):
-    username = payload.get("username", "").strip()
-    password = payload.get("password", "")
+    username = payload.get("username")
+    password = payload.get("password")
+    if not isinstance(username, str) or not isinstance(password, str):
+        raise HTTPException(status_code=400, detail="username and password must be strings")
+    username = username.strip()
     client_host = request.client.host if request.client else "unknown"
     identity = f"{client_host}\0{username.casefold()}"
     retry_after = login_retry_after(identity)
@@ -107,8 +116,10 @@ async def logout(authorization: Optional[str] = Header(None)):
 @router.put("/password")
 async def change_password(payload: dict, authorization: Optional[str] = Header(None)):
     username = await require_admin_session(authorization)
-    current_password = payload.get("current_password", "")
-    new_password = payload.get("new_password", "")
+    current_password = payload.get("current_password")
+    new_password = payload.get("new_password")
+    if not isinstance(current_password, str) or not isinstance(new_password, str):
+        raise HTTPException(status_code=400, detail="current_password and new_password must be strings")
     if not current_password or not new_password:
         raise HTTPException(status_code=400, detail="current_password and new_password are required")
     if len(new_password) < 6:

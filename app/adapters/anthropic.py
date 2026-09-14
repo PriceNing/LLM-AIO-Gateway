@@ -219,6 +219,9 @@ def _anthropic_response_to_internal(data: dict) -> InternalOutputMessage:
             "prompt_tokens": input_tokens,
             "completion_tokens": output_tokens,
             "total_tokens": input_tokens + output_tokens,
+            # 与 OpenAI 路径同名，保证缓存命中统计跨协议口径一致。
+            "prompt_cache_hit_tokens": usage.get("cache_read_input_tokens", 0) or 0,
+            "prompt_cache_miss_tokens": usage.get("cache_creation_input_tokens", 0) or 0,
         },
         raw=data,
     )

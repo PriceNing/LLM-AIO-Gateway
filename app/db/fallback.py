@@ -33,6 +33,12 @@ def json_loads(value: str, fallback):
 
 def json_dumps(value, fallback) -> str:
     if isinstance(value, str):
+        # 字符串直接存库前必须确认是合法 JSON，否则非 JSON 文本会被原样写入，
+        # 读取端只能靠兜底降级，配置静默失真。
+        try:
+            json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"expected a JSON string, got non-JSON text: {exc}") from exc
         return value
     if value is None:
         value = fallback

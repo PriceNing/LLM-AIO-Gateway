@@ -56,6 +56,8 @@ async def iter_anthropic_output_events(
     block_states: dict[int, dict] = {}
     input_tokens = 0
     output_tokens = 0
+    cache_hit_tokens = 0
+    cache_miss_tokens = 0
     finish_reason = "stop"
     provider_id = provider_info.get("id", "")
 
@@ -75,6 +77,9 @@ async def iter_anthropic_output_events(
     try:
         async with shared_client(provider_info.get("api_base") or "", timeout) as client:
             for attempt in range(retries + 1):
+                # 只要已向下游 yield 过任何事件，就绝不允许重试：重新请求会把已输出
+                # 的文本/工具参数再发一遍，造成客户端内容重复。重试仅限首字节前失败。
+                emitted = False
                 try:
                     async for event in _iter_anthropic_stream_once(
                         client=client,
@@ -87,19 +92,24 @@ async def iter_anthropic_output_events(
                         if event.kind == "usage" and event.usage:
                             input_tokens = _usage_value(event.usage, input_tokens, "input_tokens", "prompt_tokens")
                             output_tokens = _usage_value(event.usage, output_tokens, "output_tokens", "completion_tokens")
+                            cache_hit_tokens = _usage_value(event.usage, cache_hit_tokens, "prompt_cache_hit_tokens")
+                            cache_miss_tokens = _usage_value(event.usage, cache_miss_tokens, "prompt_cache_miss_tokens")
                         if event.kind == "message_done":
                             finish_reason = event.finish_reason or finish_reason
                             continue
+                        emitted = True
                         yield event
                     break
                 except HTTPException as exc:
                     status_code = getattr(exc, "status_code", 0)
-                    if attempt < retries and _is_retryable_status(status_code):
+                    if not emitted and attempt < retries and _is_retryable_status(status_code):
+                        block_states.clear()
                         await asyncio.sleep(backoff * (2 ** attempt))
                         continue
                     raise
                 except (httpx.TimeoutException, httpx.TransportError):
-                    if attempt < retries:
+                    if not emitted and attempt < retries:
+                        block_states.clear()
                         await asyncio.sleep(backoff * (2 ** attempt))
                         continue
                     raise
@@ -120,10 +130,17 @@ async def iter_anthropic_output_events(
         output_tokens,
         len(block_states),
     )
-    yield InternalOutputEvent(
-        kind="usage",
-        usage={"input_tokens": input_tokens, "output_tokens": output_tokens, "total_tokens": input_tokens + output_tokens},
-    )
+    final_usage = {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+    }
+    # 与 OpenAI 路径保持同名字段；为零时不携带，避免破坏对 usage 的精确断言。
+    if cache_hit_tokens:
+        final_usage["prompt_cache_hit_tokens"] = cache_hit_tokens
+    if cache_miss_tokens:
+        final_usage["prompt_cache_miss_tokens"] = cache_miss_tokens
+    yield InternalOutputEvent(kind="usage", usage=final_usage)
     yield InternalOutputEvent(kind="message_done", finish_reason=finish_reason)
 
 
@@ -138,7 +155,11 @@ async def _iter_anthropic_stream_once(
 ):
     input_tokens = 0
     output_tokens = 0
+    cache_creation = 0
+    cache_read = 0
     finish_reason = "stop"
+    saw_message_delta = False
+    saw_message_stop = False
     async with client.stream(
         "POST",
         _anthropic_message_url(provider_info.get("api_base") or ""),
@@ -182,6 +203,8 @@ async def _iter_anthropic_stream_once(
             if event_type == "message_start":
                 usage = data.get("message", {}).get("usage", {}) or data.get("usage", {}) or {}
                 input_tokens = _usage_value(usage, input_tokens, "input_tokens", "prompt_tokens")
+                cache_creation = _usage_value(usage, cache_creation, "cache_creation_input_tokens")
+                cache_read = _usage_value(usage, cache_read, "cache_read_input_tokens")
                 _app_log.debug("[anthropic_stream_adapter] message_start input_tokens=%d", input_tokens)
                 yield InternalOutputEvent(kind="message_start", role="assistant", raw=data)
             elif event_type == "content_block_start":
@@ -291,9 +314,12 @@ async def _iter_anthropic_stream_once(
                     finish_reason = "length"
                 elif stop_reason:
                     finish_reason = "stop"
+                saw_message_delta = True
                 usage = data.get("usage", {}) or {}
                 input_tokens = _usage_value(usage, input_tokens, "input_tokens", "prompt_tokens")
                 output_tokens = _usage_value(usage, output_tokens, "output_tokens", "completion_tokens")
+                cache_creation = _usage_value(usage, cache_creation, "cache_creation_input_tokens")
+                cache_read = _usage_value(usage, cache_read, "cache_read_input_tokens")
                 _app_log.debug(
                     "[anthropic_stream_adapter] message_delta stop_reason=%s finish_reason=%s input_tokens=%d output_tokens=%d",
                     stop_reason,
@@ -301,15 +327,21 @@ async def _iter_anthropic_stream_once(
                     input_tokens,
                     output_tokens,
                 )
-                yield InternalOutputEvent(
-                    kind="usage",
-                    usage={
-                        "input_tokens": input_tokens,
-                        "output_tokens": output_tokens,
-                        "total_tokens": input_tokens + output_tokens,
-                    },
-                    raw=data,
-                )
+                usage_payload = {
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "total_tokens": input_tokens + output_tokens,
+                }
+                if cache_read:
+                    usage_payload["prompt_cache_hit_tokens"] = cache_read
+                if cache_creation:
+                    usage_payload["prompt_cache_miss_tokens"] = cache_creation
+                yield InternalOutputEvent(kind="usage", usage=usage_payload, raw=data)
             elif event_type == "message_stop":
+                saw_message_stop = True
                 break
+    if not saw_message_delta and not saw_message_stop:
+        # 上游既没发 message_delta 也没发 message_stop 就关闭了连接：内容被截断，
+        # 不能伪装成 finish_reason=stop 的正常结束。
+        raise HTTPException(status_code=502, detail="Upstream: anthropic stream closed before message completion")
     yield InternalOutputEvent(kind="message_done", finish_reason=finish_reason)

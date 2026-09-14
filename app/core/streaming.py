@@ -113,6 +113,7 @@ async def stream_internal_output(
     final_model = model
     final_provider_id = provider_id or ""
     visible_output_started = False
+    saw_message_done = False
     stream_details: dict[str, Any] = {"stream": True, "fallback_status": "unused"}
     if base_details:
         stream_details.update(base_details)
@@ -138,7 +139,7 @@ async def stream_internal_output(
     async def metered_events():
         nonlocal total_tokens, final_model, final_provider_id, visible_output_started, stream_details
         nonlocal streamed_text_parts, streamed_reasoning_parts, streamed_tool_calls, current_tool, streamed_usage
-        nonlocal first_output_at
+        nonlocal first_output_at, saw_message_done
         async for event in record_streaming_events(
             events,
             conv_key=conv_key,
@@ -220,6 +221,7 @@ async def stream_internal_output(
                 streamed_tool_calls.append(current_tool)
                 current_tool = None
             elif event.kind == "message_done":
+                saw_message_done = True
                 visible_output_started = True
                 if first_output_at is None:
                     first_output_at = time.monotonic()
@@ -236,7 +238,11 @@ async def stream_internal_output(
 
     try:
         if endpoint == "chat_completions":
-            async for line in render_chat_completions_sse(upstream_events, model=model):
+            async for line in render_chat_completions_sse(
+                upstream_events,
+                model=model,
+                include_usage=bool((render_extra or {}).get("include_usage")),
+            ):
                 yield line
         elif endpoint == "completions":
             async for line in render_completions_sse(upstream_events, model=model):
@@ -305,7 +311,14 @@ async def stream_internal_output(
         )
     except BaseException as exc:
         if is_client_disconnect_error(exc):
-            closed_after_output = bool(streamed_tool_calls)
+            # 口径与 native 路径的 completed_output_item 对齐：
+            # - 已流完的工具调用（tool_call_done）= 完成回合（Codex 会在工具项
+            #   完成后主动关闭 SSE 再发后续请求），记成功；
+            # - 收到 message_done 且已有文本产出 = 响应已完整，记成功；
+            # - 只有部分文本、未完成回合 = 取消。
+            closed_after_output = bool(streamed_tool_calls) or bool(
+                saw_message_done and (streamed_text_parts or streamed_reasoning_parts)
+            )
             logged_model = str(final_model or model or "-")
             logged_provider = str(final_provider_id or provider_id or "")
             if closed_after_output:
@@ -408,6 +421,8 @@ async def stream_internal_output(
                 )
                 increment_global_stats(False, cancelled=True)
                 if username != "legacy":
+                    # 有意为之：取消不计费用户 token（请求日志仍记录 tokens 供审计），
+                    # 与 fail 路径保持同一口径。
                     increment_user_usage(username, api_key_value, False, 0)
             if tool_only_turns is not None and conv_key:
                 tool_only_turns.reset(conv_key)
@@ -488,7 +503,7 @@ async def stream_internal_output(
         if tool_only_turns is not None and conv_key:
             tool_only_turns.reset(conv_key)
         if endpoint == "responses":
-            async for line in render_responses_error_sse(model=model, message=error_msg, previous_response_id=previous_response_id):
+            async for line in render_responses_error_sse(model=model, message=error_msg, previous_response_id=previous_response_id, response_id=response_id):
                 yield line
         elif endpoint == "messages":
             yield f"event: error\ndata: {json.dumps({'type': 'error', 'error': {'type': 'server_error', 'message': error_msg}})}\n\n"

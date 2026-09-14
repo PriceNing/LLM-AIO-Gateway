@@ -137,7 +137,11 @@ async def get_shared_client(base_url: str, timeout: float) -> httpx.AsyncClient:
 
 
 async def aclose_shared_clients() -> None:
-    """Close every pooled client. Called from the application lifespan shutdown."""
+    """Close every pooled client. Called from the application lifespan shutdown.
+
+    注意：这里有意不检查 in_use——进程即将退出，在飞请求无论如何都会终止；
+    "在飞客户端绝不关闭"的不变量仅适用于运行期间的驱逐/重建路径。
+    """
     async with _lock:
         clients = [entry.client for entry in _entries.values()]
         _entries.clear()

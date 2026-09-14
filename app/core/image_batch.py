@@ -87,7 +87,14 @@ class ImageInvocationCache:
                 self._entries.pop(claim.key, None)
             if not claim.future.done():
                 if isinstance(exc, asyncio.CancelledError):
-                    claim.future.cancel()
+                    # 不能 cancel()：concurrent.futures.CancelledError 与
+                    # asyncio.CancelledError 是同一个类，等待者在线程里调
+                    # future.result() 时会被 anyio 当成"自己的任务被取消"，
+                    # 导致连接正常的等待者无端失败。改用普通异常，让等待者
+                    # 拿到可处理的错误（缓存条目已移除，重试可重新发起）。
+                    claim.future.set_exception(
+                        RuntimeError("image generation owner was cancelled; retry the request")
+                    )
                 else:
                     claim.future.set_exception(exc)
 

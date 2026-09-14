@@ -116,7 +116,13 @@ def stats_counters_for_status(status: str) -> OutcomeCounters:
 
 
 def is_client_disconnect_error(exc: BaseException) -> bool:
-    """Detect client-gone errors from Starlette/anyio/asyncio transport layers."""
+    """Detect client-gone errors from Starlette/anyio/asyncio transport layers.
+
+    只信任异常类型/来源，不对任意异常做宽泛文本匹配：
+    "connection reset" / "remote protocol error" 等文本同样出现在**上游**
+    httpx/httpcore 错误里，误判会把 fallback 耗尽后的上游异常当成
+    "客户端断开"吞掉：不发 error 帧、不发 [DONE]、统计记成 cancelled。
+    """
     if isinstance(exc, GeneratorExit):
         return True
     try:
@@ -127,22 +133,31 @@ def is_client_disconnect_error(exc: BaseException) -> bool:
     except Exception:
         pass
 
+    # 经 fallback 链抛出的上游错误带有 request_details，绝不是客户端断开。
+    if isinstance(getattr(exc, "request_details", None), dict):
+        return False
+
+    module = getattr(type(exc), "__module__", "") or ""
+    # httpx/httpcore 异常永远是上游侧错误（即使文本里含 reset/broken pipe）。
+    if module.split(".")[0] in {"httpx", "httpcore"}:
+        return False
+
     name = type(exc).__name__
     if name in {"ClientDisconnect", "CancelledError", "BrokenResourceError", "ClosedResourceError"}:
         return True
 
-    module = getattr(type(exc), "__module__", "") or ""
     if "starlette" in module and "disconnect" in name.lower():
         return True
 
+    # 写客户端 socket 失败时 uvicorn/事件循环抛的是内置连接错误。
+    if isinstance(exc, (ConnectionResetError, BrokenPipeError, ConnectionAbortedError)):
+        return True
+
+    # 仅保留明确指向客户端的文本标记，不再匹配通用网络错误文本。
     text = str(exc).lower()
     markers = (
         "client disconnected",
-        "connection reset",
-        "broken pipe",
-        "connection closed",
         "client has disconnected",
-        "remote protocol error",
     )
     return any(marker in text for marker in markers)
 

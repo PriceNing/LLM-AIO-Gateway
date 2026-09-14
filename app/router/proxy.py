@@ -426,7 +426,15 @@ async def _generate_and_store_cached(
             image_invocation_cache.reject(claim, exc)
             raise
 
-    cached = await anyio.to_thread.run_sync(claim.future.result)
+    # 等待者不能无限阻塞在 future.result() 上：图像批次上限可达 2400s，
+    # 多个等待者会长期占用 anyio 线程池。超时后失效幂等键并报错，
+    # 客户端重试可重新发起。
+    wait_timeout = float(get_default("image_generation_batch_timeout_seconds", 2400)) + 60
+    try:
+        cached = await anyio.to_thread.run_sync(partial(claim.future.result, timeout=wait_timeout))
+    except TimeoutError:
+        image_invocation_cache.invalidate(cache_key)
+        raise RuntimeError(f"image generation wait timed out after {int(wait_timeout)}s")
     if not all(item.path.is_file() for item in cached.stored):
         image_invocation_cache.invalidate(cache_key)
         return await _generate_and_store_cached(
@@ -509,7 +517,7 @@ async def _execute_image_invocations(
                 "[responses image_generation.item_done] batch=%s index=%d total=%d status=success attempts=%d reused=%s duration_ms=%d bytes=%d",
                 batch_id, index + 1, len(invocations), outcome.backend_attempts,
                 str(reused).lower(), outcome.duration_ms,
-                sum(item.path.stat().st_size for item in outcome.stored),
+                _stored_image_bytes(outcome.stored),
             )
         except Exception as exc:
             outcome = _ImageInvocationOutcome(
@@ -1055,6 +1063,17 @@ def _responses_incomplete_tool_history(body: dict | None) -> bool:
     return "unpaired_tool_call" in _native_cross_provider_incompatible_reasons(body)
 
 
+def _stored_image_bytes(items) -> int:
+    """日志统计用的字节数；文件被后台清理任务删除不能影响已成功的结果判定。"""
+    total = 0
+    for item in items or []:
+        try:
+            total += item.path.stat().st_size
+        except OSError:
+            pass
+    return total
+
+
 def _incomplete_tool_history_http_error(exc: Exception | None = None) -> HTTPException:
     error = HTTPException(
         status_code=400,
@@ -1090,6 +1109,7 @@ async def _native_responses_stream_with_accounting(events, *, username, api_key_
     terminal_error = None
     stream_started_at = time.monotonic()
     first_output_at = None
+    client_disconnected = False
     try:
         async for frame in iter_sse_frames(events):
             payload = sse_payload(frame)
@@ -1135,7 +1155,6 @@ async def _native_responses_stream_with_accounting(events, *, username, api_key_
     finally:
         usage = (response_body or {}).get("usage") or {}
         tokens = usage.get("total_tokens") or 0
-        client_disconnected = locals().get("client_disconnected", False)
         # Codex closes the SSE after a completed tool/message item and then
         # continues with a follow-up request. That is a finished turn, not a
         # user cancel.
@@ -1172,7 +1191,6 @@ async def _native_responses_stream_with_accounting(events, *, username, api_key_
             partial_output=bool(not closed_after_output and saw_output and (failed or not response_body)),
         )
         _attach_stream_performance(details, usage, first_output_at, stream_started_at)
-        _log_request(username, api_key_value, model, provider_id, "responses", success, tokens, requested_model, details=details)
         status = details.get("status", "ok" if success else "fail")
         if success:
             error_text = ""
@@ -1184,26 +1202,36 @@ async def _native_responses_stream_with_accounting(events, *, username, api_key_
             error_text = "native Responses stream ended after client-visible output without a completed event"
         else:
             error_text = "native Responses stream did not complete"
-        _record_request_log(
-            endpoint="responses",
-            username=username,
-            api_key_value=api_key_value,
-            requested_model=requested_model,
-            final_model=model,
-            final_provider=provider_id,
-            request_body=request_body,
-            response_body=response_body,
-            success=success,
-            status=status,
-            tokens=tokens,
-            usage=usage,
-            details=details,
-            error_message=error_text,
-            stream=True,
-            request_started_at=stream_started_at,
-            generation_started_at=first_output_at or stream_started_at,
-        )
-        _record_success_metrics(username, api_key_value, tokens, status)
+
+        def _accounting():
+            # 记账是每请求最重的同步写入（全量 request_body 的 json.dumps +
+            # SQLite 写），必须离开事件循环，与 streaming.py 的 P1 优化同口径。
+            _log_request(username, api_key_value, model, provider_id, "responses", success, tokens, requested_model, details=details)
+            _record_request_log(
+                endpoint="responses",
+                username=username,
+                api_key_value=api_key_value,
+                requested_model=requested_model,
+                final_model=model,
+                final_provider=provider_id,
+                request_body=request_body,
+                response_body=response_body,
+                success=success,
+                status=status,
+                tokens=tokens,
+                usage=usage,
+                details=details,
+                error_message=error_text,
+                stream=True,
+                request_started_at=stream_started_at,
+                generation_started_at=first_output_at or stream_started_at,
+            )
+            _record_success_metrics(username, api_key_value, tokens, status)
+
+        try:
+            await anyio.to_thread.run_sync(_accounting)
+        except Exception as accounting_exc:
+            _app_log.warning("[responses native accounting] failed: %s", accounting_exc)
 
 
 def _responses_capability_is_fresh(capability: dict | None) -> bool:
@@ -1373,26 +1401,6 @@ async def _native_capability_for_request(provider: dict | None, model: str) -> b
     return await _probe_model_responses_capability(provider, model)
 
 
-async def _wait_for_native_response_event(events) -> bytes:
-    """Buffer initial SSE keepalives until an actual Responses lifecycle event."""
-    buffered = b""
-    while True:
-        chunk = await events.__anext__()
-        buffered += chunk
-        while (split := split_sse_frame(buffered)) is not None:
-            frame, _rest = split
-            for line in frame.splitlines():
-                if not line.startswith(b"data:"):
-                    continue
-                try:
-                    payload = json.loads(line[5:].lstrip().decode("utf-8"))
-                except (UnicodeDecodeError, json.JSONDecodeError):
-                    continue
-                if str(payload.get("type") or "").startswith("response."):
-                    return buffered
-            buffered = _rest
-
-
 async def _wait_for_native_response_output(events) -> bytes:
     """Buffer native SSE until usable output, rejecting empty completion before fallback."""
     buffered = b""
@@ -1477,7 +1485,13 @@ async def _native_response_with_fallbacks(internal, *, stream: bool, required_to
                 # Do not yield until the first chunk: this preserves the existing
                 # stream fallback invariant.
                 events = stream_native_response(provider, attempt)
-                first = await _wait_for_native_response_output(events)
+                try:
+                    first = await _wait_for_native_response_output(events)
+                except BaseException:
+                    # 首字节判定失败时生成器挂起在 yield 处，内部 async with
+                    # 持有上游连接；不显式关闭就只能等 GC（S5 不变量）。
+                    await aclose_async_iterator(events)
+                    raise
                 async def prefixed():
                     yield first
                     async for chunk in events:
@@ -1794,7 +1808,11 @@ async def _call_nonstream_target(target: RouteTarget, internal, *, temperature, 
                 temperature=temperature,
                 max_tokens=max_tokens,
                 **chat_kwargs_from_internal(internal),
-            )
+            ),
+            # attempt_timeout 到期取消时必须立即返回，不能等线程跑完；否则
+            # 上游挂死时"主动超时→fallback"要等到 litellm 自身超时才触发。
+            # 被 abandon 的线程由 litellm 自己的 request_timeout 兜底回收。
+            abandon_on_cancel=True,
         )
         output = response_to_internal_output(response)
     _attach_output_request_details(
@@ -3191,6 +3209,7 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
                     remember_reasoning_content=_remember_reasoning_content,
                     tool_only_turns=_tool_only_turns,
                     base_details={**routing_details_from_policy(policy), **_thinking_fields_from_payload(body)},
+                    render_extra={"include_usage": bool((body.get("stream_options") or {}).get("include_usage"))},
                 ),
                 media_type="text/event-stream"
             )
@@ -3347,6 +3366,10 @@ async def completions(request: Request, authorization: Optional[str] = Header(No
         )
         _record_success_metrics(username, api_key_value, tokens, status)
         return rendered
+    except HTTPException:
+        # 适配器把上游状态映射为 HTTPException（429/502 等），必须保留状态码
+        # 语义透传，不能压成 500，否则客户端无法正确退避；与 chat 端点一致。
+        raise
     except Exception as e:
         details = _request_details_from_exception(
             e,
@@ -3483,6 +3506,9 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
         )
         _record_success_metrics(username, api_key_value, tokens, status)
         return rendered
+    except HTTPException:
+        # 保留 anthropic 适配器映射的上游状态码（429/502 等），与 chat 端点一致。
+        raise
     except Exception as e:
         details = _request_details_from_exception(
             e,
@@ -3619,13 +3645,39 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
         if not image_enabled:
             raise HTTPException(status_code=403, detail="Image generation is not enabled for the requested model")
         prompt = _responses_image_prompt(input_data, instructions)
-        image_results, generator = await _generate_with_configured_backend(prompt, {
-            "n": image_tool.get("n") or body.get("n"),
-            "size": image_tool.get("size") or body.get("size"),
-            "quality": image_tool.get("quality") or body.get("quality"),
-            "background": image_tool.get("background") or body.get("background"),
-            "output_format": image_tool.get("output_format") or body.get("output_format"),
-        })
+        try:
+            image_results, generator = await _generate_with_configured_backend(prompt, {
+                "n": image_tool.get("n") or body.get("n"),
+                "size": image_tool.get("size") or body.get("size"),
+                "quality": image_tool.get("quality") or body.get("quality"),
+                "background": image_tool.get("background") or body.get("background"),
+                "output_format": image_tool.get("output_format") or body.get("output_format"),
+            })
+        except Exception as exc:
+            # 显式图像生成分支在主 try 之外，失败必须自己补记统计/请求日志，
+            # 否则管理端只看到成功记录，图像成功率虚高。
+            fail_details = _request_details_from_exception(
+                exc, stream=False,
+                attempted_model=model, attempted_provider=adapter_provider_id or "",
+            )
+            fail_details = {
+                **fail_details,
+                "request_kind": "image_generation",
+                "responses_mode": "image_generation",
+                "upstream_endpoint": "images/generations",
+            }
+            _log_request(username, api_key_value, model, adapter_provider_id or "", "responses", False, 0, requested_model, details=fail_details)
+            _record_request_log(
+                endpoint="responses", username=username, api_key_value=api_key_value,
+                requested_model=requested_model, final_model=model,
+                final_provider=adapter_provider_id or "", request_body=body,
+                response_body=None, success=False, status=fail_details.get("status", "fail"),
+                tokens=0, details=fail_details, error_message=error_detail_for_log(exc),
+            )
+            increment_global_stats(success=False)
+            if username != "legacy":
+                increment_user_usage(username, api_key_value, False, 0)
+            raise
         image_provider, image_model = _image_generator_identity(generator)
         details = {**routing_details_from_policy(policy), "request_kind": "image_generation", "responses_mode": "image_generation", "upstream_endpoint": "images/generations", "image_model": image_model, "image_backend_provider": image_provider, "image_backend_model": image_model, "image_backend_type": str(generator.get("backend_type") or ""), "image_fallback_status": "unused", "image_count": len(image_results), "image_bytes": image_results_bytes(image_results)}
         if stream:
@@ -3725,7 +3777,10 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                 preprocess_request=_policy_preprocess_request,
                 conversation_cache_key=_conversation_cache_key,
                 reasoning_context=_reasoning_context if isinstance(input_data, list) else None,
+                tool_only_turns=_tool_only_turns,
+                tool_only_limit=TOOL_ONLY_LIMIT,
                 log_label="responses.image_bridge",
+                conv_key_override=conv_key,
             )
             configure_internal_image_bridge(internal, body)
             output, provider_info, adapter_provider_id = await _call_nonstream_with_fallbacks(
@@ -4323,7 +4378,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                 response_body=rendered, success=True, status=details.get("status", "ok"), tokens=tokens,
                 usage=output.usage, details=details,
             )
-            _record_success_metrics(username, api_key_value, tokens, "ok")
+            _record_success_metrics(username, api_key_value, tokens, details.get("status", "ok"))
             return rendered
 
         native_required = _responses_requires_native(body)
@@ -4422,7 +4477,10 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
             internal, username=username, api_key_value=api_key_value,
             preprocess_request=_policy_preprocess_request, conversation_cache_key=_conversation_cache_key,
             reasoning_context=_reasoning_context if isinstance(input_data, list) else None,
+            tool_only_turns=_tool_only_turns,
+            tool_only_limit=TOOL_ONLY_LIMIT,
             log_label="responses",
+            conv_key_override=conv_key,
         )
         model = internal.target_model
         provider_id = internal.provider_id

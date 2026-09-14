@@ -88,6 +88,7 @@ docker compose up -d
 | `POST /v1/messages` | Anthropic Messages | Claude Code 兼容 Messages API，支持工具、流式、图片。 |
 | `POST /v1/responses` 或 `/responses` | OpenAI Responses | Codex 兼容 Responses API，支持工具、流式、previous response ID。 |
 | `POST /v1/images/generations` 或 `/images/generations` | OpenAI Images | 将 OpenAI Images 兼容请求发送至管理员配置的全局生图后端。 |
+| `GET /v1/image-results/{token}` 或 `/image-results/{token}` | 图像结果下载 | 通过不可猜测的能力令牌下载短期保存的生图原图。 |
 | `GET /v1/models` | OpenAI Models | 返回当前 API Key 可用模型列表。 |
 
 ### Chat Completions 示例
@@ -206,6 +207,7 @@ curl http://localhost:8000/v1/responses \
 | `temperature` | 0.7 | 默认温度。 |
 | `max_request_body_bytes` | 33554432 | 入站请求体大小上限（32 MiB）；超出返回 413。 |
 | `litellm_request_timeout` | 120 | liteLLM 上游调用超时。 |
+| `same_target_retry_limit` | 1 | 同一目标首字节瞬态失败时的原地重试次数（0–3）。 |
 | `tool_only_limit` | 20 | 工具调用循环断路器阈值。 |
 | `min_image_max_tokens` | 2000 | 含图片请求的最小 max tokens。 |
 | `session_ttl_hours` | 12 | 管理员会话有效期。 |
@@ -243,6 +245,8 @@ curl http://localhost:8000/v1/responses \
 | `responses_capability_supported_ttl` | 604800 | 原生 Responses 能力探测阳性缓存 TTL。 |
 | `responses_capability_unsupported_ttl` | 21600 | 原生 Responses 能力探测阴性缓存 TTL。 |
 | `responses_capability_transient_ttl` | 300 | 原生 Responses 能力探测临时失败缓存 TTL。 |
+| `responses_capability_probe_timeout` | 8 | 原生 Responses 能力探测的请求超时（秒）。 |
+| `responses_capability_probe_max_output_tokens` | 16 | 原生 Responses 能力探测请求的 max_output_tokens。 |
 | `anthropic_thinking_budget_tokens` | 1024 | Anthropic thinking 模式预算。 |
 
 ## 安全与限流
@@ -307,7 +311,7 @@ OpenAI 兼容提供商默认走 Chat Completions；仅在原生 Responses 能力
 pytest tests/ -q
 ```
 
-当前预期结果：`745 passed`。
+当前预期结果：`823 passed`。
 
 真实烟测建议：
 

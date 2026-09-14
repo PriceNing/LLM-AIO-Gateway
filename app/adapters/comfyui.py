@@ -307,6 +307,14 @@ async def generate_comfyui_images(
     # output count. Submit one job per requested image instead of silently
     # returning fewer images than the OpenAI Images contract requested.
     if requested > 1 and not mapping.get("batch_size"):
+        if not mapping.get("seed"):
+            # 无 seed 映射时工作流内固定种子会让 n 次提交产出完全相同的图，
+            # 接口层却表现为"成功返回 n 张"；至少留痕提醒管理员配置 seed 映射。
+            _app_log.warning(
+                "[comfyui] n=%d split into single-image jobs without a seed mapping; "
+                "results may be identical. Configure a seed mapping to vary outputs.",
+                requested,
+            )
         results = []
         for _ in range(requested):
             results.extend(await generate_comfyui_images(

@@ -1,5 +1,6 @@
 """Tests for request log and config export/import admin endpoints."""
 import json
+from datetime import datetime
 import pytest
 from fastapi.testclient import TestClient
 from main import app
@@ -158,11 +159,14 @@ def test_request_logs_require_auth():
 
 def test_system_log_meta_and_list(temp_db, tmp_path):
     log_root = tmp_path / "logs"
-    day_dir = log_root / "2026-06-06"
+    # 日志保留修复后，configure() 会真正删除超过 retention_days 的日期目录，
+    # 因此 fixture 必须使用当前日期而不是固定的过期日期。
+    day_name = datetime.now().strftime("%Y-%m-%d")
+    day_dir = log_root / day_name
     day_dir.mkdir(parents=True)
     (day_dir / "app.log").write_text(
-        '{"ts":"2026-06-06T12:00:00.000Z","request_id":"rid1","level":"INFO","logger":"llmgw.app","msg":"hello"}\n'
-        '{"ts":"2026-06-06T12:00:01.000Z","request_id":"rid2","level":"ERROR","logger":"llmgw.app","msg":"bad thing"}\n',
+        f'{{"ts":"{day_name}T12:00:00.000Z","request_id":"rid1","level":"INFO","logger":"llmgw.app","msg":"hello"}}\n'
+        f'{{"ts":"{day_name}T12:00:01.000Z","request_id":"rid2","level":"ERROR","logger":"llmgw.app","msg":"bad thing"}}\n',
         encoding="utf-8",
     )
     config = load_config(str(tmp_path / "system-log-config.json"), force_reload=True)
@@ -175,12 +179,12 @@ def test_system_log_meta_and_list(temp_db, tmp_path):
     r = client.get("/admin/system-logs/meta", headers=temp_db["headers"])
     assert r.status_code == 200
     body = r.json()
-    assert "2026-06-06" in body["dates"]
+    assert day_name in body["dates"]
     assert any(ch["id"] == "app" for ch in body["channels"])
 
     r = client.get(
         "/admin/system-logs",
-        params={"date": "2026-06-06", "channel": "app", "level": "ERROR"},
+        params={"date": day_name, "channel": "app", "level": "ERROR"},
         headers=temp_db["headers"],
     )
     assert r.status_code == 200

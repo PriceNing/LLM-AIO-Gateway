@@ -643,7 +643,10 @@ def test_fallback_json_loads_with_fallback():
 def test_fallback_json_dumps():
     from app.db.fallback import json_dumps
     assert json_dumps([1, 2], []) == '[1, 2]'
-    assert json_dumps('already', []) == 'already'
+    # 合法 JSON 字符串原样通过；非 JSON 文本必须拒绝，避免脏数据静默入库。
+    assert json_dumps('[1, 2]', []) == '[1, 2]'
+    with pytest.raises(ValueError):
+        json_dumps('already', [])
     assert json_dumps(None, [42]) == '[42]'
 
 def test_fallback_to_bool():

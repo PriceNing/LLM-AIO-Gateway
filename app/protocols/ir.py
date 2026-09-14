@@ -264,6 +264,9 @@ def openai_messages_to_ir(messages: list[dict[str, Any]]) -> list[InternalMessag
             result.append(InternalMessage(role="user", parts=[unknown_part(msg)], raw={}))
             continue
         role = msg.get("role", "user")
+        if role == "developer":
+            # OpenAI 新协议的 developer 角色承载系统指令，与 responses 入口保持一致映射为 system。
+            role = "system"
         if role not in ("system", "user", "assistant", "tool"):
             role = "user"
         parts = _parts_from_openai_content(msg.get("content"))
@@ -314,11 +317,17 @@ def _anthropic_content_to_parts(content: Any) -> list[InternalPart]:
                 parts.append(text_part(txt, raw=dict(block), extensions=extensions))
         elif block_type == "image":
             src = block.get("source", {}) if isinstance(block.get("source"), dict) else {}
-            parts.append(image_part({
+            source = {
                 "kind": src.get("type", "unknown"),
                 "media_type": src.get("media_type"),
                 "data": src.get("data"),
-            }, raw=dict(block)))
+            }
+            # url / file 类型的 source 必须保留引用字段，否则图片在出口投影时被静默丢弃。
+            if src.get("url"):
+                source["url"] = src.get("url")
+            if src.get("file_id"):
+                source["file_id"] = src.get("file_id")
+            parts.append(image_part(source, raw=dict(block)))
         elif block_type == "tool_use":
             parts.append(tool_call_part(
                 block.get("id", ""),
@@ -328,10 +337,12 @@ def _anthropic_content_to_parts(content: Any) -> list[InternalPart]:
                 raw=dict(block),
             ))
         elif block_type == "tool_result":
+            extensions = {"is_error": True} if block.get("is_error") else {}
             parts.append(tool_result_part(
                 block.get("tool_use_id", ""),
                 _anthropic_content_to_parts(block.get("content", "")),
                 raw=dict(block),
+                extensions=extensions,
             ))
         elif block_type == "thinking":
             extensions = {}
@@ -405,6 +416,11 @@ def responses_input_to_ir(
 
     last_tool_assistant_idx = None
     tool_call_assistant_idx = {}
+    # Codex 的典型序列是 [reasoning, function_call, ...]，reasoning 出现在它所属的
+    # function_call 组之前；先暂存，等下一个 assistant/function_call 消息出现时再挂载。
+    pending_reasoning: list[str] = []
+    # 仅允许 reasoning item 回填到"紧随其后、尚未产生工具输出"的 function_call 组。
+    reasoning_backfill_ok = False
     i = 0
     while i < len(input_data):
         item = input_data[i]
@@ -425,6 +441,10 @@ def responses_input_to_ir(
                 role = "user"
             parts = _parts_from_responses_content(item.get("content", ""))
             rc = item.get("reasoning_content")
+            if role == "assistant" and pending_reasoning:
+                combined = "\n\n".join([*pending_reasoning, *([rc] if rc else [])])
+                pending_reasoning.clear()
+                rc = combined
             if role == "assistant" and rc:
                 parts.insert(0, reasoning_part(rc, raw=rc))
             if role == "system":
@@ -463,14 +483,16 @@ def responses_input_to_ir(
                 ))
                 i += 1
             rc = next((fc.get("reasoning_content") for fc in fc_items if isinstance(fc, dict) and fc.get("reasoning_content")), None)
+            if pending_reasoning:
+                combined = "\n\n".join([*pending_reasoning, *([rc] if rc else [])])
+                pending_reasoning.clear()
+                rc = combined
             if messages and messages[-1].role == "assistant" and not any(part.kind == "tool_call" for part in messages[-1].parts):
                 prev = messages[-1]
-                prev_text = _text_from_parts(prev.parts).strip()
-                prev.parts = [part for part in prev.parts if part.kind != "text"]
-                if rc:
+                # 保留上一条 assistant 的可见正文：OpenAI/Anthropic 都允许 content 与
+                # tool_calls 共存，改写成 reasoning 会让正文在多数上游丢失。
+                if rc and not any(part.kind == "reasoning" for part in prev.parts):
                     prev.parts.insert(0, reasoning_part(rc, raw=rc))
-                elif prev_text:
-                    prev.parts.insert(0, reasoning_part(prev_text, raw=prev_text))
                 prev.parts.extend(tool_parts)
                 last_tool_assistant_idx = len(messages) - 1
             else:
@@ -480,11 +502,13 @@ def responses_input_to_ir(
                 parts.extend(tool_parts)
                 messages.append(InternalMessage(role="assistant", parts=parts, raw={"type": "function_call_group", "items": fc_items}))
                 last_tool_assistant_idx = len(messages) - 1
+            reasoning_backfill_ok = True
             for part in tool_parts:
                 if part.tool_call_id:
                     tool_call_assistant_idx[str(part.tool_call_id)] = last_tool_assistant_idx
 
         elif item_type in ("function_call_output", "custom_tool_call_output"):
+            reasoning_backfill_ok = False
             call_id = str(item.get("call_id", ""))
             rc = item.get("reasoning_content")
             assistant_idx = tool_call_assistant_idx.get(call_id, last_tool_assistant_idx)
@@ -501,10 +525,16 @@ def responses_input_to_ir(
 
         elif item_type == "reasoning":
             rc = _reasoning_text(item.get("reasoning_content") or item.get("summary") or item.get("text") or item.get("content"))
-            if rc and last_tool_assistant_idx is not None:
-                assistant = messages[last_tool_assistant_idx]
-                if assistant.role == "assistant" and not any(part.kind == "reasoning" for part in assistant.parts):
-                    assistant.parts.insert(0, reasoning_part(rc, raw=dict(item)))
+            if rc:
+                attached = False
+                # 紧跟在 function_call 之后（尚未出现工具输出）的 reasoning 回填到该组。
+                if reasoning_backfill_ok and last_tool_assistant_idx is not None:
+                    assistant = messages[last_tool_assistant_idx]
+                    if assistant.role == "assistant" and not any(part.kind == "reasoning" for part in assistant.parts):
+                        assistant.parts.insert(0, reasoning_part(rc, raw=dict(item)))
+                        attached = True
+                if not attached:
+                    pending_reasoning.append(rc)
             i += 1
 
         elif item_type == "input_image":
@@ -520,6 +550,12 @@ def responses_input_to_ir(
         else:
             i += 1
     return messages
+
+
+def _tool_result_is_error(part: InternalPart) -> bool:
+    if part.extensions.get("is_error"):
+        return True
+    return bool(isinstance(part.raw, dict) and part.raw.get("is_error"))
 
 
 def _merge_openai_system_contents(contents: list[Any]) -> Any:
@@ -632,9 +668,12 @@ def ir_to_anthropic_messages(messages: list[InternalMessage]) -> tuple[list[dict
         elif msg.role == "tool":
             for part in msg.parts:
                 if part.kind == "tool_result":
+                    block = {"type": "tool_result", "tool_use_id": part.tool_call_id, "content": _anthropic_tool_result_content(part.parts)}
+                    if _tool_result_is_error(part):
+                        block["is_error"] = True
                     anthropic_messages.append({
                         "role": "user",
-                        "content": [{"type": "tool_result", "tool_use_id": part.tool_call_id, "content": _anthropic_tool_result_content(part.parts)}],
+                        "content": [block],
                     })
     system = ""
     if system_parts:
@@ -659,7 +698,10 @@ def _parts_to_anthropic_content(parts: list[InternalPart]) -> list[dict[str, Any
             args = part.arguments if part.arguments is not None else _parse_arguments(part.raw_arguments)
             content.append({"type": "tool_use", "id": part.tool_call_id, "name": part.name, "input": args or {}})
         elif part.kind == "tool_result":
-            content.append({"type": "tool_result", "tool_use_id": part.tool_call_id, "content": _anthropic_tool_result_content(part.parts)})
+            block = {"type": "tool_result", "tool_use_id": part.tool_call_id, "content": _anthropic_tool_result_content(part.parts)}
+            if _tool_result_is_error(part):
+                block["is_error"] = True
+            content.append(block)
         elif part.kind == "reasoning":
             if part.extensions.get("redacted") or (isinstance(part.raw, dict) and part.raw.get("type") == "redacted_thinking"):
                 data = part.extensions.get("data")
@@ -667,13 +709,14 @@ def _parts_to_anthropic_content(parts: list[InternalPart]) -> list[dict[str, Any
                     data = part.raw.get("data", "")
                 content.append({"type": "redacted_thinking", "data": data or ""})
             else:
-                block = {"type": "thinking", "thinking": part.text}
                 signature = part.extensions.get("signature")
                 if not signature and isinstance(part.raw, dict):
                     signature = part.raw.get("signature")
                 if signature:
-                    block["signature"] = signature
-                content.append(block)
+                    content.append({"type": "thinking", "thinking": part.text, "signature": signature})
+                # 无签名的 thinking 块会被 Anthropic 上游以 400 拒绝（扩展思考多轮
+                # 要求回传带签名块），这里直接丢弃，避免把跨协议转换来的
+                # reasoning_content 变成非法载荷。
         elif part.raw is not None:
             text = _unknown_part_text(part.raw)
             if text:

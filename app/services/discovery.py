@@ -134,18 +134,30 @@ async def refresh_provider_models(provider_id: str) -> dict:
         discovered_ids = set(discovered_by_id)
         with get_db() as db:
             existing_rows = db.execute(
-                "SELECT model_id FROM provider_models WHERE provider_id = ?",
+                "SELECT model_id, preprocessor, image_generation, responses_status FROM provider_models WHERE provider_id = ?",
                 (provider_id,),
             ).fetchall()
             existing_ids = {row["model_id"] for row in existing_rows}
 
+            def _has_admin_config(row) -> bool:
+                if str(row["preprocessor"] or "").strip():
+                    return True
+                if str(row["image_generation"] or "").strip():
+                    return True
+                return str(row["responses_status"] or "") not in ("", "unknown")
+
+            # 上游模型列表临时变动（改名/分页/权限）时，直接 DELETE 会丢失
+            # 管理员在该模型上配置的 preprocessor / 生图标记 / 能力探测结果；
+            # 有配置的过期模型保留，只清理无配置的。
+            configured_ids = {row["model_id"] for row in existing_rows if _has_admin_config(row)}
             stale_ids = existing_ids - discovered_ids
-            if stale_ids:
+            deletable_ids = stale_ids - configured_ids
+            if deletable_ids:
                 db.executemany(
                     "DELETE FROM provider_models WHERE provider_id = ? AND model_id = ?",
-                    [(provider_id, model_id) for model_id in stale_ids],
+                    [(provider_id, model_id) for model_id in deletable_ids],
                 )
-                removed = len(stale_ids)
+                removed = len(deletable_ids)
 
             for model_id, model in discovered_by_id.items():
                 if model_id in existing_ids:

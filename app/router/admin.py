@@ -381,9 +381,10 @@ async def list_users(authorization: Optional[str] = Header(None)):
 @router.post("/users")
 async def create_user(user_info: dict, authorization: Optional[str] = Header(None)):
     await require_admin_session(authorization)
-    username = (user_info.get("username") or "").strip()
-    if not username:
-        raise HTTPException(status_code=400, detail="username is required")
+    raw_username = user_info.get("username")
+    if not isinstance(raw_username, str) or not raw_username.strip():
+        raise HTTPException(status_code=400, detail="username is required and must be a string")
+    username = raw_username.strip()
     if not isinstance(user_info.get("enabled", True), bool) and user_info.get("enabled") is not None:
         raise HTTPException(status_code=400, detail="enabled must be a boolean")
     try:
@@ -411,14 +412,30 @@ async def delete_user_endpoint(username: str, authorization: Optional[str] = Hea
     return {"status": "deleted"}
 
 
+def _normalize_allowed_models(value):
+    """校验/归一化 allowed_models。
+
+    字符串会被 json.dumps 存成 JSON 字符串，读取端退化为逐字符匹配，
+    白名单行为不可预期；这里宽容单个字符串，拒绝其他非法类型。
+    """
+    if isinstance(value, str):
+        return [value] if value.strip() else ["*"]
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise HTTPException(status_code=400, detail="allowed_models must be a list of strings")
+    return value
+
+
 @router.post("/users/{username}/api-keys")
 async def add_user_api_key_endpoint(username: str, key_info: dict, authorization: Optional[str] = Header(None)):
     await require_admin_session(authorization)
+    allowed_models = key_info.get("allowed_models")
+    if allowed_models is not None:
+        allowed_models = _normalize_allowed_models(allowed_models)
     try:
         return add_user_api_key(
             username,
             key_info.get("name", "default"),
-            key_info.get("allowed_models")
+            allowed_models
         )
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -427,6 +444,9 @@ async def add_user_api_key_endpoint(username: str, key_info: dict, authorization
 @router.put("/users/{username}/api-keys/{key}")
 async def update_user_api_key_endpoint(username: str, key: str, updates: dict, authorization: Optional[str] = Header(None)):
     await require_admin_session(authorization)
+    if "allowed_models" in updates:
+        updates = dict(updates)
+        updates["allowed_models"] = _normalize_allowed_models(updates["allowed_models"])
     result = update_user_api_key(username, key, updates)
     if not result:
         raise HTTPException(status_code=404, detail="API key not found")
@@ -445,16 +465,25 @@ async def delete_user_api_key_endpoint(username: str, key: str, authorization: O
 async def get_stats(authorization: Optional[str] = Header(None)):
     await require_admin_session(authorization)
     stats = get_global_stats()
-    total = int(stats.get("total_calls", 0) or 0)
-    failed = int(stats.get("failed_calls", 0) or 0)
-    degraded = int(stats.get("degraded_calls", 0) or 0)
-    rejected = int(stats.get("rejected_calls", 0) or 0)
-    cancelled = int(stats.get("cancelled_calls", 0) or 0)
-    stateful_fallback_blocked = int(stats.get("stateful_fallback_blocked_calls", 0) or 0)
-    image_generation_calls = int(stats.get("image_generation_calls", 0) or 0)
-    image_generation_failed_calls = int(stats.get("image_generation_failed_calls", 0) or 0)
-    image_generation_images = int(stats.get("image_generation_images", 0) or 0)
-    image_generation_bytes = int(stats.get("image_generation_bytes", 0) or 0)
+
+    def _stat_int(key: str) -> int:
+        # global_stats 的 value 损坏为非数字时 get_global_stats 会原样返回字符串，
+        # int() 直接抛异常会把统计页打成 500；这里降级为 0。
+        try:
+            return int(stats.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    total = _stat_int("total_calls")
+    failed = _stat_int("failed_calls")
+    degraded = _stat_int("degraded_calls")
+    rejected = _stat_int("rejected_calls")
+    cancelled = _stat_int("cancelled_calls")
+    stateful_fallback_blocked = _stat_int("stateful_fallback_blocked_calls")
+    image_generation_calls = _stat_int("image_generation_calls")
+    image_generation_failed_calls = _stat_int("image_generation_failed_calls")
+    image_generation_images = _stat_int("image_generation_images")
+    image_generation_bytes = _stat_int("image_generation_bytes")
     success_rate = ((total - failed) / total * 100) if total > 0 else 100.0
     # Health rate treats fallback-recovered calls as unhealthy for ops visibility.
     health_rate = ((total - failed - degraded) / total * 100) if total > 0 else 100.0
@@ -512,7 +541,11 @@ async def create_routing_rule(rule: dict, authorization: Optional[str] = Header(
 @router.put("/routing-rules/{rule_id}")
 async def update_routing_rule_endpoint(rule_id: str, updates: dict, authorization: Optional[str] = Header(None)):
     await require_admin_session(authorization)
-    result = update_routing_rule(rule_id, updates)
+    try:
+        result = update_routing_rule(rule_id, updates)
+    except ValueError as exc:
+        # 非法 match_scope 等输入错误应返回 400，与创建端点保持一致。
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not result:
         raise HTTPException(status_code=404, detail="Rule not found")
     return result
@@ -622,7 +655,10 @@ async def get_fallback_policy_endpoint(policy_id: str, authorization: Optional[s
 @router.put("/fallback-policies/{policy_id}")
 async def update_fallback_policy_endpoint(policy_id: str, updates: dict, authorization: Optional[str] = Header(None)):
     await require_admin_session(authorization)
-    policy = update_fallback_policy(policy_id, updates)
+    try:
+        policy = update_fallback_policy(policy_id, updates)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not policy:
         raise HTTPException(status_code=404, detail="Fallback policy not found")
     return policy
@@ -674,12 +710,17 @@ async def get_stats_history(from_ts: Optional[str] = None, to_ts: Optional[str] 
         from_ts = from_ts + " 00:00:00" if len(from_ts) == 10 else from_ts
     if granularity not in ("hour", "day", "week", "month"):
         granularity = "day"
-    return get_history_stats(from_ts, to_ts, granularity)
+    try:
+        return get_history_stats(from_ts, to_ts, granularity)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"invalid from_ts/to_ts: {exc}") from exc
 
 
 @router.post("/stats/reset")
 async def reset_stats(authorization: Optional[str] = Header(None)):
     username = await require_admin_session(authorization)
+    # 注意：有意保留 request_records 历史明细（/admin/stats/history 仍可查），
+    # 只归零计数器；历史曲线与总计数器口径不同属预期行为。
     reset_global_stats()
     reset_user_stats()
     clear_request_log()
@@ -967,7 +1008,7 @@ async def toggle_model_image_generation(body: dict, authorization: Optional[str]
 
 # -- Request/Response detail logs --
 
-_VALID_ENDPOINTS = {"chat_completions", "completions", "messages", "responses"}
+_VALID_ENDPOINTS = {"chat_completions", "completions", "messages", "responses", "images_generations"}
 
 
 # -- System log files --
@@ -1149,6 +1190,14 @@ def _validate_users_payload(payload) -> list:
     return users
 
 
+def _safe_import_int(value) -> int:
+    """导入文件里的统计字段可能是任意脏数据，非法值降级为 0 而不是 500。"""
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _import_user_api_key(username: str, entry: dict, mode: str) -> str:
     key = str(entry.get("key") or "").strip()
     if not key:
@@ -1175,8 +1224,8 @@ def _import_user_api_key(username: str, entry: dict, mode: str) -> str:
             """,
             (
                 key, username, name, json.dumps(allowed_models, ensure_ascii=False), 1 if enabled else 0,
-                int(stats.get("total_calls") or 0), int(stats.get("failed_calls") or 0),
-                int(stats.get("total_tokens") or 0), created_at,
+                _safe_import_int(stats.get("total_calls")), _safe_import_int(stats.get("failed_calls")),
+                _safe_import_int(stats.get("total_tokens")), created_at,
             ),
         )
     return "created"
@@ -1309,6 +1358,9 @@ def _import_provider(entry: dict, mode: str) -> str:
         return "skipped"
     existing = get_provider(pid)
     payload = dict(entry)
+    # add_provider 依赖 name 字段；手工编辑的导入文件可能缺 name，
+    # 不能让它变成 KeyError → 500，退而用 id 作为名称。
+    payload.setdefault("name", pid)
     # Legacy config exports used one mixed ``extra_headers`` object.  Keep
     # imports backward-compatible while storing the two new concerns apart.
     legacy_headers = payload.pop("extra_headers", None)
@@ -1411,21 +1463,31 @@ async def import_config_endpoint(payload: dict, authorization: Optional[str] = H
     providers, preprocessors, image_generators, routing, fallbacks = _validate_config_payload(payload)
 
     summary = {"providers": {}, "preprocessors": {}, "image_generators": {}, "routing_rules": {}, "fallback_policies": {}}
-    for entry in providers:
-        outcome = _import_provider(entry, mode)
-        summary["providers"][outcome] = summary["providers"].get(outcome, 0) + 1
-    for preprocessor_id, config in preprocessors.items():
-        outcome = _import_preprocessor(preprocessor_id, config, mode)
-        summary["preprocessors"][outcome] = summary["preprocessors"].get(outcome, 0) + 1
-    for generator_id, config in image_generators.items():
-        outcome = _import_image_generator(generator_id, config, mode)
-        summary["image_generators"][outcome] = summary["image_generators"].get(outcome, 0) + 1
-    for entry in routing:
-        outcome = _import_routing_rule(entry, mode)
-        summary["routing_rules"][outcome] = summary["routing_rules"].get(outcome, 0) + 1
-    for entry in fallbacks:
-        outcome = _import_fallback_policy(entry, mode)
-        summary["fallback_policies"][outcome] = summary["fallback_policies"].get(outcome, 0) + 1
+    errors: list[str] = []
 
-    _app_log.info("Config imported by '%s' mode=%s summary=%s", username, mode, summary)
-    return {"status": "ok", "mode": mode, "summary": summary}
+    def _run(section: str, label: str, fn) -> None:
+        # 单条导入失败不再让整个请求 500：记入 errors 后继续，
+        # 避免损坏的导入文件把数据库留在半导入状态且无任何反馈。
+        try:
+            outcome = fn()
+        except HTTPException as exc:
+            outcome = "failed"
+            errors.append(f"{label}: {exc.detail}")
+        except Exception as exc:
+            outcome = "failed"
+            errors.append(f"{label}: {exc}")
+        summary[section][outcome] = summary[section].get(outcome, 0) + 1
+
+    for index, entry in enumerate(providers):
+        _run("providers", f"providers[{index}]", lambda entry=entry: _import_provider(entry, mode))
+    for preprocessor_id, config in preprocessors.items():
+        _run("preprocessors", f"preprocessors[{preprocessor_id}]", lambda pid=preprocessor_id, cfg=config: _import_preprocessor(pid, cfg, mode))
+    for generator_id, config in image_generators.items():
+        _run("image_generators", f"image_generators[{generator_id}]", lambda gid=generator_id, cfg=config: _import_image_generator(gid, cfg, mode))
+    for index, entry in enumerate(routing):
+        _run("routing_rules", f"routing_rules[{index}]", lambda entry=entry: _import_routing_rule(entry, mode))
+    for index, entry in enumerate(fallbacks):
+        _run("fallback_policies", f"fallback_policies[{index}]", lambda entry=entry: _import_fallback_policy(entry, mode))
+
+    _app_log.info("Config imported by '%s' mode=%s summary=%s errors=%d", username, mode, summary, len(errors))
+    return {"status": "ok" if not errors else "partial", "mode": mode, "summary": summary, "errors": errors}

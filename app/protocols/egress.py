@@ -93,12 +93,31 @@ def _anthropic_stop_reason(finish_reason: str) -> str:
         finish_reason, "end_turn")
 
 
-async def render_chat_completions_sse(events, *, model: str):
-    chat_id = f"chatcmpl-{int(time.time())}"
+def _openai_usage_payload(usage: dict) -> dict:
+    prompt = int(usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0)
+    completion = int(usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0)
+    payload = {
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": int(usage.get("total_tokens", prompt + completion) or (prompt + completion)),
+    }
+    cached = int(usage.get("prompt_cache_hit_tokens", 0) or 0)
+    if cached:
+        payload["prompt_tokens_details"] = {"cached_tokens": cached}
+    return payload
+
+
+def _chat_usage_chunk(chat_id: str, model: str, usage: dict) -> str:
+    return f"data: {json.dumps({'id': chat_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': model, 'choices': [], 'usage': usage}, ensure_ascii=False)}\n\n"
+
+
+async def render_chat_completions_sse(events, *, model: str, include_usage: bool = False):
+    chat_id = f"chatcmpl-{uuid.uuid4().hex}"
     has_text = False
     accumulated_reasoning = ""
     text_chars = 0
     tool_calls = set()
+    usage_payload: dict | None = None
 
     _app_log.debug("[egress_chat_stream] START model=%s chat_id=%s", model, chat_id)
 
@@ -132,8 +151,16 @@ async def render_chat_completions_sse(events, *, model: str):
                     "function": {"name": event.name, "arguments": event.arguments_delta},
                 }]
             }
+        elif event.kind == "usage":
+            if event.usage:
+                usage_payload = _openai_usage_payload(event.usage)
+            continue
         elif event.kind == "message_done":
             yield _chat_chunk(chat_id, model, {}, event.finish_reason or ("tool_calls" if tool_calls else "stop"))
+            if include_usage:
+                # OpenAI 规范要求 include_usage 时在最后一个 finish 块之后补发
+                # choices=[] 的 usage 块。
+                yield _chat_usage_chunk(chat_id, model, usage_payload or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
             _app_log.debug(
                 "[egress_chat_stream] DONE model=%s finish_reason=%s text_chars=%d reasoning_chars=%d tool_calls=%d",
                 model,
@@ -148,6 +175,8 @@ async def render_chat_completions_sse(events, *, model: str):
             continue
         yield _chat_chunk(chat_id, model, delta, None)
 
+    if include_usage and usage_payload:
+        yield _chat_usage_chunk(chat_id, model, usage_payload)
     yield "data: [DONE]\n\n"
 
 
@@ -156,7 +185,7 @@ def _chat_chunk(chat_id: str, model: str, delta: dict, finish_reason):
 
 
 async def render_completions_sse(events, *, model: str):
-    cmpl_id = f"cmpl-{int(time.time())}"
+    cmpl_id = f"cmpl-{uuid.uuid4().hex}"
     _app_log.debug("[egress_completions_stream] START model=%s completion_id=%s", model, cmpl_id)
     text_chars = 0
     reasoning_chars = 0
@@ -414,7 +443,7 @@ async def render_responses_sse(events, *, model: str, previous_response_id: str 
 
 
 async def render_anthropic_messages_sse(events, *, model: str):
-    msg_id = f"msg_{int(time.time())}"
+    msg_id = f"msg_{uuid.uuid4().hex}"
     _app_log.debug("[egress_messages_stream] START model=%s message_id=%s", model, msg_id)
     yield f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': msg_id, 'type': 'message', 'role': 'assistant', 'content': [], 'model': model, 'stop_reason': None, 'stop_sequence': None, 'usage': {'input_tokens': 0, 'output_tokens': 0}}})}\n\n"
 
@@ -458,25 +487,21 @@ async def render_anthropic_messages_sse(events, *, model: str):
                 accumulated_reasoning += event.reasoning
                 yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': thinking_index, 'delta': {'type': 'thinking_delta', 'thinking': event.reasoning}})}\n\n"
         elif event.kind == "tool_call_start":
-            block_index = next_block_index
-            next_block_index += 1
+            # 不在此处预留 block index：Anthropic SSE 要求 content block 按 index 顺序
+            # 流式输出，而 tool 块在流末尾才补发，提前预留会先于后续 text 块造成乱序。
             tool_states[event.tool_index] = {
-                "block_index": block_index,
                 "id": event.tool_call_id or f"toolu_{event.tool_index}",
                 "name": event.name,
                 "arguments": "",
             }
-            _tool_log.debug("[egress_messages_stream] tool_start index=%d block_index=%d id=%s name=%s", event.tool_index, block_index, event.tool_call_id, event.name)
+            _tool_log.debug("[egress_messages_stream] tool_start index=%d id=%s name=%s", event.tool_index, event.tool_call_id, event.name)
         elif event.kind == "tool_call_arguments_delta":
             state = tool_states.setdefault(event.tool_index, {
-                "block_index": next_block_index,
                 "id": event.tool_call_id or f"toolu_{event.tool_index}",
                 "name": event.name,
                 "arguments": "",
             })
             state["arguments"] = event.arguments or (state["arguments"] + event.arguments_delta)
-            if state["block_index"] == next_block_index:
-                next_block_index += 1
         elif event.kind == "usage":
             input_tokens = event.usage.get("input_tokens", input_tokens) or input_tokens
             output_tokens = event.usage.get("output_tokens", output_tokens) or output_tokens
@@ -494,6 +519,9 @@ async def render_anthropic_messages_sse(events, *, model: str):
 
     for idx in sorted(tool_states):
         state = tool_states[idx]
+        # 在发射时刻分配 index，保证 thinking/text/tool 块的 index 严格递增。
+        state["block_index"] = next_block_index
+        next_block_index += 1
         tool_input = tool_arguments_to_input(state["arguments"])
         yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': state['block_index'], 'content_block': {'type': 'tool_use', 'id': state['id'], 'name': state['name'], 'input': {}}})}\n\n"
         yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': state['block_index'], 'delta': {'type': 'input_json_delta', 'partial_json': json.dumps(tool_input, ensure_ascii=False)}})}\n\n"
@@ -514,8 +542,9 @@ async def render_anthropic_messages_sse(events, *, model: str):
     )
 
 
-async def render_responses_error_sse(*, model: str, message: str, previous_response_id: str | None = None):
-    resp_id = f"resp_{uuid.uuid4().hex}"
+async def render_responses_error_sse(*, model: str, message: str, previous_response_id: str | None = None, response_id: str | None = None):
+    # 复用已发出的 response id，避免 created(A) / completed(B) 身份不连续。
+    resp_id = response_id or f"resp_{uuid.uuid4().hex}"
     created_at = int(time.time())
     yield f"data: {json.dumps({'type': 'error', 'error': {'message': message, 'type': 'server_error'}})}\n\n"
     completed = {
@@ -560,7 +589,7 @@ def render_chat_completion(output: InternalOutputMessage, *, model: str) -> dict
             for tool in output.tool_calls
         ]
     return {
-        "id": f"chatcmpl-{int(time.time())}",
+        "id": f"chatcmpl-{uuid.uuid4().hex}",
         "object": "chat.completion",
         "created": int(time.time()),
         "model": model,
@@ -579,7 +608,7 @@ def render_completion(output: InternalOutputMessage, *, model: str) -> dict:
         output.usage.get("total_tokens", 0),
     )
     return {
-        "id": f"cmpl-{int(time.time())}",
+        "id": f"cmpl-{uuid.uuid4().hex}",
         "object": "text_completion",
         "created": int(time.time()),
         "model": model,
@@ -620,7 +649,7 @@ def render_anthropic_message(output: InternalOutputMessage, *, model: str) -> di
     if not content_blocks:
         content_blocks.append({"type": "text", "text": ""})
     return {
-        "id": f"msg_{int(time.time())}",
+        "id": f"msg_{uuid.uuid4().hex}",
         "type": "message",
         "role": output.role or "assistant",
         "content": content_blocks,

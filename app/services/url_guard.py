@@ -117,6 +117,18 @@ async def validate_upstream_url_async(
 
     allow_private = default_allow_private_hosts() if allow_private_hosts is None else bool(allow_private_hosts)
     addresses = await asyncio.to_thread(_resolve_addresses, hostname)
+    if not addresses:
+        # 与 imagegen._validate_download_host 的硬拒绝不同：上游地址保存是管理员
+        # 配置场景，离线/内网 DNS 环境下硬拒绝会阻断正常配置。这里只留痕
+        # 警告，实际请求时仍会失败并记录。
+        import logging
+
+        logging.getLogger("llmgw.app").warning(
+            "[url_guard] %s hostname could not be resolved during validation: %s",
+            field,
+            hostname,
+        )
+        return cleaned
     for value in addresses:
         try:
             address = ipaddress.ip_address(value)

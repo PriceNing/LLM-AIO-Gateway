@@ -550,6 +550,7 @@ async def prepare_request_policy(
     preprocess: bool = True,
     apply_ir_transforms: bool = True,
     log_label: str = "request",
+    conv_key_override: str | None = None,
 ) -> RequestPolicyResult:
     """Apply request-side policy while keeping endpoint-specific output unchanged."""
     requested_model = request.requested_model
@@ -564,7 +565,11 @@ async def prepare_request_policy(
             [m.role for m in request.messages],
         )
 
-    conv_key = conversation_cache_key(api_key_value, request.messages, request.previous_response_id)
+    # 同一请求多次进入策略层时（如 /responses 先做最小策略、降级后再做完整
+    # 策略），normalize 会改变消息指纹导致 conv_key 分裂：端点级缓存写在
+    # key1，注入却查 key2，reasoning 永远命中不了。调用方可显式传入
+    # 第一次计算的 conv_key 保证两次一致。
+    conv_key = conv_key_override or conversation_cache_key(api_key_value, request.messages, request.previous_response_id)
 
     modified = False
     if preprocess:
@@ -592,6 +597,10 @@ async def prepare_request_policy(
         request.target_model = route_model
     if route_provider:
         request.provider_id = route_provider
+    # 注意：规则只改 model 不改 provider 时，复合请求（providerA/modelX）的
+    # provider_id 会保留为 providerA（"provider 粘滞"）：用户显式指定了
+    # provider，规则未声明 target_provider 则视为"同 provider 换模型"。
+    # 如需跨 provider 重定向，规则必须显式填写 target_provider。
     _app_log.info(
         "[%s ROUTE] matched=%s source=%s rule_id=%s rule='%s' requested=%s resolved=%s target=%s provider=%s reason=%s",
         log_label,

@@ -15,7 +15,9 @@ def extract_image_data_uris(content) -> list:
         return []
     result = []
     for mime_subtype, data in _DATA_IMAGE_RE.findall(content):
-        if len(data) > 100:
+        # 与 _LONG_DATA_IMAGE_RE 的 {100,} 对齐，避免恰好 100 字符的边界
+        # 数据被清除却不被提取。
+        if len(data) >= 100:
             result.append((f"image/{mime_subtype}", f"data:image/{mime_subtype};base64,{data}"))
     return result
 

@@ -23,7 +23,14 @@ _log = logging.getLogger("llmgw.app")
 # Key: md5(image_content), Value: description text
 _cache: dict[str, str] = {}
 _cache_lock = threading.Lock()
-MAX_CACHE_SIZE = get_default("image_cache_max_size", 500)
+
+
+def _max_cache_size() -> int:
+    # 运行时读取，保证 config.json 修改后生效（同文件其他配置同口径）。
+    try:
+        return max(1, int(get_default("image_cache_max_size", 500)))
+    except (TypeError, ValueError):
+        return 500
 
 
 def _cache_key(image_url: str, image_data: str = "") -> str:
@@ -39,7 +46,7 @@ def _get_cached_description(url_or_data: str) -> Optional[str]:
 
 def _set_cached_description(url_or_data: str, description: str) -> None:
     with _cache_lock:
-        if len(_cache) >= MAX_CACHE_SIZE:
+        if len(_cache) >= _max_cache_size():
             # Evict oldest (simple FIFO via dict pop)
             _cache.pop(next(iter(_cache)), None)
         _cache[_cache_key(url_or_data)] = description
@@ -201,6 +208,16 @@ def has_image_content(messages: list[InternalMessage]) -> bool:
     return False
 
 
+def _is_image_placeholder_text(text: str) -> bool:
+    """识别预处理自己插入的历史图片占位文本（_build_inline_replacement 产物）。"""
+    stripped = (text or "").lstrip()
+    return (
+        stripped.startswith("[Image #")
+        or stripped.startswith("[Image cached]")
+        or stripped.startswith("[image:")
+    )
+
+
 def _new_turn_start(messages: list[InternalMessage]) -> int:
     for i in range(len(messages) - 1, -1, -1):
         msg = messages[i]
@@ -210,7 +227,10 @@ def _new_turn_start(messages: list[InternalMessage]) -> int:
             if has_text and not has_tool_calls:
                 return i + 1
         elif msg.role == "user":
-            if any(part.kind == "text" and "<image_description" in part.text for part in msg.parts):
+            # 以前检查的 "<image_description" 标记从未被生成过（实际插入的是
+            # "[Image #N]: ..." 系列占位文本），导致以 tool 结果结尾的对话把全部
+            # 历史图片当当前轮重新描述。改为匹配真实占位文本。
+            if any(part.kind == "text" and _is_image_placeholder_text(part.text) for part in msg.parts):
                 return i + 1
     return 0
 

@@ -230,20 +230,30 @@ class LogManager:
         self._date_str = today
 
     def _cleanup_old_logs(self) -> None:
+        import shutil
         root = Path(self._log_dir)
         if not root.exists():
             return
         cutoff = datetime.now(timezone.utc) - timedelta(days=self._retention_days)
         for entry in root.iterdir():
-            if not entry.is_dir():
-                continue
-            try:
-                dir_date = datetime.strptime(entry.name, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-                if dir_date < cutoff and not any(entry.iterdir()):
-                    import shutil
+            if entry.is_dir():
+                try:
+                    dir_date = datetime.strptime(entry.name, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                except ValueError:
+                    continue
+                # 过期日期目录整个删除。以前只删空目录，而非空过期目录永远
+                # 不会被清空（代码库内没有任何删除旧日志文件的路径），
+                # retention_days 形同虚设，logs/ 无限增长直到占满磁盘。
+                if dir_date < cutoff:
                     shutil.rmtree(entry, ignore_errors=True)
-            except ValueError:
-                pass
+            elif entry.is_file():
+                # 旧版本直接写在根目录的散落日志文件，按 mtime 过期删除。
+                try:
+                    mtime = datetime.fromtimestamp(entry.stat().st_mtime, timezone.utc)
+                    if mtime < cutoff:
+                        entry.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def _capture_litellm_logs(self) -> None:
         """Route liteLLM's own log output into our app.log channel."""
@@ -296,6 +306,18 @@ def get_log_manager() -> LogManager:
 
 def get_logger(name: str) -> logging.Logger:
     return get_log_manager().get_logger(name)
+
+
+def cleanup_old_logs() -> None:
+    """供后台维护任务周期调用：长驻进程运行期间也要执行日志保留清理，
+    而不是只在启动 configure() 时清一次。"""
+    mgr = get_log_manager()
+    if not mgr._enabled:
+        return
+    try:
+        mgr._cleanup_old_logs()
+    except Exception:
+        pass
 
 
 def available_log_channels() -> dict[str, str]:

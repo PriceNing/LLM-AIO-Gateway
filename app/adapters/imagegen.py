@@ -12,7 +12,7 @@ import socket
 import time
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
@@ -180,33 +180,46 @@ async def _download_image(
     *,
     allow_private_hosts: bool = False,
 ) -> tuple[str, str]:
-    parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise ValueError("image result URL must use http or https")
-    if parsed.username or parsed.password:
-        raise ValueError("image result URL must not contain credentials")
-    await _validate_download_host(parsed.hostname or "", allow_private_hosts=allow_private_hosts)
     limit = max(64 * 1024, min(100 * 1024 * 1024, int(max_bytes)))
-    chunks = bytearray()
-    async with client.stream("GET", url, follow_redirects=False) as response:
-        response.raise_for_status()
-        content_length = response.headers.get("content-length")
-        try:
-            declared_length = int(content_length) if content_length is not None else None
-        except (TypeError, ValueError):
-            declared_length = None
-        if declared_length is not None and declared_length > limit:
-            raise ValueError("image result exceeds the configured size limit")
-        async for chunk in response.aiter_bytes():
-            chunks.extend(chunk)
-            if len(chunks) > limit:
+    current_url = url
+    for redirect in range(4):
+        parsed = urlparse(current_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("image result URL must use http or https")
+        if parsed.username or parsed.password:
+            raise ValueError("image result URL must not contain credentials")
+        await _validate_download_host(parsed.hostname or "", allow_private_hosts=allow_private_hosts)
+        chunks = bytearray()
+        async with client.stream("GET", current_url, follow_redirects=False) as response:
+            if 300 <= response.status_code < 400:
+                # raise_for_status() 对 3xx 不报错；不处理重定向会读到空 body
+                # 产出空 data URI。手动跟随并逐跳重新校验主机（SSRF 防护）。
+                location = response.headers.get("location")
+                if not location:
+                    raise ValueError("image result URL returned a redirect without Location")
+                if redirect == 3:
+                    raise ValueError("image result URL exceeded the redirect limit")
+                current_url = urljoin(current_url, location)
+                continue
+            response.raise_for_status()
+            content_length = response.headers.get("content-length")
+            try:
+                declared_length = int(content_length) if content_length is not None else None
+            except (TypeError, ValueError):
+                declared_length = None
+            if declared_length is not None and declared_length > limit:
                 raise ValueError("image result exceeds the configured size limit")
-        mime_type = (response.headers.get("content-type") or "").split(";", 1)[0].strip()
-    data = bytes(chunks)
-    mime_type = _mime_from_bytes(data, mime_type or mimetypes.guess_type(parsed.path)[0] or "image/png")
-    if not mime_type.startswith("image/"):
-        raise ValueError("image result URL did not return an image")
-    return f"data:{mime_type};base64,{base64.b64encode(data).decode('ascii')}", mime_type
+            async for chunk in response.aiter_bytes():
+                chunks.extend(chunk)
+                if len(chunks) > limit:
+                    raise ValueError("image result exceeds the configured size limit")
+            mime_type = (response.headers.get("content-type") or "").split(";", 1)[0].strip()
+        data = bytes(chunks)
+        mime_type = _mime_from_bytes(data, mime_type or mimetypes.guess_type(parsed.path)[0] or "image/png")
+        if not mime_type.startswith("image/"):
+            raise ValueError("image result URL did not return an image")
+        return f"data:{mime_type};base64,{base64.b64encode(data).decode('ascii')}", mime_type
+    raise ValueError("image result URL exceeded the redirect limit")
 
 
 async def generate_images(config: dict, *, prompt: str, model: str | None = None,
@@ -280,7 +293,10 @@ async def generate_images(config: dict, *, prompt: str, model: str | None = None
                         raise error
                     delay = error.retry_after
                     if delay is None:
-                        delay = min(max_retry_delay, retry_base * (2 ** (attempts - 1)))
+                        delay = retry_base * (2 ** (attempts - 1))
+                    # 上游 Retry-After 同样封顶：否则一次 429 带 Retry-After: 3600
+                    # 就能占住批处理并发信号量数十分钟，后续同批请求全部排队卡死。
+                    delay = max(0.0, min(float(delay), max_retry_delay))
                     await asyncio.sleep(delay)
                     continue
                 break
