@@ -21,7 +21,7 @@ LLM AIO Gateway 是一个基于 FastAPI 的统一 LLM API 网关，用一个服�
 | 图像生成网关 | 支持 `/images/generations`、Codex `/responses` 生图工具桥接、原图短期存储、压缩缩略图、批量生成和生图统计。 |
 | 工具调用可靠性 | 保留工具调用 ID，修复 malformed JSON 工具参数，并提供工具调用循环断路器。 |
 | Reasoning 连续性 | 对 DeepSeek 等 thinking 模型自动缓存和回传 `reasoning_content`，保证多轮工具调用不中断。 |
-| Web 管理面板 | 管理提供商、用户、API Key、路由规则、模型预处理器和调用统计。 |
+| Web 管理面板 | 管理提供商、用户、API Key、路由规则、模型预处理器和调用统计；响应式设计，适配桌面/平板/手机。 |
 | SQLite 存储 | 提供商、用户、密钥、路由规则、统计和请求记录保存在 `data.db`。 |
 
 ## 快速开始

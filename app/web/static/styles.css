@@ -1547,3 +1547,185 @@ a.icon-btn { text-decoration: none; }
   color: var(--danger);
 }
 
+
+/* ═══════════════════════════ Mobile / Tablet 适配 ═══════════════════════════
+   平板（≤900px）：侧边栏改为横向滚动导航条；表单/网格单列化。
+   手机（≤600px）：顶栏精简、模态近全屏、输入 16px 防 iOS 聚焦缩放、
+   表格紧凑化横向滚动、触控目标 ≥40px、刘海屏 safe-area。
+   本块位于文件末尾，按需覆盖前文同特异性规则。 */
+
+/* 移动端浏览器地址栏收展导致的 100vh 跳动：渐进增强用 dvh */
+body { min-height: 100vh; min-height: 100dvh; }
+.auth-view { min-height: 100vh; min-height: 100dvh; }
+
+/* config-grid 的 minmax(360px) 在窄屏会溢出视口 */
+.config-grid { grid-template-columns: repeat(auto-fit, minmax(min(360px, 100%), 1fr)); }
+
+@media (max-width: 900px) {
+  /* 侧边栏 → 横向滚动导航条（换行会占满整屏，滚动条更省空间且可达性好） */
+  .sidebar {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    overflow-y: hidden;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior-x: contain;
+    scrollbar-width: none;
+    position: sticky;
+    top: 0;
+    z-index: 30;
+    padding: 6px 2px;
+    margin: -6px -2px 8px;
+    background: color-mix(in srgb, var(--bg-base) 82%, transparent);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  .sidebar::-webkit-scrollbar { display: none; }
+  .nav-btn {
+    flex: 0 0 auto;
+    width: auto;
+    min-width: max-content;
+    justify-content: center;
+    padding: 10px 14px;
+    font-size: 13px;
+  }
+  .nav-btn .nav-icon { width: auto; }
+
+  .main-layout { gap: 12px; }
+  .content { width: 100%; }
+
+  /* 表单控件触控友好化 */
+  .text-input, .select-input { padding: 9px 12px; }
+  .btn { min-height: 40px; }
+  .icon-btn { width: 40px; height: 40px; }
+
+  /* 表格容器惯性滚动 */
+  .table-wrap { -webkit-overflow-scrolling: touch; }
+
+  /* 长 key/模型名允许折行，防止撑破卡片 */
+  .key-row .mono, .model-item .mono, .users-list .mono { overflow-wrap: anywhere; }
+}
+
+@media (max-width: 600px) {
+  .app-container {
+    padding: 8px 10px calc(20px + env(safe-area-inset-bottom));
+  }
+
+  /* 顶栏精简：隐藏 GitHub 文字链与管理员名，按钮换行右对齐 */
+  .topbar { padding: 10px 12px; margin-bottom: 12px; gap: 8px; }
+  .topbar-left h1 { font-size: 15px; white-space: normal; }
+  .topbar-right { width: 100%; justify-content: flex-end; gap: 6px; }
+  .topbar-right .admin-name, .github-link { display: none; }
+  .btn-sm { padding: 8px 10px; font-size: 12px; }
+
+  /* 区块头：标题独占一行，操作按钮均分整行 */
+  .section-header { gap: 8px; margin-bottom: 14px; }
+  .section-header h2 { font-size: 17px; flex-basis: 100%; }
+  .section-header .section-actions { width: 100%; }
+  .section-header .section-actions .btn { flex: 1; justify-content: center; }
+  .section-header > .btn { flex: 1; justify-content: center; }
+
+  /* 搜索框全宽（覆盖 focus 展宽动画） */
+  .search-box { flex: 1 1 100%; }
+  .search-box input, .search-box input:focus { width: 100%; }
+
+  /* iOS Safari 聚焦 <16px 输入框会自动放大页面，统一提到 16px */
+  .modal input, .modal select, .modal textarea,
+  .text-input, .select-input, .search-box input { font-size: 16px; }
+
+  /* 模态近全屏：小屏上 540px/760px 固定宽与 24px 外边距都太浪费 */
+  .modal { padding: 10px; }
+  .modal .modal-content,
+  .modal .modal-content.modal-wide,
+  .modal-wide {
+    width: 100% !important;
+    max-width: 100% !important;
+    max-height: 88vh;
+    max-height: 88dvh;
+    padding: 18px 16px;
+    overscroll-behavior: contain;
+  }
+  .modal-content h2 { font-size: 18px; margin-bottom: 16px; }
+  .modal-close { top: 10px; right: 10px; width: 36px; height: 36px; }
+
+  /* 模态底部按钮纵排，避免窄屏挤成两列小目标 */
+  .form-actions { display: flex; flex-direction: column-reverse; gap: 8px; }
+  .form-actions .btn { width: 100%; justify-content: center; }
+
+  /* 表格紧凑化：横向滚动阅读 */
+  .data-table { font-size: 12px; }
+  .data-table th, .data-table td { padding: 7px 8px; white-space: nowrap; }
+  .json-block { font-size: 11px; max-height: 280px; }
+
+  /* 详情/配置网格单列 */
+  .detail-grid { grid-template-columns: 1fr; }
+  .config-grid { grid-template-columns: 1fr; }
+  .config-card { padding: 16px; }
+
+  /* 统计卡片紧凑化（≤500px 已有单列规则，此处收窄间距与字号） */
+  .summary-cards { gap: 8px; }
+  .summary-card { padding: 14px 16px; }
+  .summary-card .card-value { font-size: 22px; }
+  .summary-card .card-icon { font-size: 32px; right: 12px; }
+
+  /* 图表与卡片内边距 */
+  .chart-card, .table-card { padding: 14px; }
+  .chart-card .chart-wrap canvas { max-height: 200px; }
+
+  /* 分页控件触控友好 */
+  .history-summary .btn { min-height: 40px; padding: 8px 14px; }
+
+  /* 认证页 */
+  .auth-panel { padding: 28px 20px; }
+}
+
+/* 触屏设备：去掉 hover 位移/辉光残留（点按后卡在 hover 态） */
+@media (hover: none) {
+  .summary-card:hover { transform: none; }
+  .model-item:hover { background: transparent; }
+  .nav-btn:hover { background: transparent; color: var(--text-secondary); }
+  .nav-btn.active:hover { background: var(--accent); color: #fff; }
+}
+
+/* ═══════════════ 修复：统计页 modern-table 无滚动容器撑破窄屏 ═══════════════
+   实时监控（11 列）与历史面板的模型/用户明细表直接放在 .table-card 内，
+   此前只有 .table-wrap/.data-table 做了横向滚动，导致手机端整页被撑宽。 */
+
+.table-card {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-x: contain;
+}
+/* 卡片横向滚动时标题钉在左侧，不随表格滚出视野 */
+.table-card h3 {
+  position: sticky;
+  left: 0;
+}
+/* 网格/弹性子项允许收缩，防止 canvas 与表格把父容器顶宽 */
+.chart-wrap { min-width: 0; }
+.chart-card { min-width: 0; }
+
+@media (max-width: 900px) {
+  .modern-table th, .modern-table td { white-space: nowrap; }
+  .modern-table th, .modern-table td { padding: 8px 10px; }
+}
+
+@media (max-width: 600px) {
+  .dashboard { gap: 12px; }
+  .modern-table { font-size: 12px; }
+  .modern-table th, .modern-table td { padding: 7px 8px; }
+
+  /* 统计页签均分整行，加大触控高度 */
+  .stats-tabs { width: 100%; }
+  .stats-tab { flex: 1; padding: 12px 8px; font-size: 13px; }
+
+  /* 历史工具栏：日期/下拉提到 16px 防 iOS 聚焦缩放，控件占满行 */
+  .history-toolbar { gap: 8px; }
+  .history-toolbar label { flex: 1 1 100%; justify-content: space-between; }
+  .history-toolbar input[type="date"],
+  .history-toolbar select { font-size: 16px; flex: 1; min-width: 0; }
+  .history-summary { gap: 10px; flex-wrap: wrap; }
+
+  /* 趋势图头部：标题与 calls/tokens 切换允许换行 */
+  .trend-header { flex-wrap: wrap; }
+}

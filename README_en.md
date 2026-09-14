@@ -21,7 +21,7 @@ The current proxy core is built around a provider-neutral internal representatio
 | Image-generation gateway | Supports `/images/generations`, Codex `/responses` tool bridging, short-lived originals, compressed previews, batches, and image usage statistics. |
 | Tool-call reliability | Preserves tool IDs across protocol conversions, repairs malformed tool JSON, and includes a tool-only loop circuit breaker. |
 | Reasoning continuity | Caches and replays `reasoning_content` for DeepSeek-style thinking models across multi-turn tool flows. |
-| Web admin panel | Manage providers, users, API keys, routing rules, model preprocessors, and usage stats. |
+| Web admin panel | Manage providers, users, API keys, routing rules, model preprocessors, and usage stats; responsive design for desktop, tablet, and phone. |
 | SQLite storage | Providers, users, keys, routing rules, stats, and request records are stored in `data.db`. |
 
 ## Quick Start
