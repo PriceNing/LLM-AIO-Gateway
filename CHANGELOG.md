@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Tightened protocol boundary handling (OpenAI/Anthropic/Responses) for more robust cross-protocol conversion.
 
 ### Added
+- Admin UI responsive/mobile support: tablet and phone breakpoints (900px/600px), touch-scroll optimizations, and small-screen layout adjustments in `styles.css`.
 - Extensive regression tests (test_database_admin_fixes / test_protocol_adapter_fixes / test_proxy_image_fixes) strengthening coverage of protocol adapters, database management, and the image pipeline.
 
 ## [0.10.3] - 2026-09-08
