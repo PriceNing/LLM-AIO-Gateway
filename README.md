@@ -215,7 +215,7 @@ curl http://localhost:8000/v1/responses \
 | `login_attempt_window_seconds` | 300 | 登录限流统计窗口。 |
 | `login_lockout_seconds` | 900 | 锁定后的恢复时间。 |
 | `login_attempt_max_identities` | 10000 | 登录限流状态最多保留的身份数量。 |
-| `request_log_max` | 200 | 内存中滚动请求日志条数。 |
+| `request_log_max` | 200 | 数据库保留的请求日志条数（后台周期裁剪；<=0 禁用裁剪）。 |
 | `storage_maintenance_interval_seconds` | 60 | 后台存储清理间隔。 |
 | `request_log_capture_payloads` | true | 是否保存请求和响应正文；关闭后只记录元数据。 |
 | `request_log_redact_fields` | `[api_key, authorization, ...]` | 请求/响应日志脱敏字段列表。 |
@@ -311,7 +311,7 @@ OpenAI 兼容提供商默认走 Chat Completions；仅在原生 Responses 能力
 pytest tests/ -q
 ```
 
-当前预期结果：`823 passed`。
+当前预期结果：`830 passed`。
 
 真实烟测建议：
 

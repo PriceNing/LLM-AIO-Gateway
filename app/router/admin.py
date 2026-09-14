@@ -416,13 +416,19 @@ def _normalize_allowed_models(value):
     """校验/归一化 allowed_models。
 
     字符串会被 json.dumps 存成 JSON 字符串，读取端退化为逐字符匹配，
-    白名单行为不可预期；这里宽容单个字符串，拒绝其他非法类型。
+    白名单行为不可预期；这里宽容单个非空字符串，拒绝其他非法类型。
+    空字符串/空列表不能默认成 ["*"]，否则"清空白名单"会变成全模型放行。
     """
     if isinstance(value, str):
-        return [value] if value.strip() else ["*"]
+        if not value.strip():
+            raise HTTPException(status_code=400, detail="allowed_models must not be empty")
+        return [value.strip()]
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
         raise HTTPException(status_code=400, detail="allowed_models must be a list of strings")
-    return value
+    normalized = [item.strip() for item in value if item.strip()]
+    if not normalized:
+        raise HTTPException(status_code=400, detail="allowed_models must not be empty")
+    return normalized
 
 
 @router.post("/users/{username}/api-keys")

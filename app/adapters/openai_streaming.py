@@ -36,15 +36,26 @@ def _tool_call_to_dict(tool_call) -> dict:
 def _infer_tool_index(tc_dict: dict, tool_states: dict[int, dict]) -> int:
     """部分 OpenAI 兼容上游的流式 tool_calls 不带 index。
 
-    若全部默认 0，多个并行工具调用会被合并串参；这里按 id 归属推断：
-    已知 id 匹配现有状态则沿用；新 id 开新下标；无 id 则延续最后一个。
+    可达性：``_tool_call_to_dict`` 对 Pydantic 对象总是产出 ``index``（默认 0），
+    因此本函数仅在“上游直接发送缺 index 的裸 dict”时被调用；若全部默认 0，
+    多个并行工具调用会被合并串参。
+
+    推断规则：已知 id 匹配现有状态则沿用；新 id 分配下一个紧凑下标；
+    无 id 则延续最后一个（增量上下文）。
     """
     tc_id = str(tc_dict.get("id") or "")
     if tc_id:
         for idx, state in tool_states.items():
             if state.get("id") == tc_id:
                 return idx
-        return (max(tool_states) + 1) if tool_states else 0
+        # 用 len() 而非 max()+1：下标只作为内部键与 SSE index，紧凑分配可
+        # 避免上游乱序 id 造成的空洞让客户端看到不连续的 tool_calls index。
+        # 与显式 index 混用时 len() 可能撞上已占用的键（如 {0,2} 时 len=2），
+        # 逐个跳过已占用槽位，保证不会把新调用合并进无关状态。
+        candidate = len(tool_states)
+        while candidate in tool_states:
+            candidate += 1
+        return candidate
     return max(tool_states) if tool_states else 0
 
 

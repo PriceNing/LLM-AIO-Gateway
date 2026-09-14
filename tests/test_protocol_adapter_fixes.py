@@ -144,6 +144,21 @@ def test_unsigned_thinking_dropped_for_anthropic_upstream():
         assert block.get("type") != "thinking"
 
 
+def test_reasoning_only_assistant_message_skipped_for_anthropic_upstream():
+    """仅含无签名 reasoning 的 assistant 消息投影后为空 content，
+    直接发送会被 Anthropic 以 'non-empty content' 拒绝，必须整条跳过。"""
+    messages = openai_messages_to_ir([
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": None, "reasoning_content": "hidden only"},
+        {"role": "user", "content": "q2"},
+    ])
+    anthropic_messages, _ = ir_to_anthropic_messages(messages)
+    roles = [m["role"] for m in anthropic_messages]
+    assert roles == ["user", "user"], "空 content 的 assistant 消息未被跳过"
+    for msg in anthropic_messages:
+        assert any(block.get("text") or block.get("type") != "text" for block in msg["content"])
+
+
 def test_signed_thinking_kept_for_anthropic_upstream():
     messages = anthropic_messages_to_ir([
         {"role": "assistant", "content": [
@@ -195,6 +210,18 @@ def test_responses_reasoning_before_function_call_attaches_to_that_group():
     assert assistants[1].get("reasoning_content") == "second plan"
 
 
+def test_responses_pending_reasoning_not_attached_across_user_turn():
+    """reasoning 与下一条 assistant 之间插入 user 消息后，不得跨回合误挂。"""
+    result = ir_to_openai_messages(responses_input_to_ir([
+        {"type": "message", "role": "user", "content": "q1"},
+        {"type": "reasoning", "summary": [{"type": "summary_text", "text": "stale plan"}]},
+        {"type": "message", "role": "user", "content": "q2"},
+        {"type": "message", "role": "assistant", "content": "answer"},
+    ]))
+    assistant = next(m for m in result if m["role"] == "assistant")
+    assert assistant.get("reasoning_content") is None
+
+
 # ---------------------------------------------------------------------------
 # #10 Responses 错误帧复用 response id
 # ---------------------------------------------------------------------------
@@ -237,6 +264,23 @@ def test_infer_tool_index_by_id():
     assert _infer_tool_index({"id": "call_b"}, states) == 1
     assert _infer_tool_index({}, states) == 0
     assert _infer_tool_index({"id": "call_x"}, {}) == 0
+
+
+def test_infer_tool_index_never_collides_with_explicit_slots():
+    # 上游混用显式 index（带空洞）与无 index 增量时，推断槽位不得撞上已占用键，
+    # 否则新调用会被合并进无关状态串参。
+    states = {0: {"id": "call_a"}, 2: {"id": "call_c"}}
+    inferred = _infer_tool_index({"id": "call_new"}, states)
+    assert inferred not in states
+
+
+def test_infer_tool_index_allocates_compact_index():
+    """新 id 必须分配紧凑下标，不受上游乱序 id 造成的空洞影响。"""
+    # 上游先给出 index=2 的调用，再发一个无 index、新 id 的调用
+    states = {2: {"id": "call_c"}}
+    assert _infer_tool_index({"id": "call_new"}, states) == 1
+    # 已知 id 仍精确回落到原下标
+    assert _infer_tool_index({"id": "call_c"}, states) == 2
 
 
 # ---------------------------------------------------------------------------

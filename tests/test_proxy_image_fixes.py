@@ -130,6 +130,11 @@ def test_proxy_endpoints_preserve_upstream_status(monkeypatch, endpoint, payload
     monkeypatch.setattr("app.router.proxy._call_nonstream_with_fallbacks", failing_call)
     response = client.post(endpoint, headers=headers, json=payload)
     assert response.status_code == 429, "上游 429 被压平成 500，客户端无法正确退避"
+    # 透传状态码的同时必须保留失败日志（可观测性不能回退）
+    from app.database import get_db
+    with get_db() as db:
+        row = db.execute("SELECT COUNT(*) AS c FROM request_logs WHERE status != 'ok'").fetchone()
+    assert row["c"] >= 1, "HTTPException 透传路径丢失了失败请求日志"
 
 
 # ---------------------------------------------------------------------------
@@ -288,3 +293,35 @@ def test_new_turn_start_detects_real_placeholder_marker():
     ]
     # 以 tool 结果结尾时，占位文本所在消息之后才是"当前轮"
     assert _new_turn_start(messages) == 1
+
+
+# ---------------------------------------------------------------------------
+# 图像 #10：已存图片文件被清理后，字节统计不得让请求失败
+# ---------------------------------------------------------------------------
+
+def test_stored_image_bytes_tolerates_missing_files(tmp_path):
+    from app.router.proxy import _stored_image_bytes
+
+    class _Item:
+        def __init__(self, path):
+            self.path = path
+
+    present = tmp_path / "ok.png"
+    present.write_bytes(b"1234567890")
+    missing = tmp_path / "gone.png"
+
+    # 后台清理任务删除文件后，stat() 会抛 FileNotFoundError(OSError)；
+    # 统计函数必须降级为跳过，而不是把已成功的生图响应打成 500。
+    assert _stored_image_bytes([_Item(present), _Item(missing)]) == 10
+    assert _stored_image_bytes([]) == 0
+    assert _stored_image_bytes(None) == 0
+
+
+def test_assistant_message_log_uses_guarded_byte_count():
+    """生图 assistant_message 路径必须复用 _stored_image_bytes，不得裸调 stat()。"""
+    import inspect
+    from app.router import proxy as proxy_module
+
+    source = inspect.getsource(proxy_module.responses_endpoint)
+    assert "artifact_bytes=%d" in source
+    assert "sum(item.path.stat().st_size for item in stored_images)" not in source

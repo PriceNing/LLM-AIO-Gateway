@@ -17,6 +17,10 @@ _initialized = False
 
 DB_PATH: str = "data.db"
 
+# ``PRAGMA user_version`` 迁移版本号。每个非幂等的一次性迁移占用一个版本，
+# 迁移体必须先检查版本、完成后推进版本，避免重复执行覆盖用户配置。
+_SCHEMA_VERSION_PROVIDER_OPTIONS = 1
+
 # -- Connection management --
 
 def _db_path() -> str:
@@ -64,7 +68,15 @@ def _migrate_provider_models_created_at(conn: sqlite3.Connection) -> None:
 
 
 def _migrate_provider_options_and_headers(conn: sqlite3.Connection) -> None:
-    """Split legacy mixed provider settings into options and upstream headers."""
+    """Split legacy mixed provider settings into options and upstream headers.
+
+    幂等性靠 ``PRAGMA user_version`` 标记，而不是靠 ``extra_headers`` 列是否
+    已被 DROP：DROP COLUMN 在列被索引/触发器引用或 SQLite < 3.35 时会失败，
+    若以列存在性作为唯一判据，迁移就会每次启动重跑，把管理员有意清空的
+    provider_options/upstream_headers 用旧列数据或 deepseek 默认值复活。
+    """
+    if conn.execute("PRAGMA user_version").fetchone()[0] >= _SCHEMA_VERSION_PROVIDER_OPTIONS:
+        return
     try:
         conn.execute("ALTER TABLE providers ADD COLUMN provider_options TEXT NOT NULL DEFAULT '{}'")
     except sqlite3.OperationalError:
@@ -74,37 +86,34 @@ def _migrate_provider_options_and_headers(conn: sqlite3.Connection) -> None:
     except sqlite3.OperationalError:
         pass
     columns = {row[1] for row in conn.execute("PRAGMA table_info(providers)").fetchall()}
-    if "extra_headers" not in columns:
-        # 旧列已删除 = 迁移已完成。绝不能每次启动都重新推导，否则管理员
-        # 有意清空的 provider_options/upstream_headers 会被旧列或 deepseek
-        # 默认值悄悄恢复（非幂等迁移覆盖用户配置）。
-        return
-    legacy_column = "extra_headers"
-    rows = conn.execute(
-        f"SELECT id, name, {legacy_column}, provider_options, upstream_headers FROM providers"
-    ).fetchall()
-    for row in rows:
-        pid, name, legacy_json, options_json, headers_json = row
-        legacy = _json_loads(legacy_json or "{}") or {}
-        options = _json_loads(options_json or "{}") or {}
-        headers = _json_loads(headers_json or "{}") or {}
-        if not options and legacy:
-            options = {key: value for key, value in legacy.items() if key in {"thinking", "thinking_budget_tokens"}}
-        if not headers and legacy:
-            headers = {key: value for key, value in legacy.items() if key not in {"thinking", "thinking_budget_tokens"}}
-        provider_name = str(name or "").lower()
-        if not options and ("deepseek" in pid.lower() or "deepseek" in provider_name):
-            options = {"thinking": "enabled"}
-        if options or headers:
-            conn.execute(
-                "UPDATE providers SET provider_options = ?, upstream_headers = ? WHERE id = ?",
-                (json.dumps(options, ensure_ascii=False), json.dumps(headers, ensure_ascii=False), pid),
-            )
-    # 迁移完成后删除旧列，保证后续启动不再重新推导（SQLite >= 3.35 支持 DROP COLUMN）。
-    try:
-        conn.execute("ALTER TABLE providers DROP COLUMN extra_headers")
-    except sqlite3.OperationalError:
-        pass
+    if "extra_headers" in columns:
+        legacy_column = "extra_headers"
+        rows = conn.execute(
+            f"SELECT id, name, {legacy_column}, provider_options, upstream_headers FROM providers"
+        ).fetchall()
+        for row in rows:
+            pid, name, legacy_json, options_json, headers_json = row
+            legacy = _json_loads(legacy_json or "{}") or {}
+            options = _json_loads(options_json or "{}") or {}
+            headers = _json_loads(headers_json or "{}") or {}
+            if not options and legacy:
+                options = {key: value for key, value in legacy.items() if key in {"thinking", "thinking_budget_tokens"}}
+            if not headers and legacy:
+                headers = {key: value for key, value in legacy.items() if key not in {"thinking", "thinking_budget_tokens"}}
+            provider_name = str(name or "").lower()
+            if not options and ("deepseek" in pid.lower() or "deepseek" in provider_name):
+                options = {"thinking": "enabled"}
+            if options or headers:
+                conn.execute(
+                    "UPDATE providers SET provider_options = ?, upstream_headers = ? WHERE id = ?",
+                    (json.dumps(options, ensure_ascii=False), json.dumps(headers, ensure_ascii=False), pid),
+                )
+        # 尽力删除旧列（SQLite >= 3.35）；失败不影响幂等性，因为版本号已推进。
+        try:
+            conn.execute("ALTER TABLE providers DROP COLUMN extra_headers")
+        except sqlite3.OperationalError:
+            pass
+    conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION_PROVIDER_OPTIONS}")
 
 
 def _migrate_provider_request_options(conn: sqlite3.Connection) -> None:

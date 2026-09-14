@@ -213,7 +213,7 @@ Important defaults:
 | `login_attempt_window_seconds` | 300 | Window used to count login attempts. |
 | `login_lockout_seconds` | 900 | Lockout duration after exceeding the attempt limit. |
 | `login_attempt_max_identities` | 10000 | Maximum number of admin-login throttle identities retained in memory. |
-| `request_log_max` | 200 | Rolling request-log entries kept in memory. |
+| `request_log_max` | 200 | Request-log rows kept in the database (trimmed periodically; <=0 disables trimming). |
 | `storage_maintenance_interval_seconds` | 60 | Background storage cleanup interval. |
 | `request_log_capture_payloads` | true | Store request/response bodies; disable to retain metadata only. |
 | `request_log_redact_fields` | `[api_key, authorization, ...]` | Redacted fields when capturing request/response bodies. |
@@ -309,7 +309,7 @@ Main code boundaries:
 pytest tests/ -q
 ```
 
-Expected current result: `823 passed`.
+Expected current result: `830 passed`.
 
 Live smoke matrix:
 

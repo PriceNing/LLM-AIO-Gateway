@@ -122,6 +122,53 @@ def test_provider_options_migration_idempotent(tmp_path):
     assert provider["upstream_headers"] == {}
 
 
+def test_provider_options_migration_idempotent_when_drop_column_fails(tmp_path):
+    """DROP COLUMN 失败（列被索引引用）时迁移仍必须幂等。
+
+    旧实现以“extra_headers 列是否已删除”作为迁移完成判据，DROP 失败就会
+    每次启动重跑，把管理员清空的 provider_options/upstream_headers 复活。
+    """
+    db_path = str(tmp_path / "legacy_idx.db")
+    conn = sqlite3.connect(db_path)
+    conn.execute("""
+        CREATE TABLE providers (
+            id TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '',
+            provider_type TEXT NOT NULL DEFAULT 'openai',
+            api_base TEXT NOT NULL DEFAULT '', api_key TEXT NOT NULL DEFAULT '',
+            enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL DEFAULT '',
+            extra_headers TEXT NOT NULL DEFAULT '{}'
+        )
+    """)
+    # 索引引用 extra_headers，使 ALTER TABLE ... DROP COLUMN 报 OperationalError
+    conn.execute("CREATE INDEX idx_legacy_extra_headers ON providers(extra_headers)")
+    conn.execute(
+        "INSERT INTO providers (id, name, api_base, extra_headers) VALUES (?, ?, ?, ?)",
+        ("deepseek1", "DS", "http://192.168.1.20:8000", json.dumps({"X-Custom": "1"})),
+    )
+    conn.commit()
+    conn.close()
+
+    config_path = str(tmp_path / "config.json")
+    config = load_config(config_path, force_reload=True)
+    config.config = {"database": db_path, "logging": {"enabled": False}}
+    config.save()
+
+    init_db(db_path)
+    assert get_provider("deepseek1")["upstream_headers"] == {"X-Custom": "1"}
+
+    update_provider("deepseek1", {"provider_options": {}, "upstream_headers": {}})
+    assert get_provider("deepseek1")["upstream_headers"] == {}
+
+    # 旧列仍在，但版本号已推进，迁移不得重跑
+    init_db(db_path)
+    provider = get_provider("deepseek1")
+    assert provider["upstream_headers"] == {}, "DROP COLUMN 失败时迁移非幂等：清空的配置被复活"
+    assert provider["provider_options"] == {}
+
+    with get_db() as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] >= 1
+
+
 # ---------------------------------------------------------------------------
 # #4 update_admin_password 返回值语义
 # ---------------------------------------------------------------------------
@@ -231,6 +278,12 @@ def test_allowed_models_string_wrapped_and_invalid_rejected(temp_db):
     assert r.json()["allowed_models"] == ["gpt-4"]
 
     r = client.post("/admin/users/alice/api-keys", headers=temp_db["headers"], json={"allowed_models": 42})
+    assert r.status_code == 400
+
+    # 空字符串/空列表不得默认为 ["*"]（全模型放行），必须明确拒绝。
+    r = client.post("/admin/users/alice/api-keys", headers=temp_db["headers"], json={"allowed_models": "   "})
+    assert r.status_code == 400
+    r = client.post("/admin/users/alice/api-keys", headers=temp_db["headers"], json={"allowed_models": []})
     assert r.status_code == 400
 
 

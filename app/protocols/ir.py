@@ -49,6 +49,8 @@ def _append_anthropic_image_content(content: list[dict[str, Any]], part: Interna
         content.append({"type": "image", "source": {"type": "base64", "media_type": media, "data": data}})
     elif source.get("url"):
         content.append({"type": "text", "text": f"[image URL: {source.get('url')}]"})
+    elif source.get("file_id"):
+        content.append({"type": "text", "text": f"[image file_id: {source.get('file_id')}]"})
 
 
 def _anthropic_tool_result_content(parts: list[InternalPart]) -> Any:
@@ -88,6 +90,9 @@ def _parts_to_openai_content(parts: list[InternalPart]) -> Any:
             elif source.get("kind") == "base64":
                 media = source.get("media_type") or "image/png"
                 content.append({"type": "image_url", "image_url": {"url": f"data:{media};base64,{source.get('data', '')}"}})
+            elif source.get("file_id"):
+                # Anthropic file 源无法投影为 OpenAI 图片块，留痕而不是静默丢弃。
+                content.append({"type": "text", "text": f"[image file_id: {source.get('file_id')}]"})
         elif part.kind == "unknown" and part.raw is not None:
             text = _unknown_part_text(part.raw)
             if text:
@@ -439,12 +444,18 @@ def responses_input_to_ir(
                 role = "system"
             if role not in ("system", "user", "assistant", "tool"):
                 role = "user"
+            # 任何 message item 都打断"reasoning 紧跟 function_call"的相邻性。
+            reasoning_backfill_ok = False
             parts = _parts_from_responses_content(item.get("content", ""))
             rc = item.get("reasoning_content")
             if role == "assistant" and pending_reasoning:
                 combined = "\n\n".join([*pending_reasoning, *([rc] if rc else [])])
                 pending_reasoning.clear()
                 rc = combined
+            elif role != "assistant" and pending_reasoning:
+                # reasoning 归属于紧随其后的 assistant 回合；中间插入 user/system
+                # 消息后，暂存的 reasoning 已过期，不得跨回合误挂。
+                pending_reasoning.clear()
             if role == "assistant" and rc:
                 parts.insert(0, reasoning_part(rc, raw=rc))
             if role == "system":
@@ -459,7 +470,13 @@ def responses_input_to_ir(
                 role = "system"
             if role not in ("system", "user", "assistant", "tool"):
                 role = "user"
+            reasoning_backfill_ok = False
             parts = _parts_from_responses_content(item.get("content", ""))
+            if role == "assistant" and pending_reasoning:
+                parts.insert(0, reasoning_part("\n\n".join(pending_reasoning), raw=dict(item)))
+                pending_reasoning.clear()
+            elif role != "assistant" and pending_reasoning:
+                pending_reasoning.clear()
             if role == "system":
                 append_system_text(messages, _text_from_parts(parts) or "", raw=dict(item))
             else:
@@ -664,7 +681,16 @@ def ir_to_anthropic_messages(messages: list[InternalMessage]) -> tuple[list[dict
         if msg.role == "system":
             system_parts.extend(_parts_to_anthropic_content(msg.parts))
         elif msg.role in ("user", "assistant"):
-            anthropic_messages.append({"role": msg.role, "content": _parts_to_anthropic_content(msg.parts)})
+            content = _parts_to_anthropic_content(msg.parts)
+            # 仅当消息本来有内容、但全部是被丢弃的无签名 reasoning 时才跳过：
+            # 空 content 会被 Anthropic 以 "non-empty content" 拒绝；而原本就空的
+            # 消息保持既有行为（空文本块），不扩大语义变更面。
+            if (
+                all(block.get("type") == "text" and not block.get("text") for block in content)
+                and any(part.kind == "reasoning" for part in msg.parts)
+            ):
+                continue
+            anthropic_messages.append({"role": msg.role, "content": content})
         elif msg.role == "tool":
             for part in msg.parts:
                 if part.kind == "tool_result":

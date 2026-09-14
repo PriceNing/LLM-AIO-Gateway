@@ -144,7 +144,9 @@ async def refresh_provider_models(provider_id: str) -> dict:
                     return True
                 if str(row["image_generation"] or "").strip():
                     return True
-                return str(row["responses_status"] or "") not in ("", "unknown")
+                # 只有探测成功的结果值得保留（避免重新探测的开销）；
+                # error/unsupported 等失败状态不是管理员配置，不应让模型永久滞留。
+                return str(row["responses_status"] or "") == "supported"
 
             # 上游模型列表临时变动（改名/分页/权限）时，直接 DELETE 会丢失
             # 管理员在该模型上配置的 preprocessor / 生图标记 / 能力探测结果；

@@ -168,19 +168,23 @@
                     <div class="section-header">
                         <h2 data-i18n="logs.title">请求/响应日志</h2>
                         <div class="section-actions">
-                            <select id="logEndpointFilter" class="select-input" onchange="loadRequestLogs()">
+                            <select id="logEndpointFilter" class="select-input" onchange="gotoRequestLogPage(0)">
                                 <option value="" data-i18n="logs.allEndpoints">全部端点</option>
                                 <option value="chat_completions">chat_completions</option>
                                 <option value="completions">completions</option>
                                 <option value="messages">messages</option>
                                 <option value="responses">responses</option>
+                                <option value="images_generations">images_generations</option>
                             </select>
                             <input type="text" id="logUsernameFilter" class="text-input" data-i18n-placeholder="logs.filterUser" placeholder="按用户名筛选" oninput="onLogFilterInput()">
-                            <select id="logStatusFilter" class="select-input" onchange="loadRequestLogs()">
+                            <select id="logStatusFilter" class="select-input" onchange="gotoRequestLogPage(0)">
                                 <option value="" data-i18n="logs.allStatus">全部状态</option>
                                 <option value="ok">ok</option>
+                                <option value="degraded">degraded</option>
                                 <option value="partial">partial</option>
                                 <option value="fail">fail</option>
+                                <option value="rejected">rejected</option>
+                                <option value="cancelled">cancelled</option>
                             </select>
                             <button class="btn btn-secondary" onclick="loadRequestLogs()" data-i18n="logs.refresh">刷新</button>
                             <button class="btn btn-danger" onclick="confirmClearRequestLogs()" data-i18n="logs.clear">清空</button>

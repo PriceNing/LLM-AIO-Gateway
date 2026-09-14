@@ -234,7 +234,10 @@ class LogManager:
         root = Path(self._log_dir)
         if not root.exists():
             return
-        cutoff = datetime.now(timezone.utc) - timedelta(days=self._retention_days)
+        # retention_days 下限 1：配置为 0 时 cutoff=now 会把当天正在写入的
+        # 日期目录也判为过期（Linux 下句柄继续写已删除文件，Windows 下静默失败）。
+        retention_days = max(1, int(self._retention_days or 1))
+        cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
         for entry in root.iterdir():
             if entry.is_dir():
                 try:

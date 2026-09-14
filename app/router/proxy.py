@@ -1569,6 +1569,15 @@ async def _native_response_with_fallbacks(internal, *, stream: bool, required_to
 
 
 def _attach_request_details(exc: Exception, **details) -> Exception:
+    """Attach policy/fallback metadata to an exception.
+
+    契约：任何从 fallback 链或上游适配器向上抛出的异常，在到达
+    ``core.streaming.stream_internal_output`` / ``core.outcome.is_client_disconnect_error``
+    之前都必须经过本函数（至少在 exhausted 路径上打标）。后者用
+    ``getattr(exc, "request_details", None) is dict`` 作为“这是上游错误、
+    不是客户端断开”的判据；新增不经过本函数的上游异常路径会破坏该判据，
+    使 httpx/httpcore 的 reset/remote-protocol 文本被误判为客户端取消。
+    """
     existing = getattr(exc, "request_details", None)
     merged = dict(existing) if isinstance(existing, dict) else {}
     for key, value in details.items():
@@ -1594,6 +1603,45 @@ def _request_details_from_exception(exc: Exception, **defaults) -> dict:
     details.setdefault("status", "fail")
     details.setdefault("error_message", error_detail_for_log(exc))
     return details
+
+
+def _log_upstream_http_exception_failure(
+    endpoint: str,
+    exc: HTTPException,
+    *,
+    username: str,
+    api_key_value: str,
+    requested_model: str,
+    model: str,
+    provider_id: str,
+    body: dict,
+) -> None:
+    """HTTPException 透传路径也要留下失败日志与统计。
+
+    状态码语义保留给客户端（429/502 等），但管理端的失败率/请求日志
+    不能因为透传而丢失记录。
+    """
+    status = "rejected" if 400 <= int(exc.status_code or 500) < 500 else "fail"
+    details = _request_details_from_exception(
+        exc,
+        stream=False,
+        attempted_model=model or requested_model,
+        attempted_provider=provider_id or "",
+    )
+    details["status"] = status
+    counters = stats_counters_for_status(status)
+    _log_request(username, api_key_value, model or requested_model, provider_id or "", endpoint, False, 0, requested_model, details=details)
+    _record_request_log(
+        endpoint=endpoint,
+        username=username, api_key_value=api_key_value, requested_model=requested_model,
+        final_model=model or requested_model, final_provider=provider_id or "",
+        request_body=body, response_body=None,
+        success=False, status=status, tokens=0, details=details,
+        error_message=error_detail_for_log(exc),
+    )
+    increment_global_stats(False, degraded=counters.degraded, rejected=counters.rejected, cancelled=counters.cancelled)
+    if username != "legacy":
+        increment_user_usage(username, api_key_value, False, 0)
 
 
 def _fallback_attempt_record(*, index: int, stage: str, target: RouteTarget, provider_id: str, status: str,
@@ -1811,7 +1859,9 @@ async def _call_nonstream_target(target: RouteTarget, internal, *, temperature, 
             ),
             # attempt_timeout 到期取消时必须立即返回，不能等线程跑完；否则
             # 上游挂死时"主动超时→fallback"要等到 litellm 自身超时才触发。
-            # 被 abandon 的线程由 litellm 自己的 request_timeout 兜底回收。
+            # 被 abandon 的线程由 litellm 自己的 request_timeout 兜底回收；
+            # 该值受 provider 配置限幅（_clamp_int 与 Pydantic le=3600，上限 1h），
+            # 因此被弃线程的占用时长有硬上界，不会无限期占住 anyio 线程池。
             abandon_on_cancel=True,
         )
         output = response_to_internal_output(response)
@@ -3366,9 +3416,15 @@ async def completions(request: Request, authorization: Optional[str] = Header(No
         )
         _record_success_metrics(username, api_key_value, tokens, status)
         return rendered
-    except HTTPException:
+    except HTTPException as http_exc:
         # 适配器把上游状态映射为 HTTPException（429/502 等），必须保留状态码
-        # 语义透传，不能压成 500，否则客户端无法正确退避；与 chat 端点一致。
+        # 语义透传，不能压成 500，否则客户端无法正确退避；同时补记失败
+        # 日志/统计，避免透传造成可观测性回归。
+        _log_upstream_http_exception_failure(
+            "completions", http_exc,
+            username=username, api_key_value=api_key_value, requested_model=requested_model,
+            model=model, provider_id=provider_id or "", body=body,
+        )
         raise
     except Exception as e:
         details = _request_details_from_exception(
@@ -3506,8 +3562,13 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
         )
         _record_success_metrics(username, api_key_value, tokens, status)
         return rendered
-    except HTTPException:
-        # 保留 anthropic 适配器映射的上游状态码（429/502 等），与 chat 端点一致。
+    except HTTPException as http_exc:
+        # 保留 anthropic 适配器映射的上游状态码（429/502 等），同时补记失败日志。
+        _log_upstream_http_exception_failure(
+            "messages", http_exc,
+            username=username, api_key_value=api_key_value, requested_model=requested_model,
+            model=model, provider_id=adapter_provider_id or provider_id or "", body=body,
+        )
         raise
     except Exception as e:
         details = _request_details_from_exception(
@@ -3674,7 +3735,13 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                 response_body=None, success=False, status=fail_details.get("status", "fail"),
                 tokens=0, details=fail_details, error_message=error_detail_for_log(exc),
             )
-            increment_global_stats(success=False)
+            fail_counters = stats_counters_for_status(fail_details.get("status", "fail"))
+            increment_global_stats(
+                False,
+                degraded=fail_counters.degraded,
+                rejected=fail_counters.rejected,
+                cancelled=fail_counters.cancelled,
+            )
             if username != "legacy":
                 increment_user_usage(username, api_key_value, False, 0)
             raise
@@ -4305,7 +4372,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                 _app_log.info(
                     "[responses image_generation.assistant_message] images=%d artifact_bytes=%d",
                     len(stored_images),
-                    sum(item.path.stat().st_size for item in stored_images),
+                    _stored_image_bytes(stored_images),
                 )
                 if stream:
                     details = apply_outcome_to_details(details, success=True)

@@ -3650,10 +3650,15 @@ function renderRequestLogs(data) {
     var summary = '<div class="history-summary"><span class="history-stat"><strong>' + total + '</strong> ' + escHtml(t('logs.total') || 'total') + '</span></div>';
     var pagination = '';
     if (total > _requestLogPageSize || _requestLogPage > 0) {
+        var pageCount = Math.max(1, Math.ceil(total / _requestLogPageSize));
+        if (_requestLogPage >= pageCount) {
+            // 删除/筛选后页数变少：纠正页码并重新拉取，避免展示越界区间。
+            _requestLogPage = pageCount - 1;
+            loadRequestLogs();
+            return;
+        }
         var first = _requestLogPage * _requestLogPageSize + 1;
         var last = Math.min(total, first + items.length - 1);
-        var pageCount = Math.max(1, Math.ceil(total / _requestLogPageSize));
-        if (_requestLogPage >= pageCount) { _requestLogPage = pageCount - 1; }
         pagination = '<div class="history-summary" style="gap:8px">';
         pagination += '<button class="btn btn-secondary" ' + (_requestLogPage <= 0 ? 'disabled' : 'onclick="gotoRequestLogPage(' + (_requestLogPage - 1) + ')"') + '>&laquo; ' + escHtml(t('common.prev') || 'Prev') + '</button>';
         pagination += '<span class="history-stat">' + first + '-' + last + ' / ' + total + '</span>';
