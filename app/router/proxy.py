@@ -50,6 +50,8 @@ from app.core.image_results import (
     store_image_results,
 )
 from app.core.image_batch import image_invocation_cache
+from app.core.model_capabilities import capabilities_for_client_entry, resolve_model_capabilities
+from app.services.model_registry import registry_lookup
 from app.core.outcome import (
     apply_outcome_to_details,
     routing_details_from_policy,
@@ -3150,12 +3152,21 @@ def list_models(authorization: Optional[str] = Header(None)):
                         "owned_by": provider["name"],
                         "provider": provider["id"]
                     }
+                    # 能力元数据：内置家族表 < 在线注册表 < 上游透传 < 管理员覆盖，
+                    # 让下游 harness 获取模型列表时顺带拿到上下文/视觉/工具能力。
+                    caps = resolve_model_capabilities(model, remote=registry_lookup(model["id"], model.get("name", "")))
                     # Models with native vision support or a vision preprocessor should advertise image support
                     # so clients such as Codex/OpenCode send image blocks instead of text placeholders.
-                    if _model_should_advertise_vision(provider, model):
+                    # 注意：`or caps.get("supports_vision")` 不是冗余——名称启发式
+                    # 未覆盖但在线注册表/内置表知道支持视觉的模型（如新款
+                    # deepseek-flash）靠这一支广告 image_support/multimodal。
+                    if _model_should_advertise_vision(provider, model) or caps.get("supports_vision"):
                         entry["supports_vision"] = True
                         entry["image_support"] = True
                         entry["multimodal"] = True
+                    # 客户端契约：能力字段只做正向声明，缺失 = 未知/不支持；
+                    # capabilities_for_client_entry 不会输出显式 false。
+                    entry.update(capabilities_for_client_entry(caps))
                     models.append(entry)
 
     return {"object": "list", "data": models}

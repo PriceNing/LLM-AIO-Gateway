@@ -1,8 +1,9 @@
 import asyncio
+import json
 import time
 
 import httpx
-from app.database import get_provider, update_provider, get_providers, get_db
+from app.database import get_provider, update_provider, get_providers, get_db, merge_upstream_model_capabilities
 from app.adapters.responses import iter_sse_frames, responses_headers, responses_url, sse_payload
 
 
@@ -40,6 +41,77 @@ def auth_headers(api_key: str, provider_type: str) -> list[dict]:
     return headers
 
 
+def _pick_positive_int(item: dict, keys: tuple[str, ...]):
+    for key in keys:
+        value = item.get(key)
+        if value is None or isinstance(value, bool):
+            # bool 是 int 子类：上游把 context_length 写成 true 时，
+            # int(True)==1 会广告成"1 token 上下文"，必须显式拒绝。
+            continue
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0:
+            return parsed
+    return None
+
+
+def upstream_capabilities(item: dict) -> dict:
+    """从上游 /models 条目提取能力元数据（OpenRouter / new-api / one-api 风格）。
+
+    普通 OpenAI 兼容端点通常只返回 id/created/owned_by，提不到任何字段时
+    返回空 dict，由内置启发式与管理员覆盖兜底。
+    """
+    caps: dict = {}
+    top_provider = item.get("top_provider") if isinstance(item.get("top_provider"), dict) else {}
+    context_window = _pick_positive_int(item, ("context_length", "context_window", "max_context_tokens", "max_context"))
+    if context_window is None:
+        context_window = _pick_positive_int(top_provider, ("context_length", "max_context_tokens"))
+    if context_window:
+        caps["context_window"] = context_window
+    max_output = _pick_positive_int(item, ("max_output_tokens", "max_completion_tokens"))
+    if max_output is None:
+        max_output = _pick_positive_int(top_provider, ("max_output_tokens", "max_completion_tokens"))
+    if max_output:
+        caps["max_output_tokens"] = max_output
+
+    raw_caps = item.get("capabilities") if isinstance(item.get("capabilities"), dict) else {}
+    architecture = item.get("architecture") if isinstance(item.get("architecture"), dict) else {}
+    modalities = item.get("input_modalities") or architecture.get("input_modalities")
+    if isinstance(modalities, list) and modalities:
+        caps["input_modalities"] = [str(m) for m in modalities]
+
+    vision = raw_caps.get("vision")
+    if vision is None:
+        vision = item.get("supports_vision")
+    if vision is None and caps.get("input_modalities"):
+        vision = "image" in caps["input_modalities"]
+    if vision is not None:
+        # 透传原值，由 normalize_capabilities 严格解析：上游用字符串
+        # "false"/"0"/"no" 表达否定时，bool() 强转会把它变成 True。
+        caps["supports_vision"] = vision
+
+    tools = raw_caps.get("function_calling")
+    if tools is None:
+        tools = item.get("supports_tools")
+    if tools is None:
+        supported_params = item.get("supported_parameters")
+        if isinstance(supported_params, list) and supported_params:
+            tools = any(p in supported_params for p in ("tools", "tool_use", "function_calling"))
+    if tools is not None:
+        caps["supports_tools"] = tools
+
+    pricing = item.get("pricing")
+    if isinstance(pricing, dict):
+        cleaned = {k: str(v) for k, v in pricing.items() if k in ("prompt", "completion", "image", "request") and isinstance(v, (str, int, float))}
+        if cleaned:
+            caps["pricing"] = cleaned
+
+    from app.core.model_capabilities import normalize_capabilities
+    return normalize_capabilities(caps)
+
+
 def parse_models(data: dict) -> list[dict]:
     raw_models = data.get("data")
     if raw_models is None:
@@ -53,10 +125,14 @@ def parse_models(data: dict) -> list[dict]:
             continue
         model_id = item.get("id") or item.get("identifier") or item.get("name")
         if model_id:
-            models.append({
+            entry = {
                 "id": model_id,
-                "name": item.get("display_name") or item.get("name") or model_id
-            })
+                "name": item.get("display_name") or item.get("name") or model_id,
+            }
+            caps = upstream_capabilities(item)
+            if caps:
+                entry["capabilities"] = caps
+            models.append(entry)
     return models
 
 
@@ -167,11 +243,13 @@ async def refresh_provider_models(provider_id: str) -> dict:
                         "UPDATE provider_models SET model_name = ? WHERE provider_id = ? AND model_id = ?",
                         (model["name"], provider_id, model_id),
                     )
+                    if model.get("capabilities"):
+                        merge_upstream_model_capabilities(db, provider_id, model_id, model["capabilities"])
                     updated += 1
                 else:
                     db.execute(
-                        "INSERT INTO provider_models (provider_id, model_id, model_name, enabled) VALUES (?, ?, ?, 1)",
-                        (provider_id, model_id, model["name"]),
+                        "INSERT INTO provider_models (provider_id, model_id, model_name, enabled, capabilities) VALUES (?, ?, ?, 1, ?)",
+                        (provider_id, model_id, model["name"], json.dumps(model.get("capabilities") or {}, ensure_ascii=False)),
                     )
                     added += 1
 

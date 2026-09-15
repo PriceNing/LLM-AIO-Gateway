@@ -47,6 +47,7 @@ def init_db(path: Optional[str] = None) -> None:
             _migrate_provider_force_chat_completions(conn)
             _remove_legacy_provider_responses_capability(conn)
             _migrate_model_responses_capability(conn)
+            _migrate_model_capabilities(conn)
             _migrate_preprocessors(conn)
             _migrate_image_generation(conn)
             _migrate_request_records_image_generation(conn)
@@ -163,6 +164,18 @@ def _migrate_model_responses_capability(conn: sqlite3.Connection) -> None:
     for col, ddl in columns.items():
         if col not in existing:
             conn.execute(f"ALTER TABLE provider_models ADD COLUMN {col} {ddl}")
+
+
+def _migrate_model_capabilities(conn: sqlite3.Connection) -> None:
+    """Per-model capability metadata (context window, vision, tools, pricing).
+
+    存储格式：{"context_window": int, "max_output_tokens": int,
+    "supports_vision": bool, "supports_tools": bool, "input_modalities": [...],
+    "pricing": {...}, "admin_keys": [管理员显式覆盖的键，上游刷新不覆盖]}。
+    """
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(provider_models)").fetchall()}
+    if "capabilities" not in existing:
+        conn.execute("ALTER TABLE provider_models ADD COLUMN capabilities TEXT NOT NULL DEFAULT '{}'")
 
 
 def _migrate_preprocessors(conn: sqlite3.Connection) -> None:
@@ -473,6 +486,7 @@ CREATE TABLE IF NOT EXISTS provider_models (
     responses_streaming_status TEXT NOT NULL DEFAULT 'unknown',
     responses_tool_types TEXT NOT NULL DEFAULT '[]',
     responses_error TEXT NOT NULL DEFAULT '',
+    capabilities TEXT NOT NULL DEFAULT '{}',
     FOREIGN KEY (provider_id) REFERENCES providers(id) ON DELETE CASCADE,
     UNIQUE(provider_id, model_id)
 );
@@ -575,6 +589,12 @@ CREATE TABLE IF NOT EXISTS request_logs (
 );
 CREATE INDEX IF NOT EXISTS idx_reqlog_ts ON request_logs(timestamp);
 CREATE INDEX IF NOT EXISTS idx_reqlog_endpoint ON request_logs(endpoint);
+CREATE TABLE IF NOT EXISTS model_registry (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    url TEXT NOT NULL DEFAULT '',
+    fetched_at TEXT NOT NULL DEFAULT '',
+    payload TEXT NOT NULL DEFAULT '[]'
+);
 """
 
 # -- Helpers --
@@ -1319,6 +1339,7 @@ def _model_from_row(row: sqlite3.Row) -> dict:
         "responses_streaming_status": row["responses_streaming_status"] or "unknown",
         "responses_tool_types": _json_loads(row["responses_tool_types"] or "[]") or [],
         "responses_error": row["responses_error"] or "",
+        "capabilities": (_json_loads(row["capabilities"] or "{}") or {}) if "capabilities" in row.keys() else {},
     }
     return model
 
@@ -1424,6 +1445,96 @@ def set_model_image_generation(model_id: str, enabled: bool) -> bool:
         else:
             cur = db.execute("UPDATE provider_models SET image_generation = ? WHERE model_id = ?", ("1" if enabled else "", mid.model_name))
         return cur.rowcount > 0
+
+
+def save_model_registry(url: str, entries: list, fetched_at: str) -> None:
+    """持久化在线模型能力注册表（单行覆盖）。"""
+    with get_db() as db:
+        db.execute(
+            "INSERT OR REPLACE INTO model_registry (id, url, fetched_at, payload) VALUES (1, ?, ?, ?)",
+            (url, fetched_at, json.dumps(entries, ensure_ascii=False)),
+        )
+
+
+def load_model_registry() -> Optional[dict]:
+    with get_db() as db:
+        row = db.execute("SELECT url, fetched_at, payload FROM model_registry WHERE id = 1").fetchone()
+    if not row:
+        return None
+    entries = _json_loads(row["payload"] or "[]") or []
+    return {"url": row["url"] or "", "fetched_at": row["fetched_at"] or "", "entries": entries}
+
+
+def set_model_capabilities(model_id: str, capabilities: dict) -> bool:
+    """管理员手动覆盖模型能力：合并写入并标记 admin_keys。
+
+    被标记的键后续上游 /models 刷新不会覆盖；传 null 值可清除覆盖并
+    恢复跟随上游/内置启发式。
+    """
+    from app.core.model_capabilities import normalize_capabilities, _CAPABILITY_KEYS
+
+    if not isinstance(capabilities, dict):
+        raise ValueError("capabilities must be an object")
+    cleaned = normalize_capabilities({k: v for k, v in capabilities.items() if v is not None})
+    cleared = [k for k, v in capabilities.items() if v is None and k in _CAPABILITY_KEYS]
+    mid = parse_model_id(model_id)
+    with get_db() as db:
+        if mid.is_composite:
+            rows = db.execute(
+                "SELECT provider_id, model_id, capabilities FROM provider_models WHERE provider_id = ? AND model_id = ?",
+                (mid.provider_id, mid.model_name),
+            ).fetchall()
+        else:
+            rows = db.execute(
+                "SELECT provider_id, model_id, capabilities FROM provider_models WHERE model_id = ?",
+                (mid.model_name,),
+            ).fetchall()
+        if not rows:
+            return False
+        for row in rows:
+            stored = _json_loads(row["capabilities"] or "{}") or {}
+            admin_keys = set(stored.get("admin_keys") or [])
+            values = {k: v for k, v in stored.items() if k in _CAPABILITY_KEYS}
+            values.update(cleaned)
+            for key in cleared:
+                values.pop(key, None)
+            admin_keys.update(cleaned.keys())
+            admin_keys.difference_update(cleared)
+            payload = {**values, "admin_keys": sorted(admin_keys)}
+            db.execute(
+                "UPDATE provider_models SET capabilities = ? WHERE provider_id = ? AND model_id = ?",
+                (json.dumps(payload, ensure_ascii=False), row["provider_id"], row["model_id"]),
+            )
+        return True
+
+
+def merge_upstream_model_capabilities(db: sqlite3.Connection, provider_id: str, model_id: str, upstream: dict) -> None:
+    """上游 /models 透传的能力元数据写回 DB（在调用方事务内执行）。
+
+    仅覆盖未被管理员标记（admin_keys）的键；上游未提供的键保留现值。
+    """
+    from app.core.model_capabilities import normalize_capabilities
+
+    cleaned = normalize_capabilities(upstream)
+    if not cleaned:
+        return
+    row = db.execute(
+        "SELECT capabilities FROM provider_models WHERE provider_id = ? AND model_id = ?",
+        (provider_id, model_id),
+    ).fetchone()
+    if row is None:
+        return
+    stored = _json_loads(row["capabilities"] or "{}") or {}
+    admin_keys = set(stored.get("admin_keys") or [])
+    values = {k: v for k, v in stored.items() if k != "admin_keys"}
+    for key, value in cleaned.items():
+        if key not in admin_keys:
+            values[key] = value
+    payload = {**values, **({"admin_keys": sorted(admin_keys)} if admin_keys else {})}
+    db.execute(
+        "UPDATE provider_models SET capabilities = ? WHERE provider_id = ? AND model_id = ?",
+        (json.dumps(payload, ensure_ascii=False), provider_id, model_id),
+    )
 
 
 def get_model_image_generation(provider_id: str, model: str) -> bool:

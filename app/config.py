@@ -68,6 +68,9 @@ def default_config() -> dict:
             "responses_capability_transient_ttl": 300,
             "responses_capability_probe_timeout": 8,
             "responses_capability_probe_max_output_tokens": 16,
+            "model_registry_enabled": True,
+            "model_registry_url": "https://openrouter.ai/api/v1/models",
+            "model_registry_ttl_seconds": 604800,
             "anthropic_thinking_budget_tokens": 1024,
         }
     }

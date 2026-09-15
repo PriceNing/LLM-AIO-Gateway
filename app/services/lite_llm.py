@@ -9,6 +9,8 @@ from app.database import get_providers, get_provider, find_provider_by_model
 from app.services.logger import get_logger
 from app.config import get_default
 from app.core.images import has_image_content, normalize_image_content
+from app.core.model_capabilities import resolve_model_capabilities
+from app.services.model_registry import registry_lookup
 
 # -- liteLLM compatibility: expose reasoning_content on response models --
 # Several OpenAI-compatible providers return reasoning_content, but some liteLLM
@@ -360,6 +362,9 @@ def get_available_models(provider_id: Optional[str] = None) -> list:
                         "name": model.get("name", model["id"]),
                         "provider": provider["id"],
                         "provider_name": provider["name"],
-                        "provider_type": provider["provider_type"]
+                        "provider_type": provider["provider_type"],
+                        # 内置家族表 < 在线注册表 < 上游透传 < 管理员覆盖。
+                        "capabilities": resolve_model_capabilities(model, remote=registry_lookup(model["id"], model.get("name", ""))),
+                        "capabilities_overridden": sorted((model.get("capabilities") or {}).get("admin_keys") or []),
                     })
     return models

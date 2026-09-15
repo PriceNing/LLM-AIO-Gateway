@@ -141,6 +141,24 @@ zh: {
     'models.testFail': '模型测试失败',
     'models.count': '个模型',
     'models.loadFail': '加载模型失败',
+    'models.editCaps': '能力元数据',
+    'models.contextWindow': '上下文窗口 (tokens)',
+    'models.maxOutput': '最大输出 (tokens)',
+    'models.vision': '视觉输入',
+    'models.tools': '工具调用',
+    'models.capsAuto': '自动（上游/内置识别）',
+    'models.capsYes': '支持',
+    'models.capsNo': '不支持',
+    'models.capsSaved': '能力元数据已保存',
+    'models.capsSaveFail': '能力元数据保存失败',
+    'models.capsHint': '保存后这些值成为手动覆盖，模型刷新不会被上游数据冲掉；选择"自动"或留空可恢复跟随上游/内置识别。注意：选"不支持"= 不向客户端声明该能力（/v1/models 省略字段），而非输出显式 false。',
+    'models.refreshCaps': '更新能力库',
+    'models.refreshCapsHint': '从在线注册表（OpenRouter）拉取最新的上下文窗口/视觉/工具能力数据',
+    'models.refreshCapsRunning': '更新中...',
+    'models.refreshCapsOk': '能力库已更新',
+    'models.refreshCapsFail': '能力库更新失败',
+    'models.capsAutoShort': '自动',
+    'models.capsOverridden': '已手动覆盖',
 
     'routing.title': '路由规则',
     'routing.add': '新增规则',
@@ -506,6 +524,24 @@ en: {
     'models.testFail': 'Model test failed',
     'models.count': 'models',
     'models.loadFail': 'Failed to load models',
+    'models.editCaps': 'Capabilities',
+    'models.contextWindow': 'Context window (tokens)',
+    'models.maxOutput': 'Max output (tokens)',
+    'models.vision': 'Vision input',
+    'models.tools': 'Tool calling',
+    'models.capsAuto': 'Auto (upstream/builtin)',
+    'models.capsYes': 'Supported',
+    'models.capsNo': 'Not supported',
+    'models.capsSaved': 'Capabilities saved',
+    'models.capsSaveFail': 'Failed to save capabilities',
+    'models.capsHint': 'Saved values become manual overrides that survive model refreshes; choose Auto or leave blank to follow upstream/builtin detection. Note: "Not supported" means the capability is not advertised to clients (field omitted from /v1/models), not an explicit false.',
+    'models.refreshCaps': 'Update Capability DB',
+    'models.refreshCapsHint': 'Fetch latest context-window/vision/tool data from the online registry (OpenRouter)',
+    'models.refreshCapsRunning': 'Updating...',
+    'models.refreshCapsOk': 'Capability registry updated',
+    'models.refreshCapsFail': 'Capability registry update failed',
+    'models.capsAutoShort': 'Auto',
+    'models.capsOverridden': 'Manually overridden',
 
     'routing.title': 'Routing Rules',
     'routing.add': 'Add Rule',
@@ -2060,12 +2096,20 @@ function renderModels() {
 
         for (var mi = 0; mi < groupModels.length; mi++) {
             var m = groupModels[mi];
+            var caps = m.capabilities || {};
+            var badges = '';
+            if (caps.context_window) badges += '<span class="badge badge-ok" title="' + escHtml(t('models.contextWindow')) + '">' + fmtTokenCount(caps.context_window) + '</span>';
+            if (caps.max_output_tokens) badges += '<span class="badge badge-partial" title="' + escHtml(t('models.maxOutput')) + '">↑' + fmtTokenCount(caps.max_output_tokens) + '</span>';
+            if (caps.supports_vision) badges += '<span class="badge badge-ok" title="' + escHtml(t('models.vision')) + '">&#128065;</span>';
+            if (caps.supports_tools) badges += '<span class="badge badge-ok" title="' + escHtml(t('models.tools')) + '">&#128295;</span>';
             html += '<div class="model-item">' +
                 '<div class="model-info">' +
                     '<span class="model-name">' + escHtml(m.name || m.id) + '</span>' +
                     '<span class="model-id mono">' + escHtml(m.id) + '</span>' +
+                    (badges ? '<span class="model-caps">' + badges + '</span>' : '') +
                 '</div>' +
                 '<div class="model-actions">' +
+                    '<button class="btn btn-secondary btn-sm" onclick="editModelCaps(\'' + jsEsc(m.id) + '\')">' + escHtml(t('models.editCaps')) + '</button>' +
                     '<button class="btn btn-secondary btn-sm" onclick="copyText(\'' + jsEsc(m.id) + '\')">' + t('models.copyId') + '</button>' +
                     '<button class="btn btn-primary btn-sm" onclick="testModel(\'' + jsEsc(m.id) + '\', this)">' + t('models.test') + '</button>' +
                 '</div>' +
@@ -2076,6 +2120,97 @@ function renderModels() {
     }
 
     container.innerHTML = html;
+}
+
+async function refreshModelRegistry(btn) {
+    var oldText = btn ? btn.textContent : '';
+    if (btn) { btn.disabled = true; btn.textContent = t('models.refreshCapsRunning'); }
+    try {
+        var result = await api('/admin/models/registry/refresh', { method: 'POST' });
+        var msg = t('models.refreshCapsOk') + ' (' + (result.models || 0) + ')';
+        if (result.note) msg += ' — ' + result.note;
+        toast(msg, result.note ? 'info' : 'success');
+        loadModels();
+    } catch (e) {
+        toast(t('models.refreshCapsFail') + ': ' + e.message, 'error');
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = oldText || t('models.refreshCaps'); }
+    }
+}
+
+function fmtTokenCount(value) {
+    var n = parseInt(value, 10) || 0;
+    if (n >= 1000000) {
+        var m = n / 1000000;
+        return (Math.round(m * 10) / 10) + 'M';
+    }
+    if (n >= 1000) return Math.round(n / 1000) + 'k';
+    return String(n);
+}
+
+function _capTriState(value) {
+    return value === true ? '1' : (value === false ? '0' : '');
+}
+
+function _capSelectHtml(id, value) {
+    var v = _capTriState(value);
+    return '<select id="' + id + '" class="select-input" style="width:100%">' +
+        '<option value=""' + (v === '' ? ' selected' : '') + '>' + escHtml(t('models.capsAuto')) + '</option>' +
+        '<option value="1"' + (v === '1' ? ' selected' : '') + '>' + escHtml(t('models.capsYes')) + '</option>' +
+        '<option value="0"' + (v === '0' ? ' selected' : '') + '>' + escHtml(t('models.capsNo')) + '</option>' +
+        '</select>';
+}
+
+function editModelCaps(modelId) {
+    var m = models.find(function(item) { return item.id === modelId; });
+    if (!m) return;
+    var caps = m.capabilities || {};
+    var overridden = m.capabilities_overridden || [];
+    function isOv(key) { return overridden.indexOf(key) >= 0; }
+    // 只预填已手动覆盖的键；自动探测值放 placeholder，避免用户直接点
+    // "保存"时把内置表/注册表的推导值冻结成永久手动覆盖。
+    function autoHint(value, formatter) {
+        return value ? (t('models.capsAutoShort') + ': ' + (formatter ? formatter(value) : value)) : '';
+    }
+    var ovNote = overridden.length
+        ? '<p class="form-hint" style="margin-top:0">' + escHtml(t('models.capsOverridden')) + ': <span class="mono">' + escHtml(overridden.join(', ')) + '</span></p>'
+        : '';
+    var html = '<h2>' + escHtml(t('models.editCaps')) + '</h2>' +
+        '<p class="mono" style="margin:-12px 0 14px;font-size:12px;opacity:0.75">' + escHtml(modelId) + '</p>' + ovNote +
+        '<div class="form-group"><label>' + escHtml(t('models.contextWindow')) + '</label>' +
+            '<input type="number" id="capContextWindow" min="0" step="1024" value="' + (isOv('context_window') ? (caps.context_window || '') : '') + '" placeholder="' + escHtml(autoHint(caps.context_window, fmtTokenCount)) + '"></div>' +
+        '<div class="form-group"><label>' + escHtml(t('models.maxOutput')) + '</label>' +
+            '<input type="number" id="capMaxOutput" min="0" step="1024" value="' + (isOv('max_output_tokens') ? (caps.max_output_tokens || '') : '') + '" placeholder="' + escHtml(autoHint(caps.max_output_tokens, fmtTokenCount)) + '"></div>' +
+        '<div class="form-group"><label>' + escHtml(t('models.vision')) + '</label>' + _capSelectHtml('capVision', isOv('supports_vision') ? caps.supports_vision : null) + '</div>' +
+        '<div class="form-group"><label>' + escHtml(t('models.tools')) + '</label>' + _capSelectHtml('capTools', isOv('supports_tools') ? caps.supports_tools : null) + '</div>' +
+        '<p class="form-hint">' + escHtml(t('models.capsHint')) + '</p>' +
+        '<div class="form-actions">' +
+            '<button class="btn btn-secondary" onclick="closeModal()">' + escHtml(t('common.cancel')) + '</button>' +
+            '<button class="btn btn-primary" onclick="saveModelCaps(\'' + jsEsc(modelId) + '\')">' + escHtml(t('common.save')) + '</button>' +
+        '</div>';
+    document.getElementById('modalContent').innerHTML = html;
+    document.getElementById('modal').style.display = 'flex';
+}
+
+async function saveModelCaps(modelId) {
+    var cw = document.getElementById('capContextWindow').value.trim();
+    var mo = document.getElementById('capMaxOutput').value.trim();
+    var vision = document.getElementById('capVision').value;
+    var tools = document.getElementById('capTools').value;
+    var caps = {
+        context_window: cw ? parseInt(cw, 10) : null,
+        max_output_tokens: mo ? parseInt(mo, 10) : null,
+        supports_vision: vision === '' ? null : vision === '1',
+        supports_tools: tools === '' ? null : tools === '1'
+    };
+    try {
+        await api('/admin/models/capabilities', { method: 'PUT', body: JSON.stringify({ model_id: modelId, capabilities: caps }) });
+        toast(t('models.capsSaved'), 'success');
+        closeModal();
+        loadModels();
+    } catch (e) {
+        toast(t('models.capsSaveFail') + ': ' + e.message, 'error');
+    }
 }
 
 async function testModel(modelId, btn) {

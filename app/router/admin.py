@@ -163,7 +163,9 @@ async def provider_health(provider_id: str, authorization: Optional[str] = Heade
 @router.get("/models")
 async def list_models(authorization: Optional[str] = Header(None)):
     await require_admin_session(authorization)
-    models = get_available_models()
+    # get_available_models 同步读 DB，并可能触发注册表缓存的全量 JSON 解析
+    # （数百 KB），移出事件循环避免周期性卡顿。
+    models = await anyio.to_thread.run_sync(get_available_models)
     return {"models": models}
 
 
@@ -807,6 +809,57 @@ async def fetch_preprocessor_models(body: dict,
                     continue  # 尝试下一个 URL/凭据组合
     _app_log.warning("[preprocessors.fetch-models] %s failed: %s", api_base, last_error or "unknown")
     raise HTTPException(status_code=502, detail="Failed to fetch models from server")
+
+
+@router.get("/models/registry/status")
+async def model_registry_status(authorization: Optional[str] = Header(None)):
+    await require_admin_session(authorization)
+    from app.services.model_registry import registry_status
+    return await anyio.to_thread.run_sync(registry_status)
+
+
+@router.post("/models/registry/refresh")
+async def model_registry_refresh(authorization: Optional[str] = Header(None)):
+    """手动强制刷新在线模型能力注册表（OpenRouter 等）。
+
+    保留"强制"语义（禁用时也可拉取），但禁用状态下结果不会应用到
+    /v1/models，必须明确告知，避免"已更新(445)"但客户端毫无变化的误导。
+    """
+    await require_admin_session(authorization)
+    from app.services.model_registry import fetch_and_store_registry, registry_enabled
+    result = await fetch_and_store_registry()
+    if result.get("status") != "ok":
+        raise HTTPException(status_code=502, detail=f"registry refresh failed: {result.get('error', 'unknown')}")
+    if not registry_enabled():
+        result["note"] = "model_registry_enabled is false; fetched data is stored but NOT applied to /v1/models"
+    return result
+
+
+@router.put("/models/capabilities")
+async def update_model_capabilities(body: dict, authorization: Optional[str] = Header(None)):
+    """管理员手动覆盖模型能力元数据。
+
+    body: {"model_id": "provider/model", "capabilities": {"context_window": 128000,
+    "supports_vision": true, ...}}；字段传 null 表示清除覆盖、恢复跟随
+    上游透传/内置启发式。被覆盖的键后续模型刷新不会被上游数据冲掉。
+    """
+    await require_admin_session(authorization)
+    from app.database import set_model_capabilities
+    from app.core.model_capabilities import normalize_capabilities
+
+    model_id = str(body.get("model_id") or "")
+    if not model_id:
+        raise HTTPException(status_code=400, detail="model_id is required")
+    capabilities = body.get("capabilities")
+    if not isinstance(capabilities, dict):
+        raise HTTPException(status_code=400, detail="capabilities must be an object")
+    try:
+        updated = set_model_capabilities(model_id, capabilities)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not updated:
+        raise HTTPException(status_code=404, detail="Model not found")
+    return {"model_id": model_id, "capabilities": normalize_capabilities(capabilities)}
 
 
 @router.put("/models/preprocessor")

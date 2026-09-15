@@ -96,6 +96,15 @@ async def lifespan(app: FastAPI):
                 await asyncio.to_thread(cleanup_old_logs)
             except Exception as exc:
                 logger.warning("[storage.maintenance] log cleanup failed: %s", exc)
+            try:
+                # 在线模型能力注册表：超过 TTL 才拉取（默认 7 天），
+                # 失败不影响既有缓存，离线部署可在 config 中关闭。
+                from app.services.model_registry import refresh_registry_if_stale
+                registry_result = await refresh_registry_if_stale()
+                if registry_result:
+                    logger.info("[model_registry] refresh %s models=%s", registry_result.get("status"), registry_result.get("models", "-"))
+            except Exception as exc:
+                logger.warning("[model_registry] refresh failed: %s", exc)
 
     maintenance_task = asyncio.create_task(_maintenance_loop())
     try:

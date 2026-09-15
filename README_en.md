@@ -22,6 +22,7 @@ The current proxy core is built around a provider-neutral internal representatio
 | Tool-call reliability | Preserves tool IDs across protocol conversions, repairs malformed tool JSON, and includes a tool-only loop circuit breaker. |
 | Reasoning continuity | Caches and replays `reasoning_content` for DeepSeek-style thinking models across multi-turn tool flows. |
 | Web admin panel | Manage providers, users, API keys, routing rules, model preprocessors, and usage stats; responsive design for desktop, tablet, and phone. |
+| Model capability metadata | `/v1/models` carries context window, vision/tool support, etc. (builtin family table < online registry < upstream passthrough < admin override); the online registry is periodically fetched from OpenRouter and persisted, so downstream harnesses can detect model capabilities. Capability fields are positive declarations only — absent means unknown/unsupported, and an admin "Not supported" override simply omits the field. |
 | SQLite storage | Providers, users, keys, routing rules, stats, and request records are stored in `data.db`. |
 
 ## Quick Start
@@ -245,6 +246,9 @@ Important defaults:
 | `responses_capability_transient_ttl` | 300 | Transient native-Responses capability probe cache TTL. |
 | `responses_capability_probe_timeout` | 8 | Request timeout (seconds) for native-Responses capability probes. |
 | `responses_capability_probe_max_output_tokens` | 16 | max_output_tokens used by native-Responses capability probes. |
+| `model_registry_enabled` | true | Enable the online model-capability registry (disable for offline deployments). |
+| `model_registry_url` | https://openrouter.ai/api/v1/models | Capability registry source (OpenRouter-style /models). Fetches reuse `allow_private_upstream_hosts` for SSRF validation: keep it true for LAN mirrors; failures back off for 1 hour, see `last_error` in `/admin/models/registry/status`. |
+| `model_registry_ttl_seconds` | 604800 | Registry refresh interval in seconds (min 3600). |
 | `anthropic_thinking_budget_tokens` | 1024 | Anthropic extended-thinking budget. |
 
 ## Safety And Limits
@@ -309,7 +313,7 @@ Main code boundaries:
 pytest tests/ -q
 ```
 
-Expected current result: `830 passed`.
+Expected current result: `865 passed`.
 
 Live smoke matrix:
 

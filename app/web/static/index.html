@@ -121,6 +121,7 @@
                         <div class="search-box">
                             <input type="text" id="modelSearch" data-i18n-placeholder="models.search" placeholder="搜索模型..." oninput="filterModels()">
                         </div>
+                        <button class="btn btn-secondary" onclick="refreshModelRegistry(this)" data-i18n="models.refreshCaps" data-i18n-title="models.refreshCapsHint">更新能力库</button>
                         <button class="btn btn-secondary" onclick="refreshAllModels()" data-i18n="models.refreshAll">刷新所有模型</button>
                     </div>
                     <div id="modelsList" class="models-list"></div>

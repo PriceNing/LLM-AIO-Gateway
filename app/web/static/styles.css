@@ -1729,3 +1729,13 @@ body { min-height: 100vh; min-height: 100dvh; }
   /* 趋势图头部：标题与 calls/tokens 切换允许换行 */
   .trend-header { flex-wrap: wrap; }
 }
+
+/* 模型能力徽章 */
+.model-caps { display: inline-flex; gap: 4px; flex-wrap: wrap; margin-top: 4px; }
+.model-caps .badge { font-size: 10px; padding: 1px 7px; }
+.model-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+@media (max-width: 600px) {
+  .model-item { flex-wrap: wrap; }
+  .model-actions { width: 100%; }
+  .model-actions .btn { flex: 1; justify-content: center; }
+}

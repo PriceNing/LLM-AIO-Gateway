@@ -22,6 +22,7 @@ LLM AIO Gateway 是一个基于 FastAPI 的统一 LLM API 网关，用一个服�
 | 工具调用可靠性 | 保留工具调用 ID，修复 malformed JSON 工具参数，并提供工具调用循环断路器。 |
 | Reasoning 连续性 | 对 DeepSeek 等 thinking 模型自动缓存和回传 `reasoning_content`，保证多轮工具调用不中断。 |
 | Web 管理面板 | 管理提供商、用户、API Key、路由规则、模型预处理器和调用统计；响应式设计，适配桌面/平板/手机。 |
+| 模型能力元数据 | `/v1/models` 附带上下文窗口、视觉/工具支持等能力信息（内置家族表 < 在线注册表 < 上游透传 < 管理员覆盖），在线注册表默认从 OpenRouter 定期拉取并持久化缓存，供下游 harness 自动识别模型能力。能力字段只做正向声明，缺失 = 未知/不支持；管理员选"不支持"即不向客户端声明该能力。 |
 | SQLite 存储 | 提供商、用户、密钥、路由规则、统计和请求记录保存在 `data.db`。 |
 
 ## 快速开始
@@ -247,6 +248,9 @@ curl http://localhost:8000/v1/responses \
 | `responses_capability_transient_ttl` | 300 | 原生 Responses 能力探测临时失败缓存 TTL。 |
 | `responses_capability_probe_timeout` | 8 | 原生 Responses 能力探测的请求超时（秒）。 |
 | `responses_capability_probe_max_output_tokens` | 16 | 原生 Responses 能力探测请求的 max_output_tokens。 |
+| `model_registry_enabled` | true | 是否启用在线模型能力注册表（离线部署可关闭）。 |
+| `model_registry_url` | https://openrouter.ai/api/v1/models | 能力注册表数据源（OpenRouter 风格 /models）。拉取复用 `allow_private_upstream_hosts` 做 SSRF 校验：指向内网镜像时需保持该开关为 true；拉取失败后进入 1 小时退避，错误原因见 `/admin/models/registry/status` 的 `last_error`。 |
+| `model_registry_ttl_seconds` | 604800 | 注册表刷新周期（秒，最小 3600）。 |
 | `anthropic_thinking_budget_tokens` | 1024 | Anthropic thinking 模式预算。 |
 
 ## 安全与限流
@@ -311,7 +315,7 @@ OpenAI 兼容提供商默认走 Chat Completions；仅在原生 Responses 能力
 pytest tests/ -q
 ```
 
-当前预期结果：`830 passed`。
+当前预期结果：`865 passed`。
 
 真实烟测建议：
 
