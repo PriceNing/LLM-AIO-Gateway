@@ -829,7 +829,11 @@ async def model_registry_refresh(authorization: Optional[str] = Header(None)):
     from app.services.model_registry import fetch_and_store_registry, registry_enabled
     result = await fetch_and_store_registry()
     if result.get("status") != "ok":
-        raise HTTPException(status_code=502, detail=f"registry refresh failed: {result.get('error', 'unknown')}")
+        detail = f"registry refresh failed: {result.get('error', 'unknown')}"
+        if not registry_enabled():
+            # 禁用态下拉取失败时补上关键上下文，避免运维排查方向跑偏。
+            detail += " (note: model_registry_enabled=false)"
+        raise HTTPException(status_code=502, detail=detail)
     if not registry_enabled():
         result["note"] = "model_registry_enabled is false; fetched data is stored but NOT applied to /v1/models"
     return result

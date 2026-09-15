@@ -694,7 +694,7 @@ async def test_registry_fetch_enforces_redirect_limit(temp_db, monkeypatch):
 def test_registry_status_shape_when_disabled(temp_db, monkeypatch):
     from app.services import model_registry
 
-    monkeypatch.setattr(model_registry, "_registry_enabled", lambda: False)
+    monkeypatch.setattr(model_registry, "registry_enabled", lambda: False)
     status = model_registry.registry_status()
     # 禁用时也要保持完整字段契约
     for key in ("enabled", "url", "fetched_at", "model_count", "ttl_seconds", "stale", "last_error"):
@@ -760,3 +760,72 @@ def test_refresh_endpoint_notes_when_registry_disabled(temp_db, monkeypatch):
     body = r.json()
     assert body["status"] == "ok"
     assert "NOT applied" in body.get("note", "")
+
+
+# ---------------------------------------------------------------------------
+# 第四轮审计：非法输入显式报错 / overridden 交集 / 禁用态失败提示
+# ---------------------------------------------------------------------------
+
+def test_set_model_capabilities_rejects_invalid_values(temp_db):
+    """审计 #1：非法值不得静默 no-op 还返回 True。"""
+    _add_test_provider("gpt-4o")
+    with pytest.raises(ValueError):
+        set_model_capabilities("p1/gpt-4o", {"context_window": 200000000})  # 超上限
+    with pytest.raises(ValueError):
+        set_model_capabilities("p1/gpt-4o", {"context_window": 0})           # 非正数
+    with pytest.raises(ValueError):
+        set_model_capabilities("p1/gpt-4o", {"supports_vision": "maybe"})    # 无法解析的布尔
+    with pytest.raises(ValueError):
+        set_model_capabilities("p1/gpt-4o", {"unknown_key": 1})              # 未知键
+    # 合法输入与 null 清除不受影响
+    assert set_model_capabilities("p1/gpt-4o", {"context_window": 128000}) is True
+    assert set_model_capabilities("p1/gpt-4o", {"context_window": None}) is True
+
+
+def test_admin_capabilities_endpoint_returns_400_for_invalid(temp_db):
+    _add_test_provider("gpt-4o")
+    r = client.put("/admin/models/capabilities", headers=temp_db["headers"], json={
+        "model_id": "p1/gpt-4o", "capabilities": {"context_window": 0},
+    })
+    assert r.status_code == 400
+    assert "invalid capability values" in r.json()["detail"]
+
+
+def test_capabilities_overridden_intersects_resolved(temp_db):
+    """审计 #2：历史脏行的 admin_keys 指向已丢弃的值时，不得虚报"已覆盖"。"""
+    _add_test_provider("m1")
+    with get_db() as db:
+        db.execute(
+            "UPDATE provider_models SET capabilities = ? WHERE provider_id = 'p1' AND model_id = 'm1'",
+            (json.dumps({"context_window": "abc", "admin_keys": ["context_window"]}),),
+        )
+    r = client.get("/admin/models", headers=temp_db["headers"])
+    assert r.status_code == 200
+    entry = next(m for m in r.json()["models"] if m["id"] == "p1/m1")
+    assert entry["capabilities_overridden"] == []
+    assert "context_window" not in entry["capabilities"] or isinstance(entry["capabilities"].get("context_window"), int)
+
+
+def test_refresh_failure_mentions_disabled_state(temp_db, monkeypatch):
+    """审计 #3：禁用 + 拉取失败时，502 detail 必须带上禁用上下文。"""
+    import httpx
+    from app.services import model_registry
+
+    _stub_guard(monkeypatch)
+
+    class BoomClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            raise httpx.ConnectError("network down")
+
+        async def __aexit__(self, *args):
+            return False
+
+    monkeypatch.setattr(httpx, "AsyncClient", BoomClient)
+    monkeypatch.setattr(model_registry, "registry_enabled", lambda: False)
+
+    r = client.post("/admin/models/registry/refresh", headers=temp_db["headers"])
+    assert r.status_code == 502
+    assert "model_registry_enabled=false" in r.json()["detail"]

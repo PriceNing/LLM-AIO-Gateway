@@ -1477,6 +1477,14 @@ def set_model_capabilities(model_id: str, capabilities: dict) -> bool:
         raise ValueError("capabilities must be an object")
     cleaned = normalize_capabilities({k: v for k, v in capabilities.items() if v is not None})
     cleared = [k for k, v in capabilities.items() if v is None and k in _CAPABILITY_KEYS]
+    # 非 null 但被 normalize 丢弃的键 = 非法输入（超限/0/无法解析的布尔/
+    # 未知键）：必须显式报错，不能静默 no-op 还返回 200 让管理员误以为已生效。
+    rejected = sorted(
+        k for k, v in capabilities.items()
+        if v is not None and (k not in _CAPABILITY_KEYS or k not in cleaned)
+    )
+    if rejected:
+        raise ValueError(f"invalid capability values: {', '.join(rejected)}")
     mid = parse_model_id(model_id)
     with get_db() as db:
         if mid.is_composite:

@@ -315,7 +315,7 @@ OpenAI 兼容提供商默认走 Chat Completions；仅在原生 Responses 能力
 pytest tests/ -q
 ```
 
-当前预期结果：`865 passed`。
+当前预期结果：`869 passed`。
 
 真实烟测建议：
 

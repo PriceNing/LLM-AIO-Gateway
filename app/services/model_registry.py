@@ -55,13 +55,8 @@ def _registry_ttl_seconds() -> int:
         return 604800
 
 
-def _registry_enabled() -> bool:
-    return bool(get_default("model_registry_enabled", True))
-
-
 def registry_enabled() -> bool:
-    """公开访问器：供 admin 端点在禁用时给出明确提示。"""
-    return _registry_enabled()
+    return bool(get_default("model_registry_enabled", True))
 
 
 def _slug_keys(model_id: str) -> list[str]:
@@ -238,7 +233,7 @@ def _ensure_loaded() -> dict[str, dict]:
 
 def registry_lookup(model_id: str, model_name: str = "") -> dict:
     """按模型 id/名称查询在线注册表能力；未命中返回空 dict（不猜测）。"""
-    if not _registry_enabled():
+    if not registry_enabled():
         return {}
     lookup = _ensure_loaded()
     if not lookup:
@@ -252,7 +247,7 @@ def registry_lookup(model_id: str, model_name: str = "") -> dict:
 
 
 def registry_status() -> dict:
-    if not _registry_enabled():
+    if not registry_enabled():
         # 保持与启用时相同的字段契约，避免调用方需要分支处理。
         return {
             "enabled": False,
@@ -288,7 +283,7 @@ def registry_status() -> dict:
 
 
 def registry_needs_refresh() -> bool:
-    if not _registry_enabled():
+    if not registry_enabled():
         return False
     if not registry_status().get("stale"):
         return False
@@ -306,7 +301,7 @@ async def refresh_registry_if_stale() -> dict | None:
 
     新鲜度判定内部的 DB 读/JSON 解析移出事件循环，与 admin 端点口径一致。
     """
-    if not _registry_enabled():
+    if not registry_enabled():
         return None
     if not await asyncio.to_thread(registry_needs_refresh):
         return None

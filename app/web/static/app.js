@@ -2178,9 +2178,9 @@ function editModelCaps(modelId) {
     var html = '<h2>' + escHtml(t('models.editCaps')) + '</h2>' +
         '<p class="mono" style="margin:-12px 0 14px;font-size:12px;opacity:0.75">' + escHtml(modelId) + '</p>' + ovNote +
         '<div class="form-group"><label>' + escHtml(t('models.contextWindow')) + '</label>' +
-            '<input type="number" id="capContextWindow" min="0" step="1024" value="' + (isOv('context_window') ? (caps.context_window || '') : '') + '" placeholder="' + escHtml(autoHint(caps.context_window, fmtTokenCount)) + '"></div>' +
+            '<input type="number" id="capContextWindow" min="1" max="100000000" step="1024" value="' + (isOv('context_window') ? (caps.context_window || '') : '') + '" placeholder="' + escHtml(autoHint(caps.context_window, fmtTokenCount)) + '"></div>' +
         '<div class="form-group"><label>' + escHtml(t('models.maxOutput')) + '</label>' +
-            '<input type="number" id="capMaxOutput" min="0" step="1024" value="' + (isOv('max_output_tokens') ? (caps.max_output_tokens || '') : '') + '" placeholder="' + escHtml(autoHint(caps.max_output_tokens, fmtTokenCount)) + '"></div>' +
+            '<input type="number" id="capMaxOutput" min="1" max="10000000" step="1024" value="' + (isOv('max_output_tokens') ? (caps.max_output_tokens || '') : '') + '" placeholder="' + escHtml(autoHint(caps.max_output_tokens, fmtTokenCount)) + '"></div>' +
         '<div class="form-group"><label>' + escHtml(t('models.vision')) + '</label>' + _capSelectHtml('capVision', isOv('supports_vision') ? caps.supports_vision : null) + '</div>' +
         '<div class="form-group"><label>' + escHtml(t('models.tools')) + '</label>' + _capSelectHtml('capTools', isOv('supports_tools') ? caps.supports_tools : null) + '</div>' +
         '<p class="form-hint">' + escHtml(t('models.capsHint')) + '</p>' +

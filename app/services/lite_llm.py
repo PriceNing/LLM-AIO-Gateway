@@ -357,6 +357,7 @@ def get_available_models(provider_id: Optional[str] = None) -> list:
         if provider and provider.get("enabled"):
             for model in provider.get("models", []):
                 if model.get("enabled"):
+                    resolved_caps = resolve_model_capabilities(model, remote=registry_lookup(model["id"], model.get("name", "")))
                     models.append({
                         "id": f"{provider['id']}/{model['id']}",
                         "name": model.get("name", model["id"]),
@@ -364,7 +365,12 @@ def get_available_models(provider_id: Optional[str] = None) -> list:
                         "provider_name": provider["name"],
                         "provider_type": provider["provider_type"],
                         # 内置家族表 < 在线注册表 < 上游透传 < 管理员覆盖。
-                        "capabilities": resolve_model_capabilities(model, remote=registry_lookup(model["id"], model.get("name", ""))),
-                        "capabilities_overridden": sorted((model.get("capabilities") or {}).get("admin_keys") or []),
+                        "capabilities": resolved_caps,
+                        # 与实际生效值取交集：历史脏行的 admin_keys 可能指向
+                        # 已被读取侧归一化丢弃的键，不得在面板上虚报"已覆盖"。
+                        "capabilities_overridden": sorted(
+                            k for k in ((model.get("capabilities") or {}).get("admin_keys") or [])
+                            if k in resolved_caps
+                        ),
                     })
     return models
