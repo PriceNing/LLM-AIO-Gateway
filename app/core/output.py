@@ -60,6 +60,9 @@ class InternalOutputMessage:
     finish_reason: str = "stop"
     usage: dict[str, int] = field(default_factory=dict)
     raw: Any = None
+    # 请求级元数据（upstream_endpoint/fallback 等）。不能依赖 raw：
+    # liteLLM 适配器的 raw 是 ModelResponse 对象，往上面写 dict 属性会静默丢失。
+    request_details: dict[str, Any] = field(default_factory=dict)
 
 
 async def aclose_async_iterator(iterator) -> None:

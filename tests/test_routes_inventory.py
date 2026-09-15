@@ -41,6 +41,7 @@ def test_expected_http_routes_are_registered():
         ("PUT", "/admin/providers/{provider_id}"),
         ("DELETE", "/admin/providers/{provider_id}"),
         ("POST", "/admin/providers/{provider_id}/refresh"),
+        ("POST", "/admin/models/responses-capability/reset"),
         ("POST", "/admin/providers/refresh-all"),
         ("GET", "/admin/providers/health-all"),
         ("GET", "/admin/providers/{provider_id}/health"),

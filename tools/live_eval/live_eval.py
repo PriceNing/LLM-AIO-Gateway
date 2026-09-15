@@ -13,20 +13,65 @@ import argparse
 import base64
 import json
 import os
+import struct
 import sys
 import time
 import traceback
 import urllib.error
 import urllib.request
+import zlib
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
 
-PNG_1X1_RED = (
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
-)
+def _png_chunk(tag: bytes, data: bytes) -> bytes:
+    return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
 
+
+def probe_image_base64() -> str:
+    """生成 64x64 RGB 渐变 PNG（仅标准库）。
+
+    注意：很多上游（如 DeepSeek）会把 1x1 占位图判为无效图片并报 400，
+    探针图必须是真实可解码、尺寸合理的图像。
+    """
+    width = height = 64
+    rows = b"".join(
+        b"\x00" + b"".join(bytes(((x * 4) % 256, (y * 4) % 256, 128)) for x in range(width))
+        for y in range(height)
+    )
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    png = (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(b"IHDR", ihdr)
+        + _png_chunk(b"IDAT", zlib.compress(rows, 9))
+        + _png_chunk(b"IEND", b"")
+    )
+    return base64.b64encode(png).decode()
+
+
+PROBE_IMAGE_PNG_B64 = probe_image_base64()
+
+# expect 值中属于"能力探针"的用例：上游拒绝时判定为 unsupported 而非网关故障
+CAPABILITY_EXPERTS = {
+    "chat_tool",
+    "messages_tool",
+    "responses_tool",
+}
+
+# 不得判为“能力不支持”的 4xx：401/403=网关侧凭据/授权问题（冒烟配置错误），
+# 404/405/410=上游“模型/端点不存在”类存在性错误（配置问题，网关代理路径自身不产生 404），
+# 408=超时，429=瞬时限流。只有 400/422 这类“请求内容被拒”才是能力缺失信号。
+UNSUPPORTED_REJECTION_EXCLUDED = (401, 403, 404, 405, 408, 410, 429)
+
+
+def is_unsupported_rejection(status: int | None, expect: str, capability_probe: bool) -> bool:
+    """仅上游明确以 4xx 拒绝能力探针时计为 unsupported；5xx/429 等仍是故障。"""
+    if status is None or not (400 <= status <= 499):
+        return False
+    if status in UNSUPPORTED_REJECTION_EXCLUDED:
+        return False
+    return expect in CAPABILITY_EXPERTS or capability_probe
 
 @dataclass
 class CaseResult:
@@ -43,6 +88,11 @@ class CaseResult:
     response_excerpt: str = ""
     log_entries: list[dict[str, Any]] = field(default_factory=list)
     judge: dict[str, Any] = field(default_factory=dict)
+    # pass/fail 计入网关得分；skip（能力未声明）与 unsupported（上游拒绝能力探针）不计入
+    verdict: str = "fail"
+    # 上游协议断言：provider_type 可推得的预期上游（多个用 | 分隔）与实际观测到的上游
+    expected_upstream: str = ""
+    observed_upstream: str = ""
 
 
 @dataclass
@@ -51,14 +101,113 @@ class ModelResult:
     cases: list[CaseResult] = field(default_factory=list)
 
     @property
+    def scored_cases(self) -> list[CaseResult]:
+        return [case for case in self.cases if case.verdict in ("pass", "fail")]
+
+    @property
     def score(self) -> float:
-        if not self.cases:
-            return 0.0
-        return round(sum(case.score for case in self.cases) / len(self.cases), 2)
+        scored = self.scored_cases
+        if not scored:
+            return 1.0
+        return round(sum(case.score for case in scored) / len(scored), 2)
 
     @property
     def passed(self) -> int:
-        return sum(1 for case in self.cases if case.ok)
+        return sum(1 for case in self.cases if case.verdict == "pass")
+
+    @property
+    def no_signal(self) -> bool:
+        """全部用例被 skip/unsupported：本次测试对该模型没有任何有效信号。"""
+        return bool(self.cases) and not self.scored_cases
+
+
+# 客户端端点 -> 日志里的 endpoint 名
+ENDPOINT_LOG_NAME = {
+    "/v1/chat/completions": "chat_completions",
+    "/v1/completions": "completions",
+    "/v1/messages": "messages",
+    "/v1/responses": "responses",
+}
+
+# 上游协议三列
+UPSTREAM_PROTOCOLS = ("chat_completions", "messages", "responses")
+
+# 可达的 客户端×上游 组合（原生 responses 上游仅 /responses 端点可触发）
+REACHABLE_CELLS: tuple[tuple[str, str], ...] = (
+    ("chat_completions", "chat_completions"),
+    ("chat_completions", "messages"),
+    ("completions", "chat_completions"),
+    ("completions", "messages"),
+    ("messages", "chat_completions"),
+    ("messages", "messages"),
+    ("responses", "chat_completions"),
+    ("responses", "messages"),
+    ("responses", "responses"),
+)
+
+
+def build_coverage_matrix(results: list[ModelResult]) -> dict[str, dict[str, int]]:
+    matrix: dict[str, dict[str, int]] = {
+        ep: {up: 0 for up in UPSTREAM_PROTOCOLS}
+        for ep in ("chat_completions", "completions", "messages", "responses")
+    }
+    for result in results:
+        for case in result.cases:
+            if not case.observed_upstream:
+                continue
+            ep = ENDPOINT_LOG_NAME.get(case.endpoint, case.endpoint)
+            row = matrix.setdefault(ep, {up: 0 for up in UPSTREAM_PROTOCOLS})
+            row[case.observed_upstream] = row.get(case.observed_upstream, 0) + 1
+    return matrix
+
+
+def missing_reachable_cells(matrix: dict[str, dict[str, int]]) -> list[tuple[str, str]]:
+    return [cell for cell in REACHABLE_CELLS if not matrix.get(cell[0], {}).get(cell[1])]
+
+
+def print_coverage_matrix(matrix: dict[str, dict[str, int]]) -> None:
+    print("\nProtocol coverage matrix (client endpoint -> observed upstream protocol):")
+    print(f"  {'client \\ upstream':24}" + "".join(f"{up:>18}" for up in UPSTREAM_PROTOCOLS))
+    for ep in ("chat_completions", "completions", "messages", "responses"):
+        row = matrix.get(ep, {})
+        cells = "".join(f"{(str(row.get(up, 0)) if row.get(up) else '-'):>18}" for up in UPSTREAM_PROTOCOLS)
+        print(f"  {ep:24}{cells}")
+    missing = missing_reachable_cells(matrix)
+    if missing:
+        print("  uncovered reachable cells: " + ", ".join(f"{ep}->{up}" for ep, up in missing))
+        print("  (需配置对应 provider_type / 支持原生 Responses 的模型才能覆盖满 9 格)")
+
+
+def expected_upstream_for(endpoint_name: str, provider_type: str) -> str:
+    """由 provider_type 推导预期上游；"|" 表示多个均可接受。无法得知时返回空。"""
+    if provider_type == "anthropic":
+        return "messages"
+    if provider_type == "openai":
+        if endpoint_name == "responses":
+            # 原生 supported 时走 responses，否则降级 chat_completions，两者均为合法路径
+            return "responses|chat_completions"
+        return "chat_completions"
+    return ""
+
+
+def observed_upstream_from_logs(entries: list[dict[str, Any]], endpoint_name: str) -> str:
+    """从 case 关联的请求日志中取最新一条匹配端点的上游协议。"""
+    best: dict[str, Any] | None = None
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("endpoint") != endpoint_name:
+            continue
+        if best is None or str(entry.get("full_time", "")) >= str(best.get("full_time", "")):
+            best = entry
+    if best is None:
+        return ""
+    details = best.get("details") if isinstance(best.get("details"), dict) else {}
+    mode = str(best.get("responses_mode") or details.get("responses_mode") or "")
+    upstream = str(best.get("upstream_endpoint") or details.get("upstream_endpoint") or "")
+    if mode == "native" or upstream == "responses":
+        return "responses"
+    if upstream in ("chat_completions", "messages"):
+        return upstream
+    return ""
 
 
 class GatewayClient:
@@ -138,15 +287,49 @@ class GatewayClient:
             self.admin_token = str(payload.get("token", ""))
         return self.admin_token
 
-    def get_models(self) -> list[str]:
+    def get_models(self) -> dict[str, dict[str, Any]]:
+        """返回 model_id -> 能力元数据（supports_vision / supports_tools 等）。"""
         status, payload, _ = self.request("GET", "/v1/models")
         if status != 200 or not isinstance(payload, dict):
             raise RuntimeError(f"/v1/models failed: HTTP {status} {payload!r}")
-        models = []
+        models: dict[str, dict[str, Any]] = {}
         for item in payload.get("data", []):
-            if isinstance(item, dict) and item.get("id"):
-                models.append(str(item["id"]))
+            if not isinstance(item, dict) or not item.get("id"):
+                continue
+            caps = {
+                key: item.get(key)
+                for key in ("supports_vision", "supports_tools", "context_window", "max_output_tokens")
+                if key in item
+            }
+            models[str(item["id"])] = caps
         return models
+
+    def get_provider_types(self) -> dict[str, str]:
+        """model_id -> provider_type（需管理员凭据；不可用时返回空表）。"""
+        if not (self.admin_username and self.admin_password):
+            return {}
+        status, payload, _ = self.request("GET", "/admin/models", admin=True)
+        if status != 200 or not isinstance(payload, dict):
+            return {}
+        out: dict[str, str] = {}
+        for item in payload.get("models", []):
+            if isinstance(item, dict) and item.get("id"):
+                out[str(item["id"])] = str(item.get("provider_type") or "")
+        return out
+
+    def reset_responses_capability(self, model_id: str) -> int | None:
+        """清除指定模型的 Responses 能力探测缓存，使本次冒烟对原生路径做真实探测。
+
+        返回受影响行数；无管理员凭据或端点不可用时返回 None。
+        """
+        if not (self.admin_username and self.admin_password):
+            return None
+        status, payload, _ = self.request(
+            "POST", "/admin/models/responses-capability/reset", {"model": model_id}, admin=True,
+        )
+        if status == 200 and isinstance(payload, dict):
+            return int(payload.get("reset", 0) or 0)
+        return None
 
     def get_recent_logs(self, model: str, since_full_time: str = "") -> list[dict[str, Any]]:
         if not (self.admin_username and self.admin_password):
@@ -331,6 +514,11 @@ def has_stream_events(parsed: Any, names: set[str]) -> bool:
     return False
 
 
+def skip_case(name: str, endpoint: str, reason: str) -> CaseResult:
+    """未声明对应能力时不真实请求，记录为 skip，不计入得分。"""
+    return CaseResult(name=name, endpoint=endpoint, ok=False, score=0.0, summary=reason, verdict="skip")
+
+
 def make_case(
     *,
     client: GatewayClient,
@@ -340,12 +528,16 @@ def make_case(
     body: dict[str, Any],
     expect: str,
     stream: bool = False,
+    capability_probe: bool = False,
+    provider_type: str = "",
 ) -> CaseResult:
     request_id = f"live-eval-{int(time.time())}-{abs(hash((model, name))) % 100000}"
     body = dict(body)
     body["model"] = model
     body.setdefault("temperature", 0)
-    body.setdefault("max_tokens", 160)
+    # 推理模型（如 deepseek thinking）的 reasoning 也吃 completion 预算，
+    # 预算太小会导致 content 被截成空字符串，误判为网关故障。
+    body.setdefault("max_tokens", 512)
     body.setdefault("metadata", {})
     if isinstance(body["metadata"], dict):
         body["metadata"]["live_eval_request_id"] = request_id
@@ -354,6 +546,22 @@ def make_case(
     try:
         status, payload, latency_ms = client.request("POST", endpoint, body, stream=stream)
         ok, score, summary = evaluate_payload(status, payload, expect)
+        verdict = "pass" if ok else "fail"
+        # 能力探针被上游以 4xx 拒绝才判 unsupported；5xx/504 是网关/基础设施故障，
+        # 429 是瞬时限流，401/403 在本网关语义下是服务端凭据问题，均不得洗成“模型不支持”。
+        if not ok and is_unsupported_rejection(status, expect, capability_probe):
+            verdict = "unsupported"
+            summary += " (upstream rejected capability probe)"
+        log_entries = client.get_recent_logs(model, started)
+        endpoint_name = ENDPOINT_LOG_NAME.get(endpoint, endpoint)
+        expected = expected_upstream_for(endpoint_name, provider_type)
+        observed = observed_upstream_from_logs(log_entries, endpoint_name) if verdict == "pass" else ""
+        if verdict == "pass" and expected and observed and observed not in expected.split("|"):
+            # 实际走了错误适配器 = 路由/协议层回归，必须硬失败
+            verdict = "fail"
+            ok = False
+            score = 0.0
+            summary += f" [upstream mismatch: expected {expected}, got {observed}]"
         return CaseResult(
             name=name,
             endpoint=endpoint,
@@ -364,8 +572,11 @@ def make_case(
             request_id=request_id,
             response_id=extract_response_id(payload),
             summary=summary,
+            verdict=verdict,
+            expected_upstream=expected,
+            observed_upstream=observed,
             response_excerpt=compact_json(payload),
-            log_entries=client.get_recent_logs(model, started),
+            log_entries=log_entries,
         )
     except Exception as exc:
         return CaseResult(
@@ -374,6 +585,7 @@ def make_case(
             ok=False,
             score=0.0,
             request_id=request_id,
+            verdict="fail",
             error=f"{type(exc).__name__}: {exc}",
             response_excerpt=traceback.format_exc(limit=4),
             log_entries=client.get_recent_logs(model, started),
@@ -418,11 +630,24 @@ def evaluate_payload(status: int, payload: Any, expect: str) -> tuple[bool, floa
     return True, 1.0, "HTTP success"
 
 
-def build_cases(client: GatewayClient, model: str, include_multimodal: bool, include_stream: bool) -> list[CaseResult]:
+def build_cases(
+    client: GatewayClient,
+    model: str,
+    include_multimodal: bool,
+    include_stream: bool,
+    caps: dict[str, Any] | None = None,
+    ignore_capabilities: bool = False,
+    provider_type: str = "",
+) -> list[CaseResult]:
+    caps = caps or {}
+    gate = not ignore_capabilities
+    supports_tools = bool(caps.get("supports_tools"))
+    supports_vision = bool(caps.get("supports_vision"))
     cases: list[CaseResult] = []
     cases.append(make_case(
         client=client,
         model=model,
+        provider_type=provider_type,
         name="chat_multi_turn",
         endpoint="/v1/chat/completions",
         expect="chat_text",
@@ -438,6 +663,7 @@ def build_cases(client: GatewayClient, model: str, include_multimodal: bool, inc
     cases.append(make_case(
         client=client,
         model=model,
+        provider_type=provider_type,
         name="completions_text",
         endpoint="/v1/completions",
         expect="completion_text",
@@ -446,6 +672,7 @@ def build_cases(client: GatewayClient, model: str, include_multimodal: bool, inc
     cases.append(make_case(
         client=client,
         model=model,
+        provider_type=provider_type,
         name="messages_multi_turn",
         endpoint="/v1/messages",
         expect="messages_text",
@@ -461,6 +688,7 @@ def build_cases(client: GatewayClient, model: str, include_multimodal: bool, inc
     first_response = make_case(
         client=client,
         model=model,
+        provider_type=provider_type,
         name="responses_first_turn",
         endpoint="/v1/responses",
         expect="responses_text",
@@ -477,95 +705,106 @@ def build_cases(client: GatewayClient, model: str, include_multimodal: bool, inc
     cases.append(make_case(
         client=client,
         model=model,
+        provider_type=provider_type,
         name="responses_followup",
         endpoint="/v1/responses",
         expect="responses_text",
         body=response_body,
     ))
-    cases.append(make_case(
-        client=client,
-        model=model,
-        name="chat_tool_call",
-        endpoint="/v1/chat/completions",
-        expect="chat_tool",
-        body={
+    tool_probes = (
+        ("chat_tool_call", "/v1/chat/completions", "chat_tool", {
             "messages": [{"role": "user", "content": "Call the lookup_order tool for order_id A123."}],
             "tools": [tool_schema_chat()],
             "tool_choice": {"type": "function", "function": {"name": "lookup_order"}},
-        },
-    ))
-    cases.append(make_case(
-        client=client,
-        model=model,
-        name="messages_tool_call",
-        endpoint="/v1/messages",
-        expect="messages_tool",
-        body={
+        }),
+        ("messages_tool_call", "/v1/messages", "messages_tool", {
             "messages": [{"role": "user", "content": "Use lookup_order for order_id A123."}],
             "tools": [tool_schema_anthropic()],
             "tool_choice": {"type": "tool", "name": "lookup_order"},
-        },
-    ))
-    cases.append(make_case(
-        client=client,
-        model=model,
-        name="responses_tool_call",
-        endpoint="/v1/responses",
-        expect="responses_tool",
-        body={
+        }),
+        ("responses_tool_call", "/v1/responses", "responses_tool", {
             "input": "Use lookup_order for order_id A123.",
             "tools": [tool_schema_responses()],
             "tool_choice": {"type": "function", "name": "lookup_order"},
-        },
-    ))
+        }),
+    )
+    if gate and not supports_tools:
+        for name, endpoint, _expect, _body in tool_probes:
+            cases.append(skip_case(name, endpoint, "skipped: model does not advertise supports_tools"))
+    else:
+        for name, endpoint, expect, body in tool_probes:
+            cases.append(make_case(
+                client=client,
+                model=model,
+                provider_type=provider_type,
+                name=name,
+                endpoint=endpoint,
+                expect=expect,
+                body=body,
+            ))
     if include_multimodal:
-        image_url = "data:image/png;base64," + PNG_1X1_RED
-        cases.append(make_case(
-            client=client,
-            model=model,
-            name="chat_multimodal",
-            endpoint="/v1/chat/completions",
-            expect="chat_text",
-            body={
-                "messages": [{"role": "user", "content": [
-                    {"type": "text", "text": "Describe this image in five words or fewer."},
-                    {"type": "image_url", "image_url": {"url": image_url}},
-                ]}],
-                "max_tokens": 2000,
-            },
-        ))
-        cases.append(make_case(
-            client=client,
-            model=model,
-            name="messages_multimodal",
-            endpoint="/v1/messages",
-            expect="messages_text",
-            body={
-                "messages": [{"role": "user", "content": [
-                    {"type": "text", "text": "Describe this image in five words or fewer."},
-                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": PNG_1X1_RED}},
-                ]}],
-                "max_tokens": 2000,
-            },
-        ))
-        cases.append(make_case(
-            client=client,
-            model=model,
-            name="responses_multimodal",
-            endpoint="/v1/responses",
-            expect="responses_text",
-            body={
-                "input": [{"role": "user", "content": [
-                    {"type": "input_text", "text": "Describe this image in five words or fewer."},
-                    {"type": "input_image", "image_url": image_url},
-                ]}],
-                "max_tokens": 2000,
-            },
-        ))
+        if gate and not supports_vision:
+            for name, endpoint in (
+                ("chat_multimodal", "/v1/chat/completions"),
+                ("messages_multimodal", "/v1/messages"),
+                ("responses_multimodal", "/v1/responses"),
+            ):
+                cases.append(skip_case(name, endpoint, "skipped: model does not advertise supports_vision"))
+        else:
+            image_url = "data:image/png;base64," + PROBE_IMAGE_PNG_B64
+            cases.append(make_case(
+                client=client,
+                model=model,
+                provider_type=provider_type,
+                name="chat_multimodal",
+                endpoint="/v1/chat/completions",
+                expect="chat_text",
+                capability_probe=True,
+                body={
+                    "messages": [{"role": "user", "content": [
+                        {"type": "text", "text": "Describe this image in five words or fewer."},
+                        {"type": "image_url", "image_url": {"url": image_url}},
+                    ]}],
+                    "max_tokens": 2000,
+                },
+            ))
+            cases.append(make_case(
+                client=client,
+                model=model,
+                provider_type=provider_type,
+                name="messages_multimodal",
+                endpoint="/v1/messages",
+                expect="messages_text",
+                capability_probe=True,
+                body={
+                    "messages": [{"role": "user", "content": [
+                        {"type": "text", "text": "Describe this image in five words or fewer."},
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": PROBE_IMAGE_PNG_B64}},
+                    ]}],
+                    "max_tokens": 2000,
+                },
+            ))
+            cases.append(make_case(
+                client=client,
+                model=model,
+                provider_type=provider_type,
+                name="responses_multimodal",
+                endpoint="/v1/responses",
+                expect="responses_text",
+                capability_probe=True,
+                body={
+                    "input": [{"role": "user", "content": [
+                        {"type": "input_text", "text": "Describe this image in five words or fewer."},
+                        {"type": "input_image", "image_url": image_url},
+                    ]}],
+                    "max_tokens": 2000,
+                },
+            ))
     if include_stream:
         cases.append(make_case(
             client=client,
             model=model,
+            provider_type=provider_type,
             name="chat_stream",
             endpoint="/v1/chat/completions",
             expect="chat_stream",
@@ -575,6 +814,7 @@ def build_cases(client: GatewayClient, model: str, include_multimodal: bool, inc
         cases.append(make_case(
             client=client,
             model=model,
+            provider_type=provider_type,
             name="messages_stream",
             endpoint="/v1/messages",
             expect="messages_stream",
@@ -584,6 +824,7 @@ def build_cases(client: GatewayClient, model: str, include_multimodal: bool, inc
         cases.append(make_case(
             client=client,
             model=model,
+            provider_type=provider_type,
             name="responses_stream",
             endpoint="/v1/responses",
             expect="responses_stream",
@@ -642,7 +883,9 @@ def run_judge(client: GatewayClient, judge_model: str, result: ModelResult) -> N
         "cases": [
             {
                 "name": case.name,
-                "ok": case.ok,
+                "verdict": case.verdict,
+                "expected_upstream": case.expected_upstream,
+                "observed_upstream": case.observed_upstream,
                 "score": case.score,
                 "status": case.status,
                 "summary": case.summary,
@@ -683,17 +926,22 @@ def run_judge(client: GatewayClient, judge_model: str, result: ModelResult) -> N
         case.judge = judge_payload
 
 
-def write_reports(results: list[ModelResult], output_dir: Path, base_url: str) -> None:
+def write_reports(results: list[ModelResult], output_dir: Path, base_url: str, matrix: dict[str, dict[str, int]] | None = None) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     payload = {
         "base_url": base_url,
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "coverage_matrix": matrix or {},
         "models": [
             {
                 "model": result.model,
                 "score": result.score,
+                "no_signal": result.no_signal,
                 "passed": result.passed,
+                "scored": len(result.scored_cases),
+                "skipped": sum(1 for case in result.cases if case.verdict == "skip"),
+                "unsupported": sum(1 for case in result.cases if case.verdict == "unsupported"),
                 "total": len(result.cases),
                 "cases": [asdict(case) for case in result.cases],
             }
@@ -715,23 +963,36 @@ def render_markdown(payload: dict[str, Any]) -> str:
         f"- Base URL: `{payload['base_url']}`",
         f"- Created at: `{payload['created_at']}`",
         "",
-        "| Model | Score | Passed | Total |",
-        "|---|---:|---:|---:|",
+        "| Model | Score | Passed | Scored | Skipped | Unsupported | Total |",
+        "|---|---:|---:|---:|---:|---:|---:|",
     ]
     for model in payload["models"]:
-        lines.append(f"| `{model['model']}` | {model['score']:.2f} | {model['passed']} | {model['total']} |")
+        score_cell = "N/A" if model.get("no_signal") else f"{model['score']:.2f}"
+        lines.append(
+            f"| `{model['model']}` | {score_cell} | {model['passed']} | {model['scored']} | "
+            f"{model['skipped']} | {model['unsupported']} | {model['total']} |"
+        )
     for model in payload["models"]:
-        lines.extend(["", f"## {model['model']}", "", "| Case | OK | Score | HTTP | Latency | Summary |", "|---|---:|---:|---:|---:|---|"])
+        lines.extend(["", f"## {model['model']}", "", "| Case | Verdict | Upstream (expected -\u003e observed) | Score | HTTP | Latency | Summary |", "|---|---|---|---:|---:|---:|---|"])
         for case in model["cases"]:
-            ok = "yes" if case["ok"] else "no"
             summary = (case["summary"] or case["error"] or "").replace("|", "\\|")
+            upstream = f"{case.get('expected_upstream') or '?'} -> {case.get('observed_upstream') or '?'}".replace("|", "\\|")
             lines.append(
-                f"| `{case['name']}` | {ok} | {case['score']:.2f} | {case.get('status') or ''} | "
+                f"| `{case['name']}` | {case['verdict']} | {upstream} | {case['score']:.2f} | {case.get('status') or ''} | "
                 f"{case.get('latency_ms', 0)}ms | {summary} |"
             )
         judge = model["cases"][0].get("judge") if model["cases"] else None
         if judge:
             lines.extend(["", "Judge:", "", "```json", json.dumps(judge.get("parsed") or judge, ensure_ascii=False, indent=2), "```"])
+    matrix = payload.get("coverage_matrix") or {}
+    if matrix:
+        lines.extend(["", "## Protocol coverage matrix", "", "| client \\ upstream | " + " | ".join(UPSTREAM_PROTOCOLS) + " |", "|---|" + "---:|" * len(UPSTREAM_PROTOCOLS)])
+        for ep in ("chat_completions", "completions", "messages", "responses"):
+            row = matrix.get(ep, {})
+            lines.append(f"| `{ep}` | " + " | ".join(str(row.get(up) or "-") for up in UPSTREAM_PROTOCOLS) + " |")
+        missing = [cell for cell in REACHABLE_CELLS if not matrix.get(cell[0], {}).get(cell[1])]
+        if missing:
+            lines.extend(["", "Uncovered reachable cells: " + ", ".join(f"`{ep}->{up}`" for ep, up in missing)])
     return "\n".join(lines) + "\n"
 
 
@@ -755,6 +1016,26 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--skip-multimodal", action="store_true")
     parser.add_argument("--skip-stream", action="store_true")
+    parser.add_argument(
+        "--ignore-capabilities",
+        action="store_true",
+        help="Probe tools/multimodal even when the model does not advertise the capability.",
+    )
+    parser.add_argument(
+        "--require-matrix",
+        action="store_true",
+        help="Exit non-zero unless every reachable client x upstream cell is covered by this run.",
+    )
+    parser.add_argument(
+        "--require-signal",
+        action="store_true",
+        help="Exit non-zero when any model ends up with zero scored cases (all skipped/unsupported).",
+    )
+    parser.add_argument(
+        "--keep-capability-cache",
+        action="store_true",
+        help="Do not reset the Responses capability probe cache before testing (keeps stale native decisions).",
+    )
     args = parser.parse_args(argv)
 
     config = load_live_eval_config(args.config, explicit="--config" in argv)
@@ -778,6 +1059,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         args.skip_multimodal = bool(config.get("skip_multimodal", False))
     if not args.skip_stream:
         args.skip_stream = bool(config.get("skip_stream", False))
+    if not args.ignore_capabilities:
+        args.ignore_capabilities = bool(config.get("ignore_capabilities", False))
+    if not args.require_matrix:
+        args.require_matrix = bool(config.get("require_matrix", False))
+    if not args.require_signal:
+        args.require_signal = bool(config.get("require_signal", False))
+    if not args.keep_capability_cache:
+        args.keep_capability_cache = bool(config.get("keep_capability_cache", False))
     return args
 
 
@@ -823,7 +1112,15 @@ def main(argv: list[str]) -> int:
         admin_username=args.admin_username,
         admin_password=args.admin_password,
     )
-    models = args.model or client.get_models()
+    advertised: dict[str, dict[str, Any]] = {}
+    try:
+        advertised = client.get_models()
+    except Exception as exc:
+        if not args.model:
+            print(f"Cannot list models: {exc}", file=sys.stderr)
+            return 2
+        print(f"Warning: /v1/models failed ({exc}); capability gating disabled", file=sys.stderr)
+    models = args.model or list(advertised)
     if args.limit:
         models = models[:args.limit]
     if not models:
@@ -831,26 +1128,64 @@ def main(argv: list[str]) -> int:
         return 1
 
     print(f"Testing {len(models)} model(s) from {args.base_url}")
+    provider_types = client.get_provider_types()
+    if not provider_types:
+        print("Note: no admin credentials; upstream-protocol assertions disabled (matrix will rely on observed logs).")
     results = []
     for index, model in enumerate(models, 1):
         print(f"\n[{index}/{len(models)}] {model}")
+        provider_type = provider_types.get(model, "")
+        if provider_type == "openai" and not args.keep_capability_cache:
+            reset_rows = client.reset_responses_capability(model)
+            if reset_rows:
+                print(f"  capability: Responses probe cache cleared ({reset_rows} row(s)); native path re-evaluated this run")
+            elif reset_rows == 0:
+                print("  WARN: capability reset matched 0 rows (provider_models row missing?); native decision may be stale")
         result = ModelResult(model=model)
         result.cases = build_cases(
             client,
             model,
             include_multimodal=not args.skip_multimodal,
             include_stream=not args.skip_stream,
+            caps=advertised.get(model, {}),
+            ignore_capabilities=args.ignore_capabilities,
+            provider_type=provider_type,
         )
         run_judge(client, args.judge_model, result)
         results.append(result)
+        marks = {"pass": "PASS", "fail": "FAIL", "skip": "SKIP ", "unsupported": "UNSPT"}
         for case in result.cases:
-            mark = "PASS" if case.ok else "FAIL"
-            print(f"  {mark:4} {case.name:22} {case.score:.2f} {case.latency_ms:5d}ms {case.summary or case.error}")
-        print(f"  SCORE {result.score:.2f} ({result.passed}/{len(result.cases)})")
+            mark = marks[case.verdict]
+            print(f"  {mark:5} {case.name:22} {case.score:.2f} {case.latency_ms:5d}ms {case.summary or case.error}")
+        skipped = sum(1 for case in result.cases if case.verdict == "skip")
+        unsupported = sum(1 for case in result.cases if case.verdict == "unsupported")
+        extra = ""
+        if skipped or unsupported:
+            extra = f", {skipped} skipped, {unsupported} unsupported"
+        if result.no_signal:
+            print(f"  SCORE N/A (0 scored{extra})  <-- 本次对该模型无任何有效信号，勿视为健康")
+        else:
+            print(f"  SCORE {result.score:.2f} ({result.passed}/{len(result.scored_cases)} scored{extra})")
+        if skipped + unsupported > len(result.scored_cases):
+            print("  WARN: 超过半数探针未形成计分信号（skip/unsupported）；能力元数据可能失真，建议 --ignore-capabilities 复验")
 
-    write_reports(results, Path(args.output_dir), args.base_url)
-    failed = sum(1 for result in results for case in result.cases if not case.ok)
-    return 1 if failed else 0
+    matrix = build_coverage_matrix(results)
+    print_coverage_matrix(matrix)
+    write_reports(results, Path(args.output_dir), args.base_url, matrix)
+    failed = sum(1 for result in results for case in result.cases if case.verdict == "fail")
+    if failed:
+        return 1
+    if args.require_signal:
+        silent = [result.model for result in results if result.no_signal]
+        if silent:
+            print("\n--require-signal: models with zero scored cases: " + ", ".join(silent))
+            return 1
+    if args.require_matrix:
+        missing = missing_reachable_cells(matrix)
+        if missing:
+            print("\n--require-matrix: uncovered reachable cells: " + ", ".join(f"{ep}->{up}" for ep, up in missing))
+            return 1
+    return 0
 
 
 if __name__ == "__main__":

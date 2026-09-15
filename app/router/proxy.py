@@ -20,7 +20,7 @@ from app.database import (
     get_enabled_image_generator, get_model_image_generation,
     get_model_responses_capability, set_model_responses_capability, update_model_responses_capability, update_model_responses_tool_types,
 )
-from app.core.text import friendly_error_msg, error_detail_for_log, mask_key
+from app.core.text import client_status_for_upstream_error, friendly_error_msg, error_detail_for_log, mask_key
 from app.core.image_intent import is_image_generation_intent, latest_user_text
 from app.core.image_bridge import (
     GATEWAY_IMAGE_ASSET_MARKER,
@@ -325,7 +325,7 @@ async def _generate_with_configured_backend(
         raise
     except Exception as exc:
         _error_log.exception("[responses image_generation] failed: %s", exc)
-        error = HTTPException(status_code=502, detail=friendly_error_msg(exc))
+        error = HTTPException(status_code=client_status_for_upstream_error(exc), detail=friendly_error_msg(exc))
         _attach_request_details(
             error,
             request_kind="image_generation",
@@ -1670,10 +1670,14 @@ def _append_fallback_attempt(details: dict, attempt: dict) -> None:
 
 
 def _output_request_details(output) -> dict:
+    details: dict = {}
+    dedicated = getattr(output, "request_details", None)
+    if isinstance(dedicated, dict):
+        details.update(dedicated)
     raw = getattr(output, "raw", None)
     if isinstance(raw, dict) and isinstance(raw.get("request_details"), dict):
-        return dict(raw["request_details"])
-    return {}
+        details.update(raw["request_details"])
+    return details
 
 
 def _merge_request_details(*parts: dict | None) -> dict:
@@ -1705,15 +1709,19 @@ def _merge_bridge_request_details(existing: dict | None, latest: dict | None) ->
 
 
 def _attach_output_request_details(output, **fields) -> None:
+    # 主存储：专用字段（LiteLLM 路径的 raw 是非 dict 对象，不能依赖）。
+    dedicated = getattr(output, "request_details", None)
+    if isinstance(dedicated, dict):
+        dedicated.update(fields)
+    # 兼容存储：raw 为 dict 的适配器路径继续同步，旧读取方不受影响。
     if getattr(output, "raw", None) is None:
         output.raw = {}
-    if not isinstance(output.raw, dict):
-        return
-    details = output.raw.setdefault("request_details", {})
-    if not isinstance(details, dict):
-        details = {}
-        output.raw["request_details"] = details
-    details.update(fields)
+    if isinstance(output.raw, dict):
+        details = output.raw.setdefault("request_details", {})
+        if not isinstance(details, dict):
+            details = {}
+            output.raw["request_details"] = details
+        details.update(fields)
 
 
 def _finalize_success_details(output=None, *, policy=None, extra: dict | None = None) -> dict:
@@ -3336,7 +3344,7 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
             increment_user_usage(username, api_key_value, False, 0)
         # 客户端只拿到安全消息，上游原文必须先落日志，否则无法回溯。
         _error_log.error("[chat_completions] FAILED: %s", error_detail_for_log(e))
-        raise HTTPException(status_code=500, detail=friendly_error_msg(e))
+        raise HTTPException(status_code=client_status_for_upstream_error(e), detail=friendly_error_msg(e))
 
 @router.post("/completions")
 async def completions(request: Request, authorization: Optional[str] = Header(None)):
@@ -3458,7 +3466,7 @@ async def completions(request: Request, authorization: Optional[str] = Header(No
         if username != "legacy":
             increment_user_usage(username, api_key_value, False, 0)
         _error_log.error("FAILED: %s", str(e))
-        raise HTTPException(status_code=500, detail=friendly_error_msg(e))
+        raise HTTPException(status_code=client_status_for_upstream_error(e), detail=friendly_error_msg(e))
 
 @router.post("/messages")
 async def anthropic_messages(request: Request, authorization: Optional[str] = Header(None)):
@@ -3602,7 +3610,7 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
         if username != "legacy":
             increment_user_usage(username, api_key_value, False, 0)
         _error_log.error("FAILED: %s", str(e))
-        raise HTTPException(status_code=500, detail=friendly_error_msg(e))
+        raise HTTPException(status_code=client_status_for_upstream_error(e), detail=friendly_error_msg(e))
 
 
 @router.post("/responses")
@@ -4673,7 +4681,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
         if username != "legacy":
             increment_user_usage(username, api_key_value, False, 0)
         _error_log.error("FAILED: %s", str(e))
-        raise HTTPException(status_code=500, detail=friendly_error_msg(e))
+        raise HTTPException(status_code=client_status_for_upstream_error(e), detail=friendly_error_msg(e))
 
 
 async def _images_generation_request(request: Request, authorization: Optional[str]):
@@ -4733,7 +4741,7 @@ async def _images_generation_request(request: Request, authorization: Optional[s
         )
         _record_success_metrics(username, api_key_value, 0, "fail")
         _error_log.error("[images_generations] FAILED: %s", error_detail_for_log(exc))
-        raise HTTPException(status_code=502, detail=friendly_error_msg(exc)) from exc
+        raise HTTPException(status_code=client_status_for_upstream_error(exc), detail=friendly_error_msg(exc)) from exc
     data = [{"b64_json": item.data_uri.split(",", 1)[1], "mime_type": item.mime_type} for item in results]
     details = {"request_kind": "image_generation", "responses_mode": "image_generation", "upstream_endpoint": "images/generations", "image_model": image_model, "image_backend_provider": image_provider_id, "image_backend_model": image_model, "image_backend_type": str(generator.get("backend_type") or ""), "image_fallback_status": "unused", "image_count": len(results), "image_bytes": image_results_bytes(results)}
     username = user.get("username", "legacy")

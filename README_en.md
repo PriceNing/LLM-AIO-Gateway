@@ -258,6 +258,25 @@ Important defaults:
 - Admin login throttling lives in `app/security.py` and is tuned by `login_attempt_*`.
 - The Anthropic and native Responses adapters reuse the shared HTTP connection pool in `app/services/http_pool.py`.
 
+## Client-Visible Error Status Codes
+
+Upstream failures are mapped to client responses by a single source of truth, `app/core/text.py::classify_for_client()` (status code and message always come from the same decision):
+
+| Upstream condition | Client status | Meaning and retry guidance |
+|---|---|---|
+| Upstream 4xx (except the special cases below, e.g. 400/404/413/422) | original status kept | request rejected; **retrying unchanged will fail again** — fix model/parameters per the message |
+| Upstream 401/403 | 502 | the gateway's own upstream credentials failed (not your key); an admin must update the provider API key |
+| Upstream 408 / real timeout (`TimeoutError`/`httpx.TimeoutException` anywhere in the chain) | 504 | retry with backoff |
+| Upstream 429 | 429 | rate limited; back off per `Retry-After` when present |
+| Upstream 5xx and any other non-4xx authoritative status (1xx/2xx/3xx) | 502 | upstream failure; retry with backoff |
+| Unclassifiable | 500 | reserved for gateway-internal bugs |
+
+Invariants:
+
+- While an authoritative upstream status exists on the exception chain (`status_code`/`response.status_code`), text heuristics must never veto it; with no authoritative status, only two secondary signals are allowed — text-detected timeout and twice-confirmed connection failure.
+- Raw upstream error text (including Anthropic SSE `error` events) goes to server logs only; clients receive a safe message plus a `request_id` for admin correlation.
+- Safety/balance upstream errors override the message via `_UPSTREAM_ERROR_MAP` but never the status code.
+
 ## Architecture Summary
 
 ```text
@@ -313,7 +332,14 @@ Main code boundaries:
 pytest tests/ -q
 ```
 
-Expected current result: `869 passed`.
+Expected current result: `943 passed`.
+
+The client-error-mapping baseline (diff-corpus coherence / required path assertions / hardcoded-status whitelist / doc count consistency) is enforced by:
+
+```bash
+# Checks 1-3 run automatically with pytest (tests/test_error_mapping_gate.py)
+python tools/scripts/check_error_mapping.py   # additionally runs check 4 (doc counts vs collected)
+```
 
 Live smoke matrix:
 

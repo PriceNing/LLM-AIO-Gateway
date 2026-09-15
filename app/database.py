@@ -1632,6 +1632,39 @@ def update_model_responses_capability(provider_id: str, model: str, **updates) -
         )
 
 
+def reset_model_responses_capability(provider_id: str | None = None, model: str | None = None) -> int:
+    """清除 Responses 能力探测缓存，下一次 /responses 请求将重新真实探测。
+
+    用于运维排障与冒烟测试的确定性（避免 unknown 退避 TTL 压住原生路径）。
+    支持三种粒度：provider+model / 仅 model（裸名跨 provider，与
+    set_model_image_generation 口径一致）/ 仅 provider（全部模型）。
+    返回受影响行数。
+    """
+    reset_sql = (
+        "UPDATE provider_models SET responses_status = 'unknown', responses_checked_at = '', "
+        "responses_expires_at = '', responses_streaming = 0, responses_streaming_status = 'unknown', "
+        "responses_tool_types = '[]', responses_error = ''"
+    )
+    if not provider_id and not model:
+        return 0
+    with get_db() as db:
+        if model and provider_id:
+            model_name = parse_model_id(model).model_name
+            cursor = db.execute(
+                reset_sql + " WHERE provider_id = ? AND (model_id IN (?, ?) OR model_name = ?)",
+                (provider_id, model, model_name, model_name),
+            )
+        elif model:
+            model_name = parse_model_id(model).model_name
+            cursor = db.execute(
+                reset_sql + " WHERE model_id IN (?, ?) OR model_name = ?",
+                (model, model_name, model_name),
+            )
+        else:
+            cursor = db.execute(reset_sql + " WHERE provider_id = ?", (provider_id,))
+        return cursor.rowcount
+
+
 def update_model_responses_tool_types(provider_id: str, model: str, tool_types: list[str]) -> None:
     normalized = sorted({str(item) for item in tool_types if item})
     with get_db() as db:

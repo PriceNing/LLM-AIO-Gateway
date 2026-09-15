@@ -43,6 +43,31 @@ def _exception_chain(exc: BaseException):
         current = current.__cause__ or current.__context__
 
 
+def has_hard_timeout(exc: BaseException) -> bool:
+    """异常链上是否存在 isinstance 级的超时证据（非文本推断）。
+
+    classify_upstream_error 的 timeout 判定含文本匹配；客户端状态码/文案需要
+    区分“真超时”与“文本里碰巧带 timeout 字样的上游 4xx 拒绝”，避免 400 被
+    改写成可重试的 504（与 client_status_for_upstream_error 的权威优先口径对齐）。
+    """
+    return any(isinstance(item, (TimeoutError, httpx.TimeoutException)) for item in _exception_chain(exc))
+
+
+def upstream_status_code(exc: BaseException) -> int | None:
+    """从异常链中提取第一个可用的上游 HTTP 状态码。
+
+    覆盖 httpx.HTTPStatusError（状态在 .response.status_code）、
+    liteLLM 异常（直接挂 .status_code）以及 OpenAI SDK 的 APIStatusError。
+    """
+    for item in _exception_chain(exc):
+        status = getattr(item, "status_code", None)
+        if status is None:
+            status = getattr(getattr(item, "response", None), "status_code", None)
+        if isinstance(status, int) and 100 <= status <= 599:
+            return status
+    return None
+
+
 def classify_upstream_error(exc: Exception) -> str:
     chain = list(_exception_chain(exc))
 

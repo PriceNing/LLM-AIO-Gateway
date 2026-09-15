@@ -76,6 +76,44 @@ def test_create_provider(temp_db):
     assert response.json()["id"] == "test-admin-provider"
 
 
+def test_reset_responses_capability(temp_db):
+    headers = temp_db["headers"]
+    client.post("/admin/providers", json={
+        "id": "cap-prov",
+        "name": "Cap Prov",
+        "provider_type": "openai",
+        "api_base": "https://cap.test.com/v1",
+        "api_key": "k",
+        "enabled": True,
+        "models": [{"id": "m-native", "name": "m-native", "enabled": True}],
+    }, headers=headers)
+    from app.database import set_model_responses_capability, get_model_responses_capability
+    set_model_responses_capability("cap-prov", "m-native", status="supported", expires_at="2999-01-01T00:00:00+00:00")
+    assert get_model_responses_capability("cap-prov", "cap-prov/m-native")["responses_status"] == "supported"
+
+    # 不传 provider_id：由复合模型名解析
+    response = client.post("/admin/models/responses-capability/reset", json={"model": "cap-prov/m-native"}, headers=headers)
+    assert response.status_code == 200
+    assert response.json()["reset"] == 1
+    cap = get_model_responses_capability("cap-prov", "cap-prov/m-native")
+    assert cap["responses_status"] == "unknown"
+    assert not cap["responses_expires_at"]
+
+    # 裸模型名：跨 provider 重置（审查报告 #8）
+    set_model_responses_capability("cap-prov", "m-native", status="supported", expires_at="2999-01-01T00:00:00+00:00")
+    response = client.post("/admin/models/responses-capability/reset", json={"model": "m-native"}, headers=headers)
+    assert response.status_code == 200
+    assert response.json()["reset"] == 1
+    # 不存在的模型名：reset=0，调用方可区分“清掉了”与“没匹配”
+    response = client.post("/admin/models/responses-capability/reset", json={"provider_id": "cap-prov", "model": "ghost-model"}, headers=headers)
+    assert response.status_code == 200 and response.json()["reset"] == 0
+
+    # 未鉴权 / 不存在的 provider / 缺参数
+    assert client.post("/admin/models/responses-capability/reset", json={"model": "cap-prov/m-native"}).status_code in (401, 403)
+    assert client.post("/admin/models/responses-capability/reset", json={"model": "ghost/x"}, headers=headers).status_code == 404
+    assert client.post("/admin/models/responses-capability/reset", json={}, headers=headers).status_code == 400
+
+
 def test_user_lifecycle(temp_db):
     headers = temp_db["headers"]
     response = client.post("/admin/users", json={

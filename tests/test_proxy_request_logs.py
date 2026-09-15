@@ -46,8 +46,9 @@ def test_chat_completions_writes_request_log(temp_db):
         headers={"Authorization": f"Bearer {api_key_row['key']}"},
         json={"model": "mock-openai/m1", "messages": [{"role": "user", "content": "hi"}]},
     )
-    # Upstream is unreachable; we expect 500 but request log still written
-    assert r.status_code in (200, 500)
+    # Upstream is unreachable; expect a gateway-side 5xx (502 connection failure,
+    # or 500 for unclassified errors) but the request log must still be written.
+    assert r.status_code in (200, 500, 502)
 
     rows = list_request_logs(limit=10)
     assert len(rows) == 1

@@ -5,7 +5,6 @@ set "SCRIPT_DIR=%~dp0"
 set "REPO_DIR=%SCRIPT_DIR%..\.."
 set "DEFAULT_CONFIG=%SCRIPT_DIR%live-eval.config.local.json"
 set "FALLBACK_CONFIG=%SCRIPT_DIR%live-eval.config.json"
-set "DEFAULT_MODEL=minimax/MiniMax-M2.7-highspeed"
 
 cd /d "%REPO_DIR%" || goto :error
 
@@ -26,7 +25,7 @@ echo.
 if not "%~1"=="" goto :run_with_args
 
 echo Choose evaluation mode:
-echo   1. Quick smoke test: %DEFAULT_MODEL% with streaming, skip multimodal
+echo   1. Quick smoke test: first model from config, streaming, skip multimodal
 echo   2. All models from config / /v1/models
 echo   3. Config defaults exactly
 echo.
@@ -43,7 +42,7 @@ if "%MODE%"=="3" (
   goto :after_run
 )
 
-python "%SCRIPT_DIR%live_eval.py" --config "%CONFIG%" --model "%DEFAULT_MODEL%" --skip-multimodal
+python "%SCRIPT_DIR%live_eval.py" --config "%CONFIG%" --limit 1 --skip-multimodal
 goto :after_run
 
 :run_with_args

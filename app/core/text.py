@@ -44,6 +44,8 @@ _TIMEOUT_FAILURE = "Upstream request timed out. Please retry."
 _RATE_LIMIT_FAILURE = "Upstream rate limited the request. Please retry later."
 _BALANCE_FAILURE = "Upstream account balance is exhausted."
 _CONNECTION_FAILURE = "Unable to reach the upstream provider. Please retry later."
+_UPSTREAM_REJECTION = "Upstream rejected the request. Check model and request parameters; retrying unchanged will fail again."
+_UPSTREAM_CREDENTIAL_FAILURE = "Gateway upstream credentials failed. Contact the administrator to update the provider API key."
 _BALANCE_FAILURE_MARKERS = (
     "insufficient balance",
     "insufficient credit",
@@ -74,10 +76,10 @@ def friendly_error_msg(e: Exception) -> str:
 
     The raw upstream text is intentionally NOT included. Callers that need it
     for logs must use ``error_detail_for_log`` (or ``str(exc)``) instead.
-    """
-    # Local import: routing_targets imports core.policy, which imports this module.
-    from app.services.routing_targets import classify_upstream_error
 
+    文案与客户端状态码同源：先过内容安全/余额等模式表（仅覆盖文案），其余
+    一律取自 ``classify_for_client``，不得另搭一套判定顺序。
+    """
     msg = str(e)
     lowered = msg.lower()
     for pattern, friendly in _UPSTREAM_ERROR_MAP:
@@ -85,14 +87,8 @@ def friendly_error_msg(e: Exception) -> str:
             return _with_trace_hint(friendly)
     if any(marker in lowered for marker in _BALANCE_FAILURE_MARKERS):
         return _with_trace_hint(_BALANCE_FAILURE)
-    trigger = classify_upstream_error(e)
-    if trigger == "timeout":
-        return _with_trace_hint(_TIMEOUT_FAILURE)
-    if trigger == "http_429":
-        return _with_trace_hint(_RATE_LIMIT_FAILURE)
-    if trigger == "connection_error" and _looks_like_connection_error(e, lowered):
-        return _with_trace_hint(_CONNECTION_FAILURE)
-    return _with_trace_hint(_GENERIC_UPSTREAM_FAILURE)
+    _status, message = classify_for_client(e)
+    return _with_trace_hint(message)
 
 
 def _looks_like_connection_error(exc: Exception, lowered: str) -> bool:
@@ -100,6 +96,61 @@ def _looks_like_connection_error(exc: Exception, lowered: str) -> bool:
         return True
     tokens = ("connection", "connect", "tls", "ssl", "eof", "reset", "refused", "unreachable", "无法连接")
     return any(token in lowered for token in tokens)
+
+
+def classify_for_client(e: Exception, *, confirmed_upstream: bool = False) -> tuple[int, str]:
+    """单一事实来源：把上游异常映射为 (客户端状态码, 客户端安全文案)。
+
+    判定顺序（状态码与文案永远同源，不得在调用方各自重拼）：
+    1. 异常链上 isinstance 级硬超时（TimeoutError / httpx.TimeoutException）→ 504；
+    2. 权威状态码（链上 status_code / response.status_code）：401/403 → 502+凭据文案
+       （网关侧上游凭据问题，不得伪装成客户端 key 失效）；408 → 504；429 → 429+限流文案；
+       其余 4xx → 保留原状态码+“修正请求”文案；5xx 及其他非 4xx 的权威状态码（1xx/2xx/3xx，
+       必然来自上游）→ 502；
+    3. 无权威状态码时：文本型 timeout → 504；二次确认的连接失败 → 502；
+    4. 其余：confirmed_upstream=True（调用方已确定异常来自上游，如 Anthropic SSE error 事件）
+       → 502；否则保守 500（网关内部错）。
+    文本启发式（如消息里出现 "429"/"500"）永远不得在存在权威状态码时否决它，
+    也不得推出比状态码更具体的文案。
+    """
+    # 延迟导入：routing_targets 导入 core.policy，而 core.policy 导入本模块。
+    from app.services.routing_targets import (
+        classify_upstream_error, has_hard_timeout, upstream_status_code,
+    )
+
+    if has_hard_timeout(e):
+        return 504, _TIMEOUT_FAILURE
+    status = upstream_status_code(e)
+    if status is not None:
+        if status in (401, 403):
+            return 502, _UPSTREAM_CREDENTIAL_FAILURE
+        if status == 408:
+            return 504, _TIMEOUT_FAILURE
+        if status == 429:
+            return 429, _RATE_LIMIT_FAILURE
+        if 400 <= status <= 499:
+            return status, _UPSTREAM_REJECTION
+        # 5xx 及其他非 4xx 的权威状态码（1xx/2xx/3xx）都必然来自上游，归 502，
+        # 不得把上游异常伪装成网关内部错（审查报告四轮 #4）。
+        return 502, _GENERIC_UPSTREAM_FAILURE
+    trigger = classify_upstream_error(e)
+    if trigger == "timeout":
+        return 504, _TIMEOUT_FAILURE
+    # classify 的兜底会把未知异常归为 connection_error，需二次确认才给 502，
+    # 否则网关内部 bug 会被伪装成上游网络故障。
+    if trigger == "connection_error" and _looks_like_connection_error(e, str(e).lower()):
+        return 502, _CONNECTION_FAILURE
+    if confirmed_upstream:
+        # 调用方已确认异常源自上游（如上游 SSE error 事件）：无法归类时归 502，
+        # 不伪装成网关内部错；避免调用方对分类器结果做本地二次改写（报告四轮 #1）。
+        return 502, _GENERIC_UPSTREAM_FAILURE
+    return 500, _GENERIC_UPSTREAM_FAILURE
+
+
+def client_status_for_upstream_error(e: Exception, *, confirmed_upstream: bool = False) -> int:
+    """客户端 HTTP 状态码；与 ``friendly_error_msg`` 同源，见 ``classify_for_client``。"""
+    status, _message = classify_for_client(e, confirmed_upstream=confirmed_upstream)
+    return status
 
 
 def error_detail_for_log(e: BaseException, *, max_chars: int = 2000) -> str:

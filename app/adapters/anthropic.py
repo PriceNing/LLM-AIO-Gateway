@@ -111,13 +111,16 @@ def _enabled_thinking_config(max_tokens: int, provider_options: dict) -> dict | 
 
 
 def _http_exception_from_upstream(status_code: int, message: str) -> HTTPException:
-    if status_code == 429:
-        mapped = 429
-    elif 400 <= status_code < 500:
-        mapped = status_code
-    else:
-        mapped = 502
-    return HTTPException(status_code=mapped, detail=f"Upstream: {message}")
+    # 状态码与客户端文案统一取自 classify_for_client（上游 401/403 → 502 凭据文案，
+    # 4xx 保留，5xx → 502）；上游原文（message）绝不进客户端 detail，由调用链
+    # 的日志路径（_log_upstream_http_exception_failure / error_detail_for_log）落盘。
+    from app.core.text import client_status_for_upstream_error, friendly_error_msg
+
+    carrier = HTTPException(status_code=status_code, detail=f"Upstream: {message}")
+    return HTTPException(
+        status_code=client_status_for_upstream_error(carrier),
+        detail=friendly_error_msg(carrier),  # 含内容安全/余额模式表，未命中时回统一文案
+    )
 
 
 def _anthropic_headers(provider_info: dict) -> dict:

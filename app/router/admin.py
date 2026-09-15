@@ -22,6 +22,7 @@ from app.database import (
     get_preprocessors, upsert_preprocessor, delete_preprocessor as delete_preprocessor_config,
     get_image_generators, upsert_image_generator, delete_image_generator as delete_image_generator_config,
     set_model_image_generation,
+    reset_model_responses_capability,
 )
 from app.core.policy import apply_fallback_policy, apply_routing_rules
 from app.adapters.anthropic import anthropic_messages_completion_for_internal
@@ -261,6 +262,27 @@ async def _run_model_test(model_id: str) -> dict:
         "preview": _test_preview(output),
         "usage": getattr(output, "usage", {}) or {},
     }
+
+
+@router.post("/models/responses-capability/reset")
+async def reset_responses_capability(body: dict, authorization: Optional[str] = Header(None)):
+    """清除 Responses 能力探测缓存，下一次 /responses 请求将重新真实探测。
+
+    body: {"model": "provider/model"} / {"model": "裸名"（跨 provider）} /
+    {"provider_id": "x"[, "model": "m"]}。reset=0 表示未匹配任何 provider_models 行。
+    供运维排障与冒烟测试使用；不改变任何管理员配置。
+    """
+    await require_admin_session(authorization)
+    provider_id = str(body.get("provider_id") or "").strip()
+    model = str(body.get("model") or "").strip()
+    if not provider_id and not model:
+        raise HTTPException(status_code=400, detail="provider_id or model is required")
+    if not provider_id and "/" in model:
+        provider_id = parse_model_id(model).provider_id or ""
+    if provider_id and not get_provider(provider_id):
+        raise HTTPException(status_code=404, detail="Provider not found")
+    reset = reset_model_responses_capability(provider_id or None, model or None)
+    return {"provider_id": provider_id or None, "model": model or None, "reset": reset}
 
 
 @router.post("/models/test")

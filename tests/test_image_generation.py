@@ -11,7 +11,7 @@ from app.database import add_admin, add_provider, add_user, add_user_api_key
 from app.security import create_session, hash_password
 
 from app.adapters.imagegen import (
-    ImageGenerationResult, _download_image, _is_public_address, generate_images,
+    ImageGenerationResult, ImageBackendHTTPError, _download_image, _is_public_address, generate_images,
     image_results_bytes, images_url,
 )
 from app.adapters.comfyui import (
@@ -2190,6 +2190,26 @@ def test_images_generation_uses_configured_backend(image_app_db, monkeypatch):
     stats = get_global_stats()
     assert stats["image_generation_calls"] == 1
     assert stats["image_generation_images"] == 1
+
+
+def _image_backend_error_generate(status_code: int, raw_detail: str):
+    async def fake_generate(config, **kwargs):
+        raise ImageBackendHTTPError(status_code, raw_detail)
+    return fake_generate
+
+
+@pytest.mark.parametrize("backend_status,expected_client", [(400, 400), (429, 429), (503, 502)])
+def test_images_generation_maps_client_status(image_app_db, monkeypatch, backend_status, expected_client):
+    # 审查报告四轮 #3：图片后端错误携带权威状态码（唯一必然带 .status_code 的路径），
+    # 客户端必须拿到映射后的状态码，且 detail 不回传后端原文。
+    monkeypatch.setattr("app.router.proxy.generate_images", _image_backend_error_generate(backend_status, "Argument not supported: size secret-backend-text"))
+    response = TestClient(app).post("/v1/images/generations", headers=image_app_db["headers"], json={
+        "model": "chat/chat-model", "prompt": "draw an apple",
+    })
+    assert response.status_code == expected_client
+    body = response.text
+    assert "secret-backend-text" not in body
+    assert "Argument not supported" not in body
 
 
 def test_codex_images_generation_accepts_fixed_image_model(image_app_db, monkeypatch):

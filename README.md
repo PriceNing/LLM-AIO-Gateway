@@ -260,6 +260,25 @@ curl http://localhost:8000/v1/responses \
 - 管理员登录走 `app/security.py` 的登录限流（`login_attempt_*`）。
 - Anthropic 与原生 Responses 适配器复用 `app/services/http_pool.py` 维护的共享 HTTP 连接池。
 
+## 客户端可见错误状态码
+
+上游失败映射到客户端响应时遵循单一事实来源 `app/core/text.py::classify_for_client()`（状态码与文案同源）：
+
+| 上游情况 | 客户端状态码 | 含义与重试建议 |
+|---|---|---|
+| 上游 4xx（除下列特例外，如 400/404/413/422） | 保留原状态码 | 请求被拒，**原样重试必然再失败**；按文案修正模型/参数 |
+| 上游 401/403 | 502 | 网关自己的上游凭据失效（非你的 key 问题），需管理员更新提供商 API Key |
+| 上游 408 / 真实超时（异常链含 `TimeoutError`/`httpx.TimeoutException`） | 504 | 可退避重试 |
+| 上游 429 | 429 | 限流，按 `Retry-After`（如有）退避重试 |
+| 上游 5xx 及其他非 4xx 的权威状态码（1xx/2xx/3xx） | 502 | 上游故障，可退避重试 |
+| 无法归类 | 500 | 保留给网关内部错误 |
+
+不变量：
+
+- 存在权威上游状态码（异常链上的 `status_code`/`response.status_code`）时，文本启发式不得否决它；无权威状态码时仅允许“文本识别的超时”与“二次确认的连接失败”两类次级信号。
+- 上游原始错误文本（含 Anthropic SSE `error` 事件）只进服务端日志，客户端仅拿安全文案 + `request_id`（用于向管理员回溯）。
+- 内容安全/余额类上游错误由 `_UPSTREAM_ERROR_MAP` 覆盖文案，但不改状态码。
+
 ## 架构摘要
 
 ```text
@@ -315,7 +334,14 @@ OpenAI 兼容提供商默认走 Chat Completions；仅在原生 Responses 能力
 pytest tests/ -q
 ```
 
-当前预期结果：`869 passed`。
+当前预期结果：`943 passed`。
+
+客户端错误映射收口基线（差分语料一致性 / 关键路径断言 / 写死状态码白名单 / 文档计数一致）已固化为：
+
+```bash
+# 检查 1–3 已作为普通用例随 pytest 自动执行（tests/test_error_mapping_gate.py）
+python tools/scripts/check_error_mapping.py   # 额外执行检查 4（文档计数 vs 实际收集数）
+```
 
 真实烟测建议：
 

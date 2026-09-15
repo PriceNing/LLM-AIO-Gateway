@@ -24,6 +24,19 @@ python tools/live_eval/live_eval.py --config local-live-eval.json
 # Skip token-expensive capability probes
 python tools/live_eval/live_eval.py --skip-multimodal --skip-stream
 
+# Probe tools/multimodal even when the model does not advertise the capability
+python tools/live_eval/live_eval.py --ignore-capabilities
+
+# Fail unless every reachable client x upstream cell is covered by this run
+python tools/live_eval/live_eval.py --require-matrix
+
+# Fail when any model ends with zero scored cases (everything skipped/unsupported)
+python tools/live_eval/live_eval.py --require-signal
+
+# Keep the gateway's Responses capability probe cache as-is (by default the tool
+# clears it per openai-type model so the native path is re-evaluated every run)
+python tools/live_eval/live_eval.py --keep-capability-cache
+
 # Include admin dashboard request logs in each case result
 # Fill admin_username/admin_password in live-eval.config.local.json.
 python tools/live_eval/live_eval.py --model provider/model-a
@@ -49,7 +62,11 @@ Example:
   "timeout": 120,
   "output_dir": "reports/live-eval",
   "skip_multimodal": false,
-  "skip_stream": false
+  "skip_stream": false,
+  "ignore_capabilities": false,
+  "require_matrix": false,
+  "require_signal": false,
+  "keep_capability_cache": false
 }
 ```
 
@@ -70,8 +87,28 @@ Config fields:
 | `output_dir` | Report output directory. Defaults to `reports/live-eval`. |
 | `skip_multimodal` | Skip image probes when true. |
 | `skip_stream` | Skip SSE probes when true. |
+| `ignore_capabilities` | Probe tools/multimodal regardless of advertised capabilities when true. |
+| `require_matrix` | Exit non-zero unless every reachable client x upstream cell is covered. |
+| `require_signal` | Exit non-zero when any model has zero scored cases this run. |
+| `keep_capability_cache` | Do not reset the Responses probe cache before openai-type models (see Safety Notes). |
 
 ## What It Tests
+
+Capability probes (tool calls, multimodal) are gated on the `supports_tools` /
+`supports_vision` metadata advertised by `/v1/models`: a model that does not advertise a
+capability records `skip` cases without sending any request, so the run does not burn
+tokens on probes the contract says are unsupported. Use `--ignore-capabilities` to force
+the probes anyway. Note this trusts the gateway's own advertised metadata — if that
+metadata is wrong, capability regressions can slip through as `SKIP`; when a model shows
+mostly skips, re-run with `--ignore-capabilities` to verify the metadata itself.
+
+With admin credentials configured, every case additionally asserts the **actual upstream
+protocol**: the tool reads `upstream_endpoint`/`responses_mode` from the admin request log
+and compares it against the protocol implied by the model's `provider_type` (anthropic ->
+`messages`; openai -> `chat_completions`; the `/responses` endpoint may legitimately use
+either native `responses` or the Chat compatibility path). A wrong adapter is a hard FAIL.
+The run ends with a client x upstream coverage matrix; `--require-matrix` turns uncovered
+reachable cells into a non-zero exit code.
 
 For each model returned by `/v1/models`, the script probes:
 
@@ -87,17 +124,30 @@ The built-in score is structural: HTTP status, response shape, non-empty text, e
 
 ## Interpreting Results
 
-Scores are per case from `0.0` to `1.0`; a model score is the average of its cases.
+Every case gets one of four verdicts:
 
-- `1.0`: endpoint and expected response structure worked.
-- `0.4`: endpoint returned but text was empty or incomplete.
-- `0.2`: endpoint returned but the expected capability shape was missing.
-- `0.0`: HTTP failure, timeout, or exception.
+- `pass`: endpoint and expected response structure worked (counted in the score).
+- `fail`: gateway-side failure — HTTP error or timeout on text/stream probes, empty output, or missing expected shape (counted in the score).
+- `skip`: the capability was not advertised by `/v1/models`; no request was sent (not counted).
+- `unsupported`: a capability probe (tool/multimodal) was rejected by the upstream with
+  HTTP **4xx** — an upstream/model limitation, not a gateway failure (not counted).
+  Only request-content rejections (400/422-style) qualify: 5xx/504 stay `fail`
+  (gateway/infra), 429 stays `fail` (transient rate limit), 401/403 stay `fail`
+  (smoke-test key misconfigured), and 404/405/410 stay `fail` (model/endpoint does
+  not exist upstream — a configuration error, never a capability gap). A model
+  advertising `supports_vision` while its upstream rejects images usually points at a
+  capability-metadata issue worth investigating separately.
 
-Tool and multimodal failures should be read as capability failures, not always gateway failures. Some upstream models simply do not support those features. The report is most useful for comparing the same gateway configuration over time and catching regressions in adapter compatibility.
+Case scores run from `0.0` to `1.0` (`1.0` worked; `0.4` returned but text was empty or incomplete; `0.2` returned but the expected shape was missing; `0.0` failed). A model score averages only `pass`/`fail` cases, and the process exits non-zero only when at least one `fail` case exists.
+
+A model advertising `supports_vision` while its upstream rejects images usually points at a capability-metadata issue worth investigating separately. The report is most useful for comparing the same gateway configuration over time and catching regressions in adapter compatibility.
 
 ## Safety Notes
 
+- By default, before testing each openai-type model the tool calls
+  `POST /admin/models/responses-capability/reset` to clear that model's Responses probe
+  cache on the **target gateway** (a side effect: the next `/responses` request performs
+  a real native probe). Use `--keep-capability-cache` / `keep_capability_cache` to skip this.
 - Start with `--limit 1` or explicit `--model` while tuning prompts.
 - Use `--skip-multimodal` if image preprocessing invokes an expensive vision model.
 - Use a dedicated test API key with restricted allowed models when possible.

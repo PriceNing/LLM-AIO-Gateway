@@ -16,7 +16,7 @@ from app.adapters.anthropic import (
     provider_retry_count,
 )
 from app.core.output import InternalOutputEvent
-from app.core.text import error_detail_for_log, friendly_error_msg
+from app.core.text import client_status_for_upstream_error, error_detail_for_log, friendly_error_msg
 from app.services.logger import get_logger
 from app.services.http_pool import shared_client
 
@@ -119,7 +119,7 @@ async def iter_anthropic_output_events(
         raise
     except Exception as exc:
         _app_log.debug("[anthropic_stream_adapter] ERROR provider=%s model=%s error=%s", provider_id, model, error_detail_for_log(exc))
-        raise HTTPException(status_code=502, detail=friendly_error_msg(exc)) from exc
+        raise HTTPException(status_code=client_status_for_upstream_error(exc), detail=friendly_error_msg(exc)) from exc
 
     _app_log.debug(
         "[anthropic_stream_adapter] DONE provider=%s model=%s finish_reason=%s input_tokens=%d output_tokens=%d blocks=%d",
@@ -199,7 +199,19 @@ async def _iter_anthropic_stream_once(
             if event_type == "error":
                 err = data.get("error", {}) or {}
                 err_msg = err.get("message") or json.dumps(data, ensure_ascii=False)
-                raise HTTPException(status_code=502, detail=f"Upstream: {err_msg}")
+                # 上游原文只进日志：客户端必须拿统一分类器的安全文案（本项目
+                # “客户端只拿安全消息”契约；原文可能含内部模型名/配额/后端 URL）。
+                _app_log.warning(
+                    "[anthropic_stream_adapter] UPSTREAM SSE ERROR provider=%s model=%s error=%s",
+                    provider_id, model, err_msg,
+                )
+                carrier = RuntimeError(f"anthropic upstream error event: {err_msg}")
+                # “已确认源自上游”的语义交给分类器（confirmed_upstream），调用方不
+                # 得对分类器结果做本地二次改写（审查报告四轮 #1）。
+                raise HTTPException(
+                    status_code=client_status_for_upstream_error(carrier, confirmed_upstream=True),
+                    detail=friendly_error_msg(carrier),
+                )
             if event_type == "message_start":
                 usage = data.get("message", {}).get("usage", {}) or data.get("usage", {}) or {}
                 input_tokens = _usage_value(usage, input_tokens, "input_tokens", "prompt_tokens")

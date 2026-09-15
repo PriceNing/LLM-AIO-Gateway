@@ -900,7 +900,7 @@ async def test_anthropic_stream_raises_on_upstream_error_event(monkeypatch):
 
     monkeypatch.setattr(anthropic_streaming, "shared_client", lambda *args, **kwargs: FakeClient())
 
-    with pytest.raises(Exception, match="bad stream"):
+    with pytest.raises(Exception) as excinfo:
         async for _ in iter_anthropic_output_events(
             provider_info={"id": "anth", "api_base": "https://anth.example", "api_key": "key"},
             messages=[{"role": "user", "content": "hi"}],
@@ -910,6 +910,11 @@ async def test_anthropic_stream_raises_on_upstream_error_event(monkeypatch):
             model="claude-test",
         ):
             pass
+    # 审查报告三轮 #4：上游 SSE error 原文不得进客户端 detail，统一归为 502。
+    from fastapi import HTTPException as _HTTPException
+    assert isinstance(excinfo.value, _HTTPException)
+    assert excinfo.value.status_code == 502
+    assert "bad stream" not in str(excinfo.value.detail)
 
 
 @pytest.mark.asyncio
