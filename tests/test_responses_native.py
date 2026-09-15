@@ -15,6 +15,7 @@ from app.router.proxy import (
     _native_downgrade_details,
     _wait_for_native_response_output,
     _native_capability_for_request,
+    _RESPONSES_CAPABILITY_PROBE_MARKER,
 )
 from app.core.policy import RouteTarget
 from app.config import load_config
@@ -23,6 +24,7 @@ from app.database import (
     add_provider,
     init_db,
     set_model_responses_capability, get_model_responses_capability,
+    set_model_responses_tools_capability,
 )
 from main import app
 
@@ -713,7 +715,44 @@ async def test_tool_shape_4xx_keeps_model_native_capability(monkeypatch):
     with pytest.raises(httpx.HTTPStatusError):
         await _native_response_with_fallbacks(internal, stream=False, required_tool_types=set())
     capability = get_model_responses_capability("tool-shape", "think-model")
+    # 模型整体原生文本能力保持 supported（不再拖文本/流式去 Chat）……
     assert capability["responses_status"] == "supported"
+    # ……但工具形态记为负向，带工具请求后续直接走 Chat（审查 15 轮回归：
+    # client-owned 工具降级被阻时，保持能力不动会造成每请求硬失败）。
+    assert capability["responses_tools_status"] == "unsupported"
+    assert capability["responses_tools_expires_at"]
+
+
+@pytest.mark.asyncio
+async def test_tool_shape_negative_routes_tools_to_chat_text_stays_native(monkeypatch):
+    # 工具形态负向新鲜时：含 tools 请求不走原生，纯文本请求继续原生。
+    add_provider({"id": "tool-neg", "name": "TN", "provider_type": "openai", "api_base": "https://tn.invalid/v1", "api_key": "key", "models": [{"id": "mix-model"}]})
+    set_model_responses_capability("tool-neg", "mix-model", status="supported", error=_RESPONSES_CAPABILITY_PROBE_MARKER, expires_at="2999-01-01T00:00:00+00:00")
+    set_model_responses_tools_capability("tool-neg", "mix-model", status="unsupported", expires_at="2999-01-01T00:00:00+00:00")
+    provider = {"id": "tool-neg", "provider_type": "openai"}
+    assert await _native_capability_for_request(provider, "mix-model", has_tools=True) is False
+    assert await _native_capability_for_request(provider, "mix-model", has_tools=False) is True
+
+
+@pytest.mark.asyncio
+async def test_native_success_with_tools_clears_tool_shape_negative(monkeypatch):
+    # 带 tools 的原生成功是正向证据：解除负向记录并记 supported。
+    add_provider({"id": "tool-clear", "name": "TC", "provider_type": "openai", "api_base": "https://tc.invalid/v1", "api_key": "key", "models": [{"id": "ok-model"}]})
+    set_model_responses_capability("tool-clear", "ok-model", status="supported", error=_RESPONSES_CAPABILITY_PROBE_MARKER, expires_at="2999-01-01T00:00:00+00:00")
+    set_model_responses_tools_capability("tool-clear", "ok-model", status="unsupported", expires_at="2000-01-01T00:00:00+00:00")
+    async def fake_post(provider, internal):
+        return {"object": "response", "id": "resp_ok", "output": [{"type": "function_call", "name": "lookup_order", "arguments": "{}"}]}
+    monkeypatch.setattr("app.router.proxy.post_native_response", fake_post)
+    internal = responses_to_internal({
+        "model": "ok-model", "input": "Use lookup_order for A123.",
+        "tools": [{"type": "function", "name": "lookup_order", "parameters": {"type": "object", "properties": {}}}],
+    })
+    internal.provider_id = "tool-clear"
+    # 新鲜负向已过期的反向验证：unsupported 但 expires 过期 → 仍尝试原生并升级。
+    response, _target, _pid, _attempts = await _native_response_with_fallbacks(internal, stream=False, required_tool_types=set())
+    assert response["id"] == "resp_ok"
+    capability = get_model_responses_capability("tool-clear", "ok-model")
+    assert capability["responses_tools_status"] == "supported"
 
 
 @pytest.mark.asyncio

@@ -18,7 +18,7 @@ from app.database import (
     increment_global_stats, increment_image_generation_stats, increment_user_usage, get_db,
     parse_model_id, add_request_record, add_request_log, update_request_log, get_enabled_preprocessor,
     get_enabled_image_generator, get_model_image_generation,
-    get_model_responses_capability, set_model_responses_capability, update_model_responses_capability, update_model_responses_tool_types,
+    get_model_responses_capability, set_model_responses_capability, update_model_responses_capability, update_model_responses_tool_types, set_model_responses_tools_capability,
 )
 from app.core.text import client_status_for_upstream_error, friendly_error_msg, error_detail_for_log, mask_key
 from app.core.image_intent import is_image_generation_intent, latest_user_text
@@ -1245,6 +1245,15 @@ def _responses_capability_is_fresh(capability: dict | None) -> bool:
         return False
 
 
+def _responses_tools_capability_is_fresh(capability: dict | None) -> bool:
+    if not capability or not capability.get("responses_tools_expires_at"):
+        return False
+    try:
+        return datetime.fromisoformat(capability["responses_tools_expires_at"]) > datetime.now(timezone.utc)
+    except (TypeError, ValueError):
+        return False
+
+
 def _responses_capability_expiry(status: str) -> str:
     ttl_key = {
         "supported": "responses_capability_supported_ttl",
@@ -1312,7 +1321,7 @@ def _native_downgrade_details(exc: Exception, attempts: list[dict] | None = None
     return details
 
 
-def _native_response_target_supported(target: RouteTarget, *, stream: bool, required_tool_types: set[str], is_primary: bool) -> tuple[dict | None, str]:
+def _native_response_target_supported(target: RouteTarget, *, stream: bool, required_tool_types: set[str], is_primary: bool, has_tools: bool = False) -> tuple[dict | None, str]:
     provider = resolve_provider(target.model, target.provider_id)
     if not provider or provider.get("provider_type") != "openai":
         return None, ""
@@ -1321,6 +1330,10 @@ def _native_response_target_supported(target: RouteTarget, *, stream: bool, requ
     # attempting native Responses. Unknown, expired, and transient results are
     # deliberately request-driven rechecks.
     if _responses_capability_is_fresh(capability) and capability.get("responses_status") == "unsupported":
+        return None, ""
+    # Tool-shape negative: a request carrying tools skips native while a fresh
+    # tool-level negative is cached; text/stream requests stay on native.
+    if has_tools and _responses_tools_capability_is_fresh(capability) and capability.get("responses_tools_status") == "unsupported":
         return None, ""
     # ``responses_tool_types`` is learned from successful response output.  It is
     # therefore positive evidence, not an exhaustive declaration of what an
@@ -1386,13 +1399,17 @@ async def _probe_model_responses_capability(provider: dict, model: str) -> bool:
         return False
 
 
-async def _native_capability_for_request(provider: dict | None, model: str) -> bool:
+async def _native_capability_for_request(provider: dict | None, model: str, has_tools: bool = False) -> bool:
     if not provider or provider.get("provider_type") != "openai":
         return False
     if provider.get("force_chat_completions"):
         return False
     provider_id = str(provider.get("id") or "")
     capability = get_model_responses_capability(provider_id, model)
+    # 工具形态级负向：含 tools 的请求直接走 Chat（兼容性路径会按策略处理工具），
+    # 文本/流式请求不受影响，继续原生。
+    if has_tools and _responses_tools_capability_is_fresh(capability) and capability.get("responses_tools_status") == "unsupported":
+        return False
     if _responses_capability_is_fresh(capability):
         status = capability.get("responses_status")
         if status == "supported":
@@ -1445,6 +1462,7 @@ async def _native_response_with_fallbacks(internal, *, stream: bool, required_to
     primary = RouteTarget(model=internal.target_model, provider_id=internal.provider_id)
     primary = RouteTarget(model=primary.model, provider_id=_fallback_provider_id_for_target(primary))
     targets = [primary]
+    has_tools = bool(internal.tools)
     stateful_markers = list(stateful_markers or [])
     # Capability mismatch is local routing information, rather than an upstream
     # failure.  Still consult the configured fallback chain: otherwise an
@@ -1452,7 +1470,7 @@ async def _native_response_with_fallbacks(internal, *, stream: bool, required_to
     # fallback provider.  An empty trigger intentionally ignores error-trigger
     # gates because no upstream request has been made yet.
     primary_provider, _primary_provider_id = _native_response_target_supported(
-        primary, stream=stream, required_tool_types=required_tool_types, is_primary=True,
+        primary, stream=stream, required_tool_types=required_tool_types, is_primary=True, has_tools=has_tools,
     )
     if primary_provider is None:
         capability_fallback = apply_fallback_policy(
@@ -1465,7 +1483,7 @@ async def _native_response_with_fallbacks(internal, *, stream: bool, required_to
     attempts = []
     while index < len(targets):
         target = targets[index]
-        provider, provider_id = _native_response_target_supported(target, stream=stream, required_tool_types=required_tool_types, is_primary=index == 0)
+        provider, provider_id = _native_response_target_supported(target, stream=stream, required_tool_types=required_tool_types, is_primary=index == 0, has_tools=has_tools)
         if provider is None:
             attempts.append({"index": index, "stage": "primary" if index == 0 else "fallback", "target": target.model, "provider_id": target.provider_id, "status": "skipped", "reason": "capability_mismatch"})
             index += 1
@@ -1515,6 +1533,12 @@ async def _native_response_with_fallbacks(internal, *, stream: bool, required_to
                 error=_RESPONSES_CAPABILITY_PROBE_MARKER,
                 expires_at=_responses_capability_expiry("supported"),
             )
+            if has_tools:
+                # 带 tools 的原生成功是工具形态的正向证据，解除既有负向记录。
+                set_model_responses_tools_capability(
+                    provider_id, target.model, status="supported",
+                    expires_at=_responses_capability_expiry("supported"),
+                )
             return response, target, provider_id, attempts
         except Exception as exc:
             last_exc = exc
@@ -1525,18 +1549,25 @@ async def _native_response_with_fallbacks(internal, *, stream: bool, required_to
             if is_protocol_unsupported:
                 set_model_responses_capability(provider_id, target.model, status="unsupported", expires_at=_responses_capability_expiry("unsupported"), error=error_detail_for_log(exc))
             elif tool_shape_rejection:
-                # 含 tools 请求收到权威 4xx（如 thinking 模式拒绝强制 tool_choice）只证明
-                # “该请求形态”不被原生支持，不得把模型整体原生能力降为 unknown——
-                # 否则文本/流式请求会被挤离原生路径 5 分钟，上游协议来回摆动（冒烟
-                # 171830 vs 171855 实测）。降级由调用方接；该形态每次仍付一发原生往返。
-                # 对比：真正的空响应（零 output item，含 _EmptyNativeResponsesError）仍记
-                # unknown——它没有“请求形态”归因，是上游原生实现不可用的直接证据，
-                # transient 300s 自保护合理（实现决定，缘由审查 14 轮 #3 提出）。
+                # 含 tools 请求收到权威 4xx（如 thinking 模式拒绝强制 tool_choice、上游不支持
+                # custom 工具）只证明“工具形态”不被原生支持：记工具形态级负向能力，
+                # 后续带工具请求直接走 Chat（兼容路径），文本/流式继续原生。
+                # 不能回到旧行为“整体降 unknown”：会把文本拖离原生（5 分钟摆动）；
+                # 也不能简单“保持能力不动”：Codex 类 client-owned 工具的降级被策略阻断，
+                # 保持能力会让每个请求都撞原生硬失败（审查 15 轮回归教训）。
+                set_model_responses_tools_capability(
+                    provider_id, target.model, status="unsupported",
+                    expires_at=_responses_capability_expiry("unsupported"),
+                    error=error_detail_for_log(exc),
+                )
                 _app_log.info(
-                    "[responses capability] tool-shape 4xx (%s) on provider=%s model=%s; keeping model capability as-is",
+                    "[responses capability] tool-shape 4xx (%s) on provider=%s model=%s; recording tool-shape negative, keeping model text capability as-is",
                     error_status, provider_id, target.model,
                 )
             else:
+                # 真空白响应（零 output item，含 _EmptyNativeResponsesError）无“请求形态”归因，
+                # 是上游原生实现不可用的直接证据，仍记 transient 300s 自保护
+                # （实现决定，缘由审查 14 轮 #3 提出）。
                 _mark_model_responses_unknown(provider_id, target.model, exc)
             attempts.append({"index": index, "stage": "primary" if index == 0 else "fallback", "target": target.model, "provider_id": provider_id, "status": "failed", "trigger": classify_upstream_error(exc), "error": error_detail_for_log(exc)})
             if index == 0:
@@ -4491,7 +4522,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
         stateful_markers = _responses_stateful_tool_markers(body)
         capability = get_model_responses_capability(adapter_provider_id, model) if provider_info else None
         native_downgrade_details = {}
-        native_supported = await _native_capability_for_request(provider_info, model)
+        native_supported = await _native_capability_for_request(provider_info, model, has_tools=bool(body.get("tools")))
         _app_log.info(
             "[responses capability] provider=%s model=%s native=%s",
             adapter_provider_id or "-", model, native_supported,

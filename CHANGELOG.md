@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Tests: `test_request_details` / `test_upstream_error_status` / `test_live_eval_probes` / `test_error_mapping_gate`, image-backend status mapping parametrization; suite grew 869 -> 945 passed.
 
 ### Fixed
-- A native Responses request carrying tools that receives an authoritative 4xx (e.g. DeepSeek thinking mode rejecting a forced `tool_choice` by name) no longer demotes the model-wide native capability to `unknown`: the request downgrades to the Chat path and succeeds, while text/stream traffic stays on native instead of oscillating for the 5-minute transient backoff (regression tests in `test_responses_native.py`).
+- A native Responses request carrying tools that receives an authoritative 4xx (e.g. DeepSeek thinking mode rejecting a forced `tool_choice`, or an upstream rejecting Codex-style `custom` tools) now records a **tool-shape-level negative capability** (`responses_tools_status`/`responses_tools_expires_at` on `provider_models`, cleared by the admin reset endpoint) instead of demoting the model-wide native capability: subsequent tool-carrying `/responses` requests route straight to the Chat compatibility path — critical for client-owned tools where a silent downgrade after the fact is disallowed — while text/stream traffic stays on native. A native success with tools clears the negative. (Regression guard: `test_responses_native.py`.)
 - `responses_error` capability-cache entries and the native-fallback warning now carry the full upstream response body (via `error_detail_for_log`), so rejection reasons are readable without digging through `request_logs`.
 
 ### Changed
@@ -30,7 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - 新增 `POST /admin/models/responses-capability/reset`：按 provider/模型清除原生 Responses 探测缓存（支持裸模型名跨 provider），为运维与冒烟提供确定性重探钩子。
 - `InternalOutputMessage` 新增 `request_details` 专用字段：修复 liteLLM 非流式成功请求丢失 `upstream_endpoint` 等元数据的观测缺口（旧版往 `raw` 对象挂 dict 属性静默失败）。
 - live-eval 冒烟工具：能力元数据门控探针、四态判定（pass/fail/skip/unsupported）、逐用例客户端×上游协议断言与 9 格覆盖矩阵、真实 64×64 探针图、推理模型友好的探针预算（Chat/Messages 512；Responses 改用协议合法的 `max_output_tokens` 并提至 2048）、四个新开关。
-- 修复：含 tools 的原生 Responses 请求收到权威 4xx（如 thinking 模式拒绝强制 tool_choice）时，不再把模型整体原生能力降为 unknown——该请求降级到 Chat 路径成功，文本/流式流量不再被拖离原生路径 5 分钟摆动（`test_responses_native.py` 双回归用例）。
+- 修复：含 tools 的原生 Responses 请求收到权威 4xx（如 thinking 模式拒绝强制 tool_choice、上游拒绝 Codex 式 custom 工具）时，改为记录**工具形态级负向能力**（`provider_models` 新增 `responses_tools_status`/`responses_tools_expires_at`，重置端点一并清除）：后续带工具请求直接走 Chat 兼容路径（client-owned 工具不允许事后静默降级，这点关键），文本/流式继续原生；带工具的原生成功会解除负向记录（`test_responses_native.py` 防回归）。
 - 修复：能力缓存的 `responses_error` 与降级 warning 现包含上游响应体（`error_detail_for_log`），拒绝原因无需再翻 `request_logs`。
 - 收口基线固化：`tools/scripts/check_error_mapping.py` 四项检查 + pytest 门禁用例；README/AGENTS/CLAUDE 写入错误映射契约。
 - **对外行为变更**：Anthropic 路径上游 401/403 不再透传（改 502），上游错误原文（含 SSE error 事件）不再出现在客户端响应中，仅落服务端日志。

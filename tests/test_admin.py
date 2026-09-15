@@ -87,8 +87,9 @@ def test_reset_responses_capability(temp_db):
         "enabled": True,
         "models": [{"id": "m-native", "name": "m-native", "enabled": True}],
     }, headers=headers)
-    from app.database import set_model_responses_capability, get_model_responses_capability
+    from app.database import set_model_responses_capability, get_model_responses_capability, set_model_responses_tools_capability
     set_model_responses_capability("cap-prov", "m-native", status="supported", expires_at="2999-01-01T00:00:00+00:00")
+    set_model_responses_tools_capability("cap-prov", "m-native", status="unsupported", expires_at="2999-01-01T00:00:00+00:00")
     assert get_model_responses_capability("cap-prov", "cap-prov/m-native")["responses_status"] == "supported"
 
     # 不传 provider_id：由复合模型名解析
@@ -98,6 +99,9 @@ def test_reset_responses_capability(temp_db):
     cap = get_model_responses_capability("cap-prov", "cap-prov/m-native")
     assert cap["responses_status"] == "unknown"
     assert not cap["responses_expires_at"]
+    # 工具形态级负向能力也必须被重置
+    assert cap["responses_tools_status"] == "unknown"
+    assert not cap["responses_tools_expires_at"]
 
     # 裸模型名：跨 provider 重置（审查报告 #8）
     set_model_responses_capability("cap-prov", "m-native", status="supported", expires_at="2999-01-01T00:00:00+00:00")

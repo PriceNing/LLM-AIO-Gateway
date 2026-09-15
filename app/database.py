@@ -159,6 +159,11 @@ def _migrate_model_responses_capability(conn: sqlite3.Connection) -> None:
         "responses_streaming_status": "TEXT NOT NULL DEFAULT 'unknown'",
         "responses_tool_types": "TEXT NOT NULL DEFAULT '[]'",
         "responses_error": "TEXT NOT NULL DEFAULT ''",
+        # 工具形态级负向能力：含 tools 请求被权威 4xx 拒绝时只降级工具路径，
+        # 不影响模型整体原生文本能力（审查 15 轮回归：client-owned 工具降级被阻，
+        # 保留能力会永久硬失败；整体 unknown 又会造成文本拖离原生）。
+        "responses_tools_status": "TEXT NOT NULL DEFAULT 'unknown'",
+        "responses_tools_expires_at": "TEXT NOT NULL DEFAULT ''",
     }
     existing = {row[1] for row in conn.execute("PRAGMA table_info(provider_models)").fetchall()}
     for col, ddl in columns.items():
@@ -1339,6 +1344,8 @@ def _model_from_row(row: sqlite3.Row) -> dict:
         "responses_streaming_status": row["responses_streaming_status"] or "unknown",
         "responses_tool_types": _json_loads(row["responses_tool_types"] or "[]") or [],
         "responses_error": row["responses_error"] or "",
+        "responses_tools_status": (row["responses_tools_status"] or "unknown") if "responses_tools_status" in row.keys() else "unknown",
+        "responses_tools_expires_at": (row["responses_tools_expires_at"] or "") if "responses_tools_expires_at" in row.keys() else "",
         "capabilities": (_json_loads(row["capabilities"] or "{}") or {}) if "capabilities" in row.keys() else {},
     }
     return model
@@ -1596,6 +1603,20 @@ def set_model_responses_capability(provider_id: str, model: str, *, status: str,
         )
 
 
+def set_model_responses_tools_capability(provider_id: str, model: str, *, status: str, expires_at: str = "", error: str = "") -> None:
+    """Record tool-shape-level native Responses capability without touching the
+    model-wide text capability (see _migrate_model_responses_capability)."""
+    if status not in {"unknown", "supported", "unsupported"}:
+        raise ValueError("invalid Responses tools capability status")
+    model_name = parse_model_id(model).model_name
+    with get_db() as db:
+        db.execute(
+            "UPDATE provider_models SET responses_tools_status = ?, responses_tools_expires_at = ?, responses_checked_at = ? "
+            "WHERE provider_id = ? AND (model_id IN (?, ?) OR model_name = ?)",
+            (status, expires_at, datetime.now(timezone.utc).isoformat(), provider_id, model, model_name, model_name),
+        )
+
+
 def update_model_responses_capability(provider_id: str, model: str, **updates) -> None:
     """Update only observed model-level capability fields without erasing evidence."""
     allowed = {
@@ -1643,7 +1664,8 @@ def reset_model_responses_capability(provider_id: str | None = None, model: str 
     reset_sql = (
         "UPDATE provider_models SET responses_status = 'unknown', responses_checked_at = '', "
         "responses_expires_at = '', responses_streaming = 0, responses_streaming_status = 'unknown', "
-        "responses_tool_types = '[]', responses_error = ''"
+        "responses_tool_types = '[]', responses_error = '', "
+        "responses_tools_status = 'unknown', responses_tools_expires_at = ''"
     )
     if not provider_id and not model:
         return 0
