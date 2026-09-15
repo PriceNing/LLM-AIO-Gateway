@@ -104,7 +104,7 @@ from app.protocols.egress import (
 )
 from app.services.lite_llm import create_chat_completion
 from app.services.preprocessing import has_image_content, preprocess_messages
-from app.services.routing_targets import candidate_targets, classify_upstream_error, is_same_target_retryable, provider_for_log, resolve_provider
+from app.services.routing_targets import candidate_targets, classify_upstream_error, is_same_target_retryable, provider_for_log, resolve_provider, upstream_status_code
 from app.services.logger import get_logger
 from app.config import get_default
 
@@ -1255,11 +1255,16 @@ def _responses_capability_expiry(status: str) -> str:
 
 
 def _mark_model_responses_unknown(provider_id: str, model: str, error: Exception | str = "") -> None:
-    """Invalidate native capability after a transient upstream failure."""
+    """Invalidate native capability after a transient upstream failure.
+
+    错误文本用 error_detail_for_log（含上游响应体），与 request_logs 的
+    native_failure_message 同口径；否则 responses_error 只剩 httpx 摘要，排障时
+    看不到真正的拒绝原因（审查 14 轮 #4）。
+    """
     set_model_responses_capability(
         provider_id, model, status="unknown",
         expires_at=_responses_capability_expiry("transient"),
-        error=str(error)[:500],
+        error=error_detail_for_log(error),
     )
 
 
@@ -1515,8 +1520,22 @@ async def _native_response_with_fallbacks(internal, *, stream: bool, required_to
             last_exc = exc
             is_empty_native = bool(getattr(exc, "native_empty_output", False))
             is_protocol_unsupported = _native_error_is_explicitly_unsupported(exc)
+            error_status = upstream_status_code(exc)
+            tool_shape_rejection = bool(internal.tools) and error_status is not None and 400 <= error_status <= 499
             if is_protocol_unsupported:
                 set_model_responses_capability(provider_id, target.model, status="unsupported", expires_at=_responses_capability_expiry("unsupported"), error=error_detail_for_log(exc))
+            elif tool_shape_rejection:
+                # 含 tools 请求收到权威 4xx（如 thinking 模式拒绝强制 tool_choice）只证明
+                # “该请求形态”不被原生支持，不得把模型整体原生能力降为 unknown——
+                # 否则文本/流式请求会被挤离原生路径 5 分钟，上游协议来回摆动（冒烟
+                # 171830 vs 171855 实测）。降级由调用方接；该形态每次仍付一发原生往返。
+                # 对比：真正的空响应（零 output item，含 _EmptyNativeResponsesError）仍记
+                # unknown——它没有“请求形态”归因，是上游原生实现不可用的直接证据，
+                # transient 300s 自保护合理（审查 14 轮 #3 的拍板：算能力信号）。
+                _app_log.info(
+                    "[responses capability] tool-shape 4xx (%s) on provider=%s model=%s; keeping model capability as-is",
+                    error_status, provider_id, target.model,
+                )
             else:
                 _mark_model_responses_unknown(provider_id, target.model, exc)
             attempts.append({"index": index, "stage": "primary" if index == 0 else "fallback", "target": target.model, "provider_id": provider_id, "status": "failed", "trigger": classify_upstream_error(exc), "error": error_detail_for_log(exc)})
@@ -4550,7 +4569,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                             + ", ".join(native_required or client_owned_tools)
                         )) from native_error
                     raise
-                _app_log.warning("[responses native fallback] no native target succeeded; downgrading basic request: %s", native_error)
+                _app_log.warning("[responses native fallback] no native target succeeded; downgrading basic request: %s", error_detail_for_log(native_error))
                 native_downgrade_details = _native_downgrade_details(native_error, native_attempts)
 
         if _responses_incomplete_tool_history(body):

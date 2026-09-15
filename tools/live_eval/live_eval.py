@@ -535,9 +535,16 @@ def make_case(
     body = dict(body)
     body["model"] = model
     body.setdefault("temperature", 0)
-    # 推理模型（如 deepseek thinking）的 reasoning 也吃 completion 预算，
-    # 预算太小会导致 content 被截成空字符串，误判为网关故障。
-    body.setdefault("max_tokens", 512)
+    # 预算字段按协议区分：max_tokens 是 Chat 风格字段，发到原生 /responses 会被
+    # 上游以 400 拒绝（tools 请求尤其严格），还会连带把能力缓存打成 unknown。
+    # 预算取 512（Chat/messages）/ 2048（responses）：推理模型的 reasoning 也吃
+    # completion 预算，太小会把 content 截成空串误判为网关故障（deepseek 续轮
+    # 实测 512 会被 thinking 吃满导致 incomplete/max_output_tokens 空输出）。
+    if endpoint == "/v1/responses":
+        budget = body.pop("max_tokens", 2048)
+        body.setdefault("max_output_tokens", budget)
+    else:
+        body.setdefault("max_tokens", 512)
     body.setdefault("metadata", {})
     if isinstance(body["metadata"], dict):
         body["metadata"]["live_eval_request_id"] = request_id

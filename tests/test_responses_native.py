@@ -692,6 +692,52 @@ async def test_stateful_request_blocks_only_after_primary_native_request_fails(m
 
 
 @pytest.mark.asyncio
+async def test_tool_shape_4xx_keeps_model_native_capability(monkeypatch):
+    # 冒烟审查③：含 tools 请求的权威 4xx（如 thinking 模式拒绝强制 tool_choice）
+    # 只证明该请求形态不支持，不得把模型整体原生能力降为 unknown。
+    add_provider({"id": "tool-shape", "name": "TS", "provider_type": "openai", "api_base": "https://ts.invalid/v1", "api_key": "key", "models": [{"id": "think-model"}]})
+    set_model_responses_capability("tool-shape", "think-model", status="supported", expires_at="2999-01-01T00:00:00+00:00")
+    req = httpx.Request("POST", "https://ts.invalid/v1/responses")
+    async def fake_post(provider, internal):
+        raise httpx.HTTPStatusError(
+            "400", request=req,
+            response=httpx.Response(400, text='{"error":{"message":"Thinking mode does not support this tool_choice"}}', request=req),
+        )
+    monkeypatch.setattr("app.router.proxy.post_native_response", fake_post)
+    internal = responses_to_internal({
+        "model": "think-model", "input": "Use lookup_order for A123.",
+        "tools": [{"type": "function", "name": "lookup_order", "parameters": {"type": "object", "properties": {}}}],
+        "tool_choice": {"type": "function", "name": "lookup_order"},
+    })
+    internal.provider_id = "tool-shape"
+    with pytest.raises(httpx.HTTPStatusError):
+        await _native_response_with_fallbacks(internal, stream=False, required_tool_types=set())
+    capability = get_model_responses_capability("tool-shape", "think-model")
+    assert capability["responses_status"] == "supported"
+
+
+@pytest.mark.asyncio
+async def test_non_tool_native_4xx_still_marks_transient_unknown(monkeypatch):
+    # 对照组：无 tools 的请求收到权威 4xx 仍按原设计记 transient unknown 退避。
+    add_provider({"id": "notool-shape", "name": "NT", "provider_type": "openai", "api_base": "https://nt.invalid/v1", "api_key": "key", "models": [{"id": "plain-model"}]})
+    set_model_responses_capability("notool-shape", "plain-model", status="supported", expires_at="2999-01-01T00:00:00+00:00")
+    req = httpx.Request("POST", "https://nt.invalid/v1/responses")
+    async def fake_post(provider, internal):
+        raise httpx.HTTPStatusError(
+            "400", request=req,
+            response=httpx.Response(400, text="previous_response_id is invalid", request=req),
+        )
+    monkeypatch.setattr("app.router.proxy.post_native_response", fake_post)
+    internal = responses_to_internal({"model": "plain-model", "input": "hello"})
+    internal.provider_id = "notool-shape"
+    with pytest.raises(httpx.HTTPStatusError):
+        await _native_response_with_fallbacks(internal, stream=False, required_tool_types=set())
+    capability = get_model_responses_capability("notool-shape", "plain-model")
+    assert capability["responses_status"] == "unknown"
+    assert capability["responses_expires_at"]
+
+
+@pytest.mark.asyncio
 async def test_explicit_tool_outputs_can_fallback_across_native_providers(monkeypatch):
     add_provider({"id": "tool-output-primary", "name": "Primary", "provider_type": "openai", "api_base": "https://primary.invalid/v1", "api_key": "key", "models": [{"id": "stateful-model"}]})
     add_provider({"id": "tool-output-fallback", "name": "Fallback", "provider_type": "openai", "api_base": "https://fallback.invalid/v1", "api_key": "key", "models": [{"id": "fallback-model"}]})
