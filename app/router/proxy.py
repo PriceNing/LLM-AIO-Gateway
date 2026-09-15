@@ -1531,7 +1531,7 @@ async def _native_response_with_fallbacks(internal, *, stream: bool, required_to
                 # 171830 vs 171855 实测）。降级由调用方接；该形态每次仍付一发原生往返。
                 # 对比：真正的空响应（零 output item，含 _EmptyNativeResponsesError）仍记
                 # unknown——它没有“请求形态”归因，是上游原生实现不可用的直接证据，
-                # transient 300s 自保护合理（审查 14 轮 #3 的拍板：算能力信号）。
+                # transient 300s 自保护合理（实现决定，缘由审查 14 轮 #3 提出）。
                 _app_log.info(
                     "[responses capability] tool-shape 4xx (%s) on provider=%s model=%s; keeping model capability as-is",
                     error_status, provider_id, target.model,
