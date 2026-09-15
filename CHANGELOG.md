@@ -5,7 +5,7 @@ All notable changes to LLM AIO Gateway will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.12.0] - 2026-09-15
+## [Unreleased] —— 发版时将本段重命名为 [0.12.0] 并补日期；在此之前任何对外面（UI 版本号、tag、Release）不得出现 0.12.0
 
 ### Added
 - Client-visible upstream error status-code mapping via a single source of truth `classify_for_client()` in `core/text.py`: authoritative upstream status wins (4xx kept as-is), upstream 401/403 -> 502 with a dedicated gateway-credentials message, 408 / isinstance-level timeout evidence -> 504, upstream 5xx and non-4xx authoritative statuses -> 502, unclassifiable -> 500 (reserved for gateway bugs). Text heuristics can never veto an authoritative status nor imply a specific 4xx/429.
@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Live-eval (`tools/live_eval/live_eval.py`): capability-gated probes from `/v1/models` metadata (skip without sending), four-state verdicts (pass/fail/skip/unsupported, 4xx-only rejections), per-case client x upstream protocol assertions with a 9-cell coverage matrix, `--ignore-capabilities` / `--require-matrix` / `--require-signal` / `--keep-capability-cache`, real 64x64 probe PNG (1x1 placeholders are rejected as invalid by upstreams), reasoning-model-safe probe budgets (512 tokens for Chat/Messages, 2048 via the protocol-correct `max_output_tokens` for Responses).
 - Error-mapping baseline gate: `tools/scripts/check_error_mapping.py` (diff corpus / required assertions / hardcoded-status whitelist / doc count consistency) plus `tests/test_error_mapping_gate.py` so checks 1-3 run with every `pytest` invocation.
 - README (zh/en): new "client-visible error status codes" contract section; AGENTS/CLAUDE: error-mapping invariants recorded.
-- Tests: `test_request_details` / `test_upstream_error_status` / `test_live_eval_probes` / `test_error_mapping_gate`, image-backend status mapping parametrization; suite grew 869 -> 943 passed.
+- Tests: `test_request_details` / `test_upstream_error_status` / `test_live_eval_probes` / `test_error_mapping_gate`, image-backend status mapping parametrization; suite grew 869 -> 945 passed.
 
 ### Fixed
 - A native Responses request carrying tools that receives an authoritative 4xx (e.g. DeepSeek thinking mode rejecting a forced `tool_choice` by name) no longer demotes the model-wide native capability to `unknown`: the request downgrades to the Chat path and succeeds, while text/stream traffic stays on native instead of oscillating for the 5-minute transient backoff (regression tests in `test_responses_native.py`).
@@ -34,7 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - 修复：能力缓存的 `responses_error` 与降级 warning 现包含上游响应体（`error_detail_for_log`），拒绝原因无需再翻 `request_logs`。
 - 收口基线固化：`tools/scripts/check_error_mapping.py` 四项检查 + pytest 门禁用例；README/AGENTS/CLAUDE 写入错误映射契约。
 - **对外行为变更**：Anthropic 路径上游 401/403 不再透传（改 502），上游错误原文（含 SSE error 事件）不再出现在客户端响应中，仅落服务端日志。
-- 测试套件 869 → 943 passed。
+- 测试套件 869 → 945 passed。
 
 ## [0.11.0] - 2026-09-08
 
