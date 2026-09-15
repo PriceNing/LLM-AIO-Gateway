@@ -5,6 +5,31 @@ All notable changes to LLM AIO Gateway will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.0] - 2026-09-15
+
+### Added
+- Client-visible upstream error status-code mapping via a single source of truth `classify_for_client()` in `core/text.py`: authoritative upstream status wins (4xx kept as-is), upstream 401/403 -> 502 with a dedicated gateway-credentials message, 408 / isinstance-level timeout evidence -> 504, upstream 5xx and non-4xx authoritative statuses -> 502, unclassifiable -> 500 (reserved for gateway bugs). Text heuristics can never veto an authoritative status nor imply a specific 4xx/429.
+- `POST /admin/models/responses-capability/reset`: clears the native Responses probe cache per provider/model (also accepts bare model names cross-provider), giving ops and live-eval a deterministic re-probe hook.
+- `InternalOutputMessage.request_details`: dedicated field for per-request upstream metadata (`upstream_endpoint`, fallback info), so liteLLM non-stream successes finally record it (previously silently dropped because `raw` is a `ModelResponse` object).
+- Live-eval (`tools/live_eval/live_eval.py`): capability-gated probes from `/v1/models` metadata (skip without sending), four-state verdicts (pass/fail/skip/unsupported, 4xx-only rejections), per-case client x upstream protocol assertions with a 9-cell coverage matrix, `--ignore-capabilities` / `--require-matrix` / `--require-signal` / `--keep-capability-cache`, real 64x64 probe PNG (1x1 placeholders are rejected as invalid by upstreams), reasoning-model-safe 512-token probe budget.
+- Error-mapping baseline gate: `tools/scripts/check_error_mapping.py` (diff corpus / required assertions / hardcoded-status whitelist / doc count consistency) plus `tests/test_error_mapping_gate.py` so checks 1-3 run with every `pytest` invocation.
+- README (zh/en): new "client-visible error status codes" contract section; AGENTS/CLAUDE: error-mapping invariants recorded.
+- Tests: `test_request_details` / `test_upstream_error_status` / `test_live_eval_probes` / `test_error_mapping_gate`, image-backend status mapping parametrization; suite grew 869 -> 943 passed.
+
+### Changed
+- **Behavior change (external contract)**: Anthropic adapter paths no longer pass upstream 401/403 through and no longer echo raw upstream error text (including SSE `error` event messages) to clients; raw text now goes to server logs only and clients receive a safe message plus `request_id`.
+- Proxy and image-generation endpoints no longer hardcode `status_code=500/502` for upstream failures — all route through the mapping function.
+- `run-live-eval.bat` quick mode no longer pins a stale model id (uses `--limit 1`).
+
+### 更新内容（中文）
+- 新增客户端可见上游错误状态码映射，单一事实来源 `classify_for_client()`：权威状态码优先（4xx 保留）、上游 401/403 → 502（独立凭据文案，不伪装成客户端 key 失效）、408/真实超时 → 504、上游 5xx 及非 4xx 权威状态 → 502、无法归类 → 500（保留给网关内部错）；文本启发式不得否决权威状态码或推出具体 4xx/429。
+- 新增 `POST /admin/models/responses-capability/reset`：按 provider/模型清除原生 Responses 探测缓存（支持裸模型名跨 provider），为运维与冒烟提供确定性重探钩子。
+- `InternalOutputMessage` 新增 `request_details` 专用字段：修复 liteLLM 非流式成功请求丢失 `upstream_endpoint` 等元数据的观测缺口（旧版往 `raw` 对象挂 dict 属性静默失败）。
+- live-eval 冒烟工具：能力元数据门控探针、四态判定（pass/fail/skip/unsupported）、逐用例客户端×上游协议断言与 9 格覆盖矩阵、真实 64×64 探针图、推理模型友好的 512 token 预算、四个新开关。
+- 收口基线固化：`tools/scripts/check_error_mapping.py` 四项检查 + pytest 门禁用例；README/AGENTS/CLAUDE 写入错误映射契约。
+- **对外行为变更**：Anthropic 路径上游 401/403 不再透传（改 502），上游错误原文（含 SSE error 事件）不再出现在客户端响应中，仅落服务端日志。
+- 测试套件 869 → 943 passed。
+
 ## [0.11.0] - 2026-09-08
 
 ### Changed
