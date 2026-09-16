@@ -52,6 +52,7 @@ from app.core.image_results import (
 from app.core.image_batch import image_invocation_cache
 from app.core.model_capabilities import capabilities_for_client_entry, resolve_model_capabilities
 from app.services.model_registry import registry_lookup
+from app.core.tool_leak import repair_output as _repair_output_tool_leaks
 from app.core.outcome import (
     apply_outcome_to_details,
     routing_details_from_policy,
@@ -1719,6 +1720,33 @@ def _append_fallback_attempt(details: dict, attempt: dict) -> None:
         attempts.append(attempt)
 
 
+def _maybe_repair_tool_leak(output, internal, *, endpoint: str, provider_id: str) -> None:
+    """非流式回程的泄漏工具调用抢救（协议无关，见 core/tool_leak 模块注释）。
+
+    上游推理框架（llama.cpp b10884 实测 ~5%）会概率性地把模板原生的
+    XML 工具调用当普通文本下发；harness 收到后误以为回合结束。这里在
+    IR 层做保守校验后还原为结构化工具调用。任何异常保持原样透传，
+    绝不影响主链路。流式回程只检测不修改（见 stream_internal_output）。
+    """
+    if not bool(get_default("repair_tool_leaks", True)):
+        return
+    if getattr(output, "tool_calls", None):
+        return  # 上游已给出结构化调用，无泄漏可救
+    try:
+        count = _repair_output_tool_leaks(output, internal.tools)
+    except Exception as exc:
+        _app_log.warning("[tool_leak] repair error endpoint=%s: %s", endpoint, str(exc)[:160])
+        return
+    if count:
+        details = getattr(output, "request_details", None)
+        if isinstance(details, dict):
+            details["tool_leak_repaired"] = count
+        _tool_log.warning(
+            "[tool_leak.repaired] endpoint=%s provider=%s model=%s blocks=%d",
+            endpoint, provider_id or "-", internal.target_model, count,
+        )
+
+
 def _output_request_details(output) -> dict:
     details: dict = {}
     dedicated = getattr(output, "request_details", None)
@@ -3329,6 +3357,7 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
                     tool_only_turns=_tool_only_turns,
                     base_details={**routing_details_from_policy(policy), **_thinking_fields_from_payload(body)},
                     render_extra={"include_usage": bool((body.get("stream_options") or {}).get("include_usage"))},
+                    declared_tools=internal.tools,
                 ),
                 media_type="text/event-stream"
             )
@@ -3340,6 +3369,7 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
             max_tokens=max_tokens,
             log_label="chat",
         )
+        _maybe_repair_tool_leak(output, internal, endpoint="chat_completions", provider_id=adapter_provider_id)
         model = internal.target_model
         provider_id = internal.provider_id
         logged_model = _target_model_for_log(RouteTarget(model=model, provider_id=adapter_provider_id or provider_id or ""), adapter_provider_id or provider_id or "")
@@ -3455,6 +3485,7 @@ async def completions(request: Request, authorization: Optional[str] = Header(No
                     log_request=_log_request,
                     record_request_log=_build_stream_recorder("completions", username, api_key_value, requested_model, body),
                     conv_key=conv_key,
+                    declared_tools=internal.tools,
                     base_details={**routing_details_from_policy(policy), **_thinking_fields_from_payload(body)},
                 ),
                 media_type="text/event-stream"
@@ -3467,6 +3498,7 @@ async def completions(request: Request, authorization: Optional[str] = Header(No
             max_tokens=max_tokens,
             log_label="completions",
         )
+        _maybe_repair_tool_leak(output, internal, endpoint="completions", provider_id=adapter_provider_id)
         model = internal.target_model
         provider_id = internal.provider_id
         logged_model = _target_model_for_log(RouteTarget(model=model, provider_id=adapter_provider_id or provider_id or ""), adapter_provider_id or provider_id or "")
@@ -3595,6 +3627,7 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
                     log_request=_log_request,
                     record_request_log=_build_stream_recorder("messages", username, api_key_value, requested_model, body),
                     conv_key=conv_key,
+                    declared_tools=internal.tools,
                     remember_reasoning_content=_remember_reasoning_content,
                     base_details={**routing_details_from_policy(policy), **_thinking_fields_from_payload(body)},
                 ),
@@ -3608,6 +3641,7 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
             max_tokens=max_tokens,
             log_label="messages",
         )
+        _maybe_repair_tool_leak(output, internal, endpoint="messages", provider_id=adapter_provider_id)
         model = internal.target_model
         provider_id = internal.provider_id
         logged_model = _target_model_for_log(RouteTarget(model=model, provider_id=adapter_provider_id or provider_id or ""), adapter_provider_id or provider_id or "")
@@ -3923,6 +3957,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                 policy, internal, temperature=temperature, max_tokens=max_tokens,
                 log_label="responses.image_bridge",
             )
+            _maybe_repair_tool_leak(output, internal, endpoint="responses.image_bridge", provider_id=adapter_provider_id)
             # The fallback runner attaches the authoritative attempt/final
             # target metadata to the output. Preserve it through the image
             # bridge so billing and admin stats use the model that actually
@@ -4496,6 +4531,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                         remember_response_chain_key=_remember_response_chain_key,
                         remember_reasoning_content=_remember_reasoning_content,
                         tool_only_turns=_tool_only_turns, render_extra=internal.extra,
+                        declared_tools=internal.tools,
                     ),
                     media_type="text/event-stream",
                 )
@@ -4647,6 +4683,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                     remember_reasoning_content=_remember_reasoning_content,
                     tool_only_turns=_tool_only_turns,
                     render_extra=internal.extra,
+                    declared_tools=internal.tools,
                 ),
                 media_type="text/event-stream"
             )
@@ -4658,6 +4695,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
             max_tokens=max_tokens,
             log_label="responses",
         )
+        _maybe_repair_tool_leak(output, internal, endpoint="responses", provider_id=adapter_provider_id)
         model = internal.target_model
         provider_id = internal.provider_id
         logged_model = _target_model_for_log(RouteTarget(model=model, provider_id=adapter_provider_id or provider_id or ""), adapter_provider_id or provider_id or "")

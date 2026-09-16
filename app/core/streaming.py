@@ -15,6 +15,7 @@ from app.core.outcome import (
 )
 from app.core.output import InternalOutputEvent, aclose_async_iterator
 from app.core.text import friendly_error_msg
+from app.core.tool_leak import parse_leaked_tool_calls
 from app.database import increment_global_stats, increment_user_usage
 from app.protocols.egress import (
     render_anthropic_messages_sse,
@@ -28,6 +29,7 @@ from app.services.logger import get_logger
 
 _app_log = get_logger("app")
 _error_log = get_logger("error")
+_tool_log = get_logger("tool_calls")
 
 RequestLogger = Callable[..., None]
 RequestDetailRecorder = Callable[..., None]
@@ -108,6 +110,7 @@ async def stream_internal_output(
     tool_only_turns=None,
     base_details: dict[str, Any] | None = None,
     render_extra: dict[str, Any] | None = None,
+    declared_tools: list | None = None,
 ):
     total_tokens = 0
     final_model = model
@@ -259,6 +262,19 @@ async def stream_internal_output(
                 extra=render_extra,
             ):
                 yield line
+        # 流式回程泄漏检测：只记录不修改（缓冲修复伤 TTFT 且泄漏长度无界，
+        # 决策依据见 core/tool_leak 模块注释；命中数据用于评估是否值得升级）。
+        if declared_tools and not streamed_tool_calls:
+            try:
+                leaked_blocks = parse_leaked_tool_calls("".join(streamed_text_parts), declared_tools)
+            except Exception:
+                leaked_blocks = None
+            if leaked_blocks:
+                stream_details["tool_leak_detected"] = len(leaked_blocks)
+                _tool_log.warning(
+                    "[tool_leak.detected_stream] endpoint=%s provider=%s model=%s blocks=%d (streaming passthrough, not repaired)",
+                    endpoint, final_provider_id or "-", final_model, len(leaked_blocks),
+                )
         success_details = apply_outcome_to_details(
             {**stream_details, "partial_output": False},
             success=True,

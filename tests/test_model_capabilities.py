@@ -829,3 +829,46 @@ def test_refresh_failure_mentions_disabled_state(temp_db, monkeypatch):
     r = client.post("/admin/models/registry/refresh", headers=temp_db["headers"])
     assert r.status_code == 502
     assert "model_registry_enabled=false" in r.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# supports_reasoning 能力字段
+# ---------------------------------------------------------------------------
+
+def test_builtin_reasoning_flags():
+    assert builtin_capabilities("deepseek-flash")["supports_reasoning"] is True
+    assert builtin_capabilities("gpt-5.6-luna")["supports_reasoning"] is True
+    assert builtin_capabilities("o3-mini")["supports_reasoning"] is True
+    assert builtin_capabilities("qwen3-coder")["supports_reasoning"] is True
+    # 未确认的家族不猜测（键缺失 = 未知）
+    assert "supports_reasoning" not in builtin_capabilities("gpt-4o")
+    assert "supports_reasoning" not in builtin_capabilities("qwen2.5-7b-instruct")
+
+
+def test_upstream_capabilities_reasoning_extraction():
+    # OpenRouter 风格：supported_parameters 含 reasoning/include_reasoning
+    assert upstream_capabilities({"id": "m", "supported_parameters": ["tools", "include_reasoning"]})["supports_reasoning"] is True
+    # 明确不带推理参数 → 显式 False
+    assert upstream_capabilities({"id": "m", "supported_parameters": ["tools", "temperature"]})["supports_reasoning"] is False
+    # 无任何信号 → 不输出该键
+    assert "supports_reasoning" not in upstream_capabilities({"id": "m", "context_length": 8192})
+    # 字符串 "false" 不得被强转成 True
+    assert upstream_capabilities({"id": "m", "supports_reasoning": "false"})["supports_reasoning"] is False
+
+
+def test_client_entry_reasoning_positive_only():
+    from app.core.model_capabilities import capabilities_for_client_entry
+    assert capabilities_for_client_entry({"supports_reasoning": True})["supports_reasoning"] is True
+    assert "supports_reasoning" not in capabilities_for_client_entry({"supports_reasoning": False})
+
+
+def test_admin_reasoning_override_roundtrip(temp_db):
+    """管理员显式选"不支持"推理 → 覆盖内置 True，客户端不再声明该字段。"""
+    _add_test_provider("deepseek-flash")
+    r = client.put("/admin/models/capabilities", headers=temp_db["headers"], json={
+        "model_id": "p1/deepseek-flash", "capabilities": {"supports_reasoning": False},
+    })
+    assert r.status_code == 200
+    model = next(m for m in get_provider("p1")["models"] if m["id"] == "deepseek-flash")
+    assert model["capabilities"]["supports_reasoning"] is False
+    assert "supports_reasoning" in model["capabilities"]["admin_keys"]

@@ -249,6 +249,7 @@ Important defaults:
 | `model_registry_enabled` | true | Enable the online model-capability registry (disable for offline deployments). |
 | `model_registry_url` | https://openrouter.ai/api/v1/models | Capability registry source (OpenRouter-style /models). Fetches reuse `allow_private_upstream_hosts` for SSRF validation: keep it true for LAN mirrors; failures back off for 1 hour, see `last_error` in `/admin/models/registry/status`. |
 | `model_registry_ttl_seconds` | 604800 | Registry refresh interval in seconds (min 3600). |
+| `repair_tool_leaks` | true | Repair leaked tool calls on non-stream responses (restores structured calls when upstream emits template-native XML as text; streaming is detect-only). |
 | `anthropic_thinking_budget_tokens` | 1024 | Anthropic extended-thinking budget. |
 
 ## Safety And Limits
@@ -332,7 +333,7 @@ Main code boundaries:
 pytest tests/ -q
 ```
 
-Expected current result: `947 passed`.
+Expected current result: `968 passed`.
 
 The client-error-mapping baseline (diff-corpus coherence / required path assertions / hardcoded-status whitelist / doc count consistency) is enforced by:
 

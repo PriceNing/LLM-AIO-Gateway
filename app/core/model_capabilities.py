@@ -17,7 +17,7 @@ import re
 # supports_vision/supports_tools 为布尔，input_modalities 为字符串列表，
 # pricing 为 {prompt|completion|image: 字符串数字}（OpenRouter 口径，$/M tokens）。
 _INT_KEYS = ("context_window", "max_output_tokens")
-_BOOL_KEYS = ("supports_vision", "supports_tools")
+_BOOL_KEYS = ("supports_vision", "supports_tools", "supports_reasoning")
 _CAPABILITY_KEYS = _INT_KEYS + _BOOL_KEYS + ("input_modalities", "pricing")
 
 # 异常/被篡改的上游数据不得直出客户端：超出合理上限的值丢弃（保持"未知"）。
@@ -106,37 +106,40 @@ def merge_capabilities(*sources: dict | None) -> dict:
 _BUILTIN_FAMILIES: list[tuple[tuple[str, ...], dict]] = [
     # Anthropic
     (("claude-3-5-haiku",), {"context_window": 200000, "max_output_tokens": 8192, "supports_vision": True, "supports_tools": True}),
+    (("claude-4", "claude-sonnet-4", "claude-opus-4", "claude-haiku-4"), {"context_window": 200000, "max_output_tokens": 8192, "supports_vision": True, "supports_tools": True, "supports_reasoning": True}),
     (("claude-3", "claude-4", "claude-sonnet", "claude-opus", "claude-haiku"), {"context_window": 200000, "max_output_tokens": 4096, "supports_vision": True, "supports_tools": True}),
     (("claude-2",), {"context_window": 100000, "supports_vision": False, "supports_tools": False}),
     # OpenAI
     (("gpt-4o",), {"context_window": 128000, "max_output_tokens": 16384, "supports_vision": True, "supports_tools": True}),
     (("gpt-4.1",), {"context_window": 1047552, "max_output_tokens": 32768, "supports_vision": True, "supports_tools": True}),
     (("gpt-4-turbo", "gpt-4-turbo-preview"), {"context_window": 128000, "max_output_tokens": 4096, "supports_vision": True, "supports_tools": True}),
-    (("gpt-6",), {"context_window": 1050000, "max_output_tokens": 128000, "supports_vision": True, "supports_tools": True}),
-    (("gpt-5",), {"max_output_tokens": 128000, "supports_vision": True, "supports_tools": True}),
-    (("o1", "o3", "o4-mini"), {"context_window": 200000, "max_output_tokens": 100000, "supports_vision": True, "supports_tools": True}),
+    (("gpt-6",), {"context_window": 1050000, "max_output_tokens": 128000, "supports_vision": True, "supports_tools": True, "supports_reasoning": True}),
+    (("gpt-5",), {"max_output_tokens": 128000, "supports_vision": True, "supports_tools": True, "supports_reasoning": True}),
+    (("o1", "o3", "o4-mini"), {"context_window": 200000, "max_output_tokens": 100000, "supports_vision": True, "supports_tools": True, "supports_reasoning": True}),
     (("gpt-3.5",), {"context_window": 16383, "max_output_tokens": 4096, "supports_vision": False, "supports_tools": True}),
     # Google
     (("gemini-1.5-pro", "gemini-1.5-ultra"), {"context_window": 2000000, "max_output_tokens": 8192, "supports_vision": True, "supports_tools": True}),
     (("gemini-1.5-flash",), {"context_window": 1000000, "max_output_tokens": 8192, "supports_vision": True, "supports_tools": True}),
-    (("gemini-2.0", "gemini-2.5"), {"context_window": 1000000, "max_output_tokens": 8192, "supports_vision": True, "supports_tools": True}),
+    (("gemini-2.0", "gemini-2.5"), {"context_window": 1000000, "max_output_tokens": 8192, "supports_vision": True, "supports_tools": True, "supports_reasoning": True}),
     (("gemini",), {"context_window": 1000000, "supports_vision": True, "supports_tools": True}),
     # DeepSeek（在线注册表不可用时的离线兜底；数据可能滞后，以注册表/管理员覆盖为准）
-    (("deepseek-flash", "deepseek-v4-flash-vision"), {"context_window": 1048576, "max_output_tokens": 943718, "supports_vision": True, "supports_tools": True}),
-    (("deepseek-v4",), {"context_window": 1048576, "max_output_tokens": 393216, "supports_vision": False, "supports_tools": True}),
-    (("deepseek-reasoner", "deepseek-r1"), {"context_window": 163840, "max_output_tokens": 32768, "supports_vision": False, "supports_tools": True}),
-    (("deepseek",), {"context_window": 163840, "max_output_tokens": 16384, "supports_vision": False, "supports_tools": True}),
+    (("deepseek-flash", "deepseek-v4-flash-vision"), {"context_window": 1048576, "max_output_tokens": 943718, "supports_vision": True, "supports_tools": True, "supports_reasoning": True}),
+    (("deepseek-v4",), {"context_window": 1048576, "max_output_tokens": 393216, "supports_vision": False, "supports_tools": True, "supports_reasoning": True}),
+    (("deepseek-reasoner", "deepseek-r1"), {"context_window": 163840, "max_output_tokens": 32768, "supports_vision": False, "supports_tools": True, "supports_reasoning": True}),
+    (("deepseek",), {"context_window": 163840, "max_output_tokens": 16384, "supports_vision": False, "supports_tools": True, "supports_reasoning": True}),
     # Qwen
     (("qwen-vl", "qwen2-vl", "qwen2.5-vl", "qwen3-vl"), {"supports_vision": True, "supports_tools": True}),
-    (("qwen2.5-coder", "qwen3-coder"), {"context_window": 128000, "max_output_tokens": 8192, "supports_vision": False, "supports_tools": True}),
-    (("qwen-max", "qwen-plus", "qwen-turbo", "qwen2.5", "qwen3"), {"context_window": 128000, "max_output_tokens": 8192, "supports_vision": False, "supports_tools": True}),
+    (("qwen3-coder",), {"context_window": 128000, "max_output_tokens": 8192, "supports_vision": False, "supports_tools": True, "supports_reasoning": True}),
+    (("qwen2.5-coder",), {"context_window": 128000, "max_output_tokens": 8192, "supports_vision": False, "supports_tools": True}),
+    (("qwen3",), {"context_window": 128000, "max_output_tokens": 8192, "supports_vision": False, "supports_tools": True, "supports_reasoning": True}),
+    (("qwen-max", "qwen-plus", "qwen-turbo", "qwen2.5"), {"context_window": 128000, "max_output_tokens": 8192, "supports_vision": False, "supports_tools": True}),
     # Meta / Mistral / 其他开源家族
     (("llama-3.1", "llama-3.3", "llama3.1", "llama3.3"), {"context_window": 128000, "max_output_tokens": 4096, "supports_vision": False, "supports_tools": True}),
     (("llama-3.2-vision",), {"context_window": 128000, "supports_vision": True, "supports_tools": True}),
     (("mistral-large",), {"context_window": 128000, "supports_vision": False, "supports_tools": True}),
     (("pixtral",), {"context_window": 128000, "supports_vision": True, "supports_tools": True}),
     (("minicpm-v", "llava", "internvl", "glm-4v"), {"supports_vision": True, "supports_tools": False}),
-    (("kimi-k2",), {"context_window": 128000, "max_output_tokens": 8192, "supports_vision": False, "supports_tools": True}),
+    (("kimi-k2",), {"context_window": 128000, "max_output_tokens": 8192, "supports_vision": False, "supports_tools": True, "supports_reasoning": True}),
     (("moonshot-v1",), {"context_window": 128000, "supports_vision": False, "supports_tools": True}),
     (("glm-4-plus", "glm-4-air", "glm-4-flash"), {"context_window": 128000, "supports_vision": False, "supports_tools": True}),
 ]
@@ -210,6 +213,8 @@ def capabilities_for_client_entry(caps: dict) -> dict:
         entry["supports_vision"] = True
     if caps.get("supports_tools"):
         entry["supports_tools"] = True
+    if caps.get("supports_reasoning"):
+        entry["supports_reasoning"] = True
     if caps.get("input_modalities"):
         entry["input_modalities"] = list(caps["input_modalities"])
     if caps.get("pricing"):

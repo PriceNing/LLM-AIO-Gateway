@@ -92,15 +92,26 @@ def upstream_capabilities(item: dict) -> dict:
         # "false"/"0"/"no" 表达否定时，bool() 强转会把它变成 True。
         caps["supports_vision"] = vision
 
+    supported_params = item.get("supported_parameters")
+    supported_params = supported_params if isinstance(supported_params, list) else []
+
     tools = raw_caps.get("function_calling")
     if tools is None:
         tools = item.get("supports_tools")
-    if tools is None:
-        supported_params = item.get("supported_parameters")
-        if isinstance(supported_params, list) and supported_params:
-            tools = any(p in supported_params for p in ("tools", "tool_use", "function_calling"))
+    if tools is None and supported_params:
+        tools = any(p in supported_params for p in ("tools", "tool_use", "function_calling"))
     if tools is not None:
         caps["supports_tools"] = tools
+
+    # 推理能力：OpenRouter 用 supported_parameters 里的 reasoning/include_reasoning
+    # 表达；自建网关也可能直接给布尔字段。无法判定时不输出（保持未知）。
+    reasoning = raw_caps.get("reasoning")
+    if reasoning is None:
+        reasoning = item.get("supports_reasoning")
+    if reasoning is None and supported_params:
+        reasoning = any(p in supported_params for p in ("reasoning", "reasoning_effort", "include_reasoning"))
+    if reasoning is not None:
+        caps["supports_reasoning"] = reasoning
 
     pricing = item.get("pricing")
     if isinstance(pricing, dict):

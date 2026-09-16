@@ -71,6 +71,7 @@ def default_config() -> dict:
             "model_registry_enabled": True,
             "model_registry_url": "https://openrouter.ai/api/v1/models",
             "model_registry_ttl_seconds": 604800,
+            "repair_tool_leaks": True,
             "anthropic_thinking_budget_tokens": 1024,
         }
     }

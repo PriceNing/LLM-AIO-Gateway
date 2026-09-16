@@ -146,6 +146,7 @@ zh: {
     'models.maxOutput': '最大输出 (tokens)',
     'models.vision': '视觉输入',
     'models.tools': '工具调用',
+    'models.reasoning': '推理能力',
     'models.capsAuto': '自动（上游/内置识别）',
     'models.capsYes': '支持',
     'models.capsNo': '不支持',
@@ -529,6 +530,7 @@ en: {
     'models.maxOutput': 'Max output (tokens)',
     'models.vision': 'Vision input',
     'models.tools': 'Tool calling',
+    'models.reasoning': 'Reasoning',
     'models.capsAuto': 'Auto (upstream/builtin)',
     'models.capsYes': 'Supported',
     'models.capsNo': 'Not supported',
@@ -2102,6 +2104,7 @@ function renderModels() {
             if (caps.max_output_tokens) badges += '<span class="badge badge-partial" title="' + escHtml(t('models.maxOutput')) + '">↑' + fmtTokenCount(caps.max_output_tokens) + '</span>';
             if (caps.supports_vision) badges += '<span class="badge badge-ok" title="' + escHtml(t('models.vision')) + '">&#128065;</span>';
             if (caps.supports_tools) badges += '<span class="badge badge-ok" title="' + escHtml(t('models.tools')) + '">&#128295;</span>';
+            if (caps.supports_reasoning) badges += '<span class="badge badge-ok" title="' + escHtml(t('models.reasoning')) + '">&#129504;</span>';
             html += '<div class="model-item">' +
                 '<div class="model-info">' +
                     '<span class="model-name">' + escHtml(m.name || m.id) + '</span>' +
@@ -2183,6 +2186,7 @@ function editModelCaps(modelId) {
             '<input type="number" id="capMaxOutput" min="1" max="10000000" step="1024" value="' + (isOv('max_output_tokens') ? (caps.max_output_tokens || '') : '') + '" placeholder="' + escHtml(autoHint(caps.max_output_tokens, fmtTokenCount)) + '"></div>' +
         '<div class="form-group"><label>' + escHtml(t('models.vision')) + '</label>' + _capSelectHtml('capVision', isOv('supports_vision') ? caps.supports_vision : null) + '</div>' +
         '<div class="form-group"><label>' + escHtml(t('models.tools')) + '</label>' + _capSelectHtml('capTools', isOv('supports_tools') ? caps.supports_tools : null) + '</div>' +
+        '<div class="form-group"><label>' + escHtml(t('models.reasoning')) + '</label>' + _capSelectHtml('capReasoning', isOv('supports_reasoning') ? caps.supports_reasoning : null) + '</div>' +
         '<p class="form-hint">' + escHtml(t('models.capsHint')) + '</p>' +
         '<div class="form-actions">' +
             '<button class="btn btn-secondary" onclick="closeModal()">' + escHtml(t('common.cancel')) + '</button>' +
@@ -2197,11 +2201,13 @@ async function saveModelCaps(modelId) {
     var mo = document.getElementById('capMaxOutput').value.trim();
     var vision = document.getElementById('capVision').value;
     var tools = document.getElementById('capTools').value;
+    var reasoning = document.getElementById('capReasoning').value;
     var caps = {
         context_window: cw ? parseInt(cw, 10) : null,
         max_output_tokens: mo ? parseInt(mo, 10) : null,
         supports_vision: vision === '' ? null : vision === '1',
-        supports_tools: tools === '' ? null : tools === '1'
+        supports_tools: tools === '' ? null : tools === '1',
+        supports_reasoning: reasoning === '' ? null : reasoning === '1'
     };
     try {
         await api('/admin/models/capabilities', { method: 'PUT', body: JSON.stringify({ model_id: modelId, capabilities: caps }) });

@@ -251,6 +251,7 @@ curl http://localhost:8000/v1/responses \
 | `model_registry_enabled` | true | 是否启用在线模型能力注册表（离线部署可关闭）。 |
 | `model_registry_url` | https://openrouter.ai/api/v1/models | 能力注册表数据源（OpenRouter 风格 /models）。拉取复用 `allow_private_upstream_hosts` 做 SSRF 校验：指向内网镜像时需保持该开关为 true；拉取失败后进入 1 小时退避，错误原因见 `/admin/models/registry/status` 的 `last_error`。 |
 | `model_registry_ttl_seconds` | 604800 | 注册表刷新周期（秒，最小 3600）。 |
+| `repair_tool_leaks` | true | 非流式回程泄漏工具调用抢救（上游把模板原生 XML 调用漏成文本时还原为结构化调用；流式仅检测记录）。 |
 | `anthropic_thinking_budget_tokens` | 1024 | Anthropic thinking 模式预算。 |
 
 ## 安全与限流
@@ -334,7 +335,7 @@ OpenAI 兼容提供商默认走 Chat Completions；仅在原生 Responses 能力
 pytest tests/ -q
 ```
 
-当前预期结果：`947 passed`。
+当前预期结果：`968 passed`。
 
 客户端错误映射收口基线（差分语料一致性 / 关键路径断言 / 写死状态码白名单 / 文档计数一致）已固化为：
 
