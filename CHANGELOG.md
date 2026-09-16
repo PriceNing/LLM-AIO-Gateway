@@ -5,6 +5,22 @@ All notable changes to LLM AIO Gateway will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] —— 发版时将本段重命名为 [0.12.1] 并补日期；在此之前任何对外面（UI 版本号、tag、Release）不得出现 0.12.1
+
+### Added
+- **`supports_reasoning` capability field**: `GET /v1/models` now also advertises whether a model supports reasoning. Sourced from builtin high-confidence families (o-series, gpt-5/6, claude-4, full deepseek line, qwen3, gemini-2.x, kimi-k2, ...), upstream/registry extraction (from `supported_parameters` containing `reasoning`/`include_reasoning`), normalized on write and read, positive-declaration only, with a three-state admin editor and a 🧠 badge in the panel.
+- **Leaked tool-call rescue layer** (`core/tool_leak.py`, new module): some local inference frameworks (llama.cpp etc.) probabilistically fail to parse template-native XML tool calls into structured `tool_calls`, leaving raw markup in the message body; harnesses like Codex then treat the turn as plain text and end it (observed ~5% on llama.cpp b10884, causing hangs). On the non-stream IR normalization point this layer does a conservative, schema-driven rescue — only when (1) the turn declared tools, (2) the whole body is exactly 1..N well-formed, adjacent tool-call blocks, (3) every tool name matches the declared set, (4) every parameter name/type validates against the schema, and (5) block count/depth are within limits. Any single condition failing → pass through unchanged (prefer under-repair over mis-repair). Hits are counted as `tool_leak_repaired` in details + the `tool_calls` log channel; streaming is detect-only (`tool_leak_detected`) to avoid buffering that hurts TTFT. New config `repair_tool_leaks` (default on); wired into 5 non-stream return points + 5 stream call sites.
+
+### Changed
+- `discovery._pick_positive_int` now rejects bools so capability ints stay ints.
+
+### 更新内容（中文）
+- **`supports_reasoning` 能力字段**：`GET /v1/models` 现额外广播模型是否支持推理。来源：内置高置信家族（o 系、gpt-5/6、claude-4、deepseek 全系、qwen3、gemini-2.x、kimi-k2 等）、上游/注册表提取（`supported_parameters` 含 `reasoning`/`include_reasoning`）、写入与读取都归一化、只做正向声明，管理面板三态编辑 + 🧠 徽章。
+- **泄漏工具调用抢救层**（`core/tool_leak.py`，新模块）：部分本地推理框架（llama.cpp 等）会概率性无法把模板原生 XML 工具调用解析成结构化 `tool_calls`，原始标记文本留在正文里；Codex 等 harness 收到后误判回合结束而卡死（llama.cpp b10884 实测 ~5%）。在非流式 IR 规范化点做保守、schema 驱动的抢救——仅当（1）本轮声明了工具、（2）正文整体恰好是 1..N 个良构且紧邻的工具调用块、（3）每个工具名命中声明集、（4）每个参数名/类型通过 schema 校验、（5）块数/深度在上限内，才把正文替换为结构化工具调用；任何一条不满足即原样透传（宁可漏修，绝不误伤）。命中记 `tool_leak_repaired` 进 details + `tool_calls` 日志通道；流式仅检测（`tool_leak_detected`）不做修改，避免缓冲伤 TTFT。新配置 `repair_tool_leaks`（默认开），接入 5 个非流式返回点 + 5 个流式调用点。
+
+### Tests
+- `test_tool_leak.py`（17 用例：事故同构样本、误伤防护矩阵、端点集成、流式检测、开关）+ `test_model_capabilities.py`（+4）；全量 **968 passed**。
+
 ## [0.12.0] - 2026-09-15
 
 ### Added
