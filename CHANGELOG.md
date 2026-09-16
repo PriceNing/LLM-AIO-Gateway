@@ -5,7 +5,7 @@ All notable changes to LLM AIO Gateway will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] —— 发版时将本段重命名为 [0.12.1] 并补日期；在此之前任何对外面（UI 版本号、tag、Release）不得出现 0.12.1
+## [0.12.1] - 2026-09-16
 
 ### Added
 - **`supports_reasoning` capability field**: `GET /v1/models` now also advertises whether a model supports reasoning. Sourced from builtin high-confidence families (o-series, gpt-5/6, claude-4, full deepseek line, qwen3, gemini-2.x, kimi-k2, ...), upstream/registry extraction (from `supported_parameters` containing `reasoning`/`include_reasoning`), normalized on write and read, positive-declaration only, with a three-state admin editor and a 🧠 badge in the panel.
