@@ -91,6 +91,17 @@ def friendly_error_msg(e: Exception) -> str:
     return _with_trace_hint(message)
 
 
+def _flagged_confirmed_upstream(exc: Exception) -> bool:
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        if bool(getattr(current, "confirmed_upstream", False)):
+            return True
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return False
+
+
 def _looks_like_connection_error(exc: Exception, lowered: str) -> bool:
     if isinstance(exc, (httpx.ConnectError, httpx.NetworkError, ConnectionError)):
         return True
@@ -108,7 +119,8 @@ def classify_for_client(e: Exception, *, confirmed_upstream: bool = False) -> tu
        其余 4xx → 保留原状态码+“修正请求”文案；5xx 及其他非 4xx 的权威状态码（1xx/2xx/3xx，
        必然来自上游）→ 502；
     3. 无权威状态码时：文本型 timeout → 504；二次确认的连接失败 → 502；
-    4. 其余：confirmed_upstream=True（调用方已确定异常来自上游，如 Anthropic SSE error 事件）
+    4. 其余：confirmed_upstream=True（调用方已确定异常来自上游，如 Anthropic SSE error 事件），
+       或异常链上带 ``confirmed_upstream`` 标记（空流 / 静默截断等网关确认的上游失败）
        → 502；否则保守 500（网关内部错）。
     文本启发式（如消息里出现 "429"/"500"）永远不得在存在权威状态码时否决它，
     也不得推出比状态码更具体的文案。
@@ -140,9 +152,10 @@ def classify_for_client(e: Exception, *, confirmed_upstream: bool = False) -> tu
     # 否则网关内部 bug 会被伪装成上游网络故障。
     if trigger == "connection_error" and _looks_like_connection_error(e, str(e).lower()):
         return 502, _CONNECTION_FAILURE
-    if confirmed_upstream:
-        # 调用方已确认异常源自上游（如上游 SSE error 事件）：无法归类时归 502，
-        # 不伪装成网关内部错；避免调用方对分类器结果做本地二次改写（报告四轮 #1）。
+    if confirmed_upstream or _flagged_confirmed_upstream(e):
+        # 调用方已确认异常源自上游（如上游 SSE error 事件、空流、静默截断）：
+        # 无法归类时归 502，不伪装成网关内部错；避免调用方对分类器结果做本地
+        # 二次改写（审查报告四轮 #1）。
         return 502, _GENERIC_UPSTREAM_FAILURE
     return 500, _GENERIC_UPSTREAM_FAILURE
 

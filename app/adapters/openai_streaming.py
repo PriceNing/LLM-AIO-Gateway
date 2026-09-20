@@ -96,6 +96,8 @@ async def iter_openai_chat_output_events(
     tool_states: dict[int, dict] = {}
     finish_reason = None
     saw_output = False
+    saw_finish = False
+    saw_answer_output = False
     tolerated_tail_error = False
 
     try:
@@ -108,11 +110,15 @@ async def iter_openai_chat_output_events(
             ):
                 if event.kind in ("text_delta", "reasoning_delta", "tool_call_start", "tool_call_arguments_delta", "usage"):
                     saw_output = True
+                if event.kind in ("text_delta", "tool_call_start", "tool_call_arguments_delta"):
+                    saw_answer_output = True
                 if event.kind == "message_delta" and event.finish_reason:
                     finish_reason = event.finish_reason
+                    saw_finish = True
                     continue
                 if event.kind == "message_done":
                     finish_reason = event.finish_reason or finish_reason
+                    saw_finish = saw_finish or bool(event.finish_reason)
                     continue
                 yield event
     except Exception as exc:
@@ -129,6 +135,7 @@ async def iter_openai_chat_output_events(
 
     if think_state["buf"]:
         yield InternalOutputEvent(kind="text_delta", text=think_state["buf"])
+        saw_answer_output = True
 
     for idx, state in sorted(tool_states.items()):
         _tool_log.debug(
@@ -146,6 +153,27 @@ async def iter_openai_chat_output_events(
             name=state["name"],
             arguments=state["arguments"],
         )
+    if not saw_finish and not saw_answer_output and not tool_states:
+        # 静默截断守卫：上游从未发送 finish_reason，也没有产出任何可见回答
+        # （正文/工具调用）。此前这里会合成 message_done(stop) 并记 ok，
+        # 下游 harness（pi/Codex）把被服务端 watchdog 掉断的流当成正常
+        # 空回合结束 → 任务未完成但 agent 停止（SuperGrok 2026-09-16 事故）。
+        # 改为报错：客户端能看到 error 并可重试，而不是静默停住。
+        _app_log.warning(
+            "[openai_stream_adapter] silent truncation provider=%s model=%s stream closed without finish_reason or answer output (tolerated_tail_error=%s)",
+            provider_id or "",
+            model,
+            tolerated_tail_error,
+        )
+        raise _silent_truncation_error(
+            model=model,
+            provider_id=provider_id or "",
+            # 走到这里已经没有回答；打上 empty_stream_response 让 fallback 层
+            # 在尚未向客户端可见输出时保留同目标退化重试。reasoning-only
+            # 已 emitted，不会换模型，此标记无效。
+            empty_stream=True,
+        )
+
     _app_log.debug(
         "[openai_stream_adapter] DONE provider=%s model=%s finish_reason=%s tool_calls=%d tolerated_tail_error=%s",
         provider_id or "",
@@ -296,3 +324,14 @@ async def _events_from_openai_chunk(chunk, *, model, tool_states: dict[int, dict
 def _is_litellm_tail_chunk_builder_error(exc: Exception) -> bool:
     msg = str(exc)
     return "Error building chunks for logging/streaming usage calculation" in msg
+
+
+def _silent_truncation_error(*, model: str, provider_id: str, empty_stream: bool) -> RuntimeError:
+    """Confirmed upstream failure: stream closed with no finish and no answer."""
+    exc = RuntimeError("upstream stream ended without a finish reason before sending any answer output")
+    exc.confirmed_upstream = True
+    exc.attempted_model = model
+    exc.attempted_provider = provider_id or ""
+    # 空流才允许 fallback 层做同目标退化重试；reasoning-only 不算 empty。
+    exc.empty_stream_response = bool(empty_stream)
+    return exc

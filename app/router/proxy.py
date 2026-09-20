@@ -2410,6 +2410,7 @@ def _empty_stream_error(target: RouteTarget, provider_id: str, *, placeholder_on
     exc.attempted_provider = provider_id or target.provider_id or ""
     exc.placeholder_only_response = placeholder_only
     exc.empty_stream_response = not placeholder_only
+    exc.confirmed_upstream = True
     return exc
 
 

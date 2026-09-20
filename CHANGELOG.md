@@ -5,6 +5,14 @@ All notable changes to LLM AIO Gateway will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- Chat stream adapters no longer mask silent truncation: if the upstream closes without a `finish_reason` and produced no answer (text/tool calls; reasoning-only counts as none), `iter_openai_chat_output_events` raises a confirmed-upstream error instead of synthesizing `message_done("stop")`. The error path records a failure and sends an error SSE so clients can retry (SuperGrok 2026-09-16 watchdog incident). Streams that already produced answer text/tool output without a finish chunk keep the legacy synthesized completion. Empty streams still participate in fallback / same-target degenerate retry.
+
+### 更新内容（中文）
+- 修复 Chat 流式适配器静默截断：上游不发 `finish_reason` 且无回答（正文/工具；仅 reasoning 不算）时改为报确认的上游失败并下发 error SSE，不再合成 `message_done("stop")` 记成功（SuperGrok 2026-09-16 服务端掐流事故）。已有正文/工具但缺 finish 的流仍走旧合成完成。空流仍可走 fallback / 同目标退化重试。
+
 ## [0.12.1] - 2026-09-16
 
 ### Added

@@ -86,6 +86,15 @@ def test_client_status_mapping(exc, expected):
     assert client_status_for_upstream_error(exc) == expected
 
 
+def test_confirmed_upstream_flag_maps_to_502():
+    exc = RuntimeError("upstream stream ended without a finish reason before sending any answer output")
+    exc.confirmed_upstream = True
+    assert client_status_for_upstream_error(exc) == 502
+    wrapped = RuntimeError("wrapper")
+    wrapped.__cause__ = exc
+    assert client_status_for_upstream_error(wrapped) == 502
+
+
 def test_wrapped_upstream_status_survives_exception_chain():
     inner = _http_status_error(400)
     outer = RuntimeError("call failed")

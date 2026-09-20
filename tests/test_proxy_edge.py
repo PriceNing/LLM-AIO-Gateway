@@ -2175,6 +2175,132 @@ def test_chat_completions_stream_does_not_fallback_after_output(monkeypatch, tem
     assert calls == [("primary-midfail-model", "primary-stream-midfail")]
 
 
+def test_chat_completions_stream_reports_error_on_reasoning_only_truncation(monkeypatch, temp_db):
+    """事故回归：只流出 reasoning、无 finish 时必须发 error SSE，不得合成 stop。"""
+    from types import SimpleNamespace
+    from app.database import add_fallback_policy, add_routing_rule
+
+    add_provider({
+        "id": "silent-trunc-primary",
+        "name": "Silent Trunc Primary",
+        "provider_type": "openai",
+        "api_base": "https://silent-trunc.example/v1",
+        "api_key": "upstream-key",
+        "enabled": True,
+        "models": [{"id": "silent-trunc-model", "name": "Primary", "enabled": True}],
+    })
+    add_provider({
+        "id": "silent-trunc-fallback",
+        "name": "Silent Trunc Fallback",
+        "provider_type": "openai",
+        "api_base": "https://silent-trunc-fb.example/v1",
+        "api_key": "upstream-key",
+        "enabled": True,
+        "models": [{"id": "silent-trunc-fb-model", "name": "Fallback", "enabled": True}],
+    })
+    add_routing_rule({
+        "name": "silent-trunc-rule", "enabled": True,
+        "match_model": "silent-trunc-source", "target_model": "silent-trunc-model",
+        "target_provider": "silent-trunc-primary",
+    })
+    add_fallback_policy({
+        "name": "silent trunc fallback", "enabled": True,
+        "match_provider": "silent-trunc-primary", "match_model": "silent-trunc-model",
+        "chain": [{"model": "silent-trunc-fb-model", "provider_id": "silent-trunc-fallback"}],
+    })
+
+    calls = []
+
+    def fake_stream(**kwargs):
+        calls.append(kwargs.get("provider_id"))
+        delta = SimpleNamespace(role=None, content=None, reasoning_content="thinking...", tool_calls=None)
+        yield SimpleNamespace(choices=[SimpleNamespace(delta=delta, finish_reason=None)], usage=None)
+
+    monkeypatch.setattr("app.adapters.openai_streaming.create_chat_completion_stream", fake_stream)
+
+    with client.stream("POST", "/v1/chat/completions", headers=temp_db["headers"], json={
+        "model": "silent-trunc-source",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": True,
+    }) as response:
+        body = response.read().decode("utf-8")
+
+    assert response.status_code == 200
+    assert "thinking..." in body
+    assert '"server_error"' in body
+    assert '"finish_reason": "stop"' not in body
+    assert "without a finish reason" not in body
+    # reasoning 已对客户端可见，禁止换模型混流
+    assert calls == ["silent-trunc-primary"]
+
+
+def test_chat_completions_stream_fallbacks_on_empty_stream_without_finish(monkeypatch, temp_db):
+    """空流无 finish 仍走 fallback，不能把退化重试弄丢。"""
+    from types import SimpleNamespace
+    from app.database import add_fallback_policy, add_routing_rule
+
+    add_provider({
+        "id": "empty-trunc-primary",
+        "name": "Empty Trunc Primary",
+        "provider_type": "openai",
+        "api_base": "https://empty-trunc.example/v1",
+        "api_key": "upstream-key",
+        "enabled": True,
+        "models": [{"id": "empty-trunc-model", "name": "Primary", "enabled": True}],
+    })
+    add_provider({
+        "id": "empty-trunc-fallback",
+        "name": "Empty Trunc Fallback",
+        "provider_type": "openai",
+        "api_base": "https://empty-trunc-fb.example/v1",
+        "api_key": "upstream-key",
+        "enabled": True,
+        "models": [{"id": "empty-trunc-fb-model", "name": "Fallback", "enabled": True}],
+    })
+    add_routing_rule({
+        "name": "empty-trunc-rule", "enabled": True,
+        "match_model": "empty-trunc-source", "target_model": "empty-trunc-model",
+        "target_provider": "empty-trunc-primary",
+    })
+    add_fallback_policy({
+        "name": "empty trunc fallback", "enabled": True,
+        "match_provider": "empty-trunc-primary", "match_model": "empty-trunc-model",
+        "chain": [{"model": "empty-trunc-fb-model", "provider_id": "empty-trunc-fallback"}],
+    })
+
+    calls = []
+
+    def fake_stream(**kwargs):
+        calls.append(kwargs.get("provider_id"))
+        if kwargs.get("provider_id") == "empty-trunc-primary":
+            if False:
+                yield None
+            return
+        delta = SimpleNamespace(role=None, content="fallback text", reasoning_content=None, tool_calls=None)
+        yield SimpleNamespace(choices=[SimpleNamespace(delta=delta, finish_reason=None)], usage=None)
+        yield SimpleNamespace(
+            choices=[SimpleNamespace(
+                delta=SimpleNamespace(role=None, content=None, reasoning_content=None, tool_calls=None),
+                finish_reason="stop",
+            )],
+            usage=None,
+        )
+
+    monkeypatch.setattr("app.adapters.openai_streaming.create_chat_completion_stream", fake_stream)
+
+    with client.stream("POST", "/v1/chat/completions", headers=temp_db["headers"], json={
+        "model": "empty-trunc-source",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": True,
+    }) as response:
+        body = response.read().decode("utf-8")
+
+    assert response.status_code == 200
+    assert "fallback text" in body
+    assert '"server_error"' not in body
+    assert calls == ["empty-trunc-primary", "empty-trunc-fallback"]
+
+
 def test_anthropic_output_keeps_reasoning_out_of_visible_text():
     from app.adapters.anthropic import _anthropic_response_to_internal
     from app.protocols.egress import render_anthropic_message

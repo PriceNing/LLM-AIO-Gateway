@@ -335,7 +335,7 @@ OpenAI 兼容提供商默认走 Chat Completions；仅在原生 Responses 能力
 pytest tests/ -q
 ```
 
-当前预期结果：`968 passed`。
+当前预期结果：`979 passed`。
 
 客户端错误映射收口基线（差分语料一致性 / 关键路径断言 / 写死状态码白名单 / 文档计数一致）已固化为：
 
