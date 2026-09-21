@@ -5,7 +5,7 @@ All notable changes to LLM AIO Gateway will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] —— 发版时将本段重命名为 [0.13.0] 并补日期；在此之前任何对外面（UI 版本号、tag、Release）不得出现 0.13.0
+## [0.13.0] - 2026-09-21
 
 ### Added
 - **Per-conversation image-generation budget**: image generation cost is now controlled post-hoc by a per-conversation budget (`state.charge_image_generation_budget`, default 20 images/hour), replacing the removed pre-flight NLP intent gating.
