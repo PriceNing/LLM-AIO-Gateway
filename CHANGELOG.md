@@ -5,7 +5,7 @@ All notable changes to LLM AIO Gateway will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] —— 发版时将本段重命名为 [0.12.3] 并补日期；在此之前任何对外面（UI 版本号、tag、Release）不得出现 0.12.3
+## [0.12.3] - 2026-09-21
 
 ### Added
 - **Image-generation bridge now shared across protocol endpoints**: the model-driven image-generation orchestration loop was lifted out of the `/responses` endpoint into a protocol-agnostic module (`app/core/image_orchestration.py`) operating on the internal representation, with all endpoint/client-specific behavior injected as callables. `/chat/completions` now supports the same image-generation bridge in non-streaming form, so image generation works uniformly across protocols.
