@@ -5,6 +5,31 @@ All notable changes to LLM AIO Gateway will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] —— 发版时将本段重命名为 [0.13.0] 并补日期；在此之前任何对外面（UI 版本号、tag、Release）不得出现 0.13.0
+
+### Added
+- **Per-conversation image-generation budget**: image generation cost is now controlled post-hoc by a per-conversation budget (`state.charge_image_generation_budget`, default 20 images/hour), replacing the removed pre-flight NLP intent gating.
+- **Responses protocol modules extracted**: `app/protocols/responses_features.py` (client wire-format feature analysis, computed at the protocol boundary and written into `InternalRequest.metadata`) and `app/services/responses_capability.py` (native-Responses upstream capability state: probing, TTL freshness, negative caching, degradation) — both lifted out of `router/proxy.py` so endpoint code stays thin.
+
+### Changed
+- **Image bridge is now purely model-driven**: the gateway always injects the bridge tool for image-capable models (same `should_inject_image_bridge` gate for chat and responses; future /messages reuses it) and never gates on NLP intent. All correction / forced `tool_choice` / empty-response 502 logic is removed; if the model does not call the tool the response passes through untouched.
+- **Bridge tool renamed** `llm_aio_image_generation` → `image_generation` (the hosted-tool name models already know from training corpora).
+- **Chat streaming with the bridge is now true streaming**: text is forwarded token-by-token; if the model calls the bridge tool, the gateway executes image generation at end-of-stream and appends the result as a continuation of the same SSE stream (with a short "generating" notice). Non-bridge requests are unaffected. Chat image results are rendered as download URLs only (no inline base64) to avoid bloating conversation history.
+- Request-log hygiene: the bridge's interim "running" log row is overwritten by the final log (shared `log_id`); mixed tool rounds keep `finish_reason=tool_calls` consistency.
+- Admin UI: image-bridge related settings surfaced.
+
+### 更新内容（中文）
+- **每会话生图预算**：生图成本现由每会话预算后置控制（`state.charge_image_generation_budget`，默认 20 张/小时），取代移除的预检 NLP 意图门控。
+- **Responses 协议模块抽离**：`app/protocols/responses_features.py`（客户端 wire 格式特征分析，在协议边界计算并写入 `InternalRequest.metadata`）与 `app/services/responses_capability.py`（native Responses 上游能力状态：探测、TTL 新鲜度、负向缓存、降级判断）——均从 `router/proxy.py` 迁出，端点代码保持精简。
+- **生图桥接改为纯模型驱动**：对具备生图能力的模型恒定注入桥接工具（chat/responses 同一入口 `should_inject_image_bridge`，未来 /messages 直接复用），不再做任何 NLP 意图检测；删除全部 correction / 强制 tool_choice / 空响应 502 逻辑，模型不调用工具就原样 passthrough。
+- **桥接工具改名** `llm_aio_image_generation` → `image_generation`（与宿主工具同名，模型训练语料中已知，提高调用命中率）。
+- **Chat 流式桥接现为真流式**：文本逐 token 转发；模型调用桥接工具时，网关在流结束时执行生图并把结果作为同一 SSE 流的续轮追加（带简短"生成中"提示）。非桥接请求不受影响。Chat 图像结果仅渲染为下载 URL（不内联 base64），避免膨胀对话历史。
+- 请求日志卫生：桥接临时"running"日志行被最终日志覆盖（共享 `log_id`）；混合工具轮保持 `finish_reason=tool_calls` 一致性。
+- 管理 UI：暴露图像桥接相关设置。
+
+### Tests
+- `test_chat_image_bridge.py`（+211）+ `test_responses_native.py`（+63）+ `test_image_intent.py`（+62）+ `test_image_generation.py`（精简）；全量 **995 passed**。
+
 ## [0.12.3] - 2026-09-21
 
 ### Added

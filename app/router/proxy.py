@@ -5,8 +5,8 @@ import threading
 import time
 import uuid
 from collections import deque
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta
 from functools import partial
 from typing import Any, Optional
 
@@ -21,17 +21,15 @@ from app.database import (
     get_model_responses_capability, set_model_responses_capability, update_model_responses_capability, update_model_responses_tool_types, set_model_responses_tools_capability,
 )
 from app.core.text import client_status_for_upstream_error, friendly_error_msg, error_detail_for_log, mask_key
-from app.core.image_intent import is_image_generation_intent, is_image_generation_intent_text, latest_user_text
+from app.core.image_intent import latest_user_text
+from app.protocols.responses_features import cross_provider_incompatible_reasons
 from app.core.image_bridge import (
     GATEWAY_IMAGE_ASSET_MARKER,
-    GATEWAY_IMAGE_DISPLAY_CALL_PREFIX,
     GATEWAY_IMAGE_RESULT_MARKER,
     IMAGE_BRIDGE_TOOL_NAME,
-    IMAGE_BRIDGE_CORRECTION_INSTRUCTIONS,
     configure_internal_image_bridge,
+    should_inject_image_bridge,
     gateway_generated_image_asset_context,
-    has_codex_generated_image_exec_tool,
-    has_codex_image_function_tool,
     has_gateway_generated_image_history,
     image_call_arguments,
     image_call_arguments_from_exec,
@@ -46,7 +44,6 @@ from app.core.image_results import (
     find_image_result,
     generation_results_from_stored,
     image_result_directory,
-    image_preview_data_uri,
     store_image_results,
 )
 from app.core.image_batch import image_invocation_cache
@@ -56,7 +53,6 @@ from app.core.image_orchestration import (
     message_to_events as _message_to_events,
     image_generator_identity as _image_generator_identity,
     image_prompt_key as _image_prompt_key,
-    generated_image_asset_manifest as _generated_image_asset_manifest,
 )
 from app.core.model_capabilities import capabilities_for_client_entry, resolve_model_capabilities
 from app.services.model_registry import registry_lookup
@@ -102,19 +98,40 @@ from app.adapters.openai import chat_kwargs_from_internal, chat_messages_from_in
 from app.adapters.output import response_to_internal_output
 from app.adapters.anthropic_streaming import iter_anthropic_output_events
 from app.adapters.openai_streaming import iter_openai_chat_output_events
-from app.adapters.responses import iter_sse_frames, post_native_response, split_sse_frame, sse_payload, stream_native_response
+from app.adapters.responses import (
+    EmptyNativeResponsesError,
+    iter_sse_frames,
+    native_completed_output_item,
+    native_response_has_output,
+    native_sse_error_message,
+    native_sse_payload_has_output,
+    observed_response_tool_types,
+    post_native_response,
+    split_sse_frame,
+    sse_payload,
+    stream_native_response,
+)
 from app.adapters.imagegen import generate_images, image_results_bytes
 from app.protocols.egress import (
     render_anthropic_message,
     render_chat_completion,
-    render_chat_completions_sse,
     render_completion,
     render_response, render_responses_image_generation, render_responses_image_generation_sse,
     render_responses_sse,
+    chat_image_url_only_output,
+    generated_image_client_output,
 )
 from app.services.lite_llm import create_chat_completion
 from app.services.preprocessing import has_image_content, preprocess_messages
 from app.services.routing_targets import candidate_targets, classify_upstream_error, is_same_target_retryable, provider_for_log, resolve_provider, upstream_status_code
+from app.services.responses_capability import (
+    RESPONSES_CAPABILITY_PROBE_MARKER,
+    mark_model_responses_unknown,
+    native_capability_for_request,
+    native_error_is_explicitly_unsupported,
+    native_response_target_supported,
+    responses_capability_expiry,
+)
 from app.services.logger import get_logger
 from app.config import get_default
 
@@ -123,127 +140,13 @@ _error_log = get_logger("error")
 _tool_log = get_logger("tool_calls")
 _req_log = get_logger("request")
 _app_log = get_logger("app")
-_RESPONSES_CAPABILITY_PROBE_MARKER = "auto_probe_v2"
+
 
 router = APIRouter()
 
 # Rolling log of recent requests for the admin stats dashboard
 _request_log = deque(maxlen=get_default("request_log_max", 200))
 _request_log_lock = threading.Lock()
-
-
-def _responses_client_owned_tool_markers(body: dict) -> list[str]:
-    """Identify Codex-owned Responses tools that Chat rewrite cannot preserve faithfully."""
-    found: list[str] = []
-    for tool in body.get("tools") or []:
-        if not isinstance(tool, dict):
-            continue
-        tool_type = str(tool.get("type") or "")
-        name = str(tool.get("name") or "")
-        if tool_type == "custom" and name and f"custom:{name}" not in found:
-            found.append(f"custom:{name}")
-        elif tool_type == "namespace" and name and f"namespace:{name}" not in found:
-            found.append(f"namespace:{name}")
-    input_data = body.get("input")
-    if isinstance(input_data, list):
-        for item in input_data:
-            if not isinstance(item, dict) or item.get("type") != "additional_tools":
-                continue
-            for tool in item.get("tools") or []:
-                if not isinstance(tool, dict):
-                    continue
-                tool_type = str(tool.get("type") or "")
-                name = str(tool.get("name") or "")
-                if tool_type == "custom" and name and f"custom:{name}" not in found:
-                    found.append(f"custom:{name}")
-                elif tool_type == "namespace" and name and f"namespace:{name}" not in found:
-                    found.append(f"namespace:{name}")
-    return found
-
-
-def _responses_requires_native(body: dict) -> list[str]:
-    """Return request features that cannot be faithfully represented by Chat."""
-    required = []
-    chat_safe_fields = {
-        "model", "input", "instructions", "tools", "tool_choice", "stream",
-        "temperature", "top_p", "presence_penalty", "frequency_penalty", "stop",
-        "user", "previous_response_id", "provider_id", "parallel_tool_calls",
-        "max_output_tokens", "max_completion_tokens",
-        # Responses metadata/options that have a reasonable IR/Chat
-        # compatibility equivalent (or can safely be ignored by the adapter).
-        # These must not force an unsupported provider down the native-only
-        # path; Codex commonly sends them on every request.
-        "reasoning", "text", "store", "metadata", "truncation", "include",
-        "background", "service_tier", "safety_identifier", "prompt_cache_key",
-        "prompt_cache_retention", "max_tool_calls", "top_logprobs", "logprobs",
-        "client_metadata",
-    }
-    for field, value in body.items():
-        if field not in chat_safe_fields and value not in (None, False, "", [], {}):
-            required.append(field)
-    # Hosted Responses tools are intentionally filtered by ingress when a
-    # provider uses the compatibility path.  They must not turn an otherwise
-    # compatible Codex request into a native-only request.
-    chat_tool_types = {"function", "custom", "namespace", "web_search"}
-    for tool in body.get("tools") or []:
-        if isinstance(tool, dict) and tool.get("type") not in chat_tool_types:
-            required.append(f"tool:{tool.get('type') or 'unknown'}")
-    return required
-
-
-def _responses_image_generation_tool(body: dict) -> dict | None:
-    for tool in body.get("tools") or []:
-        if isinstance(tool, dict) and tool.get("type") == "image_generation":
-            return tool
-    for item in body.get("input") or []:
-        if not isinstance(item, dict) or item.get("type") != "additional_tools":
-            continue
-        for tool in item.get("tools") or []:
-            if isinstance(tool, dict) and tool.get("type") == "image_generation":
-                return tool
-    choice = body.get("tool_choice")
-    if isinstance(choice, dict) and choice.get("type") == "image_generation":
-        return choice
-    return None
-
-
-def _responses_is_system_turn(body: dict) -> bool:
-    """Return whether Codex identified this as an app-owned background turn.
-
-    Codex creates auxiliary Responses requests for task titles, ambient
-    suggestion safety, and other UI metadata.  Their wrapped user prompt can
-    mention image generation even though the request itself must only produce
-    structured metadata.  Honor ``thread_source=system`` and ambient
-    suggestion markers instead of guessing from prompt wording or schemas.
-    """
-    metadata = body.get("client_metadata")
-    if not isinstance(metadata, dict):
-        return False
-    turn_metadata = metadata.get("x-codex-turn-metadata")
-    if isinstance(turn_metadata, str):
-        try:
-            turn_metadata = json.loads(turn_metadata)
-        except (TypeError, ValueError):
-            return False
-    if not isinstance(turn_metadata, dict):
-        return False
-    source = str(turn_metadata.get("thread_source") or "").strip().lower()
-    trigger = str(turn_metadata.get("turn_trigger") or "").strip().lower()
-    request_kind = str(turn_metadata.get("request_kind") or "").strip().lower()
-    return (
-        source in {"system", "ambient", "ambient_suggestion_safety", "thread_title"}
-        or trigger.startswith("ambient")
-        or trigger in {"thread_title"}
-        or request_kind.startswith("ambient")
-        or request_kind in {"thread_title"}
-    )
-
-
-def _responses_has_prior_assistant(input_data: Any) -> bool:
-    """True when a prior assistant turn is already present in the input."""
-    if not isinstance(input_data, list):
-        return False
-    return any(isinstance(item, dict) and item.get("role") == "assistant" for item in input_data)
 
 
 def _chat_latest_user_text(internal) -> str:
@@ -267,14 +170,6 @@ async def _async_event_stream(items):
     """
     for item in items:
         yield item
-
-
-def _responses_image_prompt(input_data: Any, instructions: Any = "") -> str:
-    """Extract the current user request without forwarding conversation history."""
-    prompt = latest_user_text(input_data).strip()
-    if prompt:
-        return prompt
-    return str(instructions or "").strip()
 
 
 def _resolved_image_generator(config: dict) -> dict:
@@ -698,257 +593,6 @@ def _rollback_image_bridge_artifacts(
     )
 
 
-def _generated_image_markdown_output(
-    image_results,
-    stored: list[StoredImageResult],
-    artifacts: list[dict[str, str]],
-    usage: dict | None = None,
-) -> InternalOutputMessage:
-    """Publish inline data images with HTTP download links as a fallback.
-
-    Older Codex-compatible clients do not advertise the generatedImage helper.
-    Their Markdown renderer recognizes image syntax but may refuse remote HTTP
-    image loads, leaving a blank thumbnail. A data URI keeps rendering local to
-    the client while the stored artifact URL remains available for opening or
-    downloading the original image.
-    """
-    # This is public assistant text. Private bridge markers and agent-only
-    # instructions must never be rendered in the user's conversation.
-    asset_links = [
-        f"[`{artifact['filename']}` — download original]({artifact['url']})"
-        for artifact in artifacts
-    ]
-    blocks = ["Original: " + " · ".join(asset_links)] if asset_links else []
-    inline_limit = max(1, int(get_default("image_preview_inline_limit", 4)))
-    inline_results = image_results[:inline_limit]
-    for index, result in enumerate(inline_results, start=1):
-        label = "Generated image" if len(stored) == 1 else f"Generated image {index}"
-        blocks.append(f"![{label}]({image_preview_data_uri(result)})")
-    omitted = len(image_results) - len(inline_results)
-    if omitted > 0:
-        blocks.append(
-            f"{omitted} additional generated image preview(s) were omitted to keep the "
-            "response small; all originals are listed above."
-        )
-    return InternalOutputMessage(
-        text="\n\n".join(block for block in blocks if block),
-        finish_reason="stop",
-        usage=dict(usage or {}),
-    )
-
-
-def _generated_image_exec_output(
-    image_results,
-    artifacts: list[dict[str, str]],
-    usage: dict | None = None,
-) -> InternalOutputMessage:
-    """Ask Codex's client-owned exec runtime to publish native image results."""
-    display_source = "\n".join(
-        "generatedImage({ image_url: %s, output_hint: %s });" % (
-            json.dumps(str(result.data_uri or ""), ensure_ascii=False),
-            json.dumps("The generated image has already been displayed to the user.", ensure_ascii=False),
-        )
-        for result in image_results
-    )
-    manifest = _generated_image_asset_manifest(artifacts)
-    source = display_source
-    if manifest:
-        # Keep the project handoff in the tool history rather than ordinary
-        # assistant text. Codex executes only generatedImage(); the trailing
-        # block comment is recovered by the gateway on the next tool round
-        # and injected into private system context for the model.
-        source = f"{display_source}\n/*\n{manifest}\n*/"
-    suffix = uuid.uuid4().hex
-    return InternalOutputMessage(
-        text="",
-        tool_calls=[InternalToolCallOutput(
-            id=f"ctc_gateway_image_display_{suffix}",
-            call_id=f"{GATEWAY_IMAGE_DISPLAY_CALL_PREFIX}{suffix}",
-            name="exec",
-            arguments=json.dumps({"input": source}, ensure_ascii=False),
-        )],
-        finish_reason="tool_calls",
-        usage=dict(usage or {}),
-    )
-
-
-def _generated_image_client_output(
-    body: dict,
-    image_results,
-    stored: list[StoredImageResult],
-    artifacts: list[dict[str, str]],
-    usage: dict | None = None,
-) -> tuple[InternalOutputMessage, str]:
-    """Select Codex-native display when advertised, with Markdown as fallback."""
-    if has_codex_generated_image_exec_tool(body):
-        return _generated_image_exec_output(image_results, artifacts, usage), "codex_exec_generated_image"
-    output = _generated_image_markdown_output(image_results, stored, artifacts, usage)
-    return output, "assistant_message"
-
-
-def _responses_required_tool_types(body: dict) -> set[str]:
-    return {str(tool.get("type") or "") for tool in body.get("tools") or [] if isinstance(tool, dict) and tool.get("type")}
-
-
-def _responses_stateful_tool_markers(body: dict) -> list[str]:
-    """Collect prior Responses tool/agent markers for logging and fallback policy.
-
-    Only ``previous_response_id`` is provider-bound and blocks cross-provider
-    native fallback. Explicit tool outputs remain eligible so a failed primary
-    can still reach another native-capable target; dialect incompatibilities
-    are filtered separately.
-    """
-    input_data = body.get("input")
-    found = []
-    if body.get("previous_response_id"):
-        found.append("previous_response_id")
-    if not isinstance(input_data, list):
-        return found
-    marker_types = {
-        "custom_tool_call_output",
-        "function_call_output",
-        "computer_call_output",
-    }
-    for item in input_data:
-        if not isinstance(item, dict):
-            continue
-        item_type = str(item.get("type") or "")
-        if item_type in marker_types and item_type not in found:
-            found.append(item_type)
-    return found
-
-
-def _observed_response_tool_types(response: dict) -> set[str]:
-    observed = set()
-    for item in response.get("output") or []:
-        if not isinstance(item, dict):
-            continue
-        item_type = str(item.get("type") or "")
-        if item_type == "custom_tool_call":
-            observed.add("custom")
-        elif item_type == "function_call":
-            observed.add("namespace" if item.get("namespace") else "function")
-        elif item_type.endswith("_call"):
-            observed.add(item_type[:-5])
-    return observed
-
-
-class _EmptyNativeResponsesError(RuntimeError):
-    """The upstream completed a Responses request without client-usable output."""
-
-    native_empty_output = True
-
-
-def _native_completed_output_item(item: dict | None) -> bool:
-    """True when a Responses output item is a finished client-visible turn."""
-    if not isinstance(item, dict):
-        return False
-    item_type = str(item.get("type") or "")
-    return item_type in {
-        "message", "function_call", "custom_tool_call",
-        "computer_call", "image_generation_call", "output_text",
-    } or item_type.endswith("_call")
-
-
-def _native_response_has_output(response: dict | None) -> bool:
-    """Return whether a completed Responses payload contains usable output items."""
-    if not isinstance(response, dict):
-        return False
-    output = response.get("output")
-    if not isinstance(output, list):
-        return bool(str(response.get("output_text") or "").strip())
-    for item in output:
-        if not isinstance(item, dict):
-            continue
-        item_type = str(item.get("type") or "")
-        if item_type in {"message", "function_call", "custom_tool_call", "computer_call", "image_generation_call"}:
-            return True
-        if item_type.endswith("_call") or item_type in {"reasoning", "output_text"}:
-            return True
-    return False
-
-
-def _native_sse_payload_has_output(payload: dict | None) -> bool:
-    if not isinstance(payload, dict):
-        return False
-    event_type = str(payload.get("type") or "")
-    if event_type in {
-        "response.output_item.added", "response.output_item.done",
-        "response.content_part.added", "response.content_part.done",
-        "response.output_text.delta", "response.output_text.done",
-        "response.function_call_arguments.delta",
-        "response.function_call_arguments.done",
-        "response.custom_tool_call_input.delta",
-        "response.custom_tool_call_input.done",
-        "response.computer_call.delta",
-    }:
-        item = payload.get("item") or payload.get("output_item") or {}
-        if event_type.endswith(".delta") or event_type.endswith(".done"):
-            return True
-        return isinstance(item, dict) and bool(str(item.get("type") or ""))
-    return False
-
-
-def _native_sse_error_message(payload: dict | None) -> str | None:
-    """Return a message for Responses SSE error payloads, including typeless ``event: error`` frames."""
-    if not isinstance(payload, dict):
-        return None
-    event_type = str(payload.get("type") or "")
-    error = payload.get("error")
-    # OpenAI uses type=error. Some proxies emit ``event: error`` with only an
-    # ``error`` object and no type. Ignore response.* frames that happen to
-    # contain an error key.
-    if event_type not in {"", "error"}:
-        return None
-    if event_type == "" and not isinstance(error, dict):
-        return None
-    if isinstance(error, dict):
-        return str(error.get("message") or error.get("type") or error)
-    if error:
-        return str(error)
-    if event_type == "error":
-        return str(payload.get("message") or "native Responses stream error")
-    return None
-
-
-def _native_cross_provider_incompatible_reasons(body: dict | None) -> list[str]:
-    """Shapes that commonly 400 when a Codex native body is forwarded to another vendor."""
-    if not isinstance(body, dict):
-        return []
-    reasons: list[str] = []
-    input_data = body.get("input")
-    call_ids: set[str] = set()
-    output_ids: set[str] = set()
-    if isinstance(input_data, list):
-        for item in input_data:
-            if not isinstance(item, dict):
-                continue
-            item_type = str(item.get("type") or "")
-            if item_type in {"function_call", "custom_tool_call"}:
-                call_id = str(item.get("call_id") or item.get("id") or "")
-                if call_id:
-                    call_ids.add(call_id)
-            elif item_type in {"function_call_output", "custom_tool_call_output"}:
-                call_id = str(item.get("call_id") or "")
-                if call_id:
-                    output_ids.add(call_id)
-    if call_ids - output_ids:
-        reasons.append("unpaired_tool_call")
-    reasoning = body.get("reasoning")
-    if isinstance(reasoning, dict) and reasoning.get("encrypted_content") and "encrypted_reasoning" not in reasons:
-        reasons.append("encrypted_reasoning")
-    return reasons
-
-
-def _responses_incomplete_tool_history(body: dict | None) -> bool:
-    """True when Responses input has tool calls without matching outputs.
-
-    Chat Completions cannot repair that shape. Downgrading it only repeats the
-    same 400 across fallback providers.
-    """
-    return "unpaired_tool_call" in _native_cross_provider_incompatible_reasons(body)
-
-
 def _stored_image_bytes(items) -> int:
     """日志统计用的字节数；文件被后台清理任务删除不能影响已成功的结果判定。"""
     total = 0
@@ -973,8 +617,8 @@ def _incomplete_tool_history_http_error(exc: Exception | None = None) -> HTTPExc
     return error
 
 
-def _native_empty_output_error(response: dict | None = None) -> _EmptyNativeResponsesError:
-    error = _EmptyNativeResponsesError("native Responses completed without client-visible output")
+def _native_empty_output_error(response: dict | None = None) -> EmptyNativeResponsesError:
+    error = EmptyNativeResponsesError("native Responses completed without client-visible output")
     _attach_request_details(
         error,
         native_empty_output=True,
@@ -999,11 +643,11 @@ async def _native_responses_stream_with_accounting(events, *, username, api_key_
     try:
         async for frame in iter_sse_frames(events):
             payload = sse_payload(frame)
-            has_output = _native_sse_payload_has_output(payload)
+            has_output = native_sse_payload_has_output(payload)
             if has_output and first_output_at is None:
                 first_output_at = time.monotonic()
             saw_output = saw_output or has_output
-            sse_error = _native_sse_error_message(payload)
+            sse_error = native_sse_error_message(payload)
             if sse_error:
                 failed = True
                 terminal_error = sse_error
@@ -1011,7 +655,7 @@ async def _native_responses_stream_with_accounting(events, *, username, api_key_
                 response_body = payload.get("response")
                 terminal_error = payload.get("error") or (response_body or {}).get("error")
                 failed = payload.get("type") != "response.completed"
-                if not failed and not saw_output and not _native_response_has_output(response_body):
+                if not failed and not saw_output and not native_response_has_output(response_body):
                     failed = True
                     terminal_error = "native Responses completed without client-visible output"
                 if not failed:
@@ -1023,13 +667,13 @@ async def _native_responses_stream_with_accounting(events, *, username, api_key_
                         streaming=True,
                         streaming_status="supported",
                         tool_types=capability.get("responses_tool_types") or [],
-                        expires_at=_responses_capability_expiry("supported"),
+                        expires_at=responses_capability_expiry("supported"),
                     )
             if payload and payload.get("type") == "response.output_item.done":
                 item = payload.get("item") or {}
-                if _native_completed_output_item(item):
+                if native_completed_output_item(item):
                     completed_output_item = True
-                observed = _observed_response_tool_types({"output": [item]})
+                observed = observed_response_tool_types({"output": [item]})
                 if observed:
                     capability = get_model_responses_capability(provider_id, model) or {}
                     update_model_responses_tool_types(provider_id, model, list(set(capability.get("responses_tool_types") or []) | observed))
@@ -1120,68 +764,6 @@ async def _native_responses_stream_with_accounting(events, *, username, api_key_
             _app_log.warning("[responses native accounting] failed: %s", accounting_exc)
 
 
-def _responses_capability_is_fresh(capability: dict | None) -> bool:
-    if not capability or not capability.get("responses_expires_at"):
-        return False
-    try:
-        return datetime.fromisoformat(capability["responses_expires_at"]) > datetime.now(timezone.utc)
-    except (TypeError, ValueError):
-        return False
-
-
-def _responses_tools_capability_is_fresh(capability: dict | None) -> bool:
-    if not capability or not capability.get("responses_tools_expires_at"):
-        return False
-    try:
-        return datetime.fromisoformat(capability["responses_tools_expires_at"]) > datetime.now(timezone.utc)
-    except (TypeError, ValueError):
-        return False
-
-
-def _responses_capability_expiry(status: str) -> str:
-    ttl_key = {
-        "supported": "responses_capability_supported_ttl",
-        "unsupported": "responses_capability_unsupported_ttl",
-    }.get(status, "responses_capability_transient_ttl")
-    fallback = 604800 if status == "supported" else 21600 if status == "unsupported" else 300
-    return (datetime.now(timezone.utc) + timedelta(seconds=max(0, int(get_default(ttl_key, fallback))))).isoformat()
-
-
-def _mark_model_responses_unknown(provider_id: str, model: str, error: Exception | str = "") -> None:
-    """Invalidate native capability after a transient upstream failure.
-
-    错误文本用 error_detail_for_log（含上游响应体），与 request_logs 的
-    native_failure_message 同口径；否则 responses_error 只剩 httpx 摘要，排障时
-    看不到真正的拒绝原因（审查 14 轮 #4）。
-    """
-    set_model_responses_capability(
-        provider_id, model, status="unknown",
-        expires_at=_responses_capability_expiry("transient"),
-        error=error_detail_for_log(error),
-    )
-
-
-def _native_error_is_explicitly_unsupported(exc: Exception) -> bool:
-    response = getattr(exc, "response", None)
-    status = getattr(exc, "status_code", None) or getattr(response, "status_code", None)
-    if status not in {400, 404, 405, 422, 501}:
-        return False
-    try:
-        detail = response.text.lower()
-    except Exception:
-        detail = str(exc).lower()
-    mentions_responses = any(marker in detail for marker in ("/responses", "responses api", "response api", "responses endpoint", "native responses"))
-    rejects_protocol = any(marker in detail for marker in (
-        "not supported", "unsupported", "not implemented", "unknown endpoint",
-        "method not allowed", "unprocessable", "invalid request",
-    ))
-    if status in {404, 405, 501}:
-        return mentions_responses or rejects_protocol
-    if status == 422:
-        return mentions_responses or rejects_protocol or not detail.strip()
-    return mentions_responses and rejects_protocol
-
-
 def _native_downgrade_details(exc: Exception, attempts: list[dict] | None = None) -> dict:
     """Describe a failed native attempt that was completed through compatibility."""
     response = getattr(exc, "response", None)
@@ -1205,110 +787,6 @@ def _native_downgrade_details(exc: Exception, attempts: list[dict] | None = None
     return details
 
 
-def _native_response_target_supported(target: RouteTarget, *, stream: bool, required_tool_types: set[str], is_primary: bool, has_tools: bool = False) -> tuple[dict | None, str]:
-    provider = resolve_provider(target.model, target.provider_id)
-    if not provider or provider.get("provider_type") != "openai":
-        return None, ""
-    capability = get_model_responses_capability(provider.get("id") or target.provider_id, target.model)
-    # Only a fresh explicit negative result prevents a real user request from
-    # attempting native Responses. Unknown, expired, and transient results are
-    # deliberately request-driven rechecks.
-    if _responses_capability_is_fresh(capability) and capability.get("responses_status") == "unsupported":
-        return None, ""
-    # Tool-shape negative: a request carrying tools skips native while a fresh
-    # tool-level negative is cached; text/stream requests stay on native.
-    if has_tools and _responses_tools_capability_is_fresh(capability) and capability.get("responses_tools_status") == "unsupported":
-        return None, ""
-    # ``responses_tool_types`` is learned from successful response output.  It is
-    # therefore positive evidence, not an exhaustive declaration of what an
-    # upstream can do.  Treating an absent entry as unsupported prevented a newly
-    # discovered native fallback from ever handling Codex tools (the generic
-    # capability probe deliberately does not execute tools).
-    #
-    # Keep accepting ``required_tool_types`` here so callers document why they
-    # selected native dispatch; explicit negative capability data can be added
-    # later without changing this boundary.
-    del stream, required_tool_types, is_primary
-    return provider, provider_for_log(provider, target.provider_id)
-
-
-async def _probe_model_responses_capability(provider: dict, model: str) -> bool:
-    """Probe native Responses support and cache the result per provider/model.
-
-    A normal OpenAI-compatible provider is not proof of Responses support.  The
-    probe intentionally requires a valid Responses object.  Explicit protocol
-    rejections (and incomplete 422s) are cached as unsupported.  Generic 400s
-    and transient 5xx/network failures stay unknown so a request-level validation
-    error cannot disable native Responses for hours.
-    """
-    provider_id = str(provider.get("id") or "")
-    probe = responses_to_internal({
-        "model": model,
-        "input": "capability probe",
-        "stream": False,
-        "max_output_tokens": max(1, int(get_default("responses_capability_probe_max_output_tokens", 16))),
-    })
-    probe.target_model = model
-    probe.provider_id = provider_id
-    try:
-        probe_provider = dict(provider)
-        probe_provider["request_timeout"] = max(1, int(get_default("responses_capability_probe_timeout", 8)))
-        payload = await post_native_response(probe_provider, probe)
-        supported = isinstance(payload, dict) and payload.get("object") == "response"
-        if supported:
-            set_model_responses_capability(
-                provider_id, model, status="supported",
-                streaming=False, streaming_status="unknown",
-                error=_RESPONSES_CAPABILITY_PROBE_MARKER,
-                expires_at=_responses_capability_expiry("supported"),
-            )
-        return supported
-    except Exception as exc:
-        response = getattr(exc, "response", None)
-        status = getattr(exc, "status_code", None) or getattr(response, "status_code", None)
-        # Incomplete 422s are a practical unsupported signal for Chat-only or
-        # partial Responses proxies.  Generic 400s are not: request-level
-        # validation errors must not be cached as a missing protocol.  Other
-        # 4xx responses are only negative when the body explicitly identifies
-        # the Responses endpoint/protocol as unsupported.
-        explicitly_unsupported = _native_error_is_explicitly_unsupported(exc)
-        if explicitly_unsupported or status == 422:
-            set_model_responses_capability(
-                provider_id, model, status="unsupported",
-                expires_at=_responses_capability_expiry("unsupported"),
-                error=error_detail_for_log(exc),
-            )
-        else:
-            _mark_model_responses_unknown(provider_id, model, exc)
-        return False
-
-
-async def _native_capability_for_request(provider: dict | None, model: str, has_tools: bool = False) -> bool:
-    if not provider or provider.get("provider_type") != "openai":
-        return False
-    if provider.get("force_chat_completions"):
-        return False
-    provider_id = str(provider.get("id") or "")
-    capability = get_model_responses_capability(provider_id, model)
-    # 工具形态级负向：含 tools 的请求直接走 Chat（兼容性路径会按策略处理工具），
-    # 文本/流式请求不受影响，继续原生。
-    if has_tools and _responses_tools_capability_is_fresh(capability) and capability.get("responses_tools_status") == "unsupported":
-        return False
-    if _responses_capability_is_fresh(capability):
-        status = capability.get("responses_status")
-        if status == "supported":
-            # Legacy optimistic supported rows are revalidated once.
-            return capability.get("responses_error") == _RESPONSES_CAPABILITY_PROBE_MARKER
-        if status == "unsupported":
-            return False
-        if status == "unknown":
-            # A recent real request or capability probe already failed for a
-            # transient/request-specific reason. Honor the transient TTL as a
-            # native retry backoff and use the Chat compatibility path meanwhile.
-            return False
-    return await _probe_model_responses_capability(provider, model)
-
-
 async def _wait_for_native_response_output(events) -> bytes:
     """Buffer native SSE until usable output, rejecting empty completion before fallback."""
     buffered = b""
@@ -1319,11 +797,11 @@ async def _wait_for_native_response_output(events) -> bytes:
         while (split := split_sse_frame(buffered)) is not None:
             frame, rest = split
             payload = sse_payload(frame)
-            saw_output = saw_output or _native_sse_payload_has_output(payload)
+            saw_output = saw_output or native_sse_payload_has_output(payload)
             if saw_output:
                 return buffered
             if payload:
-                sse_error = _native_sse_error_message(payload)
+                sse_error = native_sse_error_message(payload)
                 if sse_error:
                     error = RuntimeError(sse_error)
                     _attach_request_details(error, native_failure_reason="sse_error")
@@ -1335,7 +813,7 @@ async def _wait_for_native_response_output(events) -> bytes:
                     raise error
                 if event_type == "response.completed":
                     response = payload.get("response")
-                    if not saw_output and not _native_response_has_output(response):
+                    if not saw_output and not native_response_has_output(response):
                         raise _native_empty_output_error(response)
                     return buffered
             buffered = rest
@@ -1353,7 +831,7 @@ async def _native_response_with_fallbacks(internal, *, stream: bool, required_to
     # advanced Responses request is rejected before it can reach a compatible
     # fallback provider.  An empty trigger intentionally ignores error-trigger
     # gates because no upstream request has been made yet.
-    primary_provider, _primary_provider_id = _native_response_target_supported(
+    primary_provider, _primary_provider_id = native_response_target_supported(
         primary, stream=stream, required_tool_types=required_tool_types, is_primary=True, has_tools=has_tools,
     )
     if primary_provider is None:
@@ -1367,14 +845,14 @@ async def _native_response_with_fallbacks(internal, *, stream: bool, required_to
     attempts = []
     while index < len(targets):
         target = targets[index]
-        provider, provider_id = _native_response_target_supported(target, stream=stream, required_tool_types=required_tool_types, is_primary=index == 0, has_tools=has_tools)
+        provider, provider_id = native_response_target_supported(target, stream=stream, required_tool_types=required_tool_types, is_primary=index == 0, has_tools=has_tools)
         if provider is None:
             attempts.append({"index": index, "stage": "primary" if index == 0 else "fallback", "target": target.model, "provider_id": target.provider_id, "status": "skipped", "reason": "capability_mismatch"})
             index += 1
             continue
         if index > 0:
             native_body = (internal.metadata.get("responses_native") or {}).get("request_body") or internal.raw_body
-            incompatible = _native_cross_provider_incompatible_reasons(native_body)
+            incompatible = cross_provider_incompatible_reasons(native_body)
             if incompatible:
                 attempts.append({
                     "index": index,
@@ -1408,30 +886,30 @@ async def _native_response_with_fallbacks(internal, *, stream: bool, required_to
                 attempts.append({"index": index, "stage": "primary" if index == 0 else "fallback", "target": target.model, "provider_id": provider_id, "status": "success"})
                 return prefixed(), target, provider_id, attempts
             response = await post_native_response(provider, attempt)
-            if not _native_response_has_output(response):
+            if not native_response_has_output(response):
                 raise _native_empty_output_error(response)
             attempts.append({"index": index, "stage": "primary" if index == 0 else "fallback", "target": target.model, "provider_id": provider_id, "status": "success"})
             set_model_responses_capability(
                 provider_id, target.model, status="supported",
                 streaming=False, streaming_status="unknown",
-                error=_RESPONSES_CAPABILITY_PROBE_MARKER,
-                expires_at=_responses_capability_expiry("supported"),
+                error=RESPONSES_CAPABILITY_PROBE_MARKER,
+                expires_at=responses_capability_expiry("supported"),
             )
             if has_tools:
                 # 带 tools 的原生成功是工具形态的正向证据，解除既有负向记录。
                 set_model_responses_tools_capability(
                     provider_id, target.model, status="supported",
-                    expires_at=_responses_capability_expiry("supported"),
+                    expires_at=responses_capability_expiry("supported"),
                 )
             return response, target, provider_id, attempts
         except Exception as exc:
             last_exc = exc
             is_empty_native = bool(getattr(exc, "native_empty_output", False))
-            is_protocol_unsupported = _native_error_is_explicitly_unsupported(exc)
+            is_protocol_unsupported = native_error_is_explicitly_unsupported(exc)
             error_status = upstream_status_code(exc)
             tool_shape_rejection = bool(internal.tools) and error_status is not None and 400 <= error_status <= 499
             if is_protocol_unsupported:
-                set_model_responses_capability(provider_id, target.model, status="unsupported", expires_at=_responses_capability_expiry("unsupported"), error=error_detail_for_log(exc))
+                set_model_responses_capability(provider_id, target.model, status="unsupported", expires_at=responses_capability_expiry("unsupported"), error=error_detail_for_log(exc))
             elif tool_shape_rejection:
                 # 含 tools 请求收到权威 4xx（如 thinking 模式拒绝强制 tool_choice、上游不支持
                 # custom 工具）只证明“工具形态”不被原生支持：记工具形态级负向能力，
@@ -1441,7 +919,7 @@ async def _native_response_with_fallbacks(internal, *, stream: bool, required_to
                 # 保持能力会让每个请求都撞原生硬失败（审查 15 轮回归教训）。
                 set_model_responses_tools_capability(
                     provider_id, target.model, status="unsupported",
-                    expires_at=_responses_capability_expiry("unsupported"),
+                    expires_at=responses_capability_expiry("unsupported"),
                     error=error_detail_for_log(exc),
                 )
                 _app_log.info(
@@ -1449,10 +927,10 @@ async def _native_response_with_fallbacks(internal, *, stream: bool, required_to
                     error_status, provider_id, target.model,
                 )
             else:
-                # 真空白响应（零 output item，含 _EmptyNativeResponsesError）无“请求形态”归因，
+                # 真空白响应（零 output item，含 EmptyNativeResponsesError）无“请求形态”归因，
                 # 是上游原生实现不可用的直接证据，仍记 transient 300s 自保护
                 # （实现决定，缘由审查 14 轮 #3 提出）。
-                _mark_model_responses_unknown(provider_id, target.model, exc)
+                mark_model_responses_unknown(provider_id, target.model, exc)
             attempts.append({"index": index, "stage": "primary" if index == 0 else "fallback", "target": target.model, "provider_id": provider_id, "status": "failed", "trigger": classify_upstream_error(exc), "error": error_detail_for_log(exc)})
             if index == 0:
                 decision = apply_fallback_policy(provider_id, target.model, classify_upstream_error(exc))
@@ -1501,7 +979,6 @@ async def _native_response_with_fallbacks(internal, *, stream: bool, required_to
         error.required_tool_types = sorted(required_tool_types)
     _attach_request_details(error, fallback_attempts=attempts, fallback_status="exhausted", responses_stateful=bool(stateful_markers), responses_state_markers=stateful_markers)
     raise error
-
 
 
 def _attach_request_details(exc: Exception, **details) -> Exception:
@@ -3221,15 +2698,16 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
     provider_info = resolve_provider(model, provider_id)
     adapter_provider_id = provider_for_log(provider_info, provider_id)
 
-    # Image-generation bridge for chat clients. Mirror the /responses entry
-    # rules: require an explicit image request on an image-capable model.
-    # Works for both streaming and non-streaming requests: streaming buffers
-    # the upstream stream, collapses it into a planner message, then runs the
-    # same bridge loop (see the stream branch below).
+    # Image-generation bridge for chat clients. 现代 harness 约定：工具可用性
+    # 只由模型能力 + 后端配置决定（should_inject_image_bridge），调用时机由模型
+    # 自主决定，成本由每会话生图预算后置控制（state.charge_image_generation_budget）。
+    # 纯模型驱动：工具可用性只由模型能力 + 后端配置决定，调用时机完全由模型
+    # 自主决定。注入了 bridge 工具后流式一律走缓冲路径（模型可能在任何一轮
+    # 调用工具，网关必须在转发前看到完整响应才能执行生图）；模型不调用就
+    # 原样 passthrough，不做任何意图判断或强制纠正。
     image_enabled = bool(provider_info and get_model_image_generation(adapter_provider_id, model))
     chat_user_text = _chat_latest_user_text(internal)
-    image_request_intent = is_image_generation_intent_text(chat_user_text)
-    image_bridge = image_enabled and image_request_intent
+    image_bridge = should_inject_image_bridge(image_enabled=image_enabled)
     if image_bridge:
         configure_internal_image_bridge(internal, body)
         _app_log.info(
@@ -3239,163 +2717,165 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
 
     try:
         if stream:
-            if image_bridge:
-                # Streaming image bridge: buffer the upstream stream, collapse
-                # it into a planner message, then run the same bridge loop as
-                # the non-streaming path. The generated-image result is
-                # rendered as a chat SSE event sequence; if the model chose
-                # not to generate, the buffered stream is passed through.
-                events = _stream_events_with_fallbacks(
-                    internal, temperature=temperature, max_tokens=max_tokens,
-                    log_label="chat.image_bridge",
-                )
-                buffered = [ev async for ev in events]
-                planner_output = _events_to_message(buffered)
-                _maybe_repair_tool_leak(planner_output, internal, endpoint="chat.image_bridge", provider_id=adapter_provider_id)
-                model = internal.target_model
-                provider_id = internal.provider_id
-
-                configured_generator = _resolved_image_generator(get_enabled_image_generator() or {})
-                image_provider, image_model = _image_generator_identity(configured_generator)
-                image_provider = image_provider or adapter_provider_id
-                image_model = image_model or model
-                running_details = {
-                    **routing_details_from_policy(policy),
-                    **_thinking_fields_from_payload(body),
-                    "request_kind": "image_generation",
-                    "chat_mode": "model_driven_image_generation_running",
-                    "upstream_endpoint": "images/generations",
-                    "image_model": image_model,
-                    "image_backend_provider": image_provider,
-                    "image_backend_model": image_model,
-                    "image_backend_type": str(configured_generator.get("backend_type") or ""),
-                    "image_fallback_status": "unused",
-                    "image_requested_count": 0,
-                    "image_succeeded_count": 0,
-                    "image_failed_count": 0,
-                    "image_count": 0,
-                    "image_bytes": 0,
-                    "image_artifact_count": 0,
-                    "stream": True,
-                    "status": "running",
-                }
-                _image_log_id_box = [0]
-
-                def _record_running():
-                    _image_log_id_box[0] = _record_request_log(
-                        endpoint="chat_completions", username=username, api_key_value=api_key_value,
-                        requested_model=requested_model, final_model=model,
-                        final_provider=image_provider, request_body=body,
-                        response_body=None, success=True, status="running", tokens=0,
-                        details=running_details, stream=True,
-                    )
-                    return _image_log_id_box[0]
-
-                def _on_progress(progress_details):
-                    _record_request_log(
-                        endpoint="chat_completions", username=username, api_key_value=api_key_value,
-                        requested_model=requested_model, final_model=model,
-                        final_provider=image_provider, request_body=body,
-                        response_body=None, success=True, status="running", tokens=0,
-                        details=progress_details, stream=True, log_id=_image_log_id_box[0],
-                    )
-
-                def _describe_upstream(out, provider_id):
-                    details = _output_request_details(out)
-                    final_model = _target_model_for_log(
-                        RouteTarget(model=internal.target_model, provider_id=provider_id),
-                        provider_id,
-                    )
-                    return details, final_model, provider_id
-
-                outcome = await run_image_bridge(
-                    internal, policy=policy, model=model, temperature=temperature, max_tokens=max_tokens,
-                    base_details={**routing_details_from_policy(policy), **_thinking_fields_from_payload(body)},
-                    running_details=running_details,
-                    configured_generator=configured_generator,
-                    planner_output=planner_output,
-                    planner_provider_info=provider_info,
-                    planner_provider_id=adapter_provider_id,
-                    allow_correction=image_request_intent,
-                    has_client_image_exec_tool=False,
-                    call_model=_call_nonstream_with_fallbacks,
-                    execute_invocations=lambda invocations, progress=None: _execute_image_invocations(
-                        body, username=username, api_key_value=api_key_value, invocations=invocations, progress=progress,
-                    ),
-                    build_artifacts=lambda stored, args, start_index, used_filenames: _stored_image_artifacts(
-                        request, stored, arguments=args, start_index=start_index, used_filenames=used_filenames,
-                    ),
-                    render_client_output=lambda results, stored, artifacts, usage: (
-                        _generated_image_markdown_output(results, stored, artifacts, usage), "markdown"
-                    ),
-                    latest_user_text=lambda: chat_user_text,
-                    record_running=_record_running,
-                    on_progress=_on_progress,
-                    describe_upstream=_describe_upstream,
-                    merge_upstream=_merge_bridge_request_details,
-                    log_label="chat.image_bridge",
-                )
-                if outcome is not None:
-                    image_events = _message_to_events(outcome.image_output)
-                    # The image was generated out-of-band (buffer-and-replay), so
-                    # the client would otherwise sit on a silent stream for the
-                    # whole generation. Emit a short notice first so it can show
-                    # "generating..." instead of appearing hung.
-                    image_events.insert(0, InternalOutputEvent(
-                        kind="text_delta", text="（正在生成图片，请稍候…）\n\n",
-                    ))
-                    details = apply_outcome_to_details(outcome.details, success=True)
-                    details["stream"] = True
-                    _log_request(username, api_key_value, outcome.bridge_final_model, outcome.bridge_final_provider, "chat_completions", True, outcome.tokens, requested_model, details=details)
-                    _record_request_log(
-                        endpoint="chat_completions", username=username, api_key_value=api_key_value,
-                        requested_model=requested_model, final_model=outcome.bridge_final_model,
-                        final_provider=outcome.bridge_final_provider, request_body=body,
-                        response_body=None, success=True, status=outcome.request_status, tokens=outcome.tokens,
-                        usage=outcome.usage, details=details, log_id=_image_log_id_box[0],
-                    )
-                    _record_success_metrics(username, api_key_value, outcome.tokens, outcome.request_status)
-                    return StreamingResponse(
-                        render_chat_completions_sse(
-                            _async_event_stream(image_events), model=outcome.bridge_final_model,
-                            include_usage=bool((body.get("stream_options") or {}).get("include_usage")),
-                        ),
-                        media_type="text/event-stream",
-                    )
-                # Model chose not to generate: passthrough the buffered stream,
-                # hiding the gateway's private bridge tool call from the client.
-                passthrough_events = [
-                    ev for ev in buffered
-                    if not (ev.kind in ("tool_call_start", "tool_call_arguments_delta", "tool_call_done")
-                            and ev.name == IMAGE_BRIDGE_TOOL_NAME)
-                ]
-                return StreamingResponse(
-                    _stream_internal_output(
-                        events=_async_event_stream(passthrough_events),
-                        endpoint="chat_completions",
-                        model=model,
-                        username=username,
-                        api_key_value=api_key_value,
-                        provider_id=adapter_provider_id,
-                        requested_model=requested_model,
-                        log_request=_log_request,
-                        record_request_log=_build_stream_recorder("chat_completions", username, api_key_value, requested_model, body),
-                        conv_key=conv_key,
-                        remember_reasoning_content=_remember_reasoning_content,
-                        tool_only_turns=_tool_only_turns,
-                        base_details={**routing_details_from_policy(policy), **_thinking_fields_from_payload(body)},
-                        render_extra={"include_usage": bool((body.get("stream_options") or {}).get("include_usage"))},
-                        declared_tools=internal.tools,
-                    ),
-                    media_type="text/event-stream"
-                )
-
             events = _stream_events_with_fallbacks(
                 internal,
                 temperature=temperature,
                 max_tokens=max_tokens,
-                log_label="chat",
+                log_label="chat" if not image_bridge else "chat.image_bridge",
             )
+            if image_bridge:
+                # 真流式 + 流末续接：文本实时转发给客户端；上游流结束时若模型
+                # 调用了 bridge 工具，在这里执行生图并把结果作为同一 SSE 流的
+                # 续接事件（客户端看到：实时文本 -> 暂停生成 -> 图片结果/续轮）。
+                bridge_call_events: list = []
+                forwarded_tool_indexes: set = set()
+                image_log_id_box = [0]
+                source_events = events  # 闭包晚绑定：先固定上游事件流，避免下方 events 重绑定后迭代到自身
+
+                async def _run_bridge_continuation():
+                    planner_output = _events_to_message(bridge_call_events)
+                    _maybe_repair_tool_leak(planner_output, internal, endpoint="chat.image_bridge", provider_id=adapter_provider_id)
+                    bridge_model = internal.target_model
+
+                    configured_generator = _resolved_image_generator(get_enabled_image_generator() or {})
+                    image_provider, image_model = _image_generator_identity(configured_generator)
+                    image_provider = image_provider or adapter_provider_id
+                    image_model = image_model or bridge_model
+                    running_details = {
+                        **routing_details_from_policy(policy),
+                        **_thinking_fields_from_payload(body),
+                        "request_kind": "image_generation",
+                        "chat_mode": "model_driven_image_generation_running",
+                        "upstream_endpoint": "images/generations",
+                        "image_model": image_model,
+                        "image_backend_provider": image_provider,
+                        "image_backend_model": image_model,
+                        "image_backend_type": str(configured_generator.get("backend_type") or ""),
+                        "image_fallback_status": "unused",
+                        "image_requested_count": 0,
+                        "image_succeeded_count": 0,
+                        "image_failed_count": 0,
+                        "image_count": 0,
+                        "image_bytes": 0,
+                        "image_artifact_count": 0,
+                        "stream": True,
+                        "status": "running",
+                    }
+                    def _record_running():
+                        image_log_id_box[0] = _record_request_log(
+                            endpoint="chat_completions", username=username, api_key_value=api_key_value,
+                            requested_model=requested_model, final_model=bridge_model,
+                            final_provider=image_provider, request_body=body,
+                            response_body=None, success=True, status="running", tokens=0,
+                            details=running_details, stream=True,
+                        )
+                        return image_log_id_box[0]
+
+                    def _on_progress(progress_details):
+                        _record_request_log(
+                            endpoint="chat_completions", username=username, api_key_value=api_key_value,
+                            requested_model=requested_model, final_model=bridge_model,
+                            final_provider=image_provider, request_body=body,
+                            response_body=None, success=True, status="running", tokens=0,
+                            details=progress_details, stream=True, log_id=image_log_id_box[0],
+                        )
+
+                    def _describe_upstream(out, provider_id):
+                        details = _output_request_details(out)
+                        final_model = _target_model_for_log(
+                            RouteTarget(model=internal.target_model, provider_id=provider_id),
+                            provider_id,
+                        )
+                        return details, final_model, provider_id
+
+                    outcome = await run_image_bridge(
+                        internal, policy=policy, model=bridge_model, temperature=temperature, max_tokens=max_tokens,
+                        base_details={**routing_details_from_policy(policy), **_thinking_fields_from_payload(body)},
+                        running_details=running_details,
+                        configured_generator=configured_generator,
+                        planner_output=planner_output,
+                        planner_provider_info=provider_info,
+                        planner_provider_id=adapter_provider_id,
+                        has_client_image_exec_tool=False,
+                        call_model=_call_nonstream_with_fallbacks,
+                        execute_invocations=lambda invocations, progress=None: _execute_image_invocations(
+                            body, username=username, api_key_value=api_key_value, invocations=invocations, progress=progress,
+                        ),
+                        build_artifacts=lambda stored, args, start_index, used_filenames: _stored_image_artifacts(
+                            request, stored, arguments=args, start_index=start_index,
+                            used_filenames=used_filenames,
+                        ),
+                        render_client_output=lambda results, stored, artifacts, usage: (
+                            chat_image_url_only_output(results, stored, artifacts, usage), "markdown"
+                        ),
+                        latest_user_text=lambda: chat_user_text,
+                        record_running=_record_running,
+                        on_progress=_on_progress,
+                        describe_upstream=_describe_upstream,
+                        merge_upstream=_merge_bridge_request_details,
+                        log_label="chat.image_bridge",
+                    )
+                    if outcome is None:
+                        return
+                    if outcome.display_mode == "passthrough":
+                        _app_log.info(
+                            "[chat.image_bridge passthrough] model=%s provider=%s tool_calls=%d",
+                            outcome.bridge_final_model, outcome.bridge_final_provider or "-",
+                            len(outcome.image_output.tool_calls),
+                        )
+                    else:
+                        # 生图是流末续接执行，客户端已收到实时文本，先发一条
+                        # 提示避免看起来卡住。
+                        yield InternalOutputEvent(
+                            kind="text_delta", text="\n\n（正在生成图片，请稍候…）\n\n",
+                        )
+                    for ev in _message_to_events(outcome.image_output):
+                        if (
+                            ev.kind == "message_done"
+                            and forwarded_tool_indexes
+                            and (ev.finish_reason or "stop") != "tool_calls"
+                        ):
+                            # 同轮已实时转发过客户端工具调用：最终 finish_reason
+                            # 必须是 tool_calls，否则客户端会把工具轮当文本轮收尾。
+                            ev = replace(ev, finish_reason="tool_calls")
+                        yield ev
+
+                async def _live_bridge_events():
+                    async for ev in source_events:
+                        if (
+                            ev.kind in ("tool_call_start", "tool_call_arguments_delta", "tool_call_done")
+                            and ev.name == IMAGE_BRIDGE_TOOL_NAME
+                        ):
+                            bridge_call_events.append(ev)
+                            continue
+                        if ev.kind == "tool_call_start":
+                            forwarded_tool_indexes.add(ev.tool_index)
+                        if ev.kind == "message_done" and bridge_call_events:
+                            # renderer 在 message_done 处终止迭代（源流不会被耗尽），
+                            # 所以 bridge 必须在转发 message_done 之前执行；续接事件
+                            # 自带最终 message_done。
+                            async for cont in _run_bridge_continuation():
+                                yield cont
+                            return
+                        yield ev
+                    if bridge_call_events:
+                        # 上游流在 message_done 前就结束（异常截断等）：兜底续接。
+                        async for cont in _run_bridge_continuation():
+                            yield cont
+
+                events = _live_bridge_events()
+                # 生图 bridge 会先记一行 "running" 日志；流编排器的最终日志复用
+                # 同一 log_id 覆盖它，避免请求列表里留下中间态记录。
+                _base_stream_recorder = _build_stream_recorder("chat_completions", username, api_key_value, requested_model, body)
+
+                def _bridge_aware_stream_recorder(**payload):
+                    if image_log_id_box[0]:
+                        payload["log_id"] = image_log_id_box[0]
+                    _base_stream_recorder(**payload)
+
+                record_request_log = _bridge_aware_stream_recorder
+            else:
+                record_request_log = _build_stream_recorder("chat_completions", username, api_key_value, requested_model, body)
             return StreamingResponse(
                 _stream_internal_output(
                     events=events,
@@ -3406,7 +2886,7 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
                     provider_id=adapter_provider_id,
                     requested_model=requested_model,
                     log_request=_log_request,
-                    record_request_log=_build_stream_recorder("chat_completions", username, api_key_value, requested_model, body),
+                    record_request_log=record_request_log,
                     conv_key=conv_key,
                     remember_reasoning_content=_remember_reasoning_content,
                     tool_only_turns=_tool_only_turns,
@@ -3498,7 +2978,6 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
                 planner_output=output,
                 planner_provider_info=provider_info,
                 planner_provider_id=adapter_provider_id,
-                allow_correction=image_request_intent,
                 has_client_image_exec_tool=False,
                 call_model=_call_nonstream_with_fallbacks,
                 execute_invocations=lambda invocations, progress=None: _execute_image_invocations(
@@ -3510,7 +2989,7 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
                     used_filenames=used_filenames,
                 ),
                 render_client_output=lambda results, stored, artifacts, usage: (
-                    _generated_image_markdown_output(results, stored, artifacts, usage), "markdown"
+                    chat_image_url_only_output(results, stored, artifacts, usage), "markdown"
                 ),
                 latest_user_text=lambda: chat_user_text,
                 record_running=_record_running,
@@ -3990,16 +3469,18 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
     )
     provider_info = resolve_provider(model, provider_id)
     adapter_provider_id = provider_for_log(provider_info, provider_id)
-    image_tool = _responses_image_generation_tool(body)
+    # Responses wire-level request flags are computed once at ingress and
+    # carried in IR metadata; endpoint code must not re-parse the raw body.
+    meta = internal.metadata
+    image_tool = meta.get("image_generation_tool")
     explicit_image_choice = isinstance(body.get("tool_choice"), dict) and body["tool_choice"].get("type") == "image_generation"
     image_enabled = bool(provider_info and get_model_image_generation(adapter_provider_id, model))
-    system_turn = _responses_is_system_turn(body)
-    image_request_intent = is_image_generation_intent(input_data, instructions)
+    system_turn = bool(meta.get("is_system_turn"))
     # Sub2API leaves Codex's client-owned image_gen namespace intact.  The
     # first Responses turn must therefore return a namespaced function_call;
     # Codex will then call /images/generations itself.  Do not replace this
     # protocol with the gateway's synthetic image_generation_call response.
-    codex_image_tool = has_codex_image_function_tool(body)
+    codex_image_tool = bool(meta.get("has_codex_image_function_tool"))
     image_bridge = False
 
     # A forced hosted-tool choice is an explicit invocation and can execute
@@ -4012,7 +3493,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
             raise HTTPException(status_code=400, detail="Image generation cannot use previous_response_id")
         if not image_enabled:
             raise HTTPException(status_code=403, detail="Image generation is not enabled for the requested model")
-        prompt = _responses_image_prompt(input_data, instructions)
+        prompt = str(meta.get("latest_user_prompt") or "")
         try:
             image_results, generator = await _generate_with_configured_backend(prompt, {
                 "n": image_tool.get("n") or body.get("n"),
@@ -4085,31 +3566,17 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
         _record_success_metrics(username, api_key_value, 0, "ok")
         return rendered
 
-    # Match sub2api's public transform, but project the hosted tool to an
-    # internal function because this gateway's configured image backend is
-    # separate from the chat provider. Keep the capability on display-result
-    # follow-up turns: a project can require several distinct assets over
-    # multiple Codex tool rounds. Idempotency and the per-request invocation
-    # budget prevent duplicate loops; merely having one result in history must
-    # not disable the remaining task's image capability.
-    # Model capability is not user intent.  Injecting the private bridge for
-    # every request made to an image-capable model causes ordinary Responses
-    # traffic (including code/tool turns) to be routed through the image
-    # planner and makes its logs look like image-generation requests.
-    # Require an explicit image request or an explicit hosted image tool; the
-    # two follow-up markers preserve an already-started gateway image flow.
-    should_bridge_image = (
-        image_request_intent
-        or image_tool is not None
-        or image_display_followup
-        or bool(image_asset_context)
+    # 现代 harness 约定：桥接工具可用性只由模型能力 + 后端配置决定
+    # （should_inject_image_bridge，与 chat 端点同一入口，/messages 未来扩展
+    # 直接复用），调用时机由模型自主决定，成本由每会话生图预算后置控制。
+    # system turn 与客户端自有的 Codex image_gen 命名空间除外（前者没有用户
+    # 请求上下文，后者走客户端自持的 /images/generations 回路）。
+    should_bridge_image = should_inject_image_bridge(
+        image_enabled=image_enabled,
+        system_turn=system_turn,
+        has_codex_image_function_tool=codex_image_tool,
     )
-    if (
-        image_enabled
-        and should_bridge_image
-        and not system_turn
-        and not has_codex_image_function_tool(body)
-    ):
+    if should_bridge_image:
         inject_hosted_image_capability(body)
         configure_internal_image_bridge(internal, body)
         image_bridge = True
@@ -4235,16 +3702,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                 planner_output=output,
                 planner_provider_info=provider_info,
                 planner_provider_id=adapter_provider_id,
-                allow_correction=(
-                    image_request_intent
-                    and not codex_image_tool
-                    and not has_codex_generated_image_exec_tool(body)
-                    and not image_display_followup
-                    and not image_already_generated
-                    and not system_turn
-                    and not _responses_has_prior_assistant(input_data)
-                ),
-                has_client_image_exec_tool=has_codex_generated_image_exec_tool(body),
+                has_client_image_exec_tool=bool(meta.get("has_codex_generated_image_exec_tool")),
                 call_model=_call_nonstream_with_fallbacks,
                 execute_invocations=lambda invocations, progress=None: _execute_image_invocations(
                     body, username=username, api_key_value=api_key_value,
@@ -4254,8 +3712,9 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                     request, stored, arguments=args, start_index=start_index,
                     used_filenames=used_filenames,
                 ),
-                render_client_output=lambda results, stored, artifacts, usage: _generated_image_client_output(
-                    body, results, stored, artifacts, usage,
+                render_client_output=lambda results, stored, artifacts, usage: generated_image_client_output(
+                    bool(meta.get("has_codex_generated_image_exec_tool")),
+                    results, stored, artifacts, usage,
                 ),
                 latest_user_text=lambda: latest_user_text(input_data),
                 record_running=_record_running,
@@ -4349,12 +3808,12 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
             _record_success_metrics(username, api_key_value, tokens, details.get("status", "ok"))
             return rendered
 
-        native_required = _responses_requires_native(body)
-        required_tool_types = _responses_required_tool_types(body)
-        stateful_markers = _responses_stateful_tool_markers(body)
+        native_required = list(meta.get("requires_native_responses") or [])
+        required_tool_types = set(meta.get("required_tool_types") or [])
+        stateful_markers = list(meta.get("stateful_tool_markers") or [])
         capability = get_model_responses_capability(adapter_provider_id, model) if provider_info else None
         native_downgrade_details = {}
-        native_supported = await _native_capability_for_request(provider_info, model, has_tools=bool(body.get("tools")))
+        native_supported = await native_capability_for_request(provider_info, model, has_tools=bool(body.get("tools")))
         _app_log.info(
             "[responses capability] provider=%s model=%s native=%s",
             adapter_provider_id or "-", model, native_supported,
@@ -4394,7 +3853,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                 tokens = usage.get("total_tokens") or (usage.get("input_tokens", 0) + usage.get("output_tokens", 0))
                 if rendered.get("id"):
                     _remember_response_chain_key(rendered["id"], conv_key)
-                observed = _observed_response_tool_types(rendered)
+                observed = observed_response_tool_types(rendered)
                 if observed:
                     capability = get_model_responses_capability(adapter_provider_id, model) or {}
                     update_model_responses_tool_types(adapter_provider_id, model, list(set(capability.get("responses_tool_types") or []) | observed))
@@ -4406,8 +3865,8 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                 return rendered
             except Exception as native_error:
                 native_attempts = list(getattr(native_error, "request_details", {}).get("fallback_attempts", []) or [])
-                client_owned_tools = _responses_client_owned_tool_markers(body)
-                if _responses_incomplete_tool_history(body):
+                client_owned_tools = list(meta.get("client_owned_tool_markers") or [])
+                if meta.get("incomplete_tool_history"):
                     # Chat Completions cannot invent missing tool outputs.
                     # Downgrading this shape only repeats the same 400 across
                     # every fallback provider.
@@ -4426,7 +3885,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                     # Codex custom/namespace tools and other native-only
                     # features must not silently fall back to Chat.  The Chat
                     # adapter can still serve ordinary text/function requests.
-                    if getattr(native_error, "native_capability_unavailable", False) or _native_error_is_explicitly_unsupported(native_error):
+                    if getattr(native_error, "native_capability_unavailable", False) or native_error_is_explicitly_unsupported(native_error):
                         raise HTTPException(status_code=422, detail=(
                             "No configured provider supports native Responses required by this request: "
                             + ", ".join(native_required or client_owned_tools)
@@ -4435,7 +3894,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                 _app_log.warning("[responses native fallback] no native target succeeded; downgrading basic request: %s", error_detail_for_log(native_error))
                 native_downgrade_details = _native_downgrade_details(native_error, native_attempts)
 
-        if _responses_incomplete_tool_history(body):
+        if meta.get("incomplete_tool_history"):
             raise _incomplete_tool_history_http_error()
 
         # The initial minimal policy deliberately leaves a native payload untouched.
@@ -4900,5 +4359,6 @@ def _build_stream_recorder(
             details=payload.get('details') or {},
             partial_output=payload.get('partial_output', False),
             error_message=payload.get('error_message'),
+            log_id=payload.get('log_id'),
         )
     return _record

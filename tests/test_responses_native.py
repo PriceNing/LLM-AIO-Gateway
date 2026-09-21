@@ -2,20 +2,27 @@ import pytest
 import httpx
 from datetime import datetime, timedelta, timezone
 
-from app.adapters.responses import iter_sse_frames, native_responses_body, responses_url, sse_payload
+from app.adapters.responses import (
+    iter_sse_frames,
+    native_responses_body,
+    observed_response_tool_types as _observed_response_tool_types,
+    responses_url,
+    sse_payload,
+)
 from app.core.types import InternalRequest
 from app.protocols.ingress import responses_to_internal
+from app.protocols.responses_features import requires_native as _responses_requires_native, required_tool_types as _responses_required_tool_types, stateful_tool_markers as _responses_stateful_tool_markers
 from app.router.proxy import (
     _native_responses_stream_with_accounting,
     _native_response_with_fallbacks,
-    _observed_response_tool_types,
-    _responses_requires_native,
-    _responses_required_tool_types,
-    _native_response_target_supported,
     _native_downgrade_details,
     _wait_for_native_response_output,
-    _native_capability_for_request,
-    _RESPONSES_CAPABILITY_PROBE_MARKER,
+)
+from app.services.responses_capability import (
+    RESPONSES_CAPABILITY_PROBE_MARKER,
+    native_capability_for_request as _native_capability_for_request,
+    native_response_target_supported as _native_response_target_supported,
+    probe_model_responses_capability as _probe_model_responses_capability,
 )
 from app.core.policy import RouteTarget
 from app.config import load_config
@@ -126,7 +133,7 @@ async def test_force_chat_completions_skips_responses_probe(monkeypatch):
     provider = {"id": "llamacpp", "provider_type": "openai", "force_chat_completions": True}
     async def fail_probe(*args, **kwargs):
         raise AssertionError("Responses probe should be skipped")
-    monkeypatch.setattr("app.router.proxy._probe_model_responses_capability", fail_probe)
+    monkeypatch.setattr("app.services.responses_capability.probe_model_responses_capability", fail_probe)
     assert await _native_capability_for_request(provider, "qwen") is False
 
 
@@ -145,7 +152,7 @@ async def test_fresh_unknown_capability_honors_transient_backoff(monkeypatch):
     async def fail_probe(*_args, **_kwargs):
         raise AssertionError("fresh unknown capability must not be probed again")
 
-    monkeypatch.setattr("app.router.proxy._probe_model_responses_capability", fail_probe)
+    monkeypatch.setattr("app.services.responses_capability.probe_model_responses_capability", fail_probe)
     provider = {"id": "native-backoff", "provider_type": "openai"}
     assert await _native_capability_for_request(provider, "model") is False
 
@@ -163,6 +170,7 @@ async def test_unknown_capability_probe_caches_unsupported_on_incomplete_422(mon
             response=httpx.Response(422, text="Unprocessable Entity", request=request),
         )
     monkeypatch.setattr("app.router.proxy.post_native_response", fake_post)
+    monkeypatch.setattr("app.services.responses_capability.post_native_response", fake_post)
     provider = {"id": "compat-proxy", "provider_type": "openai"}
     assert await _native_capability_for_request(provider, "gpt-5.6-luna") is False
     assert get_model_responses_capability("compat-proxy", "gpt-5.6-luna")["responses_status"] == "unsupported"
@@ -181,6 +189,7 @@ async def test_unknown_capability_probe_caches_unsupported_on_llamacpp_400(monke
             response=httpx.Response(400, text="/responses endpoint not supported", request=request),
         )
     monkeypatch.setattr("app.router.proxy.post_native_response", fake_post)
+    monkeypatch.setattr("app.services.responses_capability.post_native_response", fake_post)
     provider = {"id": "llamacpp", "provider_type": "openai"}
     assert await _native_capability_for_request(provider, "qwen") is False
     assert get_model_responses_capability("llamacpp", "qwen")["responses_status"] == "unsupported"
@@ -199,6 +208,7 @@ async def test_unknown_capability_probe_caches_unsupported_on_missing_endpoint_4
             response=httpx.Response(404, text="unknown endpoint", request=request),
         )
     monkeypatch.setattr("app.router.proxy.post_native_response", fake_post)
+    monkeypatch.setattr("app.services.responses_capability.post_native_response", fake_post)
     provider = {"id": "chat-only", "provider_type": "openai"}
     assert await _native_capability_for_request(provider, "qwen") is False
     assert get_model_responses_capability("chat-only", "qwen")["responses_status"] == "unsupported"
@@ -217,6 +227,7 @@ async def test_generic_responses_400_is_not_cached_as_unsupported(monkeypatch):
             response=httpx.Response(400, text="previous_response_id is invalid", request=request),
         )
     monkeypatch.setattr("app.router.proxy.post_native_response", fake_post)
+    monkeypatch.setattr("app.services.responses_capability.post_native_response", fake_post)
     provider = {"id": "pixel-400", "provider_type": "openai"}
     assert await _native_capability_for_request(provider, "gpt-5.6-luna") is False
     capability = get_model_responses_capability("pixel-400", "gpt-5.6-luna") or {}
@@ -236,6 +247,7 @@ async def test_generic_probe_400_writes_transient_unknown_backoff(monkeypatch):
             response=httpx.Response(400, text="previous_response_id is invalid", request=request),
         )
     monkeypatch.setattr("app.router.proxy.post_native_response", fake_post)
+    monkeypatch.setattr("app.services.responses_capability.post_native_response", fake_post)
     provider = {"id": "pixel-400", "provider_type": "openai"}
     assert await _native_capability_for_request(provider, "gpt-5.6-luna") is False
     capability = get_model_responses_capability("pixel-400", "gpt-5.6-luna")
@@ -253,8 +265,9 @@ async def test_capability_probe_uses_short_timeout_and_output_limit(monkeypatch)
         return {"object": "response", "id": "resp_probe", "output": [{"type": "message"}]}
 
     monkeypatch.setattr("app.router.proxy.post_native_response", fake_post)
+    monkeypatch.setattr("app.services.responses_capability.post_native_response", fake_post)
     provider = {"id": "pixel", "provider_type": "openai", "request_timeout": 120}
-    from app.router.proxy import _probe_model_responses_capability
+    from app.services.responses_capability import probe_model_responses_capability as _probe_model_responses_capability
     assert await _probe_model_responses_capability(provider, "gpt-5.6-terra") is True
     assert seen["timeout"] == 8
     assert seen["body"]["max_output_tokens"] == 16
@@ -271,6 +284,7 @@ async def test_real_native_request_promotes_unknown_model_without_background_pro
     async def fake_post(provider, internal):
         return {"object": "response", "id": "resp_pixel", "output": [{"type": "message"}]}
     monkeypatch.setattr("app.router.proxy.post_native_response", fake_post)
+    monkeypatch.setattr("app.services.responses_capability.post_native_response", fake_post)
     internal = responses_to_internal({"model": "gpt-5.6-luna", "input": "hello"})
     internal.provider_id = "pixel"
     await _native_response_with_fallbacks(internal, stream=False, required_tool_types=set())
@@ -320,6 +334,7 @@ async def test_explicit_protocol_rejection_is_short_lived_model_negative_cache(m
             response=httpx.Response(404, text='{"error":{"message":"Responses endpoint not supported"}}', request=request),
         )
     monkeypatch.setattr("app.router.proxy.post_native_response", fake_post)
+    monkeypatch.setattr("app.services.responses_capability.post_native_response", fake_post)
     internal = responses_to_internal({"model": "deepseek-v4-pro", "input": "hello"})
     internal.provider_id = "deepseek"
     with pytest.raises(httpx.HTTPStatusError):
@@ -346,6 +361,7 @@ async def test_transient_native_failure_invalidates_supported_capability(monkeyp
             response=httpx.Response(503, request=request),
         )
     monkeypatch.setattr("app.router.proxy.post_native_response", fake_post)
+    monkeypatch.setattr("app.services.responses_capability.post_native_response", fake_post)
     internal = responses_to_internal({"model": "model", "input": "hello"})
     internal.provider_id = "pixel-transient"
     with pytest.raises(httpx.HTTPStatusError):
@@ -370,6 +386,7 @@ async def test_model_not_found_404_does_not_create_negative_capability_cache(mon
         )
 
     monkeypatch.setattr("app.router.proxy.post_native_response", fake_post)
+    monkeypatch.setattr("app.services.responses_capability.post_native_response", fake_post)
     internal = responses_to_internal({"model": "model", "input": "hello"})
     internal.provider_id = "provider"
     with pytest.raises(httpx.HTTPStatusError):
@@ -393,6 +410,7 @@ async def test_arbitrary_validation_error_does_not_create_negative_capability_ca
         )
 
     monkeypatch.setattr("app.router.proxy.post_native_response", fake_post)
+    monkeypatch.setattr("app.services.responses_capability.post_native_response", fake_post)
     internal = responses_to_internal({"model": "model", "input": "hello"})
     internal.provider_id = "provider"
     with pytest.raises(httpx.HTTPStatusError):
@@ -520,6 +538,7 @@ async def test_native_fallback_is_used_when_primary_lacks_responses_capability(m
         return {"object": "response", "id": "resp_fallback", "output": [{"type": "computer_call"}]}
 
     monkeypatch.setattr("app.router.proxy.post_native_response", fake_post)
+    monkeypatch.setattr("app.services.responses_capability.post_native_response", fake_post)
     internal = responses_to_internal({
         "model": "primary-model", "input": "use computer",
         "tools": [{"type": "computer"}],
@@ -579,6 +598,7 @@ async def test_unknown_same_model_native_fallback_is_probed_then_used(monkeypatc
         return {"object": "response", "id": "resp_probed", "output": [{"type": "message"}]}
 
     monkeypatch.setattr("app.router.proxy.post_native_response", fake_post)
+    monkeypatch.setattr("app.services.responses_capability.post_native_response", fake_post)
     internal = responses_to_internal({"model": "shared-model", "input": "hello"})
     internal.provider_id = "native-primary-fail"
 
@@ -627,6 +647,7 @@ async def test_native_fallback_keeps_administrator_chain_order(monkeypatch):
         return {"object": "response", "id": "resp_order", "output": [{"type": "message"}]}
 
     monkeypatch.setattr("app.router.proxy.post_native_response", fake_post)
+    monkeypatch.setattr("app.services.responses_capability.post_native_response", fake_post)
     internal = responses_to_internal({"model": "primary-model", "input": "hello"})
     internal.provider_id = "order-primary"
     response, _target, provider_id, attempts = await _native_response_with_fallbacks(internal, stream=False, required_tool_types=set())
@@ -685,6 +706,7 @@ async def test_stateful_request_blocks_only_after_primary_native_request_fails(m
     async def fake_post(provider, internal):
         raise httpx.HTTPStatusError("bad gateway", request=httpx.Request("POST", "https://primary.invalid"), response=httpx.Response(502))
     monkeypatch.setattr("app.router.proxy.post_native_response", fake_post)
+    monkeypatch.setattr("app.services.responses_capability.post_native_response", fake_post)
     internal = responses_to_internal({"model": "stateful-model", "previous_response_id": "resp_old", "input": [{"type": "function_call_output", "call_id": "call_old", "output": "ok"}]})
     internal.provider_id = "stateful-primary-fails"
     with pytest.raises(httpx.HTTPStatusError) as raised:
@@ -706,6 +728,7 @@ async def test_tool_shape_4xx_keeps_model_native_capability(monkeypatch):
             response=httpx.Response(400, text='{"error":{"message":"Thinking mode does not support this tool_choice"}}', request=req),
         )
     monkeypatch.setattr("app.router.proxy.post_native_response", fake_post)
+    monkeypatch.setattr("app.services.responses_capability.post_native_response", fake_post)
     internal = responses_to_internal({
         "model": "think-model", "input": "Use lookup_order for A123.",
         "tools": [{"type": "function", "name": "lookup_order", "parameters": {"type": "object", "properties": {}}}],
@@ -727,7 +750,7 @@ async def test_tool_shape_4xx_keeps_model_native_capability(monkeypatch):
 async def test_tool_shape_negative_routes_tools_to_chat_text_stays_native(monkeypatch):
     # 工具形态负向新鲜时：含 tools 请求不走原生，纯文本请求继续原生。
     add_provider({"id": "tool-neg", "name": "TN", "provider_type": "openai", "api_base": "https://tn.invalid/v1", "api_key": "key", "models": [{"id": "mix-model"}]})
-    set_model_responses_capability("tool-neg", "mix-model", status="supported", error=_RESPONSES_CAPABILITY_PROBE_MARKER, expires_at="2999-01-01T00:00:00+00:00")
+    set_model_responses_capability("tool-neg", "mix-model", status="supported", error=RESPONSES_CAPABILITY_PROBE_MARKER, expires_at="2999-01-01T00:00:00+00:00")
     set_model_responses_tools_capability("tool-neg", "mix-model", status="unsupported", expires_at="2999-01-01T00:00:00+00:00")
     provider = {"id": "tool-neg", "provider_type": "openai"}
     assert await _native_capability_for_request(provider, "mix-model", has_tools=True) is False
@@ -738,11 +761,12 @@ async def test_tool_shape_negative_routes_tools_to_chat_text_stays_native(monkey
 async def test_native_success_with_tools_clears_tool_shape_negative(monkeypatch):
     # 带 tools 的原生成功是正向证据：解除负向记录并记 supported。
     add_provider({"id": "tool-clear", "name": "TC", "provider_type": "openai", "api_base": "https://tc.invalid/v1", "api_key": "key", "models": [{"id": "ok-model"}]})
-    set_model_responses_capability("tool-clear", "ok-model", status="supported", error=_RESPONSES_CAPABILITY_PROBE_MARKER, expires_at="2999-01-01T00:00:00+00:00")
+    set_model_responses_capability("tool-clear", "ok-model", status="supported", error=RESPONSES_CAPABILITY_PROBE_MARKER, expires_at="2999-01-01T00:00:00+00:00")
     set_model_responses_tools_capability("tool-clear", "ok-model", status="unsupported", expires_at="2000-01-01T00:00:00+00:00")
     async def fake_post(provider, internal):
         return {"object": "response", "id": "resp_ok", "output": [{"type": "function_call", "name": "lookup_order", "arguments": "{}"}]}
     monkeypatch.setattr("app.router.proxy.post_native_response", fake_post)
+    monkeypatch.setattr("app.services.responses_capability.post_native_response", fake_post)
     internal = responses_to_internal({
         "model": "ok-model", "input": "Use lookup_order for A123.",
         "tools": [{"type": "function", "name": "lookup_order", "parameters": {"type": "object", "properties": {}}}],
@@ -767,6 +791,7 @@ async def test_non_tool_native_4xx_still_marks_transient_unknown(monkeypatch):
             response=httpx.Response(400, text="previous_response_id is invalid", request=req),
         )
     monkeypatch.setattr("app.router.proxy.post_native_response", fake_post)
+    monkeypatch.setattr("app.services.responses_capability.post_native_response", fake_post)
     internal = responses_to_internal({"model": "plain-model", "input": "hello"})
     internal.provider_id = "notool-shape"
     with pytest.raises(httpx.HTTPStatusError):
@@ -800,6 +825,7 @@ async def test_explicit_tool_outputs_can_fallback_across_native_providers(monkey
         return {"object": "response", "id": "resp_fallback", "output": [{"type": "message"}]}
 
     monkeypatch.setattr("app.router.proxy.post_native_response", fake_post)
+    monkeypatch.setattr("app.services.responses_capability.post_native_response", fake_post)
     internal = responses_to_internal({
         "model": "stateful-model",
         "input": [
@@ -820,23 +846,23 @@ async def test_explicit_tool_outputs_can_fallback_across_native_providers(monkey
 
 
 def test_stateful_markers_include_previous_response_id_and_not_plain_tools():
-    from app.router.proxy import _responses_stateful_tool_markers
+    from app.protocols.responses_features import stateful_tool_markers as _responses_stateful_tool_markers
     assert _responses_stateful_tool_markers({"input": "hello", "tools": [{"type": "function"}]}) == []
     assert _responses_stateful_tool_markers({"previous_response_id": "resp_1", "input": "hello"}) == ["previous_response_id"]
 
 
 def test_responses_native_required_fields_do_not_include_common_codex_options():
-    from app.router.proxy import _responses_requires_native
+    from app.protocols.responses_features import requires_native as _responses_requires_native
     assert _responses_requires_native({"model": "x", "input": "hello", "max_output_tokens": 32, "tools": [{"type": "function", "name": "f"}]}) == []
 
 
 def test_responses_native_required_fields_do_not_include_codex_custom_tools():
-    from app.router.proxy import _responses_requires_native
+    from app.protocols.responses_features import requires_native as _responses_requires_native
     assert _responses_requires_native({"model": "x", "input": "hello", "tools": [{"type": "custom", "name": "exec_command"}]}) == []
 
 
 def test_codex_owned_tools_are_tracked_separately_from_native_required_fields():
-    from app.router.proxy import _responses_client_owned_tool_markers
+    from app.protocols.responses_features import client_owned_tool_markers as _responses_client_owned_tool_markers
     assert _responses_client_owned_tool_markers({
         "model": "x",
         "input": [{"type": "additional_tools", "tools": [{"type": "namespace", "name": "collaboration"}]}],
@@ -845,7 +871,7 @@ def test_codex_owned_tools_are_tracked_separately_from_native_required_fields():
 
 
 def test_responses_compatibility_accepts_client_metadata_and_hosted_tools():
-    from app.router.proxy import _responses_requires_native
+    from app.protocols.responses_features import requires_native as _responses_requires_native
     assert _responses_requires_native({
         "model": "x", "input": "hello", "client_metadata": {"client": "codex"},
         "tools": [{"type": "web_search"}],
@@ -853,7 +879,7 @@ def test_responses_compatibility_accepts_client_metadata_and_hosted_tools():
 
 
 def test_cross_provider_skips_unpaired_tool_calls_but_not_paired_outputs():
-    from app.router.proxy import _native_cross_provider_incompatible_reasons
+    from app.protocols.responses_features import cross_provider_incompatible_reasons as _native_cross_provider_incompatible_reasons
     unpaired = {
         "input": [{"type": "function_call", "call_id": "fc_c_1", "name": "exec_command", "arguments": "{}"}],
     }
@@ -892,6 +918,7 @@ async def test_unpaired_tool_call_skips_cross_provider_native_fallback(monkeypat
         raise httpx.HTTPStatusError("bad request", request=request, response=httpx.Response(400, request=request))
 
     monkeypatch.setattr("app.router.proxy.post_native_response", fake_post)
+    monkeypatch.setattr("app.services.responses_capability.post_native_response", fake_post)
     internal = responses_to_internal({
         "model": "stateful-model",
         "input": [{"type": "function_call", "call_id": "fc_c_1", "name": "exec_command", "arguments": "{}"}],

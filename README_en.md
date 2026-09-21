@@ -333,7 +333,7 @@ Main code boundaries:
 pytest tests/ -q
 ```
 
-Expected current result: `996 passed`.
+Expected current result: `995 passed`.
 
 The client-error-mapping baseline (diff-corpus coherence / required path assertions / hardcoded-status whitelist / doc count consistency) is enforced by:
 

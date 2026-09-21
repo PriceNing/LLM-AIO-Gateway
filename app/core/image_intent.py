@@ -1,4 +1,8 @@
-"""Conservative image-generation intent detection for Responses clients."""
+"""Helpers for extracting the latest explicit user input (Responses clients).
+
+生图工具注入与调用时机已改为纯模型驱动（见 image_bridge.should_inject_image_bridge），
+本模块不再包含任何意图检测逻辑，只保留 latest_user_text 提取工具。
+"""
 
 from __future__ import annotations
 
@@ -6,14 +10,6 @@ import re
 from typing import Any
 
 
-_CN_IMAGE_WORDS = ("图片", "图像", "照片", "插画", "海报", "头像", "壁纸", "素材")
-_CN_ACTION_WORDS = ("生成", "画", "绘制", "制作", "创建", "做一张", "出图", "生图")
-_EN_ACTION_RE = re.compile(r"\b(?:generate|generated|draw|create|make|render|illustrate)\b", re.IGNORECASE)
-_EN_IMAGE_RE = re.compile(
-    r"\b(?:images?|pictures?|photos?|illustrations?|posters?|wallpapers?|avatars?|art|assets?|visuals?|textures?|variants?)\b"
-    r"|\bvisual\s+assets?\b",
-    re.IGNORECASE,
-)
 _HARNESS_WRAPPER_TAGS = (
     "environment_context",
     "thread_title",
@@ -32,48 +28,6 @@ _LEADING_HARNESS_WRAPPER_RE = re.compile(
 )
 _PSEUDO_USER_WRAPPER_RE = re.compile(
     rf"^(?:<({_HARNESS_WRAPPER_TAG_RE})\b[^>]*>[\s\S]*?</\1>\s*)+$",
-    re.IGNORECASE,
-)
-_NEGATED_IMAGE_REQUEST_RE = re.compile(
-    r"(?:不要|无需|不需要|禁止|别)\s*(?:生成|画|绘制|制作|创建|生图)|"
-    r"(?:不要|无需|不需要|禁止|别).{0,12}(?:调用|使用|进入|触发).{0,12}(?:图像生成|图片生成|生图)(?:功能|工具|服务)?|"
-    r"\b(?:do\s+not|don't|never|without)\s+(?:generate|draw|create|make|render|illustrate)\b",
-    re.IGNORECASE,
-)
-_IMAGE_DISCUSSION_RE = re.compile(
-    r"(?:如何|怎么|为什么|为何|是否|能否|可否|请解释|介绍一下).{0,24}(?:图片|图像|照片|生图)|"
-    r"\b(?:how|why|whether|explain|describe|documentation|api)\b.{0,40}"
-    r"(?:image|picture|photo|illustration|image[ _-]?generation)",
-    re.IGNORECASE,
-)
-_IMAGE_UI_COMPONENT_RE = re.compile(
-    r"\bimage\s+(?:upload|input|picker|viewer|preview|editor|component|field|button|endpoint|api|model|tool)\b",
-    re.IGNORECASE,
-)
-_CN_STANDALONE_IMAGE_RE = re.compile(
-    r"(?:生成|画|绘制|制作|创建|做|出)\s*(?:一|两|三|四|五|六|七|八|九|十|\d+)?\s*"
-    r"(?:张|幅|个)?\s*图(?:\s|$|[，。！？,.!?])"
-)
-# "画一个红苹果" -- a paint verb plus a concrete quantity+measure and a subject
-# that is not an abstract/diagram noun. Explicit "图/图片/..." is handled by the
-# image-word and standalone rules above; those nouns are excluded here so this
-# rule only fires for a plain concrete subject (an object, a scene, a person).
-_CN_PAINT_OBJECT_RE = re.compile(
-    r"(?:画|绘制)\s*[一两三四五六七八九十\d]+\s*[张幅个位片束对栋座棵轮匹朵条头份只首]\s*"
-    r"(?!流程|示意|结构|架构|框架|原理|设计|方案|界面|图表|表格|代码|文字|描述|说明|逻辑|文档|步骤|图|表|歌|故事|小说|脚本|歌词|旋律|诗歌|剧本)"
-)
-# Vector-format requests ("svg", "矢量图") ask for a vector file, which the
-# raster image backend cannot produce. These are NOT routed to the image
-# bridge -- the model should answer with SVG markup or explain the limitation
-# instead of receiving a useless bitmap. "矢量风格"/"vector style" (a look, not
-# a file type) is deliberately NOT matched so those still generate a bitmap.
-# CJK characters are word characters, so \b does not fire at a CJK/Latin
-# boundary; use negative lookarounds so "使用svg画" / "draw a vector logo" both
-# match while longer identifiers (e.g. "svgz") do not.
-_VECTOR_FORMAT_RE = re.compile(
-    r"(?<![a-z])svg(?![a-z])"
-    r"|矢量(?!风格)"
-    r"|(?<![a-z])vector(?:al)?\s+(?:image|graphic|file|format|logo|art)",
     re.IGNORECASE,
 )
 
@@ -120,7 +74,7 @@ def latest_user_text(input_data: Any) -> str:
 
     Responses tool-result items normally omit ``role``.  Treating a missing
     role as a user role lets command output, logs, or injected context become
-    an image-generation intent on later agent turns.
+    user text on later agent turns.
     """
     if isinstance(input_data, str):
         return _unwrap_harness_text(input_data)
@@ -140,37 +94,3 @@ def latest_user_text(input_data: Any) -> str:
             if unwrapped:
                 return unwrapped
     return ""
-
-
-def is_image_generation_intent_text(text: str) -> bool:
-    """Detect an explicit image-generation request in a plain user string."""
-    text = (text or "").strip()
-    if not text:
-        return False
-    if _NEGATED_IMAGE_REQUEST_RE.search(text) or _IMAGE_DISCUSSION_RE.search(text):
-        return False
-    if _VECTOR_FORMAT_RE.search(text):
-        return False
-    if (
-        any(action in text for action in _CN_ACTION_WORDS)
-        and (
-            any(word in text for word in _CN_IMAGE_WORDS)
-            or _CN_STANDALONE_IMAGE_RE.search(text)
-            or _CN_PAINT_OBJECT_RE.search(text)
-        )
-    ):
-        return True
-    return bool(
-        _EN_ACTION_RE.search(text)
-        and _EN_IMAGE_RE.search(text)
-        and not _IMAGE_UI_COMPONENT_RE.search(text)
-    )
-
-
-def is_image_generation_intent(input_data: Any, instructions: Any = "") -> bool:
-    """Detect an explicit request to create an image, not image discussion."""
-    text = latest_user_text(input_data)
-    # System/developer instructions describe agent capabilities and repository
-    # policy; they are never user authorization to invoke image generation.
-    del instructions
-    return is_image_generation_intent_text(text)

@@ -3,10 +3,14 @@ import time
 import uuid
 
 from app.adapters.output import tool_arguments_to_input
-from app.core.output import InternalOutputEvent, InternalOutputMessage
+from app.core.output import InternalOutputEvent, InternalOutputMessage, InternalToolCallOutput
 from app.protocols.ingress import custom_tool_input_from_arguments
 from app.services.logger import get_logger
 from app.adapters.imagegen import ImageGenerationResult
+from app.config import get_default
+from app.core.image_bridge import GATEWAY_IMAGE_DISPLAY_CALL_PREFIX
+from app.core.image_orchestration import generated_image_asset_manifest
+from app.core.image_results import image_preview_data_uri
 
 
 _app_log = get_logger("app")
@@ -710,3 +714,138 @@ def render_response(output: InternalOutputMessage, *, model: str, previous_respo
             "total_tokens": output.usage.get("total_tokens", 0),
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# 生图结果渲染（客户端协议边界）。
+# 从 router/proxy.py 迁入：这些函数产出客户端可见的 InternalOutputMessage
+# 形状，属于 egress 渲染层；选择依据是客户端能力标志（IR metadata），
+# 不再直接解析客户端原始 body。
+# ---------------------------------------------------------------------------
+
+def generated_image_markdown_output(
+    image_results,
+    stored: list,
+    artifacts: list[dict[str, str]],
+    usage: dict | None = None,
+) -> InternalOutputMessage:
+    """Publish inline data images with HTTP download links as a fallback.
+
+    Older Codex-compatible clients do not advertise the generatedImage helper.
+    Their Markdown renderer recognizes image syntax but may refuse remote HTTP
+    image loads, leaving a blank thumbnail. A data URI keeps rendering local to
+    the client while the stored artifact URL remains available for opening or
+    downloading the original image.
+    """
+    # This is public assistant text. Private bridge markers and agent-only
+    # instructions must never be rendered in the user's conversation.
+    asset_links = [
+        f"[`{artifact['filename']}` — download original]({artifact['url']})"
+        for artifact in artifacts
+    ]
+    blocks = ["Original: " + " · ".join(asset_links)] if asset_links else []
+    inline_limit = max(1, int(get_default("image_preview_inline_limit", 4)))
+    inline_results = image_results[:inline_limit]
+    for index, result in enumerate(inline_results, start=1):
+        label = "Generated image" if len(stored) == 1 else f"Generated image {index}"
+        blocks.append(f"![{label}]({image_preview_data_uri(result)})")
+    omitted = len(image_results) - len(inline_results)
+    if omitted > 0:
+        blocks.append(
+            f"{omitted} additional generated image preview(s) were omitted to keep the "
+            "response small; all originals are listed above."
+        )
+    return InternalOutputMessage(
+        text="\n\n".join(block for block in blocks if block),
+        finish_reason="stop",
+        usage=dict(usage or {}),
+    )
+
+
+def chat_image_url_only_output(
+    image_results,
+    stored: list,
+    artifacts: list[dict[str, str]],
+    usage: dict | None = None,
+) -> InternalOutputMessage:
+    """Chat 端点专用：只输出下载 URL + 简短文本，不内联 base64 data URI。
+
+    为什么不能内联 data URI（与 generated_image_markdown_output 不同）：
+    chat 流式响应作为 assistant message 写进会话历史。客户端（Pi/agent loop）
+    会在下一轮把这整段文本原样回喂给上游。如果内联，前 4 张图的 base64
+    会产生 250KB+ 文本，累积多轮后历史爆炸，既浪费 token 又可能把上游
+    模型带偏（看到"我已经输出过图了"而空响应）。下载 URL 是固定的几十
+    个字符，不会污染历史。
+
+    客户端看到 URL 后用 curl 拉原图（/v1/image-results/<hash>）；之前的会话
+    已经验证该路由可用。Codex /responses 保留 generated_image_markdown_output
+    (数据 URI 是该协议的必需)。
+    """
+    if not artifacts:
+        text = "Image generated."
+    else:
+        asset_links = [
+            f"[`{artifact['filename']}` — download original]({artifact['url']})"
+            for artifact in artifacts
+        ]
+        count = len(artifacts)
+        prefix = "Generated image" if count == 1 else f"Generated {count} images"
+        text = f"{prefix}: " + " · ".join(asset_links)
+    return InternalOutputMessage(
+        text=text,
+        finish_reason="stop",
+        usage=dict(usage or {}),
+    )
+
+
+def generated_image_exec_output(
+    image_results,
+    artifacts: list[dict[str, str]],
+    usage: dict | None = None,
+) -> InternalOutputMessage:
+    """Ask Codex's client-owned exec runtime to publish native image results."""
+    display_source = "\n".join(
+        "generatedImage({ image_url: %s, output_hint: %s });" % (
+            json.dumps(str(result.data_uri or ""), ensure_ascii=False),
+            json.dumps("The generated image has already been displayed to the user.", ensure_ascii=False),
+        )
+        for result in image_results
+    )
+    manifest = generated_image_asset_manifest(artifacts)
+    source = display_source
+    if manifest:
+        # Keep the project handoff in the tool history rather than ordinary
+        # assistant text. Codex executes only generatedImage(); the trailing
+        # block comment is recovered by the gateway on the next tool round
+        # and injected into private system context for the model.
+        source = f"{display_source}\n/*\n{manifest}\n*/"
+    suffix = uuid.uuid4().hex
+    return InternalOutputMessage(
+        text="",
+        tool_calls=[InternalToolCallOutput(
+            id=f"ctc_gateway_image_display_{suffix}",
+            call_id=f"{GATEWAY_IMAGE_DISPLAY_CALL_PREFIX}{suffix}",
+            name="exec",
+            arguments=json.dumps({"input": source}, ensure_ascii=False),
+        )],
+        finish_reason="tool_calls",
+        usage=dict(usage or {}),
+    )
+
+
+def generated_image_client_output(
+    has_client_image_exec_tool: bool,
+    image_results,
+    stored: list,
+    artifacts: list[dict[str, str]],
+    usage: dict | None = None,
+) -> tuple[InternalOutputMessage, str]:
+    """Select Codex-native display when advertised, with Markdown as fallback.
+
+    ``has_client_image_exec_tool`` comes from IR metadata (client capability
+    captured at ingress), not from the raw request body.
+    """
+    if has_client_image_exec_tool:
+        return generated_image_exec_output(image_results, artifacts, usage), "codex_exec_generated_image"
+    output = generated_image_markdown_output(image_results, stored, artifacts, usage)
+    return output, "assistant_message"

@@ -29,8 +29,8 @@ from app.database import (
 )
 from app.protocols.egress import render_response, render_responses_image_generation
 from app.protocols.ingress import responses_to_internal
-from app.core.image_intent import is_image_generation_intent, latest_user_text
-from app.router.proxy import _responses_is_system_turn
+from app.core.image_intent import latest_user_text
+from app.protocols.responses_features import is_system_turn as _responses_is_system_turn, image_prompt as _responses_image_prompt
 from app.core.image_bridge import (
     GATEWAY_IMAGE_ASSET_MARKER,
     GATEWAY_IMAGE_DISPLAY_CALL_PREFIX,
@@ -410,37 +410,6 @@ def test_codex_ambient_and_system_turns_are_detected():
     }) is True
 
 
-def test_image_generation_intent_is_conservative():
-    assert is_image_generation_intent("生成一个苹果的图像") is True
-    assert is_image_generation_intent("请画一张赛博朋克城市图片") is True
-    assert is_image_generation_intent("generate an image of an apple") is True
-    assert is_image_generation_intent("这张图片为什么打不开") is False
-    assert is_image_generation_intent("请解释 image_generation 工具") is False
-    assert is_image_generation_intent("Build the UI and create an image upload component") is False
-    assert is_image_generation_intent("不要生成图像，只解释接口") is False
-    assert is_image_generation_intent("请不要调用任何图像生成") is False
-    assert is_image_generation_intent("禁止使用生图工具，只检查代码") is False
-    assert is_image_generation_intent("制作一个流程图并写进文档") is False
-    assert is_image_generation_intent("生成一张图") is True
-
-
-def test_image_generation_intent_ignores_tool_outputs_and_instructions():
-    input_data = [
-        {"type": "message", "role": "user", "content": [
-            {"type": "input_text", "text": "review 代码并补充文档"},
-        ]},
-        {"type": "function_call_output", "call_id": "call_1",
-         "output": "日志包含：生成一张诊断图片"},
-        {"type": "custom_tool_call_output", "call_id": "call_2",
-         "output": "image generation is available"},
-    ]
-    assert latest_user_text(input_data) == "review 代码并补充文档"
-    assert is_image_generation_intent(input_data) is False
-    assert is_image_generation_intent(
-        input_data, instructions="When useful, generate an image with the image tool."
-    ) is False
-
-
 def test_responses_model_driven_bridge_generates_after_model_tool_call(image_app_db, monkeypatch):
     calls = []
 
@@ -477,13 +446,16 @@ def test_responses_model_driven_bridge_generates_after_model_tool_call(image_app
     assert calls == ["生成一个苹果的图像"]
 
 
-def test_responses_ordinary_request_does_not_enter_image_bridge(image_app_db, monkeypatch):
+def test_responses_ordinary_request_injects_bridge_but_does_not_generate(image_app_db, monkeypatch):
+    """现代 harness 约定：生图模型上桥接工具常驻，普通请求由模型自主不调用。"""
     calls = 0
 
     async def fake_planner(policy, internal, **kwargs):
         nonlocal calls
         calls += 1
-        assert all(tool.name != IMAGE_BRIDGE_TOOL_NAME for tool in internal.tools)
+        # The bridge tool stays resident on image-capable models; the model
+        # simply does not call it for ordinary requests.
+        assert any(tool.name == IMAGE_BRIDGE_TOOL_NAME for tool in internal.tools)
         return InternalOutputMessage(text="Reviewed the code.", usage={"total_tokens": 3}), {"id": "chat"}, "chat"
 
     monkeypatch.setattr("app.router.proxy._call_nonstream_with_fallbacks", fake_planner)
@@ -501,7 +473,9 @@ def test_responses_image_bridge_logs_actual_fallback_target(image_app_db, monkey
     async def fake_planner(policy, internal, **kwargs):
         internal.target_model = "qianye/chat-model"
         internal.provider_id = "qianye"
-        output = InternalOutputMessage(text="No image needed.", usage={"total_tokens": 4})
+        # Completely empty response -- no text, no tool calls. 纯模型驱动：
+        # 不 502、不纠正，原样 passthrough；日志仍记录实际 fallback 目标。
+        output = InternalOutputMessage(usage={"total_tokens": 4})
         output.raw = {"request_details": {
             "fallback_status": "used",
             "attempt_index": 1,
@@ -517,15 +491,14 @@ def test_responses_image_bridge_logs_actual_fallback_target(image_app_db, monkey
         "model": "chat/chat-model",
         "input": "Generate an image of an apple",
     })
-    assert response.status_code == 502, response.text
-    assert "did not invoke the image-generation tool" in response.text
+    assert response.status_code == 200, response.text
     log = list_request_logs(limit=1)[0]
     assert log["requested_model"] == "chat/chat-model"
     assert log["model"] == "qianye/chat-model"
     assert log["provider"] == "qianye"
-    assert log["status"] == "fail"
-    assert log["details"]["request_kind"] == "image_generation"
-    assert log["details"]["responses_mode"] == "image_generation_failed"
+    # 上游走了 fallback（fallback_status=used）-> degraded
+    assert log["status"] == "degraded"
+    assert log["details"].get("fallback_status") == "used"
 
 
 def test_responses_api_key_codex_streams_image_through_generated_image_exec(image_app_db, monkeypatch):
@@ -1216,7 +1189,6 @@ def test_responses_codex_intent_bridge_excludes_large_context(image_app_db, monk
         {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "生成一只红色苹果"}]},
     ]
     assert latest_user_text(input_data) == "生成一只红色苹果"
-    from app.router.proxy import _responses_image_prompt
     assert _responses_image_prompt(input_data, huge_context) == "生成一只红色苹果"
 
 
@@ -1262,12 +1234,12 @@ def test_responses_codex_exec_planner_is_not_forced_into_image_generation(image_
         }
         assert "tool_choice" in internal.extra["allowed_openai_params"]
         exec_tool = next(tool for tool in internal.tools if tool.name == "exec")
-        assert "tools.llm_aio_image_generation" in exec_tool.description
+        assert "tools.image_generation" in exec_tool.description
         return InternalOutputMessage(
             tool_calls=[InternalToolCallOutput(
                 id="call_image", call_id="call_image", name="exec",
                 arguments=json.dumps({
-                    "input": 'const r = await tools.llm_aio_image_generation({prompt:"board texture",filename:"board.png"}); text(r);',
+                    "input": 'const r = await tools.image_generation({prompt:"board texture",filename:"board.png"}); text(r);',
                 }),
             )], finish_reason="tool_calls", usage={"total_tokens": 4},
         ), {"id": "chat"}, "chat"
@@ -1368,8 +1340,8 @@ def test_codex_exec_batch_generates_every_nested_image_call(image_app_db, monkey
     async def fake_planner(policy, internal, **kwargs):
         script = (
             "const r = await Promise.all(["
-            "tools.llm_aio_image_generation({filename:'aria.png',prompt:'original Aria poster'}),"
-            "tools.llm_aio_image_generation({filename:'ren.png',prompt:'original Ren poster'})"
+            "tools.image_generation({filename:'aria.png',prompt:'original Aria poster'}),"
+            "tools.image_generation({filename:'ren.png',prompt:'original Ren poster'})"
             "]); text(JSON.stringify(r));"
         )
         return InternalOutputMessage(
@@ -2003,7 +1975,7 @@ def test_codex_bridge_preserves_client_image_gen_function_tool():
 
 def test_codex_exec_image_call_is_consumed_by_gateway():
     arguments = json.dumps({
-        "input": 'const r = await tools.llm_aio_image_generation({"prompt":"draw an apple","size":"1024x1024"}); text(r);',
+        "input": 'const r = await tools.image_generation({"prompt":"draw an apple","size":"1024x1024"}); text(r);',
     })
     assert image_call_arguments_from_exec(arguments) == {
         "prompt": "draw an apple", "size": "1024x1024",
@@ -2013,7 +1985,7 @@ def test_codex_exec_image_call_is_consumed_by_gateway():
 def test_codex_exec_image_call_accepts_luna_javascript_object_literal():
     arguments = json.dumps({
         "input": (
-            'const r = await tools.llm_aio_image_generation({'
+            'const r = await tools.image_generation({'
             'filename:"gomoku-board-texture.png",size:"1024x1024",quality:"high",'
             'prompt:"dark texture with literal {accent:blue} text"}); text(r);'
         ),
@@ -2030,8 +2002,8 @@ def test_codex_exec_image_call_accepts_multiple_single_quoted_javascript_literal
     arguments = json.dumps({
         "input": (
             "const r = await Promise.all(["
-            "tools.llm_aio_image_generation({filename:'aria.png',prompt:'Aria with {gold} light'}),"
-            "tools.llm_aio_image_generation({filename:'ren.png',size:'1024x1536',prompt:'Ren poster'})"
+            "tools.image_generation({filename:'aria.png',prompt:'Aria with {gold} light'}),"
+            "tools.image_generation({filename:'ren.png',size:'1024x1536',prompt:'Ren poster'})"
             "]); text(JSON.stringify(r));"
         ),
     })
@@ -2056,7 +2028,7 @@ def test_codex_exec_description_advertises_gateway_virtual_image_tool():
     inject_hosted_image_capability(body)
     configure_internal_image_bridge(internal, body)
     exec_tool = next(tool for tool in internal.tools if tool.name == "exec")
-    assert "tools.llm_aio_image_generation" in exec_tool.description
+    assert "tools.image_generation" in exec_tool.description
     assert "absent from ALL_TOOLS" in exec_tool.description
     assert "OPENAI_API_KEY" in internal.system
     assert "do not inspect" in internal.system.lower()

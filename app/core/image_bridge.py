@@ -19,7 +19,7 @@ from app.core.types import InternalRequest, InternalTool, prepend_system_text, t
 
 IMAGE_BRIDGE_MARKER = "<llm-aio-codex-image-generation>"
 IMAGE_BRIDGE_CORRECTION_MARKER = "<llm-aio-codex-image-generation-required>"
-IMAGE_BRIDGE_TOOL_NAME = "llm_aio_image_generation"
+IMAGE_BRIDGE_TOOL_NAME = "image_generation"
 CODEX_IMAGE_FUNCTION_NAME = "image_gen.imagegen"
 GATEWAY_IMAGE_DISPLAY_CALL_PREFIX = "call_gateway_image_display_"
 GATEWAY_IMAGE_RESULT_MARKER = "<!-- llm-aio-generated-image -->"
@@ -41,7 +41,7 @@ IMAGE_BRIDGE_INSTRUCTIONS = (
     "available instead of treating static checks or mocked DOM tests as end-to-end validation. "
     "Codex code-mode agents may call capabilities through the custom exec tool. In that mode, "
     "invoke this gateway capability directly with JavaScript such as: "
-    "const result = await tools.llm_aio_image_generation({\"prompt\":\"...\","
+    "const result = await tools.image_generation({\"prompt\":\"...\","
     "\"filename\":\"asset.png\"}); text(result); "
     "This is a gateway-owned virtual nested tool: it may be absent from the client-side "
     "ALL_TOOLS listing, and the gateway consumes the call before it reaches the client. Do not "
@@ -53,23 +53,9 @@ IMAGE_BRIDGE_INSTRUCTIONS = (
     "</llm-aio-codex-image-generation>"
 )
 
-IMAGE_BRIDGE_CORRECTION_INSTRUCTIONS = (
-    f"{IMAGE_BRIDGE_CORRECTION_MARKER}\n"
-    "The current user explicitly requires newly generated raster images or project assets, but "
-    "no image-generation call was made. Before continuing with shell, file, browser, or other "
-    "project work, generate the required assets now. Call llm_aio_image_generation once for each "
-    "distinct required asset, or in Codex exec mode emit an exec script that calls "
-    "tools.llm_aio_image_generation with a JSON object containing prompt and filename. Do not "
-    "treat an absent ALL_TOOLS entry as an error. Gateway provider credentials are server-side: "
-    "do not inspect or request a local OPENAI_API_KEY and do not switch to scripts/image_gen.py. "
-    "After the gateway returns the asset manifest, "
-    "download the original into the workspace and continue the user's complete task.\n"
-    "</llm-aio-codex-image-generation-required>"
-)
-
 _CODEX_EXEC_IMAGE_CAPABILITY = (
     " Gateway virtual nested capability: when raster image generation is required, you may emit "
-    "an exec script `const result = await tools.llm_aio_image_generation({\"prompt\":\"...\","
+    "an exec script `const result = await tools.image_generation({\"prompt\":\"...\","
     "\"filename\":\"asset.png\"}); text(result);`. It is valid even when absent from ALL_TOOLS; "
     "the gateway intercepts it before client execution."
 )
@@ -339,6 +325,47 @@ def inject_hosted_image_capability(body: dict[str, Any]) -> bool:
     return changed
 
 
+def should_inject_image_bridge(
+    *,
+    image_enabled: bool,
+    system_turn: bool = False,
+    has_codex_image_function_tool: bool = False,
+) -> bool:
+    """Decide whether the gateway image bridge is injected for this request.
+
+    Modern-harness convention: tool availability is decided by model capability
+    plus backend configuration only. The model autonomously decides when to
+    invoke the tool, and cost is controlled post-hoc by the per-conversation
+    image budget (``state.charge_image_generation_budget``).  No NLP intent
+    detection on user text happens here.  Shared by the chat/responses
+    endpoints so the future /messages extension reuses the exact same rule.
+    """
+    return bool(image_enabled) and not system_turn and not has_codex_image_function_tool
+
+
+def has_image_bridge_history(messages: list) -> bool:
+    """True when conversation history already contains a bridge tool call
+    or a gateway-generated image result in assistant text.
+
+    Image mode is sticky: follow-ups like "再试试" must keep the image bridge
+    active even though the latest user text carries no image keywords.
+
+    chat 端点的 bridge 调用由网关消费，不会以 tool_call 形式回喂给客户端；
+    历史里只留下 assistant 文本中的下载链接（/v1/image-results/<hash>），
+    所以两种信号都要识别。
+    """
+    for message in messages:
+        for part in getattr(message, "parts", []) or []:
+            kind = getattr(part, "kind", "")
+            if kind == "tool_call" and getattr(part, "name", "") == IMAGE_BRIDGE_TOOL_NAME:
+                return True
+            if kind == "text" and getattr(message, "role", "") == "assistant":
+                text = part.text or ""
+                if "/v1/image-results/" in text or GATEWAY_IMAGE_RESULT_MARKER in text:
+                    return True
+    return False
+
+
 def configure_internal_image_bridge(internal: InternalRequest, body: dict[str, Any]) -> None:
     """Project the hosted capability to a provider-neutral function tool."""
     parameters = {
@@ -404,7 +431,7 @@ def image_call_arguments(arguments: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-_EXEC_IMAGE_CALL_RE = re.compile(r"(?:tools\.)?llm_aio_image_generation\s*\(")
+_EXEC_IMAGE_CALL_RE = re.compile(r"(?:tools\.)?image_generation\s*\(")
 
 
 def _quote_javascript_object_keys(source: str) -> str:

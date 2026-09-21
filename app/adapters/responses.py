@@ -117,3 +117,111 @@ async def stream_native_response(provider: dict, internal):
             async for chunk in response.aiter_raw():
                 # Preserve the upstream event framing byte-for-byte.
                 yield chunk
+
+
+# ---------------------------------------------------------------------------
+# Native Responses 上游 wire 校验（上游协议边界）。
+# 从 router/proxy.py 迁入：这些判断只依赖上游 native Responses 的原始
+# JSON/SSE 载荷，属于 native Responses adapter 的协议职责。
+# ---------------------------------------------------------------------------
+def observed_response_tool_types(response: dict) -> set[str]:
+    observed = set()
+    for item in response.get("output") or []:
+        if not isinstance(item, dict):
+            continue
+        item_type = str(item.get("type") or "")
+        if item_type == "custom_tool_call":
+            observed.add("custom")
+        elif item_type == "function_call":
+            observed.add("namespace" if item.get("namespace") else "function")
+        elif item_type.endswith("_call"):
+            observed.add(item_type[:-5])
+    return observed
+
+
+
+class EmptyNativeResponsesError(RuntimeError):
+    """The upstream completed a Responses request without client-usable output."""
+
+    native_empty_output = True
+
+
+
+def native_completed_output_item(item: dict | None) -> bool:
+    """True when a Responses output item is a finished client-visible turn."""
+    if not isinstance(item, dict):
+        return False
+    item_type = str(item.get("type") or "")
+    return item_type in {
+        "message", "function_call", "custom_tool_call",
+        "computer_call", "image_generation_call", "output_text",
+    } or item_type.endswith("_call")
+
+
+
+def native_response_has_output(response: dict | None) -> bool:
+    """Return whether a completed Responses payload contains usable output items."""
+    if not isinstance(response, dict):
+        return False
+    output = response.get("output")
+    if not isinstance(output, list):
+        return bool(str(response.get("output_text") or "").strip())
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+        item_type = str(item.get("type") or "")
+        if item_type in {"message", "function_call", "custom_tool_call", "computer_call", "image_generation_call"}:
+            return True
+        if item_type.endswith("_call") or item_type in {"reasoning", "output_text"}:
+            return True
+    return False
+
+
+
+def native_sse_payload_has_output(payload: dict | None) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    event_type = str(payload.get("type") or "")
+    if event_type in {
+        "response.output_item.added", "response.output_item.done",
+        "response.content_part.added", "response.content_part.done",
+        "response.output_text.delta", "response.output_text.done",
+        "response.function_call_arguments.delta",
+        "response.function_call_arguments.done",
+        "response.custom_tool_call_input.delta",
+        "response.custom_tool_call_input.done",
+        "response.computer_call.delta",
+    }:
+        item = payload.get("item") or payload.get("output_item") or {}
+        if event_type.endswith(".delta") or event_type.endswith(".done"):
+            return True
+        return isinstance(item, dict) and bool(str(item.get("type") or ""))
+    return False
+
+
+
+def native_sse_error_message(payload: dict | None) -> str | None:
+    """Return a message for Responses SSE error payloads, including typeless ``event: error`` frames."""
+    if not isinstance(payload, dict):
+        return None
+    event_type = str(payload.get("type") or "")
+    error = payload.get("error")
+    # OpenAI uses type=error. Some proxies emit ``event: error`` with only an
+    # ``error`` object and no type. Ignore response.* frames that happen to
+    # contain an error key.
+    if event_type not in {"", "error"}:
+        return None
+    if event_type == "" and not isinstance(error, dict):
+        return None
+    if isinstance(error, dict):
+        return str(error.get("message") or error.get("type") or error)
+    if error:
+        return str(error)
+    if event_type == "error":
+        return str(payload.get("message") or "native Responses stream error")
+    return None
+
+
+
+
+

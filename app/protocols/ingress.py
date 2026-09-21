@@ -13,6 +13,7 @@ from app.protocols.ir import (
     responses_input_to_ir,
 )
 from app.core.text import strip_billing_header
+from app.protocols.responses_features import request_flags as responses_request_flags
 
 
 _INCOMPLETE_JSON_PREFIXES = ("{", "[", '"')
@@ -553,5 +554,12 @@ def responses_to_internal(body: dict[str, Any]) -> InternalRequest:
         previous_response_id=body.get("previous_response_id") or "",
         extra=extra,
         raw_body=body,
-        metadata={"input_is_list": isinstance(input_data, list), "instructions": instructions, "responses_native": {"request_body": copy.deepcopy(body)}},
+        metadata={
+            "input_is_list": isinstance(input_data, list),
+            "instructions": instructions,
+            "responses_native": {"request_body": copy.deepcopy(body)},
+            # Responses wire-level request flags (协议边界，见 responses_features)。
+            # 端点/策略代码只读这里，不再直接解析客户端原始 body。
+            **responses_request_flags(body),
+        },
     )

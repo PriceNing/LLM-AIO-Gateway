@@ -32,7 +32,6 @@ import anyio
 
 from app.core.types import (
     InternalMessage,
-    append_system_text,
     text_part,
     tool_call_part,
     tool_result_part,
@@ -40,7 +39,6 @@ from app.core.types import (
 from app.core.output import InternalOutputEvent, InternalOutputMessage, InternalToolCallOutput
 from app.core.image_bridge import (
     IMAGE_BRIDGE_TOOL_NAME,
-    IMAGE_BRIDGE_CORRECTION_INSTRUCTIONS,
     image_call_arguments,
     image_call_arguments_from_exec,
     image_call_arguments_list_from_exec,
@@ -48,6 +46,7 @@ from app.core.image_bridge import (
 from app.core.image_results import StoredImageResult, generation_results_from_stored
 from app.adapters.imagegen import image_results_bytes
 from app.core.outcome import apply_outcome_to_details
+from app.core.state import charge_image_generation_budget
 from app.core.text import friendly_error_msg
 
 _log = logging.getLogger("llmgw.app")
@@ -342,7 +341,6 @@ async def run_image_bridge(
     planner_output: InternalOutputMessage,
     planner_provider_info: Any,
     planner_provider_id: str,
-    allow_correction: bool,
     has_client_image_exec_tool: bool,
     call_model: _CallModel,
     execute_invocations: _ExecuteInvocations,
@@ -374,69 +372,30 @@ async def run_image_bridge(
             "[image_generation.batch_limited] requested=%d allowed=%d",
             len(requested_image_invocations), max_image_invocations,
         )
+    # 后置成本门：每会话时间窗口生图预算（现代 harness 的 budget 模式），
+    # 只限制窗口内可生成数量，不影响工具可用性。
+    budget_allowed = charge_image_generation_budget(
+        getattr(policy, "conv_key", "") or "", len(image_invocations)
+    )
+    if budget_allowed < len(image_invocations):
+        _log.warning(
+            "[image_generation.budget_limited] requested=%d allowed=%d conv_key=%s",
+            len(image_invocations), budget_allowed, getattr(policy, "conv_key", "") or "-",
+        )
+        image_invocations = image_invocations[:budget_allowed]
     _log.info(
         "[image_generation.planner_calls] total=%d image=%d names=%s",
         len(output.tool_calls), len(image_invocations),
         [call.name for call in output.tool_calls],
     )
-    image_correction_applied = False
     all_initial_calls_are_images = len(requested_image_invocations) == len(output.tool_calls)
 
     bridge_upstream_details, bridge_final_model, bridge_final_provider = describe_upstream(
         output, adapter_provider_id
     )
 
-    if allow_correction and not requested_image_invocations and not output.tool_calls:
-        append_system_text(internal.messages, IMAGE_BRIDGE_CORRECTION_INSTRUCTIONS)
-        internal.tool_choice = {
-            "type": "function",
-            "function": {"name": IMAGE_BRIDGE_TOOL_NAME},
-        }
-        allowed = internal.extra.setdefault("allowed_openai_params", [])
-        if "tool_choice" not in allowed:
-            allowed.append("tool_choice")
-        image_correction_applied = True
-        _log.warning(
-            "[image_generation.correction] no image invocation; forcing bridge tool choice model=%s provider=%s",
-            internal.target_model, adapter_provider_id or "-",
-        )
-        correction_output, provider_info, adapter_provider_id = await call_model(
-            policy, internal, temperature=temperature, max_tokens=max_tokens,
-            log_label=f"{log_label}.correction",
-        )
-        correction_invocations = image_bridge_invocations(correction_output)
-        if correction_invocations:
-            output = correction_output
-            snap = describe_upstream(correction_output, adapter_provider_id)
-            bridge_upstream_details = merge_upstream(bridge_upstream_details, snap[0])
-            _, bridge_final_model, bridge_final_provider = snap
-            requested_image_invocations = correction_invocations
-            image_invocations = correction_invocations[:max_image_invocations]
-            skipped_initial_invocations = correction_invocations[max_image_invocations:]
-            all_initial_calls_are_images = len(correction_invocations) == len(correction_output.tool_calls)
-        else:
-            from fastapi import HTTPException
-            correction_error = HTTPException(
-                status_code=502,
-                detail="The model did not invoke the image-generation tool",
-            )
-            _attach_request_details(
-                correction_error,
-                **{
-                    **bridge_upstream_details,
-                    "attempted_model": bridge_final_model,
-                    "attempted_provider": bridge_final_provider,
-                    "request_kind": "image_generation",
-                    "responses_mode": "image_generation_failed",
-                    "upstream_endpoint": "images/generations",
-                    "image_count": 0,
-                    "image_failed_count": 1,
-                    "image_correction_applied": True,
-                    "error_message": "model did not invoke image generation tool after correction",
-                },
-            )
-            raise correction_error
-
+    # 纯模型驱动：模型没调用生图工具就直接 passthrough（返回 None），
+    # 不追加指令、不强制 tool_choice、不 502。
     if not image_invocations:
         return None
 
@@ -747,7 +706,7 @@ async def run_image_bridge(
         "image_failure_attempt_count": image_failure_attempt_count,
         "image_retried_count": image_retried_count,
         "image_reused_count": image_reused_count,
-        "image_correction_applied": image_correction_applied,
+        "image_correction_applied": False,
         "image_artifact_count": len(stored_images),
         "continuation_tokens": continuation_tokens,
         "image_continuation_error": continuation_error,
@@ -792,7 +751,7 @@ async def run_image_bridge(
         bridge_final_model=bridge_final_model,
         bridge_final_provider=bridge_final_provider,
         continuation_error=continuation_error,
-        correction_applied=image_correction_applied,
+        correction_applied=False,
     )
 
 

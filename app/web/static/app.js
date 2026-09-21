@@ -3093,29 +3093,13 @@ function renderHistoryStats(data) {
         html += '<div class="chart-card glass"><div class="trend-header"><h3>' + t('stats.trendChart') + '</h3><div class="trend-toggle"><button class="trend-btn active" id="historyTrendCalls" onclick="switchHistoryTrend(\'calls\')">' + t('stats.trendCalls') + '</button><button class="trend-btn" id="historyTrendTokens" onclick="switchHistoryTrend(\'tokens\')">' + t('stats.trendTokens') + '</button></div></div><div class="chart-wrap"><canvas id="historyTrendChart"></canvas></div></div>';
     }
 
-    // Model breakdown table
-    html += '<div class="table-card glass"><h3>' + t('stats.modelBreakdown') + '</h3>';
-    html += '<table class="modern-table"><thead><tr><th>' + t('stats.model') + '</th><th>' + t('stats.totalCalls') + '</th><th>' + t('stats.failedCalls') + '</th><th>' + t('stats.tokens') + '</th></tr></thead><tbody>';
-    for (var i = 0; i < models.length; i++) {
-        var m = models[i];
-        html += '<tr><td>' + escHtml(m.model) + '</td><td>' + m.total.toLocaleString() + '</td><td>' + m.failed.toLocaleString() + '</td><td>' + m.tokens.toLocaleString() + '</td></tr>';
-    }
-    if (models.length === 0) {
-        html += '<tr><td colspan="4" style="text-align:center;color:var(--text-tertiary);padding:16px">' + t('stats.noRecords') + '</td></tr>';
-    }
-    html += '</tbody></table></div>';
+    // Model breakdown table (sortable headers)
+    _historyTableSort.model = { col: null, dir: 0 };
+    _historyTableSort.user = { col: null, dir: 0 };
+    html += _historyBreakdownTable('model', t('stats.modelBreakdown'), t('stats.model'), models, 'model');
 
-    // User breakdown table
-    html += '<div class="table-card glass"><h3>' + t('stats.userBreakdown') + '</h3>';
-    html += '<table class="modern-table"><thead><tr><th>' + t('stats.client') + '</th><th>' + t('stats.totalCalls') + '</th><th>' + t('stats.failedCalls') + '</th><th>' + t('stats.tokens') + '</th></tr></thead><tbody>';
-    for (var j = 0; j < users.length; j++) {
-        var u = users[j];
-        html += '<tr><td>' + escHtml(u.username) + '</td><td>' + u.total.toLocaleString() + '</td><td>' + u.failed.toLocaleString() + '</td><td>' + u.tokens.toLocaleString() + '</td></tr>';
-    }
-    if (users.length === 0) {
-        html += '<tr><td colspan="4" style="text-align:center;color:var(--text-tertiary);padding:16px">' + t('stats.noRecords') + '</td></tr>';
-    }
-    html += '</tbody></table></div>';
+    // User breakdown table (sortable headers)
+    html += _historyBreakdownTable('user', t('stats.userBreakdown'), t('stats.client'), users, 'username');
 
     container.innerHTML = html;
 
@@ -3144,6 +3128,75 @@ function renderHistoryStats(data) {
     } else {
         window._historyTmData = null;
         window._historyTrendChart = null;
+    }
+}
+
+var _historyTableSort = { model: { col: null, dir: 0 }, user: { col: null, dir: 0 } };
+
+function _historySortIndicator(table, col) {
+    var s = _historyTableSort[table];
+    if (s.col !== col) return '<span class="sort-ind">&#8597;</span>';
+    return '<span class="sort-ind active">' + (s.dir === 1 ? '&#9650;' : '&#9660;') + '</span>';
+}
+
+function _historyBreakdownTable(table, title, nameLabel, rows, nameKey) {
+    var h = '<div class="table-card glass"><h3>' + title + '</h3>';
+    h += '<table class="modern-table"><thead><tr>';
+    h += '<th class="sortable" data-col="' + nameKey + '" onclick="sortHistoryTable(\'' + table + '\',\'' + nameKey + '\')">' + nameLabel + _historySortIndicator(table, nameKey) + '</th>';
+    h += '<th class="sortable" data-col="total" onclick="sortHistoryTable(\'' + table + '\',\'total\')">' + t('stats.totalCalls') + _historySortIndicator(table, 'total') + '</th>';
+    h += '<th class="sortable" data-col="failed" onclick="sortHistoryTable(\'' + table + '\',\'failed\')">' + t('stats.failedCalls') + _historySortIndicator(table, 'failed') + '</th>';
+    h += '<th class="sortable" data-col="tokens" onclick="sortHistoryTable(\'' + table + '\',\'tokens\')">' + t('stats.tokens') + _historySortIndicator(table, 'tokens') + '</th>';
+    h += '</tr></thead><tbody id="' + table + 'BreakdownTbody">';
+    h += _historyBreakdownRows(rows, nameKey);
+    h += '</tbody></table></div>';
+    return h;
+}
+
+function _historyBreakdownRows(rows, nameKey) {
+    if (rows.length === 0) {
+        return '<tr><td colspan="4" style="text-align:center;color:var(--text-tertiary);padding:16px">' + t('stats.noRecords') + '</td></tr>';
+    }
+    var html = '';
+    for (var i = 0; i < rows.length; i++) {
+        var r = rows[i];
+        html += '<tr><td>' + escHtml(r[nameKey]) + '</td><td>' + r.total.toLocaleString() + '</td><td>' + r.failed.toLocaleString() + '</td><td>' + r.tokens.toLocaleString() + '</td></tr>';
+    }
+    return html;
+}
+
+function sortHistoryTable(table, col) {
+    var data = window._lastHistoryData;
+    if (!data) return;
+    var rows = table === 'model' ? (data.models || []) : (data.users || []);
+    var s = _historyTableSort[table];
+    if (s.col === col) {
+        s.dir = s.dir === 0 ? -1 : (s.dir === 1 ? -1 : 1);
+    } else {
+        s.col = col;
+        s.dir = (col === 'total' || col === 'failed' || col === 'tokens') ? -1 : 1;
+    }
+    var nameKey = table === 'model' ? 'model' : 'username';
+    var sorted = rows.slice().sort(function(a, b) {
+        var va = a[col], vb = b[col];
+        var cmp;
+        if (typeof va === 'number' && typeof vb === 'number') {
+            cmp = va - vb;
+        } else {
+            cmp = String(va == null ? '' : va).localeCompare(String(vb == null ? '' : vb));
+        }
+        return cmp * s.dir;
+    });
+    var tbody = document.getElementById(table + 'BreakdownTbody');
+    if (tbody) tbody.innerHTML = _historyBreakdownRows(sorted, nameKey);
+    // refresh header indicators
+    var card = tbody ? tbody.closest('.table-card') : null;
+    if (card) {
+        var ths = card.querySelectorAll('thead th.sortable');
+        for (var i = 0; i < ths.length; i++) {
+            var colName = ths[i].getAttribute('data-col');
+            var ind = ths[i].querySelector('.sort-ind');
+            if (ind && colName) ind.outerHTML = _historySortIndicator(table, colName);
+        }
     }
 }
 

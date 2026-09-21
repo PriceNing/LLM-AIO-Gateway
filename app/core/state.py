@@ -120,6 +120,31 @@ response_chain_cache = TTLDict(
     ttl_seconds=get_default("reasoning_cache_ttl", 1800),
     max_size=get_default("reasoning_cache_max_size", 1000),
 )
+image_generation_budget = TTLDict(
+    ttl_seconds=get_default("image_generation_budget_ttl", 3600),
+    max_size=get_default("image_generation_budget_max_size", 1000),
+)
+
+
+def charge_image_generation_budget(conv_key: str, count: int) -> int:
+    """Reserve up to ``count`` images from the conversation's time-window budget.
+
+    Returns the number of images actually allowed (0..count).  This is the
+    post-hoc cost control (modern-harness budget/rate-limit pattern): the
+    bridge tool stays resident and the model decides when to call it; the
+    budget only caps how many images may be generated per window, it never
+    decides whether the tool is available.
+    """
+    if count <= 0:
+        return 0
+    limit = int(get_default("image_generation_budget_limit", 20) or 0)
+    if not conv_key or limit <= 0:
+        return count
+    used = int(image_generation_budget.get(conv_key) or 0)
+    allowed = min(count, max(0, limit - used))
+    if allowed:
+        image_generation_budget.increment(conv_key, allowed)
+    return allowed
 
 
 def ir_tool_message_count(messages: list[InternalMessage]) -> int:

@@ -1117,6 +1117,10 @@ a.icon-btn { text-decoration: none; }
 }
 .modern-table tbody tr { transition: background var(--transition-fast); }
 .modern-table tbody tr:hover { background: var(--bg-surface); }
+.modern-table th.sortable { cursor: pointer; user-select: none; transition: color var(--transition-fast); }
+.modern-table th.sortable:hover { color: var(--text-primary); }
+.modern-table th.sortable .sort-ind { margin-left: 4px; font-size: 10px; opacity: 0.45; }
+.modern-table th.sortable .sort-ind.active { opacity: 1; color: var(--accent, #38bdf8); }
 
 .badge {
   display: inline-block;
