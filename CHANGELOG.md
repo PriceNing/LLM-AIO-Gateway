@@ -5,6 +5,25 @@ All notable changes to LLM AIO Gateway will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] —— 发版时将本段重命名为 [0.12.3] 并补日期；在此之前任何对外面（UI 版本号、tag、Release）不得出现 0.12.3
+
+### Added
+- **Image-generation bridge now shared across protocol endpoints**: the model-driven image-generation orchestration loop was lifted out of the `/responses` endpoint into a protocol-agnostic module (`app/core/image_orchestration.py`) operating on the internal representation, with all endpoint/client-specific behavior injected as callables. `/chat/completions` now supports the same image-generation bridge in non-streaming form, so image generation works uniformly across protocols.
+- `app/core/image_intent.py` now exposes a pure-string `is_image_generation_intent_text()` helper, decoupling intent detection from the request object.
+- **Note**: the Anthropic `/messages` endpoint does not yet support the image-generation bridge (not wired in this release).
+
+### Changed
+- `tools/live_eval/live_eval.py` image probes updated to cover the new cross-protocol bridge.
+
+### 更新内容（中文）
+- **图像生成桥接跨协议共享**：把「模型驱动生图」编排循环从 `/responses` 端点抽到协议无关模块（`app/core/image_orchestration.py`），基于内部表示（IR）运作，端点/客户端特定行为以可调用注入。`/chat/completions` 现以非流式形式支持同一图像生成桥接，图像生成在各协议端点行为统一。
+- `app/core/image_intent.py` 现暴露纯字符串函数 `is_image_generation_intent_text()`，把意图检测与请求对象解耦。
+- **说明**：Anthropic `/messages` 端点暂未支持图像生成桥接（本次未接入）。
+- `tools/live_eval/live_eval.py` 图像探针更新，覆盖新的跨协议桥接。
+
+### Tests
+- `test_chat_image_bridge.py`（新，240 行）+ `test_live_eval_probes.py`（+74）+ `test_image_intent.py`（+36）；全量 **996 passed**。
+
 ## [0.12.2] - 2026-09-21
 
 ### Fixed

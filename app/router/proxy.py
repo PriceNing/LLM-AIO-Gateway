@@ -21,7 +21,7 @@ from app.database import (
     get_model_responses_capability, set_model_responses_capability, update_model_responses_capability, update_model_responses_tool_types, set_model_responses_tools_capability,
 )
 from app.core.text import client_status_for_upstream_error, friendly_error_msg, error_detail_for_log, mask_key
-from app.core.image_intent import is_image_generation_intent, latest_user_text
+from app.core.image_intent import is_image_generation_intent, is_image_generation_intent_text, latest_user_text
 from app.core.image_bridge import (
     GATEWAY_IMAGE_ASSET_MARKER,
     GATEWAY_IMAGE_DISPLAY_CALL_PREFIX,
@@ -50,6 +50,14 @@ from app.core.image_results import (
     store_image_results,
 )
 from app.core.image_batch import image_invocation_cache
+from app.core.image_orchestration import (
+    run_image_bridge,
+    events_to_message as _events_to_message,
+    message_to_events as _message_to_events,
+    image_generator_identity as _image_generator_identity,
+    image_prompt_key as _image_prompt_key,
+    generated_image_asset_manifest as _generated_image_asset_manifest,
+)
 from app.core.model_capabilities import capabilities_for_client_entry, resolve_model_capabilities
 from app.services.model_registry import registry_lookup
 from app.core.tool_leak import repair_output as _repair_output_tool_leaks
@@ -99,6 +107,7 @@ from app.adapters.imagegen import generate_images, image_results_bytes
 from app.protocols.egress import (
     render_anthropic_message,
     render_chat_completion,
+    render_chat_completions_sse,
     render_completion,
     render_response, render_responses_image_generation, render_responses_image_generation_sse,
     render_responses_sse,
@@ -230,6 +239,36 @@ def _responses_is_system_turn(body: dict) -> bool:
     )
 
 
+def _responses_has_prior_assistant(input_data: Any) -> bool:
+    """True when a prior assistant turn is already present in the input."""
+    if not isinstance(input_data, list):
+        return False
+    return any(isinstance(item, dict) and item.get("role") == "assistant" for item in input_data)
+
+
+def _chat_latest_user_text(internal) -> str:
+    """Extract the latest user prompt from an internal chat request."""
+    for message in reversed(internal.messages):
+        if message.role != "user":
+            continue
+        parts = [part.text for part in message.parts if part.kind == "text" and part.text]
+        text = "\n".join(parts).strip()
+        if text:
+            return text
+    return ""
+
+
+async def _async_event_stream(items):
+    """Yield a pre-materialized list of output events as an async iterator.
+
+    The streaming image bridge buffers the upstream stream and renders an
+    out-of-band result, so it hands renderers a plain list; this adapts that
+    list to the async-iterator interface the SSE renderers expect.
+    """
+    for item in items:
+        yield item
+
+
 def _responses_image_prompt(input_data: Any, instructions: Any = "") -> str:
     """Extract the current user request without forwarding conversation history."""
     prompt = latest_user_text(input_data).strip()
@@ -255,17 +294,6 @@ def _resolved_image_generator(config: dict) -> dict:
             resolved["model"] = image_mid.model_name
             resolved["provider_id"] = image_provider.get("id") or image_mid.provider_id
     return resolved
-
-
-def _image_generator_identity(generator: dict) -> tuple[str, str]:
-    """Return the effective backend identity, not the client's model hint."""
-    backend_type = str(generator.get("backend_type") or "existing_model").strip()
-    if backend_type == "comfyui":
-        return "comfyui", "comfyui"
-    return (
-        str(generator.get("provider_id") or "").strip(),
-        str(generator.get("model") or generator.get("provider_model") or "").strip(),
-    )
 
 
 async def _generate_with_configured_backend(
@@ -670,29 +698,6 @@ def _rollback_image_bridge_artifacts(
     )
 
 
-def _generated_image_asset_manifest(artifacts: list[dict[str, str]]) -> str:
-    """Build a compact, model-readable handoff that survives conversation history."""
-    if not artifacts:
-        return ""
-    lines = [
-        GATEWAY_IMAGE_ASSET_MARKER,
-        "Generated image originals are available as project assets:",
-    ]
-    for index, artifact in enumerate(artifacts, start=1):
-        lines.append(
-            f"{index}. `{artifact['filename']}` ({artifact['mime_type']}): "
-            f"[download original]({artifact['url']})"
-        )
-    lines.extend([
-        "For coding or design tasks, download these URLs into the project workspace with a "
-        "terminal command before continuing, verify the files exist, and reference those files "
-        "from the project. The images are stored by the gateway, not in the agent workspace.",
-        "Do not claim image generation is unavailable and do not recreate these same assets "
-        "with PIL, SVG, Canvas, or CSS unless the user explicitly requests a replacement.",
-    ])
-    return "\n".join(lines)
-
-
 def _generated_image_markdown_output(
     image_results,
     stored: list[StoredImageResult],
@@ -779,128 +784,6 @@ def _generated_image_client_output(
         return _generated_image_exec_output(image_results, artifacts, usage), "codex_exec_generated_image"
     output = _generated_image_markdown_output(image_results, stored, artifacts, usage)
     return output, "assistant_message"
-
-
-def _merge_image_bridge_output(
-    planner_output: InternalOutputMessage,
-    image_output: InternalOutputMessage,
-) -> InternalOutputMessage:
-    """Replace private image bridge calls without dropping client-owned work."""
-    replacement_calls = list(image_output.tool_calls)
-    merged_calls: list[InternalToolCallOutput] = []
-    replacement_inserted = False
-    for call in planner_output.tool_calls:
-        is_private_image_call = call.name == IMAGE_BRIDGE_TOOL_NAME
-        is_wrapped_image_call = call.name == "exec" and bool(
-            image_call_arguments_from_exec(call.arguments)
-        )
-        if is_private_image_call or is_wrapped_image_call:
-            if not replacement_inserted:
-                merged_calls.extend(replacement_calls)
-                replacement_inserted = True
-            continue
-        merged_calls.append(call)
-
-    if replacement_calls and not replacement_inserted:
-        merged_calls.extend(replacement_calls)
-
-    text_parts = [part for part in (planner_output.text, image_output.text) if part]
-    return InternalOutputMessage(
-        role=planner_output.role,
-        text="\n\n".join(text_parts),
-        reasoning=planner_output.reasoning,
-        tool_calls=merged_calls,
-        finish_reason="tool_calls" if merged_calls else image_output.finish_reason,
-        # image_output carries the aggregate usage from the initial planner
-        # and every continuation round. planner_output may contain only the
-        # final round and must not replace that total.
-        usage=dict(image_output.usage or planner_output.usage),
-    )
-
-
-def _append_image_bridge_results(
-    internal,
-    invocations: list[tuple[InternalToolCallOutput, dict[str, Any], list[dict[str, str]]]],
-    *,
-    failed: list[tuple[InternalToolCallOutput, dict[str, Any], str]] | None = None,
-) -> None:
-    """Add gateway-executed image calls and compact results to the model history."""
-    call_parts = []
-    failed = failed or []
-    for call, arguments, _ in invocations:
-        call_parts.append(tool_call_part(
-            call.call_id or call.id,
-            call.name,
-            arguments,
-            raw_arguments=call.arguments,
-        ))
-    for call, arguments, _ in failed:
-        call_parts.append(tool_call_part(
-            call.call_id or call.id,
-            call.name,
-            arguments,
-            raw_arguments=call.arguments,
-        ))
-    internal.messages.append(InternalMessage(role="assistant", parts=call_parts))
-    for call, _, artifacts in invocations:
-        if artifacts:
-            summary = _generated_image_asset_manifest(artifacts)
-        else:
-            summary = (
-                "This image was already generated and displayed earlier in the current task. "
-                "Continue without regenerating it."
-            )
-        internal.messages.append(InternalMessage(
-            role="tool",
-            parts=[tool_result_part(call.call_id or call.id, [text_part(summary)])],
-        ))
-    for call, _, error_message in failed:
-        summary = (
-            "Image generation failed for this invocation after gateway retries. "
-            f"Error: {error_message}. Continue the task using successful assets and retry only "
-            "this failed prompt if it is still required; do not regenerate successful prompts."
-        )
-        internal.messages.append(InternalMessage(
-            role="tool",
-            parts=[tool_result_part(call.call_id or call.id, [text_part(summary)])],
-        ))
-
-
-def _image_bridge_invocations(
-    output: InternalOutputMessage,
-) -> list[tuple[InternalToolCallOutput, dict[str, Any]]]:
-    invocations = []
-    for call in output.tool_calls:
-        if call.name == IMAGE_BRIDGE_TOOL_NAME:
-            invocations.append((call, image_call_arguments(call.arguments)))
-            continue
-        if call.name == "exec":
-            wrapped_arguments = image_call_arguments_list_from_exec(call.arguments)
-            if len(wrapped_arguments) == 1:
-                invocations.append((call, wrapped_arguments[0]))
-                continue
-            for index, wrapped_args in enumerate(wrapped_arguments, start=1):
-                base_id = call.call_id or call.id or "exec_image"
-                synthetic_id = f"{base_id}_image_{index}"
-                invocations.append((InternalToolCallOutput(
-                    id=synthetic_id,
-                    call_id=synthetic_id,
-                    name=IMAGE_BRIDGE_TOOL_NAME,
-                    arguments=json.dumps(wrapped_args, ensure_ascii=False),
-                    raw=call.raw,
-                ), wrapped_args))
-    return invocations
-
-
-def _image_prompt_key(arguments: dict[str, Any]) -> str:
-    prompt = " ".join(str(arguments.get("prompt") or "").lower().split())
-    return json.dumps({
-        "prompt": prompt,
-        "size": arguments.get("size"),
-        "quality": arguments.get("quality"),
-        "background": arguments.get("background"),
-        "output_format": arguments.get("output_format"),
-    }, sort_keys=True, ensure_ascii=False)
 
 
 def _responses_required_tool_types(body: dict) -> set[str]:
@@ -3251,6 +3134,10 @@ def list_models(authorization: Optional[str] = Header(None)):
                         entry["supports_vision"] = True
                         entry["image_support"] = True
                         entry["multimodal"] = True
+                    # 生图能力：provider_models.image_generation 显式标记的模型才广告（正声明，
+                    # 缺失 = 不支持），让 live_eval 等下游按能力 gate 生图探针。
+                    if get_model_image_generation(provider["id"], model["id"]):
+                        entry["supports_image_generation"] = True
                     # 客户端契约：能力字段只做正向声明，缺失 = 未知/不支持；
                     # capabilities_for_client_entry 不会输出显式 false。
                     entry.update(capabilities_for_client_entry(caps))
@@ -3331,11 +3218,178 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
         user, api_key, requested_model, model, provider_id, endpoint="chat_completions"
     )
     conv_key = policy.conv_key
-    provider_info = None
-    adapter_provider_id = provider_id or ""
+    provider_info = resolve_provider(model, provider_id)
+    adapter_provider_id = provider_for_log(provider_info, provider_id)
+
+    # Image-generation bridge for chat clients. Mirror the /responses entry
+    # rules: require an explicit image request on an image-capable model.
+    # Works for both streaming and non-streaming requests: streaming buffers
+    # the upstream stream, collapses it into a planner message, then runs the
+    # same bridge loop (see the stream branch below).
+    image_enabled = bool(provider_info and get_model_image_generation(adapter_provider_id, model))
+    chat_user_text = _chat_latest_user_text(internal)
+    image_request_intent = is_image_generation_intent_text(chat_user_text)
+    image_bridge = image_enabled and image_request_intent
+    if image_bridge:
+        configure_internal_image_bridge(internal, body)
+        _app_log.info(
+            "[chat image_generation.bridge_injected] model=%s provider=%s stream=%s",
+            model, adapter_provider_id or "-", stream,
+        )
 
     try:
         if stream:
+            if image_bridge:
+                # Streaming image bridge: buffer the upstream stream, collapse
+                # it into a planner message, then run the same bridge loop as
+                # the non-streaming path. The generated-image result is
+                # rendered as a chat SSE event sequence; if the model chose
+                # not to generate, the buffered stream is passed through.
+                events = _stream_events_with_fallbacks(
+                    internal, temperature=temperature, max_tokens=max_tokens,
+                    log_label="chat.image_bridge",
+                )
+                buffered = [ev async for ev in events]
+                planner_output = _events_to_message(buffered)
+                _maybe_repair_tool_leak(planner_output, internal, endpoint="chat.image_bridge", provider_id=adapter_provider_id)
+                model = internal.target_model
+                provider_id = internal.provider_id
+
+                configured_generator = _resolved_image_generator(get_enabled_image_generator() or {})
+                image_provider, image_model = _image_generator_identity(configured_generator)
+                image_provider = image_provider or adapter_provider_id
+                image_model = image_model or model
+                running_details = {
+                    **routing_details_from_policy(policy),
+                    **_thinking_fields_from_payload(body),
+                    "request_kind": "image_generation",
+                    "chat_mode": "model_driven_image_generation_running",
+                    "upstream_endpoint": "images/generations",
+                    "image_model": image_model,
+                    "image_backend_provider": image_provider,
+                    "image_backend_model": image_model,
+                    "image_backend_type": str(configured_generator.get("backend_type") or ""),
+                    "image_fallback_status": "unused",
+                    "image_requested_count": 0,
+                    "image_succeeded_count": 0,
+                    "image_failed_count": 0,
+                    "image_count": 0,
+                    "image_bytes": 0,
+                    "image_artifact_count": 0,
+                    "stream": True,
+                    "status": "running",
+                }
+                _image_log_id_box = [0]
+
+                def _record_running():
+                    _image_log_id_box[0] = _record_request_log(
+                        endpoint="chat_completions", username=username, api_key_value=api_key_value,
+                        requested_model=requested_model, final_model=model,
+                        final_provider=image_provider, request_body=body,
+                        response_body=None, success=True, status="running", tokens=0,
+                        details=running_details, stream=True,
+                    )
+                    return _image_log_id_box[0]
+
+                def _on_progress(progress_details):
+                    _record_request_log(
+                        endpoint="chat_completions", username=username, api_key_value=api_key_value,
+                        requested_model=requested_model, final_model=model,
+                        final_provider=image_provider, request_body=body,
+                        response_body=None, success=True, status="running", tokens=0,
+                        details=progress_details, stream=True, log_id=_image_log_id_box[0],
+                    )
+
+                def _describe_upstream(out, provider_id):
+                    details = _output_request_details(out)
+                    final_model = _target_model_for_log(
+                        RouteTarget(model=internal.target_model, provider_id=provider_id),
+                        provider_id,
+                    )
+                    return details, final_model, provider_id
+
+                outcome = await run_image_bridge(
+                    internal, policy=policy, model=model, temperature=temperature, max_tokens=max_tokens,
+                    base_details={**routing_details_from_policy(policy), **_thinking_fields_from_payload(body)},
+                    running_details=running_details,
+                    configured_generator=configured_generator,
+                    planner_output=planner_output,
+                    planner_provider_info=provider_info,
+                    planner_provider_id=adapter_provider_id,
+                    allow_correction=image_request_intent,
+                    has_client_image_exec_tool=False,
+                    call_model=_call_nonstream_with_fallbacks,
+                    execute_invocations=lambda invocations, progress=None: _execute_image_invocations(
+                        body, username=username, api_key_value=api_key_value, invocations=invocations, progress=progress,
+                    ),
+                    build_artifacts=lambda stored, args, start_index, used_filenames: _stored_image_artifacts(
+                        request, stored, arguments=args, start_index=start_index, used_filenames=used_filenames,
+                    ),
+                    render_client_output=lambda results, stored, artifacts, usage: (
+                        _generated_image_markdown_output(results, stored, artifacts, usage), "markdown"
+                    ),
+                    latest_user_text=lambda: chat_user_text,
+                    record_running=_record_running,
+                    on_progress=_on_progress,
+                    describe_upstream=_describe_upstream,
+                    merge_upstream=_merge_bridge_request_details,
+                    log_label="chat.image_bridge",
+                )
+                if outcome is not None:
+                    image_events = _message_to_events(outcome.image_output)
+                    # The image was generated out-of-band (buffer-and-replay), so
+                    # the client would otherwise sit on a silent stream for the
+                    # whole generation. Emit a short notice first so it can show
+                    # "generating..." instead of appearing hung.
+                    image_events.insert(0, InternalOutputEvent(
+                        kind="text_delta", text="（正在生成图片，请稍候…）\n\n",
+                    ))
+                    details = apply_outcome_to_details(outcome.details, success=True)
+                    details["stream"] = True
+                    _log_request(username, api_key_value, outcome.bridge_final_model, outcome.bridge_final_provider, "chat_completions", True, outcome.tokens, requested_model, details=details)
+                    _record_request_log(
+                        endpoint="chat_completions", username=username, api_key_value=api_key_value,
+                        requested_model=requested_model, final_model=outcome.bridge_final_model,
+                        final_provider=outcome.bridge_final_provider, request_body=body,
+                        response_body=None, success=True, status=outcome.request_status, tokens=outcome.tokens,
+                        usage=outcome.usage, details=details, log_id=_image_log_id_box[0],
+                    )
+                    _record_success_metrics(username, api_key_value, outcome.tokens, outcome.request_status)
+                    return StreamingResponse(
+                        render_chat_completions_sse(
+                            _async_event_stream(image_events), model=outcome.bridge_final_model,
+                            include_usage=bool((body.get("stream_options") or {}).get("include_usage")),
+                        ),
+                        media_type="text/event-stream",
+                    )
+                # Model chose not to generate: passthrough the buffered stream,
+                # hiding the gateway's private bridge tool call from the client.
+                passthrough_events = [
+                    ev for ev in buffered
+                    if not (ev.kind in ("tool_call_start", "tool_call_arguments_delta", "tool_call_done")
+                            and ev.name == IMAGE_BRIDGE_TOOL_NAME)
+                ]
+                return StreamingResponse(
+                    _stream_internal_output(
+                        events=_async_event_stream(passthrough_events),
+                        endpoint="chat_completions",
+                        model=model,
+                        username=username,
+                        api_key_value=api_key_value,
+                        provider_id=adapter_provider_id,
+                        requested_model=requested_model,
+                        log_request=_log_request,
+                        record_request_log=_build_stream_recorder("chat_completions", username, api_key_value, requested_model, body),
+                        conv_key=conv_key,
+                        remember_reasoning_content=_remember_reasoning_content,
+                        tool_only_turns=_tool_only_turns,
+                        base_details={**routing_details_from_policy(policy), **_thinking_fields_from_payload(body)},
+                        render_extra={"include_usage": bool((body.get("stream_options") or {}).get("include_usage"))},
+                        declared_tools=internal.tools,
+                    ),
+                    media_type="text/event-stream"
+                )
+
             events = _stream_events_with_fallbacks(
                 internal,
                 temperature=temperature,
@@ -3362,6 +3416,148 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
                 ),
                 media_type="text/event-stream"
             )
+
+        if image_bridge:
+            # The entry prepare_request_policy already ran the full strategy
+            # (routing/preprocess/reasoning/transforms) and every step is
+            # idempotent, so the bridge reuses that policy instead of running a
+            # second full pass. The bridge tool was injected above, after the
+            # first pass, but policy decisions are insensitive to it.
+            output, provider_info, adapter_provider_id = await _call_nonstream_with_fallbacks(
+                policy,
+                internal,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                log_label="chat.image_bridge",
+            )
+            _maybe_repair_tool_leak(output, internal, endpoint="chat.image_bridge", provider_id=adapter_provider_id)
+            model = internal.target_model
+            provider_id = internal.provider_id
+
+            configured_generator = _resolved_image_generator(get_enabled_image_generator() or {})
+            image_provider, image_model = _image_generator_identity(configured_generator)
+            image_provider = image_provider or adapter_provider_id
+            image_model = image_model or model
+            running_details = {
+                **routing_details_from_policy(policy),
+                **_thinking_fields_from_payload(body),
+                "request_kind": "image_generation",
+                "chat_mode": "model_driven_image_generation_running",
+                "upstream_endpoint": "images/generations",
+                "image_model": image_model,
+                "image_backend_provider": image_provider,
+                "image_backend_model": image_model,
+                "image_backend_type": str(configured_generator.get("backend_type") or ""),
+                "image_fallback_status": "unused",
+                "image_requested_count": 0,
+                "image_succeeded_count": 0,
+                "image_failed_count": 0,
+                "image_count": 0,
+                "image_bytes": 0,
+                "image_artifact_count": 0,
+                "status": "running",
+            }
+            _image_log_id_box = [0]
+
+            def _record_running():
+                _image_log_id_box[0] = _record_request_log(
+                    endpoint="chat_completions", username=username, api_key_value=api_key_value,
+                    requested_model=requested_model, final_model=model,
+                    final_provider=image_provider, request_body=body,
+                    response_body=None, success=True, status="running", tokens=0,
+                    details=running_details, stream=False,
+                )
+                return _image_log_id_box[0]
+
+            def _on_progress(progress_details):
+                _record_request_log(
+                    endpoint="chat_completions", username=username, api_key_value=api_key_value,
+                    requested_model=requested_model, final_model=model,
+                    final_provider=image_provider, request_body=body,
+                    response_body=None, success=True, status="running", tokens=0,
+                    details=progress_details, stream=False, log_id=_image_log_id_box[0],
+                )
+
+            def _describe_upstream(out, provider_id):
+                details = _output_request_details(out)
+                final_model = _target_model_for_log(
+                    RouteTarget(model=internal.target_model, provider_id=provider_id),
+                    provider_id,
+                )
+                return details, final_model, provider_id
+
+            outcome = await run_image_bridge(
+                internal,
+                policy=policy,
+                model=model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                base_details={**routing_details_from_policy(policy), **_thinking_fields_from_payload(body)},
+                running_details=running_details,
+                configured_generator=configured_generator,
+                planner_output=output,
+                planner_provider_info=provider_info,
+                planner_provider_id=adapter_provider_id,
+                allow_correction=image_request_intent,
+                has_client_image_exec_tool=False,
+                call_model=_call_nonstream_with_fallbacks,
+                execute_invocations=lambda invocations, progress=None: _execute_image_invocations(
+                    body, username=username, api_key_value=api_key_value,
+                    invocations=invocations, progress=progress,
+                ),
+                build_artifacts=lambda stored, args, start_index, used_filenames: _stored_image_artifacts(
+                    request, stored, arguments=args, start_index=start_index,
+                    used_filenames=used_filenames,
+                ),
+                render_client_output=lambda results, stored, artifacts, usage: (
+                    _generated_image_markdown_output(results, stored, artifacts, usage), "markdown"
+                ),
+                latest_user_text=lambda: chat_user_text,
+                record_running=_record_running,
+                on_progress=_on_progress,
+                describe_upstream=_describe_upstream,
+                merge_upstream=_merge_bridge_request_details,
+                log_label="chat.image_bridge",
+            )
+            if outcome is not None:
+                image_output = outcome.image_output
+                details = outcome.details
+                request_status = outcome.request_status
+                tokens = outcome.tokens
+                bridge_final_model = outcome.bridge_final_model
+                bridge_final_provider = outcome.bridge_final_provider
+                image_request_log_id = _image_log_id_box[0]
+                rendered = render_chat_completion(image_output, model=model)
+                details = apply_outcome_to_details(details, success=True)
+                _log_request(username, api_key_value, bridge_final_model, bridge_final_provider, "chat_completions", True, tokens, requested_model, details=details)
+                _record_request_log(
+                    endpoint="chat_completions", username=username, api_key_value=api_key_value,
+                    requested_model=requested_model, final_model=bridge_final_model,
+                    final_provider=bridge_final_provider, request_body=body,
+                    response_body=rendered, success=True, status=request_status, tokens=tokens,
+                    usage=outcome.usage, details=details, log_id=image_request_log_id,
+                )
+                _record_success_metrics(username, api_key_value, tokens, request_status)
+                return rendered
+
+            # The model chose not to generate an image. Never expose the
+            # gateway's private proxy function in the client-visible response.
+            output.tool_calls = [call for call in output.tool_calls if call.name != IMAGE_BRIDGE_TOOL_NAME]
+            logged_model = _target_model_for_log(RouteTarget(model=internal.target_model, provider_id=adapter_provider_id), adapter_provider_id)
+            rendered = render_chat_completion(output, model=model)
+            tokens = output.usage.get("total_tokens", 0)
+            details = {**routing_details_from_policy(policy), **_output_request_details(output), "chat_mode": "image_bridge_model_passthrough"}
+            details = apply_outcome_to_details(details, success=True)
+            _log_request(username, api_key_value, logged_model, adapter_provider_id or "", "chat_completions", True, tokens, requested_model, details=details)
+            _record_request_log(
+                endpoint="chat_completions", username=username, api_key_value=api_key_value,
+                requested_model=requested_model, final_model=logged_model,
+                final_provider=adapter_provider_id or "", request_body=body,
+                response_body=rendered, success=True, status=details.get("status", "ok"), tokens=tokens,
+                usage=output.usage, details=details,
+            )
+            _record_success_metrics(username, api_key_value, tokens, details.get("status", "ok"))
+            return rendered
 
         output, provider_info, adapter_provider_id = await _call_nonstream_with_fallbacks(
             policy,
@@ -3400,7 +3596,14 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
         _log_request(username, api_key_value, logged_model, adapter_provider_id or "", "chat_completions", True, tokens, requested_model, details=success_details)
         _record_success_metrics(username, api_key_value, tokens, status)
         return rendered
-    except HTTPException:
+    except HTTPException as http_exc:
+        # image bridge correction 失败（502）等透传路径也要留下失败日志/统计，
+        # 与 completions/messages/responses 端点对齐，避免可观测性盲区。
+        _log_upstream_http_exception_failure(
+            "chat_completions", http_exc,
+            username=username, api_key_value=api_key_value, requested_model=requested_model,
+            model=model, provider_id=adapter_provider_id or provider_id or "", body=body,
+        )
         raise
     except Exception as e:
         _error_log.error("[chat] %s", str(e))
@@ -3969,516 +4172,107 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                 adapter_provider_id,
             )
             bridge_final_provider = adapter_provider_id
-            requested_image_invocations = _image_bridge_invocations(output)
-            max_image_invocations = 8
-            image_invocations = requested_image_invocations[:max_image_invocations]
-            skipped_initial_invocations = requested_image_invocations[max_image_invocations:]
-            if skipped_initial_invocations:
-                _app_log.warning(
-                    "[responses image_generation.batch_limited] requested=%d allowed=%d",
-                    len(requested_image_invocations), max_image_invocations,
-                )
-            _app_log.info(
-                "[responses image_generation.planner_calls] total=%d image=%d names=%s",
-                len(output.tool_calls), len(image_invocations),
-                [call.name for call in output.tool_calls],
-            )
-            # The bridge advertises an optional capability. Never replace the
-            # model's chosen text or ordinary tool call with a forced image
-            # invocation. Besides overriding agent intent, that behavior made
-            # unrelated tasks fail when the global image backend was disabled.
-            image_correction_applied = False
-            all_initial_calls_are_images = len(requested_image_invocations) == len(output.tool_calls)
-            # An explicit image request must not silently degrade into a text
-            # completion when the model ignores the advertised image tool.
-            # Ordinary image discussion never reaches this branch because
-            # ``image_bridge`` is gated by ``image_request_intent`` above.
-            # Client-owned Codex image tools are also excluded: their tool
-            # loop belongs to the client, not this hosted bridge.
-            if (
-                image_request_intent
-                and not requested_image_invocations
-                and not output.tool_calls
-                and not codex_image_tool
-                and not has_codex_generated_image_exec_tool(body)
-                and not image_display_followup
-                and not image_already_generated
-                and not system_turn
-                and (isinstance(input_data, str) or not isinstance(input_data, list) or not any(
-                    isinstance(item, dict) and item.get("role") == "assistant"
-                    for item in input_data
-                ))
-            ):
-                append_system_text(internal.messages, IMAGE_BRIDGE_CORRECTION_INSTRUCTIONS)
-                internal.tool_choice = {
-                    "type": "function",
-                    "function": {"name": IMAGE_BRIDGE_TOOL_NAME},
-                }
-                allowed = internal.extra.setdefault("allowed_openai_params", [])
-                if "tool_choice" not in allowed:
-                    allowed.append("tool_choice")
-                image_correction_applied = True
-                _app_log.warning(
-                    "[responses image_generation.correction] no image invocation; "
-                    "forcing bridge tool choice model=%s provider=%s",
-                    internal.target_model, adapter_provider_id or "-",
-                )
-                correction_output, provider_info, adapter_provider_id = await _call_nonstream_with_fallbacks(
-                    policy, internal, temperature=temperature, max_tokens=max_tokens,
-                    log_label="responses.image_bridge.correction",
-                )
-                correction_invocations = _image_bridge_invocations(correction_output)
-                if correction_invocations:
-                    output = correction_output
-                    bridge_upstream_details = _merge_bridge_request_details(
-                        bridge_upstream_details, _output_request_details(correction_output),
-                    )
-                    bridge_final_model = _target_model_for_log(
-                        RouteTarget(model=internal.target_model, provider_id=adapter_provider_id),
-                        adapter_provider_id,
-                    )
-                    bridge_final_provider = adapter_provider_id
-                    requested_image_invocations = correction_invocations
-                    image_invocations = correction_invocations[:max_image_invocations]
-                    skipped_initial_invocations = correction_invocations[max_image_invocations:]
-                    all_initial_calls_are_images = len(correction_invocations) == len(correction_output.tool_calls)
-                    # Continue through the existing backend execution path.
-                else:
-                    correction_error = HTTPException(
-                        status_code=502,
-                        detail="The model did not invoke the image-generation tool",
-                    )
-                    # The correction is a second planner request. Preserve
-                    # the first request's authoritative fallback history and
-                    # final target, otherwise a failed correction is logged as
-                    # if it only touched the primary model.
-                    failure_details = {
-                        **bridge_upstream_details,
-                        "attempted_model": bridge_final_model,
-                        "attempted_provider": bridge_final_provider,
-                        "request_kind": "image_generation",
-                        "responses_mode": "image_generation_failed",
-                        "upstream_endpoint": "images/generations",
-                        "image_count": 0,
-                        "image_failed_count": 1,
-                        "image_correction_applied": True,
-                        "error_message": "model did not invoke image generation tool after correction",
-                    }
-                    _attach_request_details(
-                        correction_error, **failure_details,
-                    )
-                    raise correction_error
-            if image_invocations:
-                image_results = bridge_image_results
-                stored_images = bridge_stored_images
-                image_artifacts: list[dict[str, str]] = []
-                used_asset_filenames: set[str] = set()
-                completed_invocations = []
-                failed_invocations = []
-                generator = {}
-                prompt_chars = 0
-                image_failure_attempt_count = 0
-                image_retried_count = 0
-                image_reused_count = 0
-                unresolved_failed_keys: set[str] = set()
-                image_invocation_attempt_count = 0
-                configured_generator = _resolved_image_generator(get_enabled_image_generator() or {})
-                image_provider, image_model = _image_generator_identity(configured_generator)
-                image_provider = image_provider or adapter_provider_id
-                image_model = image_model or model
-                running_details = {
-                    **routing_details_from_policy(policy),
-                    "request_kind": "image_generation",
-                    "responses_mode": "model_driven_image_generation_running",
-                    "upstream_endpoint": "images/generations",
-                    "image_model": image_model,
-                    "image_backend_provider": image_provider,
-                    "image_backend_model": image_model,
-                    "image_backend_type": str(configured_generator.get("backend_type") or ""),
-                    "image_fallback_status": "unused",
-                    "image_requested_count": len(image_invocations),
-                    "image_succeeded_count": 0,
-                    "image_failed_count": 0,
-                    "image_count": 0,
-                    "image_bytes": 0,
-                    "image_artifact_count": 0,
-                    "status": "running",
-                }
-                image_request_log_id = _record_request_log(
+            configured_generator = _resolved_image_generator(get_enabled_image_generator() or {})
+            image_provider, image_model = _image_generator_identity(configured_generator)
+            image_provider = image_provider or adapter_provider_id
+            image_model = image_model or model
+            running_details = {
+                **routing_details_from_policy(policy),
+                "request_kind": "image_generation",
+                "responses_mode": "model_driven_image_generation_running",
+                "upstream_endpoint": "images/generations",
+                "image_model": image_model,
+                "image_backend_provider": image_provider,
+                "image_backend_model": image_model,
+                "image_backend_type": str(configured_generator.get("backend_type") or ""),
+                "image_fallback_status": "unused",
+                "image_requested_count": 0,
+                "image_succeeded_count": 0,
+                "image_failed_count": 0,
+                "image_count": 0,
+                "image_bytes": 0,
+                "image_artifact_count": 0,
+                "status": "running",
+            }
+            _image_log_id_box = [0]
+
+            def _record_running():
+                _image_log_id_box[0] = _record_request_log(
                     endpoint="responses", username=username, api_key_value=api_key_value,
                     requested_model=requested_model, final_model=model,
                     final_provider=image_provider, request_body=body,
                     response_body=None, success=True, status="running", tokens=0,
                     details=running_details, stream=stream,
                 )
+                return _image_log_id_box[0]
 
-                def record_image_progress(batch_id, outcomes, total):
-                    succeeded = [item for item in outcomes if item.error is None]
-                    failed = [item for item in outcomes if item.error is not None]
-                    progress_details = {
-                        **running_details,
-                        "image_batch_id": batch_id,
-                        "image_completed_count": len(outcomes),
-                        "image_requested_count": total,
-                        "image_succeeded_count": len(succeeded),
-                        "image_failed_count": len(failed),
-                        "image_artifact_count": sum(len(item.stored) for item in succeeded),
-                        "image_retried_count": sum(max(0, item.backend_attempts - 1) for item in succeeded),
-                        "image_reused_count": sum(1 for item in succeeded if item.reused),
-                    }
-                    _record_request_log(
-                        endpoint="responses", username=username, api_key_value=api_key_value,
-                        requested_model=requested_model, final_model=model,
-                        final_provider=image_provider, request_body=body,
-                        response_body=None, success=True, status="running", tokens=0,
-                        details=progress_details, stream=stream, log_id=image_request_log_id,
-                    )
+            def _on_progress(progress_details):
+                _record_request_log(
+                    endpoint="responses", username=username, api_key_value=api_key_value,
+                    requested_model=requested_model, final_model=model,
+                    final_provider=image_provider, request_body=body,
+                    response_body=None, success=True, status="running", tokens=0,
+                    details=progress_details, stream=stream, log_id=_image_log_id_box[0],
+                )
 
-                initial_outcomes = await _execute_image_invocations(
-                    body,
-                    username=username,
-                    api_key_value=api_key_value,
-                    invocations=image_invocations,
-                    progress=record_image_progress,
+            def _describe_upstream(out, provider_id):
+                details = _output_request_details(out)
+                final_model = _target_model_for_log(
+                    RouteTarget(model=internal.target_model, provider_id=provider_id),
+                    provider_id,
                 )
-                image_invocation_attempt_count += len(initial_outcomes)
-                for outcome in initial_outcomes:
-                    call, args = outcome.call, outcome.arguments
-                    prompt = str(args.get("prompt") or latest_user_text(input_data) or "")
-                    prompt_chars += len(prompt)
-                    if outcome.error is not None:
-                        image_failure_attempt_count += 1
-                        unresolved_failed_keys.add(_image_prompt_key(args))
-                        failed_invocations.append((call, args, friendly_error_msg(outcome.error)))
-                        continue
-                    generator = outcome.generator
-                    image_retried_count += max(0, outcome.backend_attempts - 1)
-                    image_reused_count += 1 if outcome.reused else 0
-                    invocation_results = await anyio.to_thread.run_sync(
-                        partial(
-                            generation_results_from_stored,
-                            outcome.stored,
-                            size=args.get("size"), quality=args.get("quality"),
-                            output_format=args.get("output_format"), background=args.get("background"),
-                        )
-                    )
-                    stored_images.extend(item for item in outcome.stored if item not in stored_images)
-                    invocation_artifacts = _stored_image_artifacts(
-                        request, outcome.stored, arguments=args,
-                        start_index=len(image_artifacts) + 1,
-                        used_filenames=used_asset_filenames,
-                    )
-                    image_results.extend(invocation_results)
-                    image_artifacts.extend(invocation_artifacts)
-                    completed_invocations.append((call, args, invocation_artifacts))
-                    unresolved_failed_keys.discard(_image_prompt_key(args))
-                if not completed_invocations:
-                    first_error = next((item.error for item in initial_outcomes if item.error), None)
-                    if first_error is None:
-                        first_error = RuntimeError("image batch returned no successful images")
-                    _attach_request_details(
-                        first_error,
-                        request_kind="image_generation",
-                        responses_mode="model_driven_image_generation_failed",
-                        upstream_endpoint="images/generations",
-                        image_model=image_model,
-                        attempted_provider=image_provider,
-                        image_requested_count=len(image_invocations),
-                        image_succeeded_count=0,
-                        image_failed_count=len(failed_invocations),
-                        image_count=0,
-                        image_bytes=0,
-                    )
-                    raise first_error
-                image_provider, image_model = _image_generator_identity(generator)
-                bridge_image_model = image_model
-                planner_tokens = output.usage.get("total_tokens", 0)
-                tokens = planner_tokens
-                details = {
-                    **routing_details_from_policy(policy),
-                    "request_kind": "image_generation",
-                    "responses_mode": "model_driven_image_generation",
-                    "upstream_endpoint": "images/generations",
-                    "image_model": image_model,
-                    "image_count": len(image_results),
-                    "image_bytes": image_results_bytes(image_results),
-                    "planner_tokens": planner_tokens,
-                    "image_invocation_count": len(completed_invocations),
-                    "image_requested_count": len(image_invocations),
-                    "image_succeeded_count": len(completed_invocations),
-                    "image_failed_count": len(unresolved_failed_keys),
-                    "image_failure_attempt_count": image_failure_attempt_count,
-                    "image_retried_count": image_retried_count,
-                    "image_reused_count": image_reused_count,
-                    "image_correction_applied": image_correction_applied,
-                }
-                _app_log.info(
-                    "[responses image_generation.model_invoked] invocations=%d prompt_chars=%d image_model=%s",
-                    len(completed_invocations), prompt_chars, image_model,
-                )
-                continuation_tokens = 0
-                continuation_usage: dict[str, int] = {}
-                continuation_error = ""
-                planner_output = output
-                if not has_codex_generated_image_exec_tool(body) and all_initial_calls_are_images:
-                    _append_image_bridge_results(internal, [
-                        *completed_invocations,
-                        *((call, args, []) for call, args in skipped_initial_invocations),
-                    ], failed=failed_invocations)
-                    generated_prompt_keys = {
-                        _image_prompt_key(args) for _, args, _ in completed_invocations
-                    }
-                    continuation = InternalOutputMessage()
-                    max_continuation_rounds = 4
-                    force_without_image_tool = False
-                    for continuation_round in range(1, max_continuation_rounds + 1):
-                        try:
-                            continuation, provider_info, adapter_provider_id = await _call_nonstream_with_fallbacks(
-                                policy, internal, temperature=temperature, max_tokens=max_tokens,
-                                log_label="responses.image_bridge.continuation",
-                            )
-                        except Exception as exc:
-                            continuation_error = friendly_error_msg(exc)
-                            continuation = InternalOutputMessage(
-                                text=(
-                                    "Generated image assets are available, but the agent continuation "
-                                    "failed. Continue the task in the next turn using the listed originals."
-                                ),
-                                finish_reason="stop",
-                            )
-                            _app_log.warning(
-                                "[responses image_generation.continuation_failed] round=%d images=%d error=%s",
-                                continuation_round, len(image_results), continuation_error,
-                            )
-                            break
-                        for key, value in continuation.usage.items():
-                            continuation_usage[key] = continuation_usage.get(key, 0) + int(value or 0)
-                        continuation_tokens = continuation_usage.get("total_tokens", 0)
-                        pending_images = _image_bridge_invocations(continuation)
-                        if not pending_images:
-                            break
-                        fresh_images = [
-                            (call, args) for call, args in pending_images
-                            if _image_prompt_key(args) not in generated_prompt_keys
-                        ]
-                        remaining_image_budget = max_image_invocations - len(completed_invocations)
-                        if remaining_image_budget <= 0:
-                            fresh_images = []
-                            force_without_image_tool = len(pending_images) == len(continuation.tool_calls)
-                        else:
-                            fresh_images = fresh_images[:remaining_image_budget]
-                        _app_log.info(
-                            "[responses image_generation.continuation_images] round=%d requested=%d fresh=%d",
-                            continuation_round, len(pending_images), len(fresh_images),
-                        )
-                        if not fresh_images:
-                            _append_image_bridge_results(
-                                internal, [(call, args, []) for call, args in pending_images]
-                            )
-                            if len(pending_images) < len(continuation.tool_calls):
-                                break
-                            if force_without_image_tool:
-                                break
-                            if continuation_round == max_continuation_rounds:
-                                force_without_image_tool = True
-                                break
-                            continue
-                        round_results = []
-                        round_completed = []
-                        round_failed = []
+                return details, final_model, provider_id
 
-                        def record_continuation_progress(batch_id, outcomes, total):
-                            current_success = sum(1 for item in outcomes if item.error is None)
-                            current_failed = sum(1 for item in outcomes if item.error is not None)
-                            progress_details = {
-                                **running_details,
-                                "image_batch_id": batch_id,
-                                "image_completed_count": image_invocation_attempt_count + len(outcomes),
-                                "image_requested_count": len(image_invocations) + len(fresh_images),
-                                "image_succeeded_count": len(completed_invocations) + current_success,
-                                "image_failed_count": len(unresolved_failed_keys) + current_failed,
-                                "image_artifact_count": len(stored_images) + sum(
-                                    len(item.stored) for item in outcomes if item.error is None
-                                ),
-                                "image_retried_count": image_retried_count + sum(
-                                    max(0, item.backend_attempts - 1)
-                                    for item in outcomes if item.error is None
-                                ),
-                                "image_reused_count": image_reused_count + sum(
-                                    1 for item in outcomes if item.error is None and item.reused
-                                ),
-                            }
-                            _record_request_log(
-                                endpoint="responses", username=username, api_key_value=api_key_value,
-                                requested_model=requested_model, final_model=model,
-                                final_provider=image_provider, request_body=body,
-                                response_body=None, success=True, status="running", tokens=0,
-                                details=progress_details, stream=stream, log_id=image_request_log_id,
-                            )
-
-                        round_outcomes = await _execute_image_invocations(
-                            body,
-                            username=username,
-                            api_key_value=api_key_value,
-                            invocations=fresh_images,
-                            progress=record_continuation_progress,
-                        )
-                        image_invocation_attempt_count += len(round_outcomes)
-                        for outcome in round_outcomes:
-                            call, args = outcome.call, outcome.arguments
-                            prompt = str(args.get("prompt") or latest_user_text(input_data) or "")
-                            prompt_chars += len(prompt)
-                            if outcome.error is not None:
-                                image_failure_attempt_count += 1
-                                unresolved_failed_keys.add(_image_prompt_key(args))
-                                round_failed.append((call, args, friendly_error_msg(outcome.error)))
-                                continue
-                            generator = outcome.generator
-                            image_retried_count += max(0, outcome.backend_attempts - 1)
-                            image_reused_count += 1 if outcome.reused else 0
-                            invocation_results = await anyio.to_thread.run_sync(
-                                partial(
-                                    generation_results_from_stored,
-                                    outcome.stored,
-                                    size=args.get("size"), quality=args.get("quality"),
-                                    output_format=args.get("output_format"), background=args.get("background"),
-                                )
-                            )
-                            stored_images.extend(item for item in outcome.stored if item not in stored_images)
-                            invocation_artifacts = _stored_image_artifacts(
-                                request, outcome.stored, arguments=args,
-                                start_index=len(image_artifacts) + 1,
-                                used_filenames=used_asset_filenames,
-                            )
-                            round_results.extend(invocation_results)
-                            image_artifacts.extend(invocation_artifacts)
-                            round_completed.append((call, args, invocation_artifacts))
-                            generated_prompt_keys.add(_image_prompt_key(args))
-                            unresolved_failed_keys.discard(_image_prompt_key(args))
-                        image_results.extend(round_results)
-                        completed_invocations.extend(round_completed)
-                        _continuation_provider, image_model = _image_generator_identity(generator)
-                        bridge_image_model = image_model
-                        completed_call_ids = {call.call_id or call.id for call, _, _ in round_completed}
-                        failed_call_ids = {call.call_id or call.id for call, _, _ in round_failed}
-                        skipped_invocations = [
-                            (call, args, []) for call, args in pending_images
-                            if (call.call_id or call.id) not in completed_call_ids | failed_call_ids
-                        ]
-                        _append_image_bridge_results(
-                            internal, [*round_completed, *skipped_invocations], failed=round_failed
-                        )
-                        if len(pending_images) < len(continuation.tool_calls):
-                            break
-                        if len(completed_invocations) >= max_image_invocations:
-                            force_without_image_tool = True
-                            break
-                        if continuation_round == max_continuation_rounds:
-                            force_without_image_tool = True
-                    if force_without_image_tool:
-                        internal.tools = [
-                            tool for tool in internal.tools if tool.name != IMAGE_BRIDGE_TOOL_NAME
-                        ]
-                        remaining_tools = internal.chat_tools()
-                        if remaining_tools:
-                            internal.extra["tools"] = remaining_tools
-                        else:
-                            internal.extra.pop("tools", None)
-                        try:
-                            continuation, provider_info, adapter_provider_id = await _call_nonstream_with_fallbacks(
-                                policy, internal, temperature=temperature, max_tokens=max_tokens,
-                                log_label="responses.image_bridge.continuation.final",
-                            )
-                            bridge_upstream_details = _merge_bridge_request_details(
-                                bridge_upstream_details, _output_request_details(continuation),
-                            )
-                            bridge_final_model = _target_model_for_log(
-                                RouteTarget(model=internal.target_model, provider_id=adapter_provider_id),
-                                adapter_provider_id,
-                            )
-                            bridge_final_provider = adapter_provider_id
-                            for key, value in continuation.usage.items():
-                                continuation_usage[key] = continuation_usage.get(key, 0) + int(value or 0)
-                            continuation_tokens = continuation_usage.get("total_tokens", 0)
-                        except Exception as exc:
-                            continuation_error = friendly_error_msg(exc)
-                            continuation = InternalOutputMessage(
-                                text=(
-                                    "Generated image assets are available, but the agent continuation "
-                                    "failed. Continue the task in the next turn using the listed originals."
-                                ),
-                                finish_reason="stop",
-                            )
-                            _app_log.warning(
-                                "[responses image_generation.continuation_failed] stage=final images=%d error=%s",
-                                len(image_results), continuation_error,
-                            )
-                    planner_output = continuation
-                    continuation.tool_calls = [
-                        call for call in continuation.tool_calls
-                        if call.name != IMAGE_BRIDGE_TOOL_NAME
-                        and not (call.name == "exec" and image_call_arguments_from_exec(call.arguments))
-                    ]
-                    _app_log.info(
-                        "[responses image_generation.continuation] text_chars=%d tool_calls=%d tokens=%d",
-                        len(continuation.text or ""), len(continuation.tool_calls), continuation_tokens,
-                    )
-                combined_usage = {
-                    key: int(output.usage.get(key, 0) or 0) + int(continuation_usage.get(key, 0) or 0)
-                    for key in set(output.usage) | set(continuation_usage)
-                }
-                tokens = combined_usage.get("total_tokens", planner_tokens + continuation_tokens)
-                image_output, display_mode = await anyio.to_thread.run_sync(
-                    _generated_image_client_output,
-                    body, image_results, stored_images, image_artifacts, combined_usage,
-                )
-                image_output = _merge_image_bridge_output(planner_output, image_output)
-                details = {
-                    **details,
-                    **bridge_upstream_details,
-                    "responses_mode": f"model_driven_image_generation_{display_mode}",
-                    "image_artifact_count": len(stored_images),
-                    "continuation_tokens": continuation_tokens,
-                    "image_count": len(image_results),
-                    "image_bytes": image_results_bytes(image_results),
-                    "image_invocation_count": len(completed_invocations),
-                    "image_invocation_attempt_count": image_invocation_attempt_count,
-                    "image_requested_count": len(image_invocations),
-                    "image_succeeded_count": len(completed_invocations),
-                    "image_failed_count": len(unresolved_failed_keys),
-                    "image_failure_attempt_count": image_failure_attempt_count,
-                    "image_retried_count": image_retried_count,
-                    "image_reused_count": image_reused_count,
-                    "image_continuation_error": continuation_error,
-                    "image_correction_applied": image_correction_applied,
-                }
-                # Planner fallback is independent from the configured image backend.
-                # Do not present a recovered chat-planning request as image fallback.
-                if "fallback_status" in details:
-                    details["planner_fallback_status"] = details.pop("fallback_status")
-                if "fallback_attempts" in details:
-                    details["planner_fallback_attempts"] = details.pop("fallback_attempts")
-                details["image_fallback_status"] = "unused"
-                details["image_backend_provider"] = image_provider
-                details["image_backend_model"] = image_model
-                request_status = (
-                    "degraded"
-                    if (
-                        image_failure_attempt_count > 0
-                        or image_retried_count > 0
-                        or unresolved_failed_keys
-                        or continuation_error
-                    )
-                    else "ok"
-                )
-                details["status"] = request_status
-                details = apply_outcome_to_details(details, success=True)
-                request_status = details.get("status", request_status)
-                _app_log.info(
-                    "[responses image_generation.assistant_message] images=%d artifact_bytes=%d",
-                    len(stored_images),
-                    _stored_image_bytes(stored_images),
-                )
+            outcome = await run_image_bridge(
+                internal,
+                policy=policy,
+                model=model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                base_details=routing_details_from_policy(policy),
+                running_details=running_details,
+                configured_generator=configured_generator,
+                planner_output=output,
+                planner_provider_info=provider_info,
+                planner_provider_id=adapter_provider_id,
+                allow_correction=(
+                    image_request_intent
+                    and not codex_image_tool
+                    and not has_codex_generated_image_exec_tool(body)
+                    and not image_display_followup
+                    and not image_already_generated
+                    and not system_turn
+                    and not _responses_has_prior_assistant(input_data)
+                ),
+                has_client_image_exec_tool=has_codex_generated_image_exec_tool(body),
+                call_model=_call_nonstream_with_fallbacks,
+                execute_invocations=lambda invocations, progress=None: _execute_image_invocations(
+                    body, username=username, api_key_value=api_key_value,
+                    invocations=invocations, progress=progress,
+                ),
+                build_artifacts=lambda stored, args, start_index, used_filenames: _stored_image_artifacts(
+                    request, stored, arguments=args, start_index=start_index,
+                    used_filenames=used_filenames,
+                ),
+                render_client_output=lambda results, stored, artifacts, usage: _generated_image_client_output(
+                    body, results, stored, artifacts, usage,
+                ),
+                latest_user_text=lambda: latest_user_text(input_data),
+                record_running=_record_running,
+                on_progress=_on_progress,
+                describe_upstream=_describe_upstream,
+                merge_upstream=_merge_bridge_request_details,
+                log_label="responses.image_bridge",
+            )
+            if outcome is not None:
+                image_output = outcome.image_output
+                details = outcome.details
+                request_status = outcome.request_status
+                tokens = outcome.tokens
+                image_results = outcome.image_results
+                bridge_final_model = outcome.bridge_final_model
+                bridge_final_provider = outcome.bridge_final_provider
+                image_request_log_id = _image_log_id_box[0]
                 if stream:
                     details = apply_outcome_to_details(details, success=True)
                     _log_request(username, api_key_value, bridge_final_model, bridge_final_provider, "responses", True, tokens, requested_model, details=details)
@@ -4508,13 +4302,14 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                 _log_request(username, api_key_value, bridge_final_model, bridge_final_provider, "responses", True, tokens, requested_model, details=details)
                 _record_request_log(
                     endpoint="responses", username=username, api_key_value=api_key_value,
-                    requested_model=requested_model, final_model=bridge_final_model,
-                    final_provider=bridge_final_provider, request_body=body,
-                    response_body=rendered, success=True, status=request_status, tokens=tokens,
-                    usage=image_output.usage, details=details, log_id=image_request_log_id,
+                        requested_model=requested_model, final_model=bridge_final_model,
+                        final_provider=bridge_final_provider, request_body=body,
+                        response_body=rendered, success=True, status=request_status, tokens=tokens,
+                        usage=image_output.usage, details=details, log_id=image_request_log_id,
                 )
                 _record_success_metrics(username, api_key_value, tokens, request_status)
                 return rendered
+
 
             # The model chose not to generate an image. Never expose the
             # gateway's private proxy function in the client-visible response.

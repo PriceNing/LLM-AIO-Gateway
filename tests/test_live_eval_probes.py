@@ -141,3 +141,77 @@ def test_probe_image_is_valid_png_64():
     assert data[:8] == b"\x89PNG\r\n\x1a\n"
     width, height = struct.unpack(">II", data[16:24])
     assert (width, height) == (64, 64)
+
+
+# ---------------------------------------------------------------------------
+# 生图探针（chat / responses）
+# ---------------------------------------------------------------------------
+
+def test_chat_image_generation_probe_detects_data_uri():
+    payload = {"choices": [{"message": {"content": "![Generated image](data:image/jpeg;base64,AAAA)"}}]}
+    ok, score, _ = le.evaluate_payload(200, payload, "chat_image_generation")
+    assert ok and score == 1.0
+
+
+def test_chat_image_generation_probe_fails_without_data_uri():
+    payload = {"choices": [{"message": {"content": "I cannot generate images."}}]}
+    ok, score, _ = le.evaluate_payload(200, payload, "chat_image_generation")
+    assert not ok and score < 1.0
+
+
+def test_responses_image_generation_probe_detects_call():
+    payload = {"id": "resp_x", "output": [
+        {"type": "image_generation_call", "status": "completed", "result": "AAAA"},
+    ]}
+    ok, score, _ = le.evaluate_payload(200, payload, "responses_image_generation")
+    assert ok and score == 1.0
+
+
+def test_responses_image_generation_probe_detects_inline_data_uri():
+    # image bridge 路径：结果作为 continuation assistant message，output_text 含 data URI。
+    payload = {"id": "resp_x", "output": [
+        {"type": "message", "content": [{"type": "output_text", "text": "![Generated image](data:image/png;base64,AAAA)"}]},
+    ]}
+    ok, score, _ = le.evaluate_payload(200, payload, "responses_image_generation")
+    assert ok and score == 1.0
+
+
+def test_responses_image_generation_probe_fails_when_absent():
+    payload = {"id": "resp_x", "output": [
+        {"type": "message", "content": [{"type": "output_text", "text": "ok"}]},
+    ]}
+    ok, score, _ = le.evaluate_payload(200, payload, "responses_image_generation")
+    assert not ok and score < 1.0
+
+
+def test_responses_image_generation_probe_ignores_incomplete_call():
+    payload = {"id": "resp_x", "output": [
+        {"type": "image_generation_call", "status": "in_progress", "result": ""},
+    ]}
+    ok, _, _ = le.evaluate_payload(200, payload, "responses_image_generation")
+    assert not ok
+
+
+def _fake_client():
+    class _C:
+        def request(self, *a, **k):
+            return 200, {}, 0
+
+        def get_recent_logs(self, *a, **k):
+            return []
+
+    return _C()
+
+
+def test_build_cases_gates_image_generation_probe():
+    # 支持生图的模型：加两个生图探针 case。
+    supported = le.build_cases(client=_fake_client(), model="m", include_multimodal=False,
+                               include_stream=False, caps={"supports_image_generation": True})
+    names = {c.name for c in supported}
+    assert "chat_image_generation" in names and "responses_image_generation" in names
+    # 不支持生图的模型：两个探针都 skip（不真实请求）。
+    unsupported = le.build_cases(client=_fake_client(), model="m", include_multimodal=False,
+                                 include_stream=False, caps={})
+    skipped = {c.name: c.verdict for c in unsupported
+               if c.name in ("chat_image_generation", "responses_image_generation")}
+    assert skipped == {"chat_image_generation": "skip", "responses_image_generation": "skip"}

@@ -318,10 +318,14 @@ def test_stored_image_bytes_tolerates_missing_files(tmp_path):
 
 
 def test_assistant_message_log_uses_guarded_byte_count():
-    """生图 assistant_message 路径必须复用 _stored_image_bytes，不得裸调 stat()。"""
-    import inspect
-    from app.router import proxy as proxy_module
+    """生图 assistant_message 路径必须复用 _stored_image_bytes，不得裸调 stat()。
 
-    source = inspect.getsource(proxy_module.responses_endpoint)
+    该日志现位于 core 编排层 ``run_image_bridge``（协议无关），因此检查其源码。
+    """
+    import inspect
+    from app.core import image_orchestration
+
+    source = inspect.getsource(image_orchestration.run_image_bridge)
     assert "artifact_bytes=%d" in source
+    assert "_stored_image_bytes(stored_images)" in source
     assert "sum(item.path.stat().st_size for item in stored_images)" not in source

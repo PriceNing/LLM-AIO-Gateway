@@ -62,7 +62,7 @@ CATEGORY_RULES: list[tuple[str, set[int]]] = [
 HARDCODED_WHITELIST: Counter = Counter({
     ("app/adapters/anthropic_streaming.py",
      'raise HTTPException(status_code=502, detail="Upstream: anthropic stream closed before message completion")'): 1,
-    ("app/router/proxy.py", "status_code=502,"): 1,  # 模型未调用生图工具（网关自撰文案）
+    ("app/core/image_orchestration.py", "status_code=502,"): 1,  # 模型未调用生图工具（网关自撰文案）
     ("app/router/admin.py",
      'raise HTTPException(status_code=502, detail="Failed to fetch models from server")'): 1,
     ("app/router/admin.py", "raise HTTPException(status_code=502, detail=detail)"): 1,

@@ -68,6 +68,42 @@ def test_explicit_image_requests_still_match():
     assert is_image_generation_intent("帮我画一张猫的图片") is True
 
 
+def test_cn_paint_concrete_object_matches():
+    # "画一个X" (paint verb + quantity + concrete subject, no explicit 图/图片)
+    # is an image-generation request; abstract/diagram nouns are not.
+    assert is_image_generation_intent("画一个红苹果") is True
+    assert is_image_generation_intent("画一个流程图") is False
+    assert is_image_generation_intent("画一下代码") is False
+    assert is_image_generation_intent("制作一个架构图") is False
+
+
+def test_cn_paint_measure_words_and_abstract_exclusions():
+    # Broader measure words (m6): 片/束/只/对/座/栋/棵/条 all generate.
+    assert is_image_generation_intent("画一片海") is True
+    assert is_image_generation_intent("画一束花") is True
+    assert is_image_generation_intent("画一只猫") is True
+    assert is_image_generation_intent("画一对蝴蝶") is True
+    assert is_image_generation_intent("画一座山") is True
+    # Abstract/creative subjects that are not bitmap requests (m7).
+    assert is_image_generation_intent("画一首歌") is False
+    assert is_image_generation_intent("画一个故事") is False
+    assert is_image_generation_intent("画一个脚本") is False
+    assert is_image_generation_intent("画一个小说") is False
+
+
+def test_vector_format_requests_are_not_routed_to_bridge():
+    # Vector-format requests (svg / 矢量) ask for a vector file the raster
+    # backend cannot produce; the model should answer with markup, not a bitmap.
+    assert is_image_generation_intent("使用svg画一个骑自行车的鹈鹕") is False
+    assert is_image_generation_intent("画一张SVG海报") is False
+    assert is_image_generation_intent("画一个矢量logo") is False
+    assert is_image_generation_intent("draw a vector logo of a bird") is False
+    assert is_image_generation_intent("generate an svg of a cat") is False
+    # "矢量风格" is a look, not a file type -- still generates a bitmap.
+    assert is_image_generation_intent("画一张矢量风格的插画") is True
+    assert is_image_generation_intent("画一个红苹果") is True
+
+
 def test_thread_title_source_is_a_system_turn():
     assert _responses_is_system_turn({
         "client_metadata": {"x-codex-turn-metadata": {

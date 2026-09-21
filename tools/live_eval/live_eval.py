@@ -298,7 +298,7 @@ class GatewayClient:
                 continue
             caps = {
                 key: item.get(key)
-                for key in ("supports_vision", "supports_tools", "context_window", "max_output_tokens")
+                for key in ("supports_vision", "supports_tools", "supports_image_generation", "context_window", "max_output_tokens")
                 if key in item
             }
             models[str(item["id"])] = caps
@@ -634,6 +634,22 @@ def evaluate_payload(status: int, payload: Any, expect: str) -> tuple[bool, floa
     if expect == "responses_stream":
         ok = has_stream_events(payload, {"response.created", "response.completed"})
         return bool(ok), 1.0 if ok else 0.2, "responses stream events present" if ok else "responses stream invalid"
+    if expect == "chat_image_generation":
+        text = text_from_chat(payload)
+        ok = "data:image/" in text
+        return ok, 1.0 if ok else 0.2, "chat image data URI present" if ok else "chat image data URI missing"
+    if expect == "responses_image_generation":
+        # 两条路径都要认：原生 image_generation 工具返回 image_generation_call item；
+        # image bridge 路径把结果作为 continuation 的 assistant message（output_text 含 data URI）。
+        has_call = any(
+            isinstance(item, dict)
+            and item.get("type") == "image_generation_call"
+            and item.get("status") == "completed"
+            and bool(item.get("result"))
+            for item in payload.get("output", []) if isinstance(payload, dict)
+        )
+        ok = has_call or "data:image/" in text_from_responses(payload)
+        return ok, 1.0 if ok else 0.2, "responses image present" if ok else "responses image missing"
     return True, 1.0, "HTTP success"
 
 
@@ -650,6 +666,7 @@ def build_cases(
     gate = not ignore_capabilities
     supports_tools = bool(caps.get("supports_tools"))
     supports_vision = bool(caps.get("supports_vision"))
+    supports_image_generation = bool(caps.get("supports_image_generation"))
     cases: list[CaseResult] = []
     cases.append(make_case(
         client=client,
@@ -807,6 +824,37 @@ def build_cases(
                     "max_tokens": 2000,
                 },
             ))
+    if gate and not supports_image_generation:
+        for name, endpoint in (
+            ("chat_image_generation", "/v1/chat/completions"),
+            ("responses_image_generation", "/v1/responses"),
+        ):
+            cases.append(skip_case(name, endpoint, "skipped: model does not advertise supports_image_generation"))
+    else:
+        cases.append(make_case(
+            client=client,
+            model=model,
+            provider_type=provider_type,
+            name="chat_image_generation",
+            endpoint="/v1/chat/completions",
+            expect="chat_image_generation",
+            capability_probe=True,
+            body={
+                "messages": [{"role": "user", "content": "Generate an image of a red apple on a white background."}],
+            },
+        ))
+        cases.append(make_case(
+            client=client,
+            model=model,
+            provider_type=provider_type,
+            name="responses_image_generation",
+            endpoint="/v1/responses",
+            expect="responses_image_generation",
+            capability_probe=True,
+            body={
+                "input": [{"role": "user", "content": "Generate an image of a red apple on a white background."}],
+            },
+        ))
     if include_stream:
         cases.append(make_case(
             client=client,
