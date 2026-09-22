@@ -18,10 +18,18 @@ import re
 # pricing 为 {prompt|completion|image: 字符串数字}（OpenRouter 口径，$/M tokens）。
 _INT_KEYS = ("context_window", "max_output_tokens")
 _BOOL_KEYS = ("supports_vision", "supports_tools", "supports_reasoning")
-_CAPABILITY_KEYS = _INT_KEYS + _BOOL_KEYS + ("input_modalities", "pricing")
+# 温度锁：描述"该模型只接受某个 temperature 取值"这一参数约束事实。
+#   fixed_temperature                   无条件锁到该值
+#   fixed_temperature_with_reasoning    仅当请求带 reasoning_effort（非 none）时锁到该值
+# 两者供网关在发出请求前归一参数，避免 liteLLM/上游本地拒绝；不对外广告
+# （capabilities_for_client_entry 不投影它们），也不包含任何模型/厂商名称。
+_FLOAT_KEYS = ("fixed_temperature", "fixed_temperature_with_reasoning")
+_CAPABILITY_KEYS = _INT_KEYS + _BOOL_KEYS + _FLOAT_KEYS + ("input_modalities", "pricing")
 
 # 异常/被篡改的上游数据不得直出客户端：超出合理上限的值丢弃（保持"未知"）。
 _INT_LIMITS = {"context_window": 100_000_000, "max_output_tokens": 10_000_000}
+# temperature 的合法定义域（OpenAI 参数约束）；越界值视为非法输入丢弃。
+_FLOAT_LIMITS = {key: (0.0, 2.0) for key in _FLOAT_KEYS}
 
 _BOOL_TRUE = frozenset({"true", "1", "yes", "on"})
 _BOOL_FALSE = frozenset({"false", "0", "no", "off"})
@@ -70,6 +78,18 @@ def normalize_capabilities(raw: Any) -> dict:
             parsed = _parse_bool(raw[key])
             if parsed is not None:
                 out[key] = parsed
+    for key in _FLOAT_KEYS:
+        value = raw.get(key)
+        if value is None or isinstance(value, bool):
+            continue  # 同 _INT_KEYS：True 不得变成 1.0
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            continue
+        lo, hi = _FLOAT_LIMITS.get(key, (0.0, 2.0))
+        if not lo <= parsed <= hi:
+            continue
+        out[key] = parsed
     modalities = raw.get("input_modalities")
     if isinstance(modalities, list):
         cleaned = [str(m) for m in modalities if isinstance(m, (str, int))]
@@ -114,7 +134,11 @@ _BUILTIN_FAMILIES: list[tuple[tuple[str, ...], dict]] = [
     (("gpt-4.1",), {"context_window": 1047552, "max_output_tokens": 32768, "supports_vision": True, "supports_tools": True}),
     (("gpt-4-turbo", "gpt-4-turbo-preview"), {"context_window": 128000, "max_output_tokens": 4096, "supports_vision": True, "supports_tools": True}),
     (("gpt-6",), {"context_window": 1050000, "max_output_tokens": 128000, "supports_vision": True, "supports_tools": True, "supports_reasoning": True}),
-    (("gpt-5",), {"max_output_tokens": 128000, "supports_vision": True, "supports_tools": True, "supports_reasoning": True}),
+    # gpt-5.1 必须排在 gpt-5 之前：marker 是子串命中（"gpt-5.1" 包含 "gpt-5"）且首个命中即生效。
+    (("gpt-5.1",), {"max_output_tokens": 128000, "supports_vision": True, "supports_tools": True,
+                    "supports_reasoning": True, "fixed_temperature_with_reasoning": 1}),
+    (("gpt-5",), {"max_output_tokens": 128000, "supports_vision": True, "supports_tools": True,
+                  "supports_reasoning": True, "fixed_temperature": 1}),
     (("o1", "o3", "o4-mini"), {"context_window": 200000, "max_output_tokens": 100000, "supports_vision": True, "supports_tools": True, "supports_reasoning": True}),
     (("gpt-3.5",), {"context_window": 16383, "max_output_tokens": 4096, "supports_vision": False, "supports_tools": True}),
     # Google

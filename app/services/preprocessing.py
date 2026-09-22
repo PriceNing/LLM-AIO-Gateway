@@ -14,6 +14,7 @@ from typing import Optional
 import httpx
 
 from app.config import get_default
+from app.core.text import error_detail_for_log
 from app.core.types import InternalMessage, InternalPart, text_part, tool_result_part
 from app.core.images import extract_image_data_uris
 
@@ -137,7 +138,7 @@ async def describe_image(
                           resp.status_code, resp.text[:300])
                 return f"[image: vision model HTTP {resp.status_code}]"
     except Exception as e:
-        _log.error("[preprocess] vision call exception type=%s msg=%s", type(e).__name__, str(e))
+        _log.error("[preprocess] vision call exception type=%s msg=%s", type(e).__name__, error_detail_for_log(e))
         return "[image: vision model unavailable or timed out]"
 
 

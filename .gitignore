@@ -57,3 +57,9 @@ Thumbs.db
 htmlcov/
 
 dist/standalone/
+
+# 含服务器凭据的本地脚本/笔记：绝不入库（跨机器一致防护）
+tools/scripts/_remote_exec.py
+.prod-server.local.md
+临时审查结果.md
+当前问题.md

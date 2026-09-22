@@ -3085,7 +3085,7 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
         )
         raise
     except Exception as e:
-        _error_log.error("[chat] %s", str(e))
+        _error_log.error("[chat] %s", error_detail_for_log(e))
         details = _request_details_from_exception(
             e,
             stream=False,
@@ -3230,7 +3230,7 @@ async def completions(request: Request, authorization: Optional[str] = Header(No
         increment_global_stats(success=False)
         if username != "legacy":
             increment_user_usage(username, api_key_value, False, 0)
-        _error_log.error("FAILED: %s", str(e))
+        _error_log.error("FAILED: %s", error_detail_for_log(e))
         raise HTTPException(status_code=client_status_for_upstream_error(e), detail=friendly_error_msg(e))
 
 @router.post("/messages")
@@ -3376,7 +3376,7 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
         increment_global_stats(success=False)
         if username != "legacy":
             increment_user_usage(username, api_key_value, False, 0)
-        _error_log.error("FAILED: %s", str(e))
+        _error_log.error("FAILED: %s", error_detail_for_log(e))
         raise HTTPException(status_code=client_status_for_upstream_error(e), detail=friendly_error_msg(e))
 
 
@@ -4023,7 +4023,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
         increment_global_stats(success=False, stateful_fallback_blocked=bool(details.get("stateful_fallback_blocked")))
         if username != "legacy":
             increment_user_usage(username, api_key_value, False, 0)
-        _error_log.error("FAILED: %s", str(e))
+        _error_log.error("FAILED: %s", error_detail_for_log(e))
         raise HTTPException(status_code=client_status_for_upstream_error(e), detail=friendly_error_msg(e))
 
 

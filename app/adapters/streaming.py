@@ -2,6 +2,7 @@ import asyncio
 import queue
 import threading
 
+from app.core.text import error_detail_for_log
 from app.services.logger import get_logger, get_request_id, set_request_id
 
 
@@ -90,7 +91,7 @@ async def iter_stream_async(
             pass
         except BaseException as exc:
             error = exc
-            _error_log.error("[iter_stream_async] type=%s msg=%s", type(exc).__name__, str(exc)[:200])
+            _error_log.error("[iter_stream_async] type=%s msg=%s", type(exc).__name__, error_detail_for_log(exc))
         finally:
             if stream_gen is not None:
                 close = getattr(stream_gen, "close", None)

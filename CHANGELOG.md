@@ -5,6 +5,36 @@ All notable changes to LLM AIO Gateway will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **GPT-5 的 temperature 锁从模型名判断迁入能力层**：删除 `services/lite_llm.py` 里的 `_local_litellm_model_name()` / `_gpt5_temperature_supported()` / `_normalize_gpt5_temperature()`（`startswith("gpt-5")` / `startswith("gpt-5.1")` 硬编码），改为 `core/model_capabilities.py` 的两个能力键：`fixed_temperature`（无条件锁）与 `fixed_temperature_with_reasoning`（仅当请求带 `reasoning_effort` 时锁）。新函数 `model_temperature_locks()` 按“内置家族表 < 在线注册表 < 已存储（上游透传 + 管理员覆盖）”解析，`apply_temperature_lock()` 为纯函数且条件里不再出现任何模型名。行为与旧实现完全等价（旧版 4 个判定分支均有用例）；管理员现在可直接改锁值，无需改代码发版。该锁不对外广告（`capabilities_for_client_entry` 不投影），`/v1/models` 输出不变。
+- `normalize_capabilities()` 新增浮点能力键校验（定义域 0.0–2.0，拒绝 bool / 越界 / 无法解析，保持"未知 = 不锁"），并新增 `_FLOAT_KEYS` 与 `_FLOAT_LIMITS` 的表一致性用例。
+- `database.py` 新增 `get_model_stored_capabilities(provider_id, model)`，供请求路径按 provider/model 读取已持久化的能力（无行时返回空 dict，呯调用方回退到内置启发式）。
+
+### Removed
+- **删除 `services/lite_llm.py` 里的 liteLLM 视觉能力注入死代码**：`_model_name_suggests_vision()`（19 个模型名 marker）与 `build_completion_args()` 中向 `litellm.model_cost` 写 `{"supports_vision": True}` 占位条目的分支。证据：liteLLM 1.83.14 仅在 anthropic / gemini 的 `prompt_factory` 分支读 `supports_vision()`，`openai/` 前缀直接透传 `messages` 不做本地视觉校验；实测注册与否行为一致；全量测试对该块零依赖；网关自身不读 `model_cost`。保留它反而会往 `model_cost` 里塞入缺字段条目（`max_output_tokens: None`）。
+
+### Fixed
+- **网关不再把残缺或非位图的 data URI 提升为 `image_url` 附件**。此前 agent 工具输出被长度上限从中间切断后，一短 `%4==1` 的 base64 会被当作图片发给上游，换来 `400 invalid base64 format` —— 非法请求是网关自己组装出来的。`extract_image_data_uris()` 现在要求 base64 长度合法、可解码，且容器魔数与结束标记齐全（PNG `IEND`、JPEG `FFD9`、GIF `0x3B`、WebP `RIFF/VP8`）；无法证明是完整位图的格式（SVG 等）一律不动，不引入任何 provider/model 名称判断。
+- `normalize_image_content()` 只改写 `role == "user"` 的消息。assistant / tool 文本里的 data URI 通常是工具日志或被截断的返回值，不再被当“要给模型看的图片”。
+- 只删除“确实已被提取为附件”的那段 URI。未通过校验的载荷不再被从上下文里抹掉（此前会同时丢失文本、又送出一张坏图）。
+- **上游 4xx 响应体现在会落到日志**。`error_detail_for_log()` 改为遍历 `__cause__` / `__context__` 异常链取 `response.text` 或 `body`；`iter_stream_async`、`[%s_stream]`、各端点 `FAILED:` 与 vision 预处理异常路径统一改用该 helper。此前上游返回的具体字段错误（如 `param: "invalid base64 format"`）被 liteLLM 包装后完全丢失，无法从日志定位。payload 单独限长（`max_chars // 2`），避免上游回整页 HTML 时挤掉报错文本本身；bytes 形式的 body 按 UTF-8 解码而不是输出 `b'...'` repr。
+- **无结束标记的格式改用容器自洽长度**：WebP 校验 `RIFF` size 字段、BMP 校验 `BITMAPFILEHEADER.bfSize`，截断载荷不再被当作合法图片；TIFF 既无结束标记也无总长度字段（无法证明完整）→ 移出可提升集合，按"默认拒绝"处理。
+- 修正 `_is_webp()` 的 chunk FourCC 位置（`WEBP` 在 8:12、`VP8 ` 在 12:16）：写错时真实 WebP 图片会被误拒。
+- 删除已提升的 URI 改为**按位置**从后往前切除（不再用 `str.replace`）：base64 字符类包含 `=`，一个已验证的短 URI 可能恰好是另一个未验证长载荷的前缀，子串替换会把长载荷挖成碎片。
+- 同一条消息里重复出现的同一份载荷只提升一次（与预处理层"同轮重复图片去重"口径一致）。
+
+### Tests
+- 新增 `tests/test_image_payload_validation.py`（完整性校验、角色边界、混合载荷、异常链取证、WebP/BMP 截断、前缀污染、去重）与 `tests/image_fixtures.py`（真实可解码的 PNG / JPEG / BMP / WebP 载荷与截断工具）；`test_lite_llm.py` 与 `test_proxy_image_fixes.py` 中“重复 base64 凑长度”的伪图片常量替换为真实位图。全量 **1038 passed**。
+
+### Security
+- `.gitignore` 新增服务器凭据类本地文件的条目（`tools/scripts/_remote_exec.py`、`.prod-server.local.md` 等）。此前它们仅靠 `.git/info/exclude` 忽略（不随仓库传播），且 SVN 侧完全未忽略，存在将明文服务器密码误 `svn add` 入库的风险。
+
+### Docs
+- `AGENTS.md` / `CLAUDE.md` 新增 **Compatibility Patch Boundary** 准则：为任何厂商/模型/客户端/工具名分支设下四道准入门（归属、无身份、普遍性、优先用现有机制），并明确禁止“上游 4xx 后改写请求使其成功”与“用 fallback 吸收参数错误”。
+- 新增 `docs/compat-patch-audit.md`：存量兼容层逐项审计（归属判定 + 证据 + 待收敛项，如 GPT-5 temperature 应迁入能力层）。
+
 ## [0.13.0] - 2026-09-21
 
 ### Added

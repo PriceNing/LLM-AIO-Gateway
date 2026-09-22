@@ -14,7 +14,7 @@ from app.core.outcome import (
     stats_counters_for_status,
 )
 from app.core.output import InternalOutputEvent, aclose_async_iterator
-from app.core.text import friendly_error_msg
+from app.core.text import error_detail_for_log, friendly_error_msg
 from app.core.tool_leak import parse_leaked_tool_calls
 from app.database import increment_global_stats, increment_user_usage
 from app.protocols.egress import (
@@ -478,7 +478,7 @@ async def stream_internal_output(
             or provider_id
             or ""
         )
-        _error_log.error("[%s_stream] %s", endpoint, str(exc))
+        _error_log.error("[%s_stream] %s", endpoint, error_detail_for_log(exc))
         log_request(
             username,
             api_key_value,

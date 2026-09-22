@@ -1523,6 +1523,24 @@ def set_model_capabilities(model_id: str, capabilities: dict) -> bool:
         return True
 
 
+def get_model_stored_capabilities(provider_id: str, model: str) -> dict:
+    """读取 provider_models 上已持久化的能力（上游透传 + 管理员覆盖的合并结果）。
+
+    供请求路径按 provider/model 取能力用（如 temperature 锁）；无行时返回空 dict，
+    调用方仍会回退到内置家族启发式与在线注册表。
+    """
+    model_name = parse_model_id(model).model_name
+    with get_db() as db:
+        row = db.execute(
+            "SELECT capabilities FROM provider_models WHERE provider_id = ? AND (model_id IN (?, ?) OR model_name = ?) LIMIT 1",
+            (provider_id or "", model, model_name, model_name),
+        ).fetchone()
+    if not row:
+        return {}
+    stored = _json_loads(row["capabilities"] or "{}") or {}
+    return stored if isinstance(stored, dict) else {}
+
+
 def merge_upstream_model_capabilities(db: sqlite3.Connection, provider_id: str, model_id: str, upstream: dict) -> None:
     """上游 /models 透传的能力元数据写回 DB（在调用方事务内执行）。
 

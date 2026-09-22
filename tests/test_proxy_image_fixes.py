@@ -272,11 +272,21 @@ async def test_url_guard_warns_on_unresolvable_host(monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_image_data_uri_boundary_extraction():
-    from app.core.images import extract_image_data_uris
+    """长度门槛边界：完整位图在门槛两侧的行为。
 
-    data = "A" * 100
-    uri = f"data:image/png;base64,{data}"
-    assert extract_image_data_uris(uri) == [("image/png", uri)]
+    不断言“恰好 100 字符”：那会把 png_b64 的输出长度与 zlib 实现细节耦合在一起，
+    只要断言两侧确实分居门槛两边即可。
+    """
+    from app.core.images import extract_image_data_uris
+    from tests.image_fixtures import png_b64
+
+    at_or_above = png_b64(8, 8)     # 完整 PNG，base64 达到门槛
+    below = png_b64(1, 1)           # 同样完整，但 base64 短于门槛
+    assert len(below) < 100 <= len(at_or_above)
+
+    assert extract_image_data_uris(f"data:image/png;base64,{at_or_above}") == [
+        ("image/png", f"data:image/png;base64,{at_or_above}")]
+    assert extract_image_data_uris(f"data:image/png;base64,{below}") == []
 
 
 # ---------------------------------------------------------------------------

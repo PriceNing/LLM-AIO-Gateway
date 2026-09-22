@@ -1,3 +1,4 @@
+import json
 import re
 
 import httpx
@@ -166,18 +167,64 @@ def client_status_for_upstream_error(e: Exception, *, confirmed_upstream: bool =
     return status
 
 
-def error_detail_for_log(e: BaseException, *, max_chars: int = 2000) -> str:
-    """Full upstream error text for server-side logging only."""
-    parts = [str(e)]
-    response = getattr(e, "response", None)
-    body = ""
+def _exception_chain(e: BaseException, limit: int = 6):
+    """Walk ``__cause__``/``__context__`` a bounded number of hops.
+
+    liteLLM 会把 openai/httpx 原始异常包装成自己的异常类，原始响应体只留在链上；
+    不遍历就永远拿不到 `param`/`code` 这类真正的诊断字段。
+    """
+    seen = set()
+    current = e
+    depth = 0
+    while current is not None and id(current) not in seen and depth < limit:
+        seen.add(id(current))
+        yield current
+        depth += 1
+        current = current.__cause__ or current.__context__
+
+
+def _upstream_payload_for_log(exc: BaseException) -> str:
+    """Best-effort upstream error payload: raw response text, else parsed ``body``."""
+    response = getattr(exc, "response", None)
+    text = ""
     if response is not None:
         try:
-            body = (getattr(response, "text", None) or "").strip()
+            text = (getattr(response, "text", None) or "").strip()
         except Exception:
-            body = ""
-    if body and body not in parts[0]:
-        parts.append(body)
+            text = ""
+    if text:
+        return text
+    body = getattr(exc, "body", None)
+    if body is None:
+        return ""
+    if isinstance(body, bytes):
+        return body.decode("utf-8", errors="replace").strip()
+    if isinstance(body, str):
+        return body.strip()
+    try:
+        return json.dumps(body, ensure_ascii=False, default=str)
+    except Exception:
+        return str(body)
+
+
+def error_detail_for_log(e: BaseException, *, max_chars: int = 2000) -> str:
+    """Full upstream error text for server-side logging only.
+
+    客户端消息一律走 ``friendly_error_msg``/``classify_for_client``；这里保留原文
+    仅用于服务端排障，绝不回流到 client detail。
+
+    日志格式安全性：``services/logger.py`` 的 ``JsonFormatter`` 用 ``json.dumps`` 写入，
+    换行/控制字符会被转义为单行 JSON 字段，不会撑破结构化日志，因此此处不再额外转义。
+    payload 单独限长，避免上游回一大页 HTML 错误时报错文本本身被挤掉。
+    """
+    parts = [str(e)]
+    head = parts[0]
+    payload_budget = max(200, max_chars // 2)
+    for exc in _exception_chain(e):
+        payload = _upstream_payload_for_log(exc)
+        if payload and payload not in head:
+            parts.append(payload[:payload_budget])
+            break
     return " | ".join(part for part in parts if part)[:max_chars]
 
 

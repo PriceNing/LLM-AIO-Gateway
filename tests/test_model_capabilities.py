@@ -872,3 +872,56 @@ def test_admin_reasoning_override_roundtrip(temp_db):
     model = next(m for m in get_provider("p1")["models"] if m["id"] == "deepseek-flash")
     assert model["capabilities"]["supports_reasoning"] is False
     assert "supports_reasoning" in model["capabilities"]["admin_keys"]
+# ── 温度锁（fixed_temperature）：参数约束事实，不对外广告 ────────────────────
+
+def test_float_limits_table_covers_all_float_keys():
+    """新增 _FLOAT_KEYS 必须同步 _FLOAT_LIMITS，防止漏配导致上限被静默放宽。"""
+    from app.core.model_capabilities import _FLOAT_KEYS, _FLOAT_LIMITS
+    assert set(_FLOAT_KEYS) == set(_FLOAT_LIMITS)
+
+
+@pytest.mark.parametrize("bad", [5, -1, True, None, "hot"])
+def test_temperature_lock_rejects_out_of_range_and_bool(bad):
+    """越界 / bool / None / 无法解析的值一律丢弃，保持"未知 = 不锁"。"""
+    assert normalize_capabilities({"fixed_temperature": bad}) == {}
+
+
+def test_temperature_lock_accepts_numeric_and_string_forms():
+    assert normalize_capabilities({"fixed_temperature": 1}) == {"fixed_temperature": 1.0}
+    assert normalize_capabilities({"fixed_temperature": "0.7"}) == {"fixed_temperature": 0.7}
+    assert normalize_capabilities({"fixed_temperature_with_reasoning": 1}) == {
+        "fixed_temperature_with_reasoning": 1.0,
+    }
+
+
+def test_temperature_lock_is_never_advertised_to_clients():
+    """内部参数约束不得泄漏进 /v1/models：客户端契约只含正向能力声明。"""
+    from app.core.model_capabilities import capabilities_for_client_entry
+    entry = capabilities_for_client_entry({"fixed_temperature": 1.0, "context_window": 128000})
+    assert "fixed_temperature" not in json.dumps(entry)
+    assert entry["context_window"] == 128000
+
+
+def test_builtin_family_table_supplies_the_lock():
+    """锁来自数据表而非代码分支；gpt-5.1 必须排在 gpt-5 之前（marker 是子串命中）。"""
+    assert builtin_capabilities("gpt-5.6-terra").get("fixed_temperature") == 1
+    gpt51 = builtin_capabilities("gpt-5.1")
+    assert gpt51.get("fixed_temperature") is None
+    assert gpt51.get("fixed_temperature_with_reasoning") == 1
+
+
+def test_admin_can_override_the_builtin_lock_without_code_change(temp_db):
+    """管理员覆盖优先于内置启发式 —— 否则上游变化时又要回到改代码。"""
+    _add_test_provider("gpt-5.6-terra")
+    assert set_model_capabilities("p1/gpt-5.6-terra", {"fixed_temperature": 0.7}) is True
+    model = next(m for m in get_provider("p1")["models"] if m["id"] == "gpt-5.6-terra")
+    assert resolve_model_capabilities(model)["fixed_temperature"] == 0.7
+
+
+def test_admin_null_restores_builtin_lock(temp_db):
+    """null 清除覆盖后恢复内置启发式的锁（沿用既有 admin_keys 语义）。"""
+    _add_test_provider("gpt-5.6-terra")
+    set_model_capabilities("p1/gpt-5.6-terra", {"fixed_temperature": 0.7})
+    assert set_model_capabilities("p1/gpt-5.6-terra", {"fixed_temperature": None}) is True
+    model = next(m for m in get_provider("p1")["models"] if m["id"] == "gpt-5.6-terra")
+    assert resolve_model_capabilities(model)["fixed_temperature"] == 1

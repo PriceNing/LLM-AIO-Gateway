@@ -5,7 +5,7 @@ from litellm import completion
 from typing import Optional, Any
 from pydantic import Field
 from litellm.types.utils import ModelResponse, Message, Delta
-from app.database import get_providers, get_provider, find_provider_by_model
+from app.database import get_providers, get_provider, find_provider_by_model, get_model_stored_capabilities, parse_model_id
 from app.services.logger import get_logger
 from app.config import get_default
 from app.core.images import has_image_content, normalize_image_content
@@ -114,30 +114,6 @@ OPENAI_HOSTS = ("api.openai.com", "azure.com")
 MIN_IMAGE_MAX_TOKENS = get_default("min_image_max_tokens", 2000)
 
 
-def _model_name_suggests_vision(model: str) -> bool:
-    text = str(model or "").lower()
-    if any(marker in text for marker in ("embedding", "rerank", "audio", "tts", "whisper", "image-")):
-        return False
-    return any(marker in text for marker in (
-        "gpt-4o",
-        "gpt-4.1",
-        "gpt-5",
-        "claude-3",
-        "claude-opus-4",
-        "claude-sonnet-4",
-        "gemini",
-        "qwen-vl",
-        "qwen2-vl",
-        "qwen2.5-vl",
-        "qwen3-vl",
-        "minicpm-v",
-        "llava",
-        "vision",
-        "vl-",
-        "-vl",
-    ))
-
-
 def get_litellm_model_name(model: str, provider: dict) -> str:
     """Build the liteLLM model name for OpenAI-compatible providers."""
     provider_type = provider.get("provider_type", "openai")
@@ -169,12 +145,10 @@ def build_completion_args(model: str, provider_id: Optional[str] = None) -> tupl
     params["num_retries"] = provider.get("retry_count", 0)
 
     litellm_model = get_litellm_model_name(model, provider)
-    # Register only likely vision-capable custom models so liteLLM capability checks
-    # do not incorrectly advertise image support for every OpenAI-compatible model.
-    if (litellm_model.startswith("openai/")
-            and litellm_model not in litellm.model_cost
-            and _model_name_suggests_vision(litellm_model)):
-        litellm.model_cost[litellm_model] = {"supports_vision": True}
+    # 不再向 litellm.model_cost 注入 supports_vision 占位条目：
+    # liteLLM 1.83.14 只在 anthropic / gemini 的 prompt_factory 分支读 supports_vision()，
+    # openai/ 前缀直接透传 messages 不做本地视觉校验；实测注册与否行为一致。
+    # 保留该注入反而会往 model_cost 里塞入缺字段条目（max_output_tokens=None 等）。
     # Provider options affect protocol payloads; upstream headers affect HTTP
     # transport only. Keep these configuration channels deliberately separate.
     provider_options = provider.get("provider_options", {}) or {}
@@ -214,32 +188,46 @@ def clean_params(params: dict[str, Any]) -> dict[str, Any]:
     return cleaned
 
 
-def _local_litellm_model_name(model: str) -> str:
-    text = str(model or "")
-    if text.startswith("openai/"):
-        return text.split("/", 1)[1]
-    return text
+def model_temperature_locks(model: str, provider_id: Optional[str] = None) -> dict[str, Any]:
+    """解析该模型的 temperature 锁能力。
+
+    来源顺序与 /v1/models 一致：内置家族表 < 在线注册表 < 已存储（上游透传 + 管理员覆盖）。
+    provider_models 行不存在时仍会回退到家族表，因此行为不依赖数据库里是否有该模型行。
+    """
+    mid = parse_model_id(model)
+    name = mid.model_name
+    resolved_provider = provider_id or mid.provider_id
+    stored = get_model_stored_capabilities(resolved_provider, name) if resolved_provider else {}
+    remote = registry_lookup(name, name)
+    return resolve_model_capabilities(
+        {"id": name, "name": name, "capabilities": stored}, remote=remote
+    )
 
 
-def _gpt5_temperature_supported(model: str, kwargs: dict[str, Any]) -> bool:
-    local_model = _local_litellm_model_name(model).lower()
-    if not local_model.startswith("gpt-5"):
-        return True
-    reasoning_effort = kwargs.get("reasoning_effort")
-    return local_model.startswith("gpt-5.1") and reasoning_effort in (None, "none")
+def apply_temperature_lock(caps: dict[str, Any], kwargs: dict[str, Any]) -> None:
+    """把模型不接受的 temperature 归一为它接受的值。
 
-
-def _normalize_gpt5_temperature(model: str, kwargs: dict[str, Any]) -> None:
-    """Avoid liteLLM rejecting GPT-5-family requests before they reach upstream."""
-    if "temperature" not in kwargs or _gpt5_temperature_supported(model, kwargs):
+    纯函数（能力入参、kwargs 出参），条件里不出现任何模型/厂商名称：是否锁、
+    锁到多少完全来自能力数据（见 core/model_capabilities.py 的 fixed_temperature）。
+    """
+    if kwargs.get("temperature") is None:
         return
-    if kwargs.get("temperature") != 1:
-        get_logger("app").debug(
-            "Coercing unsupported temperature=%s to 1 for model=%s",
-            kwargs.get("temperature"),
-            model,
-        )
-        kwargs["temperature"] = 1
+    locked = caps.get("fixed_temperature")
+    if locked is None and kwargs.get("reasoning_effort") not in (None, "none"):
+        locked = caps.get("fixed_temperature_with_reasoning")
+    if locked is None:
+        return
+    try:
+        current, target = float(kwargs["temperature"]), float(locked)
+    except (TypeError, ValueError):
+        return
+    if current == target:
+        return
+    kwargs["temperature"] = int(target) if target.is_integer() else target
+    get_logger("app").debug(
+        "Locking temperature=%s to %s by model capability fixed_temperature",
+        current, kwargs["temperature"],
+    )
 
 
 def _forced_tool_choice(tool_choice: Any) -> bool:
@@ -314,7 +302,7 @@ def create_chat_completion(
 ) -> dict:
     litellm_model, extra_params = build_completion_args(model, provider_id)
     kwargs.update(extra_params)
-    _normalize_gpt5_temperature(litellm_model, kwargs)
+    apply_temperature_lock(model_temperature_locks(model, provider_id), kwargs)
     _disable_thinking_for_missing_reasoning(kwargs)
     _disable_thinking_when_tools_forced(kwargs)
     messages = _system_messages_first(messages)
@@ -333,7 +321,7 @@ def create_chat_completion_stream(
 ):
     litellm_model, extra_params = build_completion_args(model, provider_id)
     kwargs.update(extra_params)
-    _normalize_gpt5_temperature(litellm_model, kwargs)
+    apply_temperature_lock(model_temperature_locks(model, provider_id), kwargs)
     _disable_thinking_for_missing_reasoning(kwargs)
     _disable_thinking_when_tools_forced(kwargs)
     kwargs["stream"] = True
