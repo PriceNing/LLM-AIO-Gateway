@@ -5,7 +5,7 @@ All notable changes to LLM AIO Gateway will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.13.1] - 2026-09-22
 
 ### Changed
 - **GPT-5 的 temperature 锁从模型名判断迁入能力层**：删除 `services/lite_llm.py` 里的 `_local_litellm_model_name()` / `_gpt5_temperature_supported()` / `_normalize_gpt5_temperature()`（`startswith("gpt-5")` / `startswith("gpt-5.1")` 硬编码），改为 `core/model_capabilities.py` 的两个能力键：`fixed_temperature`（无条件锁）与 `fixed_temperature_with_reasoning`（仅当请求带 `reasoning_effort` 时锁）。新函数 `model_temperature_locks()` 按“内置家族表 < 在线注册表 < 已存储（上游透传 + 管理员覆盖）”解析，`apply_temperature_lock()` 为纯函数且条件里不再出现任何模型名。行为与旧实现完全等价（旧版 4 个判定分支均有用例）；管理员现在可直接改锁值，无需改代码发版。该锁不对外广告（`capabilities_for_client_entry` 不投影），`/v1/models` 输出不变。
