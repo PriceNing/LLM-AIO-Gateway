@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-10-01
+
 ### Added
 - **管理面板「设置」页**（`/admin/settings`）：三个标签——「运行参数」（按分组编辑 `config.json` 的 `defaults`，每行显示键名、当前值、内置默认值、来源标注、单位换算与范围提示；改动暂存于界面，点「保存」才落盘；已写入的键可单独「重置为默认」）、「备份与迁移」（原「配置导入/导出」，v2 起含运行参数，只含文件里显式写了的键）、「诊断」（只读：版本、配置文件路径与可写性、mtime、顶层配置（带「需重启」标记）、已注册的运行时推送钩子）。
 - **`app/core/settings_schema.py`**：schema 驱动的设置元数据（分组、单位、上下界、值相关风险规则、i18n 提示），自动生成设置页内容，无需第二份硬编码列表。
