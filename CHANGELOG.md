@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.2] - 2026-10-01
+
+### Fixed
+- **修复 v0.14.1 的启动致命回归（旧库无法启动，生产部署失败并崩溃重启循环）。** 0.14.1 为了按 `request_id` 检索，把 `CREATE INDEX IF NOT EXISTS idx_reqlog_request_id ON request_logs(request_id)` 写进了 `_SCHEMA`。而 `init_db()` 的顺序是先 `executescript(_SCHEMA)`、后 `migrate()`：对已存在的库，`CREATE TABLE IF NOT EXISTS` 是空操作（旧表没有 `request_id` 列），紧接的 `CREATE INDEX` 在 `executescript` 里抛 `sqlite3.OperationalError: no such column: request_id`，lifespan 直接退出。全新库（包括所有测试用的临时库）不会触发，所以 1133 个用例全绿仍漏掉了这条真实启动路径。现索引只在 `request_logs_db.migrate()` 里 `ALTER TABLE` 补列之后创建，`_SCHEMA` 不再引用迁移列。
+- 数据无损：失败发生在 `executescript` 中途，之前语句全为 `IF NOT EXISTS` 空操作，`migrate()` 未执行，本地与生产 `data.db` 均为 `PRAGMA integrity_check ok`，未残留半截列。
+
+### Tests
+- 新增启动路径回归闸门 `tests/test_database_migration.py` + `tests/fixtures/schema_v0.14.0.sql`（发布版本 schema 快照）：用旧库跑真实 `init_db()`，断言不报错、表齐全、哨兵旧行保留、重复重启幂等、升级后无需人工迁移即可写入并按 `request_id` 检索。已验证这些用例在 0.14.1 代码下全部失败、修复后全部通过（参数化自 schema 快照，以后任何列/索引顺序错误都会在这里先炸，而不是在生产第一次启动时炸）。
+  另附 `test_schema_snapshots_exist` 自检：快照缺失 / 为空 / 已含新列时**直接红**。否则 `parametrize` 会生成 0 个用例，套件静默全绿而闸门已经消失——`release.yml` 的 `test → build → release → container` 全靠 `pytest tests/ -q` 卡住，这条闸门是全世界拉 GHCR 镜像的用户唯一的保护点，它失效必须响。全量 **1137 passed**。
+
+### Docs
+- `AGENTS.md` / `CLAUDE.md` 新增 Schema 顺序铁律：`_SCHEMA` 不得引用仅由 `migrate()` 新增的列；新增列的索引只在 `migrate()` 里建；schema 变更由 `tests/test_database_migration.py` 用发布版本 schema 快照兜住，新增列/索引后要把当时 `_SCHEMA` 另存为新的 `tests/fixtures/schema_v<版本>.sql`。
+
+### Upgrade
+- **不要直接部署 v0.14.1**（已发布的镜像对任何已有数据库都会启动失败）。从 0.14.0 及更早版本升级时，新镜像首次启动会自动 `ALTER TABLE` 补列，无需手工迁移；若已误部 0.14.1，先回滚到 0.14.0，再部 0.14.2。
+
 ## [0.14.1] - 2026-10-01
 
 ### Fixed

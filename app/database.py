@@ -595,8 +595,6 @@ CREATE TABLE IF NOT EXISTS request_logs (
 );
 CREATE INDEX IF NOT EXISTS idx_reqlog_ts ON request_logs(timestamp);
 CREATE INDEX IF NOT EXISTS idx_reqlog_endpoint ON request_logs(endpoint);
--- 客户端错误里携带的就是 request_id，没有索引时按 id 查等于全表扫描（P6）。
-CREATE INDEX IF NOT EXISTS idx_reqlog_request_id ON request_logs(request_id);
 CREATE TABLE IF NOT EXISTS model_registry (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     url TEXT NOT NULL DEFAULT '',

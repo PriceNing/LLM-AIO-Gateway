@@ -63,3 +63,8 @@ tools/scripts/_remote_exec.py
 .prod-server.local.md
 临时审查结果.md
 当前问题.md
+
+# 一次性临时脚本/目录：容易把凭据、生产库副本直接写死在里面（v0.14.1 事故后加）
+.tmp_*.py
+.tmp_*/
+.tmp_*
