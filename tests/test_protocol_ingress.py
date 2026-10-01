@@ -127,6 +127,59 @@ def test_sanitize_tool_history_preserves_assistant_text_and_drops_orphan_results
     assert "tool_calls" not in projected[1]
 
 
+def test_sanitize_tool_history_drops_unnamed_tool_call_and_its_result():
+    # 上游流式退化输出（只给 id 不给 name）被客户端存进历史后，严格上游（MiMo token-plan
+    # 等）会整请求 400：messages[i].tool_calls[j] is missing a function name。
+    # 网关重放前必须清掉无名调用，并连带清掉它的 tool_result（否则变成 orphan result）。
+    messages = openai_messages_to_ir([
+        {"role": "user", "content": "start"},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "call_1", "type": "function", "function": {"name": "run", "arguments": "{}"}},
+            {"id": "call_2", "type": "function", "function": {"arguments": "{}"}},
+        ]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+        {"role": "tool", "tool_call_id": "call_2", "content": "ok too"},
+        {"role": "user", "content": "continue"},
+    ])
+
+    assert sanitize_tool_history(messages) == 2
+
+    projected = ir_to_openai_messages(messages)
+    assert [message["role"] for message in projected] == ["user", "assistant", "tool", "user"]
+    assert [call["id"] for call in projected[1]["tool_calls"]] == ["call_1"]
+    assert [call["function"]["name"] for call in projected[1]["tool_calls"]] == ["run"]
+    assert projected[2]["tool_call_id"] == "call_1"
+
+
+def test_sanitize_tool_history_drops_message_whose_only_call_is_unnamed():
+    messages = openai_messages_to_ir([
+        {"role": "user", "content": "start"},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "call_2", "type": "function", "function": {"name": "", "arguments": "{}"}},
+        ]},
+        {"role": "tool", "tool_call_id": "call_2", "content": "ok"},
+        {"role": "user", "content": "continue"},
+    ])
+
+    sanitize_tool_history(messages)
+
+    projected = ir_to_openai_messages(messages)
+    assert [message["role"] for message in projected] == ["user", "user"]
+
+
+def test_sanitize_tool_history_keeps_named_calls_with_blank_arguments():
+    # 只校验 name 缺失，不得把合法的调用一并洗掉。
+    messages = openai_messages_to_ir([
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "call_1", "type": "function", "function": {"name": "run", "arguments": ""}},
+        ]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+    ])
+
+    assert sanitize_tool_history(messages) == 0
+    assert ir_to_openai_messages(messages)[0]["tool_calls"][0]["function"]["name"] == "run"
+
+
 def test_sanitize_tool_history_drops_orphan_tool_message():
     messages = openai_messages_to_ir([
         {"role": "user", "content": "start"},

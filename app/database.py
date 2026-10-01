@@ -590,10 +590,13 @@ CREATE TABLE IF NOT EXISTS request_logs (
     request_body TEXT,
     response_body TEXT,
     details TEXT NOT NULL DEFAULT '{}',
-    error TEXT NOT NULL DEFAULT ''
+    error TEXT NOT NULL DEFAULT '',
+    request_id TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_reqlog_ts ON request_logs(timestamp);
 CREATE INDEX IF NOT EXISTS idx_reqlog_endpoint ON request_logs(endpoint);
+-- 客户端错误里携带的就是 request_id，没有索引时按 id 查等于全表扫描（P6）。
+CREATE INDEX IF NOT EXISTS idx_reqlog_request_id ON request_logs(request_id);
 CREATE TABLE IF NOT EXISTS model_registry (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     url TEXT NOT NULL DEFAULT '',
@@ -1985,6 +1988,7 @@ def add_request_log(
     response_body=None,
     details: Optional[dict] = None,
     error: Optional[str] = None,
+    request_id: Optional[str] = None,
 ) -> int:
     return request_logs_db.add_request_log(
         get_db,
@@ -2002,6 +2006,7 @@ def add_request_log(
         response_body=response_body,
         details=details,
         error=error,
+        request_id=request_id,
     )
 
 
@@ -2021,6 +2026,7 @@ def update_request_log(
     response_body=None,
     details: Optional[dict] = None,
     error: Optional[str] = None,
+    request_id: Optional[str] = None,
 ) -> bool:
     return request_logs_db.update_request_log(
         get_db,
@@ -2039,6 +2045,7 @@ def update_request_log(
         response_body=response_body,
         details=details,
         error=error,
+        request_id=request_id,
     )
 
 
@@ -2048,6 +2055,7 @@ def list_request_logs(
     endpoint: Optional[str] = None,
     username: Optional[str] = None,
     status: Optional[str] = None,
+    request_id: Optional[str] = None,
 ) -> list:
     return request_logs_db.list_request_logs(
         get_db,
@@ -2056,6 +2064,7 @@ def list_request_logs(
         endpoint=endpoint,
         username=username,
         status=status,
+        request_id=request_id,
     )
 
 
@@ -2063,12 +2072,14 @@ def count_request_logs(
     endpoint: Optional[str] = None,
     username: Optional[str] = None,
     status: Optional[str] = None,
+    request_id: Optional[str] = None,
 ) -> int:
     return request_logs_db.count_request_logs(
         get_db,
         endpoint=endpoint,
         username=username,
         status=status,
+        request_id=request_id,
     )
 
 

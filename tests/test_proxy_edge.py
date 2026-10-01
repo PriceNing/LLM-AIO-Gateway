@@ -1188,6 +1188,75 @@ def test_chat_completions_repairs_partial_tool_history_for_deepseek(monkeypatch,
     assert projected[2]["tool_call_id"] == "call_1"
 
 
+def test_chat_completions_strips_unnamed_tool_call_before_upstream(monkeypatch, temp_db):
+    # 真实事故：上游流式退化输出（只给 id 不给 name）被 harness 存进历史，下一轮
+    # 重放到严格 OpenAI 兼容上游 → 400 "messages[i].tool_calls[j] is missing a
+    # function name"，整个会话永久不可用。网关自己构造出向 payload，必须自验。
+    add_provider({
+        "id": "mimoplan",
+        "name": "MiMoPlan", "provider_type": "openai",
+        "api_base": "https://token-plan-cn.xiaomimimo.com/v1",
+        "api_key": "upstream-key", "enabled": True,
+        "models": [{"id": "mimo-v2.6-flash", "name": "MiMo", "enabled": True}],
+    })
+
+    captured = {}
+
+    def fake_chat_completion(**kwargs):
+        messages = kwargs["messages"]
+        captured["messages"] = messages
+
+        # Reproduce the strict validation used by the MiMo token-plan endpoint.
+        for index, message in enumerate(messages):
+            for call in message.get("tool_calls") or []:
+                if not str((call.get("function") or {}).get("name") or "").strip():
+                    raise AssertionError(f"messages[{index}] tool_call missing function name")
+            expected_ids = [call["id"] for call in message.get("tool_calls") or []]
+            cursor = index + 1
+            response_ids = []
+            while cursor < len(messages) and messages[cursor].get("role") == "tool":
+                response_ids.append(messages[cursor].get("tool_call_id"))
+                cursor += 1
+            assert response_ids == expected_ids
+
+        class Message:
+            content = "ok"
+            reasoning_content = None
+            tool_calls = []
+
+        class Choice:
+            message = Message()
+            finish_reason = "stop"
+
+        class Response:
+            choices = [Choice()]
+            usage = {"total_tokens": 3}
+
+        return Response()
+
+    monkeypatch.setattr("app.router.proxy.create_chat_completion", fake_chat_completion)
+
+    response = client.post("/v1/chat/completions", headers=temp_db["headers"], json={
+        "model": "mimoplan/mimo-v2.6-flash",
+        "messages": [
+            {"role": "user", "content": "start"},
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "run", "arguments": "{}"}},
+                {"id": "call_2", "type": "function", "function": {"arguments": "{}"}},
+            ]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+            {"role": "tool", "tool_call_id": "call_2", "content": "ok too"},
+            {"role": "user", "content": "continue"},
+        ],
+    })
+
+    assert response.status_code == 200, response.text
+    projected = captured["messages"]
+    assert [message["role"] for message in projected] == ["user", "assistant", "tool", "user"]
+    assert [call["id"] for call in projected[1]["tool_calls"]] == ["call_1"]
+    assert projected[2]["tool_call_id"] == "call_1"
+
+
 def test_responses_allows_alias_when_route_target_is_allowed(monkeypatch, temp_db):
     from app.database import add_routing_rule, get_db
 

@@ -65,6 +65,32 @@ def test_chat_completions_writes_request_log(temp_db):
     assert entry["error"]
 
 
+def test_proxy_request_log_carries_client_visible_request_id(temp_db):
+    # 客户端错误里只带 request_id；落库行必须带同一个 id，admin 才能一键定位。
+    import re
+
+    add_provider({
+        "id": "mock-openai", "name": "Mock", "provider_type": "openai",
+        "api_base": "http://127.0.0.1:1/v1", "api_key": "",
+        "enabled": True, "models": [{"id": "m1", "name": "M1", "enabled": True}],
+    })
+    from app.database import add_user, add_user_api_key as add_key
+    add_user({"username": "alice", "display_name": "Alice", "enabled": True})
+    api_key_row = add_key("alice", "sk-aio-test")
+
+    r = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {api_key_row['key']}"},
+        json={"model": "mock-openai/m1", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert r.status_code in (200, 500, 502)
+    match = re.search(r"request_id: ([0-9a-f]{12})", r.text)
+    assert match, r.text
+
+    entry = list_request_logs(limit=10)[0]
+    assert entry["request_id"] == match.group(1)
+
+
 def test_trim_request_logs_keeps_recent(temp_db):
     from app.config import get_default
     from app.database import trim_request_logs

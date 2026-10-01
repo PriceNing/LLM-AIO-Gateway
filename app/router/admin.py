@@ -1159,6 +1159,7 @@ async def list_request_logs_endpoint(
     endpoint: Optional[str] = None,
     username: Optional[str] = None,
     status: Optional[str] = None,
+    request_id: Optional[str] = None,
     authorization: Optional[str] = Header(None),
 ):
     await require_admin_session(authorization)
@@ -1166,14 +1167,18 @@ async def list_request_logs_endpoint(
     offset = max(0, int(offset))
     if endpoint and endpoint not in _VALID_ENDPOINTS:
         raise HTTPException(status_code=400, detail="invalid endpoint")
+    request_id = (request_id or "").strip() or None
     rows = list_request_logs(
         limit=limit,
         offset=offset,
         endpoint=endpoint,
         username=username,
         status=status,
+        request_id=request_id,
     )
-    total = count_request_logs(endpoint=endpoint, username=username, status=status)
+    total = count_request_logs(
+        endpoint=endpoint, username=username, status=status, request_id=request_id,
+    )
     return {"items": rows, "total": total, "limit": limit, "offset": offset}
 
 

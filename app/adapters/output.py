@@ -51,6 +51,14 @@ def response_to_internal_output(response) -> InternalOutputMessage:
             fn.get("name", ""),
             len(fn.get("arguments", "") or ""),
         )
+        if not str(fn.get("name") or "").strip():
+            # 同流式适配器：不悄悄改写上游输出，但要把无名调用记成 ERROR，
+            # 否则下一轮重放时客户端会被严格上游整体拒绝且无从溯源。
+            _app_log.error(
+                "[output_adapter] unnamed_tool_call id=%s args_chars=%d",
+                tc_id,
+                len(fn.get("arguments", "") or ""),
+            )
         tool_outputs.append(
             InternalToolCallOutput(
                 id=tc_id,

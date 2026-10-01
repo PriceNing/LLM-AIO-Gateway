@@ -7,6 +7,13 @@ from typing import Any, Iterable, Optional
 
 
 def migrate(conn):
+    """request_logs 增量迁移：客户端错误只携带 request_id，库里必须存得下、查得到。"""
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(request_logs)").fetchall()}
+    if "request_id" not in columns:
+        conn.execute("ALTER TABLE request_logs ADD COLUMN request_id TEXT NOT NULL DEFAULT ''")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_reqlog_request_id ON request_logs(request_id)"
+    )
     return None
 
 
@@ -40,14 +47,15 @@ def add_request_log(
     response_body=None,
     details=None,
     error=None,
+    request_id=None,
 ):
     with get_db() as db:
         cursor = db.execute(
             """
             INSERT INTO request_logs (
                 timestamp, endpoint, username, api_key, requested_model, model, provider,
-                status, stream, tokens, request_body, response_body, details, error
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                status, stream, tokens, request_body, response_body, details, error, request_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 timestamp,
@@ -68,6 +76,7 @@ def add_request_log(
                 else None,
                 json.dumps(details or {}, ensure_ascii=False, default=str),
                 error or "",
+                request_id or "",
             ),
         )
         return int(cursor.lastrowid or 0)
@@ -91,6 +100,7 @@ def update_request_log(
     response_body=None,
     details=None,
     error=None,
+    request_id=None,
 ):
     """Replace a running request-log row with its latest lifecycle snapshot."""
     with get_db() as db:
@@ -100,7 +110,7 @@ def update_request_log(
                 timestamp = ?, endpoint = ?, username = ?, api_key = ?,
                 requested_model = ?, model = ?, provider = ?, status = ?,
                 stream = ?, tokens = ?, request_body = ?, response_body = ?,
-                details = ?, error = ?
+                details = ?, error = ?, request_id = COALESCE(NULLIF(?, ''), request_id)
             WHERE id = ?
             """,
             (
@@ -120,6 +130,7 @@ def update_request_log(
                 if response_body is not None else None,
                 json.dumps(details or {}, ensure_ascii=False, default=str),
                 error or "",
+                request_id or "",
                 int(log_id),
             ),
         )
@@ -134,6 +145,7 @@ def list_request_logs(
     endpoint=None,
     username=None,
     status=None,
+    request_id=None,
 ):
     where = []
     params = []
@@ -146,6 +158,10 @@ def list_request_logs(
     if status:
         where.append("status = ?")
         params.append(status)
+    if request_id:
+        # 前缀匹配：客户端报错里只带了 12 位 id，粘贴时常常多一段空格或被截短。
+        where.append("request_id LIKE ?")
+        params.append(f"{str(request_id).strip()}%")
     where_clause = (" WHERE " + " AND ".join(where)) if where else ""
     sql = (
         "SELECT * FROM request_logs"
@@ -164,6 +180,7 @@ def count_request_logs(
     endpoint=None,
     username=None,
     status=None,
+    request_id=None,
 ):
     where = []
     params = []
@@ -176,6 +193,9 @@ def count_request_logs(
     if status:
         where.append("status = ?")
         params.append(status)
+    if request_id:
+        where.append("request_id LIKE ?")
+        params.append(f"{str(request_id).strip()}%")
     where_clause = (" WHERE " + " AND ".join(where)) if where else ""
     with get_db() as db:
         row = db.execute(

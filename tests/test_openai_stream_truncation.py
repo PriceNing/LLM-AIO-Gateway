@@ -152,3 +152,38 @@ async def test_tool_call_without_finish_still_completes(monkeypatch):
     ))
     assert events[-1].kind == "message_done"
     assert any(e.kind == "tool_call_done" for e in events)
+
+
+@pytest.mark.asyncio
+async def test_unnamed_tool_call_is_forwarded_but_logged(monkeypatch):
+    # 上游只发 id 不发 name（MiMo/Qwen 类退化输出）。tool_call_start 已经发出，无法
+    # 撤回，因此仍照实转发给客户端，但必须留 ERROR 痕迹；下一轮重放时由
+    # core.policy.sanitize_tool_history 负责清掉。
+    class LogSpy:
+        def __init__(self):
+            self.errors = []
+
+        def error(self, fmt, *args):
+            self.errors.append(fmt % args)
+
+        def debug(self, *args, **kwargs):
+            pass
+
+        def info(self, *args, **kwargs):
+            pass
+
+        def warning(self, *args, **kwargs):
+            pass
+
+    spy = LogSpy()
+    monkeypatch.setattr("app.adapters.openai_streaming._app_log", spy)
+    tc = SimpleNamespace(index=0, id="call_1", type="function",
+                         function=SimpleNamespace(name=None, arguments='{"a":1}'))
+    _patch(monkeypatch, _stream(_chunk(tool_calls=[tc]), _chunk(finish="tool_calls")))
+    events = await _collect(iter_openai_chat_output_events(
+        model="m", messages=[], provider_id="p", temperature=0.7, max_tokens=64,
+    ))
+    done = [e for e in events if e.kind == "tool_call_done"]
+    assert done and done[0].name == ""
+    assert any("unnamed_tool_call" in msg for msg in spy.errors)
+

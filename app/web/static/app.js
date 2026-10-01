@@ -3784,6 +3784,15 @@ function gotoRequestLogPage(page) {
     loadRequestLogs();
 }
 
+// 表格里的 request_id 点一下就把列表筛到这一个请求（客户端报错 -> 定位只需两次点击）。
+function filterRequestLogsByRequestId(requestId) {
+    var input = document.getElementById('logRequestIdFilter');
+    if (!input) return;
+    input.value = requestId || '';
+    _requestLogPage = 0;
+    loadRequestLogs();
+}
+
 async function loadRequestLogs() {
     var container = document.getElementById('requestLogsContent');
     if (!container) return;
@@ -3792,10 +3801,12 @@ async function loadRequestLogs() {
         var endpoint = document.getElementById('logEndpointFilter').value;
         var username = document.getElementById('logUsernameFilter').value.trim();
         var status = document.getElementById('logStatusFilter').value;
+        var requestId = document.getElementById('logRequestIdFilter').value.trim();
         var params = [];
         if (endpoint) params.push('endpoint=' + encodeURIComponent(endpoint));
         if (username) params.push('username=' + encodeURIComponent(username));
         if (status) params.push('status=' + encodeURIComponent(status));
+        if (requestId) params.push('request_id=' + encodeURIComponent(requestId));
         params.push('limit=' + _requestLogPageSize);
         params.push('offset=' + (_requestLogPage * _requestLogPageSize));
         var url = '/admin/request-logs';
@@ -3823,6 +3834,7 @@ function renderRequestLogs(data) {
     tableHTML += '<th>' + escHtml(t('logs.colEndpoint') || 'Endpoint') + '</th>';
     tableHTML += '<th>' + escHtml(t('logs.colUser') || 'User') + '</th>';
     tableHTML += '<th>' + escHtml(t('logs.colModel') || 'Model') + '</th>';
+    tableHTML += '<th>' + escHtml(t('logs.colRequestId') || 'Request ID') + '</th>';
     tableHTML += '<th>' + escHtml(t('logs.colStatus') || 'Status') + '</th>';
     tableHTML += '<th>' + escHtml(t('logs.colTokens') || 'Tokens') + '</th>';
     tableHTML += '<th>' + escHtml(t('logs.colActions') || 'Actions') + '</th>';
@@ -3841,6 +3853,9 @@ function renderRequestLogs(data) {
         tableHTML += '<td class="mono">' + escHtml(entry.endpoint || '-') + '</td>';
         tableHTML += '<td>' + escHtml(entry.username || '-') + '</td>';
         tableHTML += '<td class="mono">' + escHtml(entry.model || '-') + '</td>';
+        tableHTML += '<td class="mono">' + (entry.request_id
+            ? '<a href="#" class="mono" onclick="filterRequestLogsByRequestId(\'' + escAttr(entry.request_id) + '\');return false;">' + escHtml(entry.request_id) + '</a>'
+            : '-') + '</td>';
         tableHTML += '<td><span class="badge ' + badgeClass + '">' + escHtml(statusLabel) + '</span></td>';
         tableHTML += '<td>' + (entry.tokens || 0) + '</td>';
         tableHTML += '<td><button class="icon-btn" onclick="showRequestLogDetail(' + entry.id + ')" title="' + escHtml(t('logs.viewDetail') || 'View') + '">ℹ</button> ';
@@ -3902,6 +3917,7 @@ async function showRequestLogDetail(logId) {
         body += detailRow(t('stats.generationTime') || 'Generation Time', formatDurationMs(detailPick(entry.details && entry.details.generation_ms, entry.generation_ms)));
         body += detailRow(t('logs.colStatus') || 'Status', requestStatusLabel(entry));
         body += detailRow(t('stats.clientDisconnected') || 'Client Disconnected', requestWasClientDisconnected(entry));
+        body += detailRow(t('logs.colRequestId') || 'Request ID', entry.request_id || '-');
         body += detailRow(t('logs.colError') || 'Error', entry.error || '-');
         body += '</div>';
         if (entry.request_kind === 'image_generation') {
@@ -4204,6 +4220,7 @@ Object.assign(I18N.zh, {
     'logs.allEndpoints': '全部端点',
     'logs.allStatus': '全部状态',
     'logs.filterUser': '按用户名筛选',
+    'logs.filterRequestId': '按 request_id 筛选',
     'logs.refresh': '刷新',
     'logs.clear': '清空',
     'logs.empty': '还没有请求日志',
@@ -4211,6 +4228,7 @@ Object.assign(I18N.zh, {
     'logs.colEndpoint': '端点',
     'logs.colUser': '用户',
     'logs.colModel': '模型',
+    'logs.colRequestId': 'Request ID',
     'logs.colStatus': '状态',
     'logs.colTokens': 'Token 数',
     'logs.colActions': '操作',
@@ -4309,6 +4327,7 @@ Object.assign(I18N.en, {
     'logs.allEndpoints': 'All endpoints',
     'logs.allStatus': 'All statuses',
     'logs.filterUser': 'Filter by user',
+    'logs.filterRequestId': 'Filter by request_id',
     'logs.refresh': 'Refresh',
     'logs.clear': 'Clear',
     'logs.empty': 'No request logs yet',
@@ -4316,6 +4335,7 @@ Object.assign(I18N.en, {
     'logs.colEndpoint': 'Endpoint',
     'logs.colUser': 'User',
     'logs.colModel': 'Model',
+    'logs.colRequestId': 'Request ID',
     'logs.colStatus': 'Status',
     'logs.colTokens': 'Tokens',
     'logs.colActions': 'Actions',

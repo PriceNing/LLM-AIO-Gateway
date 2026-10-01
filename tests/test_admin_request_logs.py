@@ -94,6 +94,98 @@ def test_list_request_logs_filters(temp_db):
     assert r.status_code == 400
 
 
+def test_request_logs_store_and_filter_by_request_id(temp_db):
+    # 客户端错误只携带 request_id，库里必须存下它并能检索。
+    _add_log(request_id="9c7301d5de06")
+    _add_log(endpoint="messages", status="fail", request_id="a1b2c3d4e5f6")
+
+    body = client.get("/admin/request-logs", headers=temp_db["headers"]).json()
+    assert {item["request_id"] for item in body["items"]} == {"9c7301d5de06", "a1b2c3d4e5f6"}
+
+    r = client.get("/admin/request-logs", params={"request_id": "9c7301d5de06"}, headers=temp_db["headers"])
+    body = r.json()
+    assert body["total"] == 1
+    assert body["items"][0]["request_id"] == "9c7301d5de06"
+
+    # 前缀匹配：用户粘贴的 id 往往少一两位。
+    body = client.get("/admin/request-logs", params={"request_id": "a1b2c3"}, headers=temp_db["headers"]).json()
+    assert body["total"] == 1
+
+    body = client.get("/admin/request-logs", params={"request_id": "deadbeef"}, headers=temp_db["headers"]).json()
+    assert body["total"] == 0
+
+
+def test_request_log_detail_shows_request_id(temp_db):
+    lid = _add_log(request_id="feedfacecafe")
+    body = client.get(f"/admin/request-logs/{lid}", headers=temp_db["headers"]).json()
+    assert body["request_id"] == "feedfacecafe"
+
+
+def test_update_request_log_keeps_request_id_when_not_provided(temp_db):
+    from app.database import update_request_log
+
+    lid = _add_log(request_id="1234567890ab")
+    assert update_request_log(
+        lid,
+        timestamp="2026-06-06 12:05:00",
+        endpoint="chat_completions",
+        username="alice",
+        api_key="sk-aio-***",
+        requested_model="gpt-4o",
+        model="gpt-4o",
+        provider="openai",
+        status="fail",
+        stream=True,
+        tokens=0,
+        error="boom",
+    )
+    body = client.get(f"/admin/request-logs/{lid}", headers=temp_db["headers"]).json()
+    assert body["status"] == "fail"
+    assert body["request_id"] == "1234567890ab"
+
+
+_LEGACY_REQUEST_LOGS_DDL = """
+CREATE TABLE request_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    endpoint TEXT NOT NULL,
+    username TEXT NOT NULL DEFAULT '',
+    api_key TEXT NOT NULL DEFAULT '',
+    requested_model TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    provider TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT '',
+    stream INTEGER NOT NULL DEFAULT 0,
+    tokens INTEGER NOT NULL DEFAULT 0,
+    request_body TEXT,
+    response_body TEXT,
+    details TEXT NOT NULL DEFAULT '{}',
+    error TEXT NOT NULL DEFAULT ''
+)
+"""
+
+
+def test_request_logs_migration_adds_request_id_column(tmp_path):
+    # 升级旧库：缺列时 init_db 路径上的 migrate 必须补列+索引，并保留旧行。
+    import sqlite3
+    from app.db import request_logs as request_logs_db
+
+    conn = sqlite3.connect(str(tmp_path / "legacy.db"))
+    conn.execute(_LEGACY_REQUEST_LOGS_DDL)
+    conn.execute("INSERT INTO request_logs (timestamp, endpoint) VALUES ('2026-01-01 00:00:00', 'chat_completions')")
+    conn.commit()
+
+    request_logs_db.migrate(conn)
+
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(request_logs)")}
+    indexes = {row[1] for row in conn.execute("PRAGMA index_list(request_logs)")}
+    legacy_rows = conn.execute("SELECT COUNT(*) FROM request_logs").fetchone()[0]
+    conn.close()
+    assert "request_id" in columns
+    assert "idx_reqlog_request_id" in indexes
+    assert legacy_rows == 1
+
+
 def test_request_log_detail(temp_db):
     lid = _add_log(details={"fallback_status": "unused", "upstream_endpoint": "messages"})
     r = client.get(f"/admin/request-logs/{lid}", headers=temp_db["headers"])

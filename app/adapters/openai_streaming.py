@@ -145,6 +145,18 @@ async def iter_openai_chat_output_events(
             state["name"],
             len(state["arguments"]),
         )
+        if not (state["name"] or "").strip():
+            # 上游只发了 id 没发 name。tool_call_start 已经发出，无法撤回，只能继续
+            # 转发并在这里留下 ERROR 级痕迹：否则客户端存下无名调用、下一轮被严格上游
+            # 整体拒绝（core.policy.sanitize_tool_history 负责在重放时清掉它）。
+            _app_log.error(
+                "[openai_stream_adapter] unnamed_tool_call provider=%s model=%s index=%d id=%s args_chars=%d",
+                provider_id or "",
+                model,
+                idx,
+                state["id"],
+                len(state["arguments"]),
+            )
         yield InternalOutputEvent(
             kind="tool_call_done",
             tool_index=idx,

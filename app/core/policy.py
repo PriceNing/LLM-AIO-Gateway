@@ -172,6 +172,19 @@ def sanitize_tool_history(messages: list[InternalMessage]) -> int:
         )
 
         if tool_call_parts:
+            # 无名 tool_call 属于协议级畸形：OpenAI Chat 规范里 function.name 必填，
+            # Anthropic / Responses 投影同样无法表达。上游流式退化输出（只给 id 不给
+            # name）一旦被客户端写进历史，重放给任何严格上游都会 400，且客户端无法靠
+            # 重试恢复。先把它移出 call_ids，下方既有的 orphan-result 清理会连带丢弃
+            # 对应的 tool_result，不需要新增分支。
+            named_parts = [part for part in tool_call_parts if (part.name or "").strip()]
+            if len(named_parts) != len(tool_call_parts):
+                removed += len(tool_call_parts) - len(named_parts)
+                message.parts = [
+                    part for part in message.parts
+                    if part.kind != "tool_call" or (part.name or "").strip()
+                ]
+                tool_call_parts = named_parts
             call_ids = [part.tool_call_id for part in tool_call_parts if part.tool_call_id]
             response_messages: list[InternalMessage] = []
             result_ids: list[str] = []

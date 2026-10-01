@@ -137,7 +137,7 @@ from app.services.responses_capability import (
     native_response_target_supported,
     responses_capability_expiry,
 )
-from app.services.logger import get_logger
+from app.services.logger import get_logger, get_request_id
 from app.config import get_default
 
 _access_log = get_logger("access")
@@ -4278,6 +4278,7 @@ def _record_request_log(
     log_id=None,
     generation_started_at=None,
     request_started_at=None,
+    request_id=None,
 ):
     capture_payloads = bool(get_default("request_log_capture_payloads", True))
     payload_details = _normalized_request_details(endpoint, details)
@@ -4370,6 +4371,10 @@ def _record_request_log(
             response_body=_truncate_payload(final_response_body),
             details=payload_details,
             error=(error_message or ''),
+            # 客户端错误里只携带 request_id；落库后 admin 才能直接按 id 定位这条请求
+            # （包括看上游原文）。流式记录器可能跑在已恢复上下文的任务里，所以优先用
+            # 调用方显式传入的值，其次读 contextvar。
+            request_id=(request_id or get_request_id() or ''),
         )
         if log_id:
             writer(int(log_id), **writer_kwargs)
@@ -4390,13 +4395,19 @@ def _build_stream_recorder(
     requested_model,
     request_body,
     request_started_at=None,
+    request_id=None,
 ):
+    # 流式记录器在生成器 finally 里写最后一帧，那时 contextvar 可能已随请求任务退出；
+    # 建器时先固定住本次请求的 id。
+    captured_request_id = request_id or get_request_id() or ''
+
     def _record(**payload):
         _record_request_log(
             endpoint=endpoint,
             username=username,
             api_key_value=api_key_value,
             requested_model=requested_model,
+            request_id=captured_request_id,
             final_model=payload.get('final_model') or '',
             final_provider=payload.get('final_provider_id') or '',
             generation_started_at=payload.get('generation_started_at'),

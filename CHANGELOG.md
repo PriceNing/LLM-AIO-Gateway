@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-10-01
+
+### Fixed
+- **无名 tool_call 不再会永久砸死会话**：上游流式退化输出（只发 `id` + `arguments`、不发 `function.name`）会被客户端原样存进历史，下一轮重放到严格 OpenAI 兼容上游（实测 MiMo token-plan 端点）直接 `400 Param Incorrect | messages[i].tool_calls[j] is missing a function name`，整个会话永久不可用且无法靠重试恢复。现在 `core/policy.sanitize_tool_history()` 会把 `function.name` 为空的 tool_call 连同其 `tool_result`（走现有 orphan 清理）一起从出向 payload 中剔除；仅依赖协议字段（name 缺失），不含任何厂商/模型分支。两个输出适配器（`adapters/openai_streaming.py`、`adapters/output.py`）不悄悄改写上游输出，但会记 `unnamed_tool_call` ERROR，便于溯源。
+- **客户端 `request_id` 现在落库可查**：`request_logs` 表此前没有 `request_id` 列，用户报错里的 12 位 id 在 admin 面板无从检索，只能登服务器 `grep logs/<date>/error.log`。新增列（带 `idx_reqlog_request_id` 索引，`migrate()` 对旧库 `ALTER TABLE` 补列并保留旧行）、写入路径（非流式与流式记录器均固定本次 id）、`GET /admin/request-logs?request_id=` 前缀匹配筛选，以及请求日志页的 Request ID 列/筛选框（点 id 直接筛到该请求）。
+
+### Tests
+- 10 个新用例：无名 tool_call 的历史清洗（并行调用/唯一调用/合法调用不误删）、端到端“污染历史重放前被洗掉”、流式 `unnamed_tool_call` ERROR、`request_id` 写入/筛选/更新不丢失/旧库迁移。全量 **1133 passed**（较 0.14.0 +10）。
+
 ## [0.14.0] - 2026-10-01
 
 ### Added
