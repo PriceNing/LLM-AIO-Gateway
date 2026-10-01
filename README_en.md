@@ -21,7 +21,7 @@ The current proxy core is built around a provider-neutral internal representatio
 | Image-generation gateway | Supports `/images/generations`, Codex `/responses` tool bridging, short-lived originals, compressed previews, batches, and image usage statistics. |
 | Tool-call reliability | Preserves tool IDs across protocol conversions, repairs malformed tool JSON, and includes a tool-only loop circuit breaker. |
 | Reasoning continuity | Caches and replays `reasoning_content` for DeepSeek-style thinking models across multi-turn tool flows. |
-| Web admin panel | Manage providers, users, API keys, routing rules, model preprocessors, and usage stats; responsive design for desktop, tablet, and phone. |
+| Web admin panel | Manage providers, users, API keys, routing rules, model preprocessors, runtime settings, and usage stats; responsive design for desktop, tablet, and phone. |
 | Model capability metadata | `/v1/models` carries context window, vision/tool support, etc. (builtin family table < online registry < upstream passthrough < admin override); the online registry is periodically fetched from OpenRouter and persisted, so downstream harnesses can detect model capabilities. Capability fields are positive declarations only — absent means unknown/unsupported, and an admin "Not supported" override simply omits the field. |
 | SQLite storage | Providers, users, keys, routing rules, stats, and request records are stored in `data.db`. |
 
@@ -196,15 +196,18 @@ The admin API includes `POST /admin/routing-rules/dry-run` to inspect which acti
 
 ## Configuration
 
-`config.json` contains server-level settings. Changes require a service restart. The complete set of options lives in the `defaults` block of `config.example.json`.
+`config.json` contains server-level settings and is the single source of truth for them (there is no second copy in the database). The `defaults` block is editable in the admin panel under Settings / Runtime parameters and **takes effect immediately, no restart required**; hand-edit the file on the server and press "Reload from disk" for the same result. Only the top-level keys (`host`, `port`, `database`, `image_result_dir`, `cors_allow_origins`, `logging`) still require a restart, because startup runs `init_db` / `init_logging` once. The complete set of options lives in the `defaults` block of `config.example.json`.
+
+The settings page writes only the keys the administrator actually changed: untouched keys stay out of the file, so upgrading the gateway lets the new built-in defaults govern them. "Reset to default" deletes the key instead of writing the current default back. Every write is audited to the `settings` log channel (who, old value, new value, source), because `config.json` is not versioned and lives in a Docker volume with no history.
 
 Important defaults:
 
 | Key | Default | Description |
 |---|---:|---|
 | `max_tokens` | 16384 | Used when the client omits `max_tokens` and `max_completion_tokens`. |
+| `reasoning_max_tokens` | 32768 | Used instead of `max_tokens` when the client omits an output limit and the routed model declares `supports_reasoning` (thinking content shares the completion budget upstream). Only raises an unspecified default; never lowers a client-specified limit. |
 | `temperature` | 0.7 | Default temperature. |
-| `max_request_body_bytes` | 33554432 | Inbound request body limit (32 MiB); larger bodies return 413. |
+| `max_request_body_bytes` | 134217728 | Inbound request body limit (128 MiB); larger bodies return 413. Raised from 32 MiB because multi-turn image chats resend historical base64 images. |
 | `litellm_request_timeout` | 120 | liteLLM upstream call timeout. |
 | `same_target_retry_limit` | 1 | In-place retries for a transient first-byte failure on the same target (0–3). |
 | `tool_only_limit` | 20 | Tool-only loop circuit breaker threshold. |
@@ -305,7 +308,9 @@ Main code boundaries:
 | `app/core/policy.py` | Routing decisions, message normalization, preprocessing hook, reasoning injection, tool argument repair, tool-only limit. |
 | `app/core/state.py` | TTL caches, reasoning cache, tool-only counter, response-chain cache. |
 | `app/core/streaming.py` | Streaming event metering, reasoning storage, tool-only counting, stream error rendering, stats callback. |
-| `app/core/body_limit.py` | `RequestBodyLimitMiddleware` capping inbound request bodies (default 32 MiB). |
+| `app/core/body_limit.py` | `RequestBodyLimitMiddleware` capping inbound request bodies (default 128 MiB). |
+| `app/core/settings_schema.py` | Runtime settings schema generated from `default_config()`: type, bounds, unit, group, danger rule; the single validation entry point. |
+| `app/core/runtime_config.py` | Reconfigure hook registry: pushes config into values fixed at construction time (TTL cache limits, in-memory request-log maxlen, liteLLM global timeout). |
 | `app/core/images.py` | Data URI extraction, image-content detection, and OpenAI image-content normalization. |
 | `app/core/image_intent.py` | Image-generation intent check (`is_image_generation_intent`, `latest_user_text`). |
 | `app/core/image_bridge.py` | Codex `/responses` image-tool discovery, invocation parsing, and asset handoff. |
@@ -333,7 +338,7 @@ Main code boundaries:
 pytest tests/ -q
 ```
 
-Expected current result: `1038 passed`.
+Expected current result: `1123 passed`.
 
 The client-error-mapping baseline (diff-corpus coherence / required path assertions / hardcoded-status whitelist / doc count consistency) is enforced by:
 

@@ -5,6 +5,28 @@ All notable changes to LLM AIO Gateway will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **管理面板「设置」页**（`/admin/settings`）：三个标签——「运行参数」（按分组编辑 `config.json` 的 `defaults`，每行显示键名、当前值、内置默认值、来源标注、单位换算与范围提示；改动暂存于界面，点「保存」才落盘；已写入的键可单独「重置为默认」）、「备份与迁移」（原「配置导入/导出」，v2 起含运行参数，只含文件里显式写了的键）、「诊断」（只读：版本、配置文件路径与可写性、mtime、顶层配置（带「需重启」标记）、已注册的运行时推送钩子）。
+- **`app/core/settings_schema.py`**：schema 驱动的设置元数据（分组、单位、上下界、值相关风险规则、i18n 提示），自动生成设置页内容，无需第二份硬编码列表。
+- **`app/core/runtime_config.py`**：运行时推送钩子，配置写入后无需重启即可将新值推送到各子系统（TTL 缓存上限、内存日志 deque maxlen、litellm 超时）。
+- **`ConfigManager.patch()`**：部分写入——从磁盘重读原文件、只动指定键、原子写回，保留管理员手改的其他内容；`_fill_defaults()` 使用 `setdefault`，不会把内置默认值固化进文件。
+- **`resolve_request_capabilities()`**：请求路径能力解析统一入口（内置家族表 < 在线注册表 < 已存储），与 `/v1/models` 同一来源顺序；供 `apply_output_budget_policy()` 调用，不在端点/适配器里重复拼解析链。
+- **`reasoning_max_tokens`（默认 32768）**：客户端未指定输出上限且路由目标声明 `supports_reasoning` 时注入（上游把思考内容与最终答案计入同一 completion 预算，沿用面向普通对话的 `max_tokens` 容易被思考吃光）；只上调，绝不压低客户端显式传入的上限；命中注入时请求日志 details 带 `output_budget` 字段。
+- **`image_generation_budget_*` 与 `session_ttl_hours`** 在 `config.example.json` 中明确声明（此前代码已在读这三个键，但默认值里未声明，导致它们在配置文件里「隐形」）。
+- **`settings` 日志频道**：每次设置写入记录审计（管理员、来源、旧值、新值），可在「系统日志」页按频道查看。
+- 5 个新测试文件：`test_admin_settings_api.py`、`test_config_patch.py`、`test_output_budget.py`、`test_runtime_config.py`、`test_settings_schema.py`。
+
+### Changed
+- **`max_request_body_bytes` 默认值：33554432（32 MiB）→ 134217728（128 MiB）**。多轮带图对话会把历史图片以 base64 原样重发，体积天然偏大；32 MiB 上限在正常使用下会误拒合法请求。新默认值仍保持有界（schema 上限 512 MiB），设为 0/负数会禁用限制（设置页标红并要求勾选确认）。
+- **`docker-entrypoint.sh`**：删除硬编码的 `defaults` JSON 块（它是第三处真源，已和 `config.py` 的 `default_config()` 漂移）；`defaults` 现由 `config.py` 在加载时通过 `setdefault` 补齐，容器内配置文件只写引导项（`host`/`port`/`database`/`logging`）。
+- **`app/core/state.py`**：`TOOL_ONLY_LIMIT` 常量（import 时固化）改为 `tool_only_limit()` 函数（每次现读），使设置页修改后无需重启即可生效；各 TTL 缓存通过 `_CACHE_LIMITS` 登记表统一注册到 `runtime_config` 钩子，新增带 TTL/容量配置的缓存时在此登记，不另写推送逻辑。
+- 管理导航：新增「设置」标签；原「配置导入/导出」归入「备份与迁移」子标签。
+
+### Tests
+- 5 个新测试文件覆盖设置 API、`ConfigManager.patch()` 语义、输出预算注入逻辑、运行时推送钩子、schema 生成；全量 **1123 passed**（较 0.13.1 +85）。
+
 ## [0.13.1] - 2026-09-22
 
 ### Changed

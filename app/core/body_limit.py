@@ -16,8 +16,10 @@ from starlette.responses import Response
 
 from app.config import get_default
 
-# 多模态请求包含 base64 图片，默认给到 32 MiB；可通过 config.json 调整。
-DEFAULT_MAX_REQUEST_BODY_BYTES = 32 * 1024 * 1024
+# 多模态请求包含 base64 图片，且部分客户端（OpenWebUI 等）每轮都会原样重发历史图片，
+# 十数轮带图对话即可越过 32 MiB；默认给到 128 MiB，可通过 config.json 调整。
+# 仍然保留有界上限：<=0 会禁用限制，单个有效 API Key 就能用任意大的 body 打满内存。
+DEFAULT_MAX_REQUEST_BODY_BYTES = 128 * 1024 * 1024
 
 _BODY_LIMIT_METHODS = frozenset({"POST", "PUT", "PATCH"})
 

@@ -18,8 +18,9 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from app import __version__
-from app.config import load_config, get_config
+from app.config import load_config, get_config, get_default
 from app.core.body_limit import RequestBodyLimitMiddleware
+from app.core.runtime_config import apply_runtime_config
 from app.services.logger import get_logger, init_logging, set_request_id, generate_request_id
 from app.router import admin, auth, proxy
 
@@ -59,6 +60,19 @@ class RequestIdMiddleware(BaseHTTPMiddleware):
         return response
 
 
+def _maintenance_interval() -> int:
+    """存储维护周期（秒）：每轮现读，且走 get_default。
+
+    以前只在启动时读一次、还直接摸 cfg.config["defaults"]，绕过统一读取口，
+    导致设置页改完不生效。下限 5 秒防止把维护循环调成忙等。
+    """
+    try:
+        interval = int(get_default("storage_maintenance_interval_seconds", 60))
+    except (TypeError, ValueError):
+        interval = 60
+    return max(5, interval)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     from app.database import init_db, run_storage_maintenance, close_thread_connection
@@ -68,18 +82,17 @@ async def lifespan(app: FastAPI):
 
     init_logging(cfg.config.get("logging"))
 
+    # 把配置推送到“结构上定死”的运行时对象（TTL 缓存上限、内存请求日志 maxlen、
+    # litellm 全局超时）。管理页写入与 /admin/config/reload 走同一个入口。
     logger = get_logger("app")
+    runtime_applied = apply_runtime_config()
+    logger.info("[runtime_config] startup applied=%s", runtime_applied)
     stop_maintenance = asyncio.Event()
 
     async def _maintenance_loop():
         """周期裁剪请求日志并清理过期历史记录（P7/Q4）。"""
-        interval = 60
-        try:
-            interval = int(cfg.config.get("defaults", {}).get("storage_maintenance_interval_seconds", 60))
-        except (AttributeError, TypeError, ValueError):
-            interval = 60
-        interval = max(5, interval)
         while not stop_maintenance.is_set():
+            interval = _maintenance_interval()
             with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(stop_maintenance.wait(), timeout=interval)
             if stop_maintenance.is_set():

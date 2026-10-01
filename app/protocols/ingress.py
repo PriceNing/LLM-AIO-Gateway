@@ -57,6 +57,14 @@ def _max_tokens_from_body(body: dict[str, Any]) -> int:
     return max_tokens
 
 
+def _max_tokens_specified(body: dict[str, Any]) -> bool:
+    """客户端是否显式给出了输出上限。
+
+    只有未指定时策略层才允许注入/上调默认预算；显式传值（含 0）一律尊重原意。
+    """
+    return body.get("max_tokens") is not None or body.get("max_completion_tokens") is not None
+
+
 def _temperature_from_body(body: dict[str, Any]):
     if "temperature" in body:
         return body.get("temperature")
@@ -424,6 +432,7 @@ def chat_completions_to_internal(body: dict[str, Any]) -> InternalRequest:
         previous_response_id=body.get("previous_response_id") or "",
         extra=extra,
         raw_body=body,
+        metadata={"max_tokens_specified": _max_tokens_specified(body)},
     )
 
 
@@ -456,7 +465,7 @@ def completions_to_internal(body: dict[str, Any]) -> InternalRequest:
         max_tokens=_max_tokens_from_body(body),
         extra=extra,
         raw_body=body,
-        metadata={"prompt": prompt},
+        metadata={"prompt": prompt, "max_tokens_specified": _max_tokens_specified(body)},
     )
 
 
@@ -494,7 +503,7 @@ def anthropic_messages_to_internal(body: dict[str, Any]) -> InternalRequest:
         previous_response_id=body.get("previous_response_id") or "",
         extra=extra,
         raw_body=body,
-        metadata={"anthropic_input_count": len(anthropic_messages)},
+        metadata={"anthropic_input_count": len(anthropic_messages), "max_tokens_specified": _max_tokens_specified(body)},
     )
 
 
@@ -557,6 +566,7 @@ def responses_to_internal(body: dict[str, Any]) -> InternalRequest:
         metadata={
             "input_is_list": isinstance(input_data, list),
             "instructions": instructions,
+            "max_tokens_specified": _max_tokens_specified(body),
             "responses_native": {"request_body": copy.deepcopy(body)},
             # Responses wire-level request flags (协议边界，见 responses_features)。
             # 端点/策略代码只读这里，不再直接解析客户端原始 body。

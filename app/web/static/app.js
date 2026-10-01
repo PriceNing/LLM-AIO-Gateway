@@ -973,6 +973,13 @@ function toggleLang() {
 
 function refreshSection(section) {
     if (section === 'users') { renderUsers(); }
+    if (section === 'settings') {
+        // 运行参数表是 JS 拼接渲染的，切语言时必须重画，否则停留在旧语言的标签。
+        // dirty 值存在 settingsState 里，重画不会丢失未保存的修改。
+        renderSettingsStatus();
+        renderSettingsRuntime();
+        renderDiagnostics();
+    }
     if (section === 'providers') renderProviders();
     if (section === 'models') renderModels();
     if (section === 'stats') loadStats();
@@ -1199,7 +1206,7 @@ function showSection(section, evt) {
     if (section === 'image-generation') loadImageGeneration();
     if (section === 'request-logs') loadRequestLogs();
     if (section === 'system-logs') loadSystemLogMeta();
-    if (section === 'config') {/* lazy load */}
+    if (section === 'settings') loadSettings();
 }
 
 /* ═══════════════════════════════ Users ═══════════════════════════════ */
@@ -4100,12 +4107,24 @@ async function importConfig() {
         payload.mode = modeSel.value || 'skip';
         var r = await api('/admin/config/import', { method: 'POST', body: JSON.stringify(payload) });
         var summary = r.summary || {};
+        var errors = r.errors || [];
         var lines = [];
         lines.push((t('config.resultProviders') || 'Providers:') + ' ' + JSON.stringify(summary.providers || {}));
         lines.push((t('config.resultRouting') || 'Routing rules:') + ' ' + JSON.stringify(summary.routing_rules || {}));
         lines.push((t('config.resultFallbacks') || 'Fallback policies:') + ' ' + JSON.stringify(summary.fallback_policies || {}));
-        if (resultEl) resultEl.innerHTML = '<pre class="json-block">' + escHtml(lines.join('\n')) + '</pre>';
-        toast(t('config.imported') || 'Imported', 'success');
+        // 运行参数导入结果必须可见：风险值与非法键会被逐键拒掉，不显示就等于静默失败。
+        lines.push((t('config.resultSettings') || 'Settings:') + ' ' + JSON.stringify(summary.settings || {}));
+        var html = '<pre class="json-block">' + escHtml(lines.join('\n')) + '</pre>';
+        if (errors.length) {
+            html += '<div class="error-text">' + escHtml(t('config.resultErrors') || 'Rejected:') + '\n'
+                + escHtml(errors.join('\n')) + '</div>';
+        }
+        if (resultEl) resultEl.innerHTML = html;
+        if (errors.length) {
+            toast(t('config.importedPartial') + ': ' + errors.length, 'warning');
+        } else {
+            toast(t('config.imported') || 'Imported', 'success');
+        }
     } catch (e) {
         if (resultEl) resultEl.innerHTML = '<div class="error-text">' + escHtml(e.message) + '</div>';
         toast(t('config.importFail') + ': ' + e.message, 'error');
@@ -4265,6 +4284,9 @@ Object.assign(I18N.zh, {
     'config.resultProviders': '提供商:',
     'config.resultRouting': '路由规则:',
     'config.resultFallbacks': '回退策略:',
+    'config.resultSettings': '运行参数:',
+    'config.resultErrors': '被拒绝的条目:',
+    'config.importedPartial': '导入部分完成，被拒绝',
     'config.exportUsersTitle': '导出用户',
     'config.exportUsersHint': '单独导出用户和调用密钥，方便迁移到另一台机器。',
     'config.exportUsers': '下载用户 JSON',
@@ -4367,6 +4389,9 @@ Object.assign(I18N.en, {
     'config.resultProviders': 'Providers:',
     'config.resultRouting': 'Routing rules:',
     'config.resultFallbacks': 'Fallback policies:',
+    'config.resultSettings': 'Settings:',
+    'config.resultErrors': 'Rejected entries:',
+    'config.importedPartial': 'Import partially completed, rejected',
     'config.exportUsersTitle': 'Export Users',
     'config.exportUsersHint': 'Export users and API keys separately for migration to another machine.',
     'config.exportUsers': 'Download Users JSON',
@@ -4380,6 +4405,189 @@ Object.assign(I18N.en, {
     'config.resultUsers': 'Users:',
     'config.resultApiKeys': 'API keys:'
 });
+/* 设置页 i18n：运行参数 / 诊断 / 风险与提示文案。键与 app/core/settings_schema.py 的 hint、danger、group 一一对应。 */
+
+Object.assign(I18N.zh, {
+    'stats.loading': '加载中...',
+    'nav.settings': '设置',
+    'settings.title': '设置',
+    'settings.tab.runtime': '运行参数',
+    'settings.tab.backup': '备份与迁移',
+    'settings.tab.diagnostics': '诊断',
+    'settings.reloadFile': '从磁盘重新加载',
+    'settings.reloadFileHint': 'SSH 手改 config.json 后点这里，不用重启网关就能让 defaults 生效。',
+    'settings.reloadDone': '已重新加载配置文件，{n} 项 defaults 发生变化',
+    'settings.restartNeeded': '以下顶层配置需要重启才会生效',
+    'settings.reloadFail': '重新加载配置失败',
+    'settings.writable': '可写',
+    'settings.notWritable': '不可写（无法保存）',
+    'settings.fileAbsent': '配置文件不存在（用内置默认值）',
+    'settings.filePresent': '配置文件存在',
+    'settings.mtime': '最后修改',
+    'settings.hotAll': '运行参数写入后立即生效',
+    'settings.pending': '待保存 {n} 项',
+    'settings.save': '保存',
+    'settings.discard': '放弃修改',
+    'settings.saveBarEmpty': '没有待保存的修改',
+    'settings.saved': '已保存 {n} 项设置',
+    'settings.saveFail': '保存设置失败',
+    'settings.reset': '重置为默认',
+    'settings.confirmReset': '确定要重置为默认值吗？该键会从配置文件中删除，此后由内置默认值接管（网关升级带来的新默认值也会跟随）。',
+    'settings.resetDone': '已重置为默认值',
+    'settings.resetFail': '重置失败',
+    'settings.sourceFile': '来自配置文件',
+    'settings.sourceBuiltin': '内置默认',
+    'settings.default': '默认',
+    'settings.current': '当前',
+    'settings.pendingValue': '待保存',
+    'settings.dirtyTag': '未保存',
+    'settings.boolTrue': '开启',
+    'settings.boolFalse': '关闭',
+    'settings.needNumber': '需要数字',
+    'settings.needInt': '需要整数',
+    'settings.needValue': '不能为空',
+    'settings.badJson': '需要合法的 JSON 对象',
+    'settings.rangeMin': '{key} 不得小于 {min}',
+    'settings.rangeMax': '{key} 不得大于 {max}',
+    'settings.confirmDanger': '我已知悉风险并确认提交以下取值',
+    'settings.dangerConfirmRequired': '存在会放宽限制或关闭保护的取值，请先勾选确认后再保存',
+    'settings.hookFailed': '以下运行时钩子未能立即生效，当前进程仍用旧值',
+    'settings.restartRequired': '需重启',
+    'settings.readOnlyHint': '这些顶层配置在启动时只初始化一次（数据库连接、日志、监听地址、结果目录）。界面不允许修改：热改只会让文件与运行时不一致，改完必须重启网关。',
+    'settings.hooksHint': 'defaults 写入后由这些钩子把新值推送到运行时对象；钩子返回失败说明设置已落盘但本进程未接管，需要排查或重启。',
+    'settings.budgetNoteTitle': '输出预算与思考预算的关系',
+    'settings.budgetNote': 'completion 预算只有一个：max_tokens 是最终上限，reasoning_max_tokens / anthropic_thinking_budget_tokens 给思考内容预留空间，思考与最终答案共用同一预算，抬高思考预算不会增加总输出，只会挤占答案空间。这些上限只作用于"客户端未显式传参"的请求，不会压低客户端显式传入的值。',
+    'settings.diag.service': '服务',
+    'settings.diag.version': '版本',
+    'settings.diag.file': '配置文件',
+    'settings.diag.exists': '文件状态',
+    'settings.diag.writable': '写入权限',
+    'settings.diag.readOnly': '只读配置（需重启）',
+    'settings.diag.hooks': '运行时钩子',
+    'settings.group.outputBudget': '输出预算',
+    'settings.group.sampling': '采样',
+    'settings.group.inbound': '入站体积',
+    'settings.group.reasoning': '推理连续性',
+    'settings.group.tools': '工具调用',
+    'settings.group.upstream': '上游调用',
+    'settings.group.logs': '请求日志',
+    'settings.group.imagePreview': '图像预览',
+    'settings.group.imageGeneration': '图像生成',
+    'settings.group.responsesNative': '原生 Responses 探测',
+    'settings.group.registry': '在线能力库',
+    'settings.group.security': '安全与会话',
+    'settings.group.maintenance': '维护任务',
+    'settings.group.other': '其它',
+    'settings.hint.maxTokens': '客户端未指定 max_tokens 时注入的默认输出上限；只抬高"未指定"的请求，不会压低客户端显式传入的值。',
+    'settings.hint.reasoningMaxTokens': '客户端未指定输出上限且路由到的模型声明 supports_reasoning 时注入的上限，思考内容与最终答案共用同一个 completion 预算，只抬高未指定的默认值、不会压低客户端显式传入的值。',
+    'settings.hint.minImageMaxTokens': '视觉请求的最低输出预算：模型生效上限小于它时会被抬到该值，避免图片描述被截断。',
+    'settings.hint.toolOnlyLimit': '连续"只调工具、不给文本答案"的轮数上限，超过即判定为工具循环并中断；设为 0 等于关闭这层保护。',
+    'settings.hint.repairToolLeaks': '开启后会把上游泄漏到正文里的工具调用片段修复成结构化消息；关闭则原样透传给客户端。',
+    'settings.hint.thinkingBudget': 'Anthropic 思考模式的 token 预算；与最终答案共用同一个 completion 预算，调高它会压缩答案空间。',
+    'settings.hint.requestLogMax': '内存中保留的请求日志条数上限，超出后丢弃最旧记录；只影响管理页可见的历史深度，不写数据库。',
+    'settings.hint.maxRequestBodyBytes': '入站请求体字节上限，超限直接拒绝，保护进程内存；0 表示不限制。',
+    'settings.hint.allowPrivateUpstream': '允许上游地址指向内网/回环网段。仅在自建内网推理服务时开启，否则等于开放 SSRF。',
+    'settings.hint.budgetNote': '与"输出预算"分组配合看：这些上限只作用于未显式传参的请求。',
+    'settings.danger': '该取值会放宽限制或关闭保护。',
+    'settings.danger.bodyLimitOff': '禁用入站体积上限后，单个有效 API Key 可用任意大的请求体打满进程内存。',
+    'settings.danger.toolOnlyLimitOff': '关闭工具轮数上限后，模型可以无限调用工具，单个请求能长期占住连接与上游配额。',
+    'settings.danger.toolLeaksOff': '关闭工具泄漏修复后，上游吐回正文里的工具片段会原样展示给客户端。',
+    'settings.danger.payloadCaptureOff': '关闭请求体留档后，排障时看不到历史请求与响应内容。',
+    'settings.danger.redactEmpty': '清空脱敏字段列表后，api_key / token 等凭据会明文写进请求日志。',
+    'settings.danger.privateUpstream': '允许内网上游地址后，配错的提供商或路由规则可以把请求打到内网服务（SSRF）。',
+    'settings.danger.privateDownload': '允许从内网地址下载图片，网关可能变成访问内网的跳板。'
+});
+
+Object.assign(I18N.en, {
+    'nav.settings': 'Settings',
+    'settings.title': 'Settings',
+    'settings.tab.runtime': 'Runtime',
+    'settings.tab.backup': 'Backup & Migration',
+    'settings.tab.diagnostics': 'Diagnostics',
+    'settings.reloadFile': 'Reload from disk',
+    'settings.reloadFileHint': 'After editing config.json over SSH, click here to apply defaults without restarting the gateway.',
+    'settings.reloadDone': 'Config file reloaded, {n} default(s) changed',
+    'settings.restartNeeded': 'These top-level settings require a restart to take effect',
+    'settings.reloadFail': 'Failed to reload config file',
+    'settings.writable': 'Writable',
+    'settings.notWritable': 'Not writable (cannot save)',
+    'settings.fileAbsent': 'Config file missing (built-in defaults)',
+    'settings.filePresent': 'Config file present',
+    'settings.mtime': 'Last modified',
+    'settings.hotAll': 'Runtime settings apply immediately after save',
+    'settings.pending': '{n} change(s) pending',
+    'settings.save': 'Save',
+    'settings.discard': 'Discard',
+    'settings.saveBarEmpty': 'No pending changes',
+    'settings.saved': 'Saved {n} setting(s)',
+    'settings.saveFail': 'Failed to save settings',
+    'settings.reset': 'Reset to default',
+    'settings.confirmReset': 'Reset to default? The key is removed from the config file and built-in defaults take over again (including new defaults from future upgrades).',
+    'settings.resetDone': 'Reset to default',
+    'settings.resetFail': 'Reset failed',
+    'settings.sourceFile': 'From config file',
+    'settings.sourceBuiltin': 'Built-in default',
+    'settings.default': 'Default',
+    'settings.current': 'Current',
+    'settings.pendingValue': 'Pending',
+    'settings.dirtyTag': 'Unsaved',
+    'settings.boolTrue': 'On',
+    'settings.boolFalse': 'Off',
+    'settings.needNumber': 'Number required',
+    'settings.needInt': 'Integer required',
+    'settings.needValue': 'Value required',
+    'settings.badJson': 'Valid JSON object required',
+    'settings.rangeMin': '{key} must not be less than {min}',
+    'settings.rangeMax': '{key} must not be greater than {max}',
+    'settings.confirmDanger': 'I understand the risk and confirm these values',
+    'settings.dangerConfirmRequired': 'Pending values relax a limit or disable a protection. Tick the checkbox before saving.',
+    'settings.hookFailed': 'These runtime hooks did not apply immediately; the process still uses old values',
+    'settings.restartRequired': 'Restart required',
+    'settings.readOnlyHint': 'These top-level settings are initialized once at startup (database, logging, listen address, result dir). Editing them at runtime would only make the file and the process disagree, so the UI keeps them read-only; restart after changing the file.',
+    'settings.hooksHint': 'After defaults are written, these hooks push the new values into runtime objects. A failed hook means the value is persisted but not adopted by this process - investigate or restart.',
+    'settings.budgetNoteTitle': 'How output budget and thinking budget relate',
+    'settings.budgetNote': 'There is only one completion budget: max_tokens is the final ceiling, while reasoning_max_tokens / anthropic_thinking_budget_tokens reserve room for thinking. Thinking and the final answer share the same budget, so raising the thinking budget does not increase total output - it only squeezes the answer. These ceilings apply only to requests that do not pass explicit parameters; values supplied by the client are never lowered.',
+    'settings.diag.service': 'Service',
+    'settings.diag.version': 'Version',
+    'settings.diag.file': 'Config file',
+    'settings.diag.exists': 'File status',
+    'settings.diag.writable': 'Write permission',
+    'settings.diag.readOnly': 'Read-only (restart required)',
+    'settings.diag.hooks': 'Runtime hooks',
+    'settings.group.outputBudget': 'Output budget',
+    'settings.group.sampling': 'Sampling',
+    'settings.group.inbound': 'Inbound body',
+    'settings.group.reasoning': 'Reasoning continuity',
+    'settings.group.tools': 'Tool calls',
+    'settings.group.upstream': 'Upstream calls',
+    'settings.group.logs': 'Request logs',
+    'settings.group.imagePreview': 'Image preview',
+    'settings.group.imageGeneration': 'Image generation',
+    'settings.group.responsesNative': 'Native Responses probing',
+    'settings.group.registry': 'Online capability registry',
+    'settings.group.security': 'Security & session',
+    'settings.group.maintenance': 'Maintenance',
+    'settings.group.other': 'Other',
+    'settings.hint.maxTokens': 'Default output ceiling injected when the client does not send max_tokens. It only raises requests that left the value unspecified; an explicit client value is never lowered.',
+    'settings.hint.reasoningMaxTokens': 'Ceiling injected when the client sends no output limit and the routed model declares supports_reasoning. Thinking content and the final answer share the same completion budget, so this only raises the unspecified default and never lowers an explicit client value.',
+    'settings.hint.minImageMaxTokens': 'Minimum output budget for vision requests: an effective ceiling below this value is raised to it so image descriptions are not truncated.',
+    'settings.hint.toolOnlyLimit': 'Maximum consecutive turns that only call tools without a text answer; beyond it the request is treated as a tool loop and aborted. 0 disables the protection.',
+    'settings.hint.repairToolLeaks': 'Repairs tool-call fragments leaked into upstream text back into structured messages. When off they are passed through to the client as-is.',
+    'settings.hint.thinkingBudget': 'Token budget for Anthropic thinking mode. It shares the same completion budget as the final answer, so raising it compresses the answer.',
+    'settings.hint.requestLogMax': 'Number of request log entries kept in memory; the oldest are dropped. It only affects how far back the admin page can look, nothing is written to the database.',
+    'settings.hint.maxRequestBodyBytes': 'Inbound request body size limit in bytes; larger bodies are rejected to protect process memory. 0 means unlimited.',
+    'settings.hint.allowPrivateUpstream': 'Allow upstream addresses pointing at private/loopback ranges. Enable only for self-hosted intranet inference services, otherwise it opens an SSRF surface.',
+    'settings.hint.budgetNote': 'Read together with the Output budget group: these ceilings only apply to requests that omit the parameter.',
+    'settings.danger': 'This value relaxes a limit or disables a protection.',
+    'settings.danger.bodyLimitOff': 'With the inbound body limit disabled, a single valid API key can exhaust process memory with arbitrarily large request bodies.',
+    'settings.danger.toolOnlyLimitOff': 'With the tool-turn limit disabled, a model can call tools forever; one request may hold a connection and upstream quota indefinitely.',
+    'settings.danger.toolLeaksOff': 'With tool-leak repair off, tool fragments leaked into upstream text are shown to the client as-is.',
+    'settings.danger.payloadCaptureOff': 'With payload capture off, past request and response bodies are not available when troubleshooting.',
+    'settings.danger.redactEmpty': 'With an empty redaction list, credentials such as api_key and token are written into request logs in plaintext.',
+    'settings.danger.privateUpstream': 'Allowing intranet upstreams lets a misconfigured provider or routing rule send requests to internal services (SSRF).',
+    'settings.danger.privateDownload': 'Allowing image downloads from intranet addresses can turn the gateway into a pivot into the internal network.'
+});
+
 /* ═══════════════════════════════ Init ═══════════════════════════════ */
 
 document.addEventListener('DOMContentLoaded', function() {

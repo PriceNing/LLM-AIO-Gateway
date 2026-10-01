@@ -1,8 +1,9 @@
 import re
 import json
 from dataclasses import dataclass, field
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable
 
+from app.config import get_default
 from app.database import get_fallback_policies, get_routing_rules, parse_model_id
 from app.core.types import InternalMessage, InternalPart, InternalRequest, reasoning_part
 from app.core.text import mask_key, strip_billing_header
@@ -367,6 +368,7 @@ class RequestPolicyResult:
     modified_by_preprocessor: bool
     reasoning_injected: int = 0
     tool_only_limited: bool = False
+    output_budget: str = ""
 
 
 def wildcard_match(pattern: str, value: str) -> bool:
@@ -536,6 +538,58 @@ def apply_routing_rules(username: str, api_key_value: str, requested_model: str,
     )
 
 
+def _positive_int(value: Any, fallback: int) -> int:
+    """配置值解析：非法值回退到默认，显式 <=0 视为禁用（返回 0）。"""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return fallback
+    return parsed if parsed > 0 else 0
+
+
+def _reasoning_requested_by_client(request: InternalRequest) -> bool:
+    """客户端本轮是否显式要求推理/思考（只看协议字段，不看模型名）。"""
+    value = request.extra.get("enable_thinking")
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes", "on")
+    effort = request.extra.get("reasoning_effort")
+    if effort is None:
+        return False
+    return str(effort).strip().lower() not in ("", "none", "off", "false", "0")
+
+
+def apply_output_budget_policy(request: InternalRequest, capabilities: dict | None) -> str:
+    """客户端未指定输出上限时，按模型能力注入合适的 completion 预算。
+
+    推理类上游把思考内容与最终答案计入同一个 max_tokens 预算（协议事实，不是
+    厂商特例）：沿用面向普通对话的 ``defaults.max_tokens`` 时，思考可能吃光额度，
+    客户端看到空正文或停在半句的回答。因此对声明 ``supports_reasoning``（或客户端
+    本轮要求推理）的模型，用 ``defaults.reasoning_max_tokens`` 抬高注入值。
+
+    条件里不出现 provider/model 名称：是否上调完全来自能力数据与客户端协议字段。
+    只上调、不下调：客户端显式传的上限一律尊重，能力数据缺失或偏小也不会压低
+    既有请求的预算。返回注入来源（"" 表示未改动），供请求日志取证。
+    """
+    if request.metadata.get("max_tokens_specified"):
+        return ""
+    base = _positive_int(get_default("max_tokens", 16384), 16384)
+    if base <= 0:
+        # 管理员显式把 defaults.max_tokens 设为 0/负数 = 网关不注入输出上限，
+        # 推理预算同样不注入，由上游自己的默认值接管。
+        return ""
+    caps = capabilities if isinstance(capabilities, dict) else {}
+    reasoning = bool(caps.get("supports_reasoning")) or _reasoning_requested_by_client(request)
+    target = base
+    if reasoning:
+        target = max(base, _positive_int(get_default("reasoning_max_tokens", 32768), 32768))
+    if request.max_tokens >= target:
+        return ""
+    request.max_tokens = target
+    return "reasoning" if reasoning else "default"
+
+
 async def prepare_request_policy(
     request: InternalRequest,
     *,
@@ -551,6 +605,7 @@ async def prepare_request_policy(
     apply_ir_transforms: bool = True,
     log_label: str = "request",
     conv_key_override: str | None = None,
+    capabilities_lookup: Callable[[str, str], dict] | None = None,
 ) -> RequestPolicyResult:
     """Apply request-side policy while keeping endpoint-specific output unchanged."""
     requested_model = request.requested_model
@@ -614,6 +669,21 @@ async def prepare_request_policy(
         routing.target_provider or "-",
         routing.reason,
     )
+    output_budget = ""
+    if capabilities_lookup is not None:
+        caps = capabilities_lookup(request.target_model, request.provider_id) or {}
+        output_budget = apply_output_budget_policy(request, caps)
+        if output_budget:
+            _app_log.info(
+                "[%s OUTPUT_BUDGET] model=%s provider=%s source=%s max_tokens=%s supports_reasoning=%s",
+                log_label,
+                request.target_model,
+                request.provider_id or "-",
+                output_budget,
+                request.max_tokens,
+                bool(caps.get("supports_reasoning")),
+            )
+
     injected = 0
     if apply_ir_transforms and reasoning_context is not None:
         cached_rc, tool_map = reasoning_context(conv_key, request.messages)
@@ -644,4 +714,5 @@ async def prepare_request_policy(
         modified_by_preprocessor=modified,
         reasoning_injected=injected,
         tool_only_limited=limited,
+        output_budget=output_budget,
     )

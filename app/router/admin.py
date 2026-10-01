@@ -25,6 +25,9 @@ from app.database import (
     reset_model_responses_capability,
 )
 from app.core.policy import apply_fallback_policy, apply_routing_rules
+from app.config import defaults_written_on_disk, get_config, reload_config
+from app.core import settings_schema
+from app.core.runtime_config import apply_runtime_config, registered_hooks
 from app.adapters.anthropic import anthropic_messages_completion_for_internal
 from app.adapters.openai import chat_kwargs_from_internal, chat_messages_from_internal
 from app.adapters.output import response_to_internal_output
@@ -1201,7 +1204,7 @@ async def clear_request_logs_endpoint(authorization: Optional[str] = Header(None
 
 # -- Config export / import --
 
-_CONFIG_VERSION = 1
+_CONFIG_VERSION = 2
 _IMPORT_MODES = {"skip", "replace", "merge"}
 _USER_EXPORT_VERSION = 1
 
@@ -1232,6 +1235,10 @@ def _export_config(include_secrets: bool) -> dict:
         "image_generators": image_generators,
         "routing_rules": get_routing_rules(),
         "fallback_policies": get_fallback_policies(),
+        # 运行参数属于设置的一部分，随配置一起迁移。
+        # 只导出磁盘上显式写了的键：把内置默认一起导出会让目标机器从此不再
+        # 跟随新版本默认值（与“重置为默认=删键”同一语义）。
+        "settings": defaults_written_on_disk(),
     }
 
 
@@ -1360,6 +1367,182 @@ async def import_users_endpoint(payload: dict, authorization: Optional[str] = He
             summary["api_keys"][outcome] = summary["api_keys"].get(outcome, 0) + count
     _app_log.info("Users imported by '%s' mode=%s summary=%s", username, mode, summary)
     return {"status": "ok", "mode": mode, "summary": summary}
+
+
+# -- 运行参数（config.json 的 defaults 段）--
+
+_settings_log = get_logger("settings")
+
+
+def _audit_settings(username: str, source: str, before: dict, changes: dict, removed=()) -> None:
+    """运行参数变更审计。
+
+    config.json 不入库、生产文件在 volume 里，没有版本历史可查；这份日志是唯一
+    能回答“这个值是什么时候、被谁改的”的地方。
+    """
+    for key, value in (changes or {}).items():
+        _settings_log.info(
+            "admin=%s source=%s action=set key=%s old=%s new=%s", username, source, key, before.get(key), value
+        )
+    for key in removed or ():
+        _settings_log.info(
+            "admin=%s source=%s action=reset key=%s old=%s new=<内置默认>", username, source, key, before.get(key)
+        )
+
+
+def _patch_config_defaults(cfg, values: dict, remove: tuple[str, ...] = ()) -> None:
+    """写入 defaults 段。
+
+    写不进去必须响亮失败（500 = 网关自己的基础设施错误），不能退成“内存生效、
+    重启丢失”的静默降级；也不走客户端错误映射器，因为这里没有上游参与。
+    """
+    try:
+        cfg.patch("defaults", values, remove=remove)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=500, detail=f"配置文件写入失败（{cfg.file_status()['path']}）：{exc}") from exc
+
+
+def _settings_items() -> list[dict]:
+    """schema + 磁盘显式写入的键 + 当前生效值，界面一次读完即可渲染。"""
+    entries = settings_schema.schema()
+    written = defaults_written_on_disk()
+    live = get_config().config.get("defaults") or {}
+    items: list[dict] = []
+    for key, entry in entries.items():
+        value = live.get(key, entry["default"])
+        # danger = 当前值是否触发风险（服务端权威判定）；danger_rule = 规则本身，
+        # 界面用它对待提交值做预检查，避免管理员提交后才看到 409。
+        items.append({
+            **entry,
+            "value": value,
+            "written": key in written,
+            "source": "file" if key in written else "builtin",
+            "danger_rule": entry.get("danger"),
+            "danger": settings_schema.danger_for(key, value),
+        })
+    return items
+
+
+def _read_only_config() -> dict:
+    """顶层配置的只读展示。
+
+    这些键改了必须重启：lifespan 里 init_db / init_logging 只跑一次，热改只会让
+    文件与运行时不一致，比不让改更糟。
+    """
+    cfg = get_config().config
+    return {
+        "host": cfg.get("host"),
+        "port": cfg.get("port"),
+        "reload": cfg.get("reload"),
+        "database": cfg.get("database"),
+        "image_result_dir": cfg.get("image_result_dir"),
+        "cors_allow_origins": cfg.get("cors_allow_origins"),
+        "logging": cfg.get("logging"),
+    }
+
+
+@router.get("/settings")
+async def get_settings(authorization: Optional[str] = Header(None)):
+    await require_admin_session(authorization)
+    cfg = get_config()
+    return {
+        "items": _settings_items(),
+        "groups": [{"id": gid, "label": label} for gid, label in settings_schema.group_order()],
+        "file": cfg.file_status(),
+        "readOnly": _read_only_config(),
+        "runtimeHooks": registered_hooks(),
+    }
+
+
+@router.put("/settings")
+async def update_settings(payload: dict, authorization: Optional[str] = Header(None)):
+    username = await require_admin_session(authorization)
+    values = payload.get("values") if isinstance(payload, dict) else None
+    if not isinstance(values, dict) or not values:
+        raise HTTPException(status_code=400, detail="values 必须是非空 JSON 对象")
+    try:
+        normalized = settings_schema.validate_values(values)
+    except settings_schema.SettingsValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+
+    # 风险判定在服务端重做一遗，不信任界面：界面可以绕过，规则只有一份。
+    dangers = [
+        f"{key}={value}"
+        for key, value in normalized.items()
+        if settings_schema.danger_for(key, value)
+    ]
+    if dangers and payload.get("confirmDanger") is not True:
+        # 这里只列键值；具体风险文案由界面按 schema 里的 danger 规则本地翻译，
+        # 把 i18n 键拼进错误串只会让管理员看到一串代码标识。
+        raise HTTPException(
+            status_code=409,
+            detail="以下取值会放宽限制或关闭保护，需勾选确认后重试：" + "、".join(dangers),
+        )
+
+    cfg = get_config()
+    before = dict(cfg.config.get("defaults") or {})
+    _patch_config_defaults(cfg, normalized)
+    applied = apply_runtime_config()
+    _audit_settings(username, "ui", before, normalized)
+    return {
+        "items": _settings_items(),
+        "applied": applied,
+        "failedHooks": {name: result for name, result in applied.items() if result != "applied"},
+        "file": cfg.file_status(),
+    }
+
+
+@router.post("/settings/reset")
+async def reset_settings(payload: dict, authorization: Optional[str] = Header(None)):
+    """“重置为默认”= 从文件删除该键，而不是写回当前默认值。
+
+    写回当前默认值会把值永久固化在文件里，此后网关升级带来的新默认值对该键失效；
+    删除键才能让内置默认重新接管，也才是管理员期望的“恢复默认”。
+    """
+    username = await require_admin_session(authorization)
+    keys = payload.get("keys") if isinstance(payload, dict) else None
+    if not isinstance(keys, list) or not keys:
+        raise HTTPException(status_code=400, detail="keys 必须是非空数组")
+    unknown = [str(key) for key in keys if str(key) not in settings_schema.known_keys()]
+    if unknown:
+        raise HTTPException(status_code=400, detail=f"未知设置项：{'、'.join(unknown)}")
+
+    cfg = get_config()
+    before = dict(cfg.config.get("defaults") or {})
+    _patch_config_defaults(cfg, {}, tuple(str(key) for key in keys))
+    applied = apply_runtime_config()
+    _audit_settings(username, "reset", before, {}, removed=tuple(str(key) for key in keys))
+    return {
+        "items": _settings_items(),
+        "applied": applied,
+        "file": cfg.file_status(),
+    }
+
+
+@router.post("/config/reload")
+async def reload_config_endpoint(authorization: Optional[str] = Header(None)):
+    """从磁盘重读 config.json 并推送运行时对象。
+
+    给“SSH 手改文件”这条工作流用的：以前必须重启整个网关才能生效，而网关同时
+    承载管理页与在线流量，重启就是服务中断。
+    """
+    username = await require_admin_session(authorization)
+    cfg = get_config()
+    before = dict(cfg.config.get("defaults") or {})
+    before_top = {key: cfg.config.get(key) for key in settings_schema.RESTART_REQUIRED_TOP_LEVEL}
+    manager = reload_config()
+    applied = apply_runtime_config()
+    after = dict(manager.config.get("defaults") or {})
+    changed = sorted(key for key in set(before) | set(after) if before.get(key) != after.get(key))
+    top_changed = sorted(key for key in before_top if before_top.get(key) != manager.config.get(key))
+    _audit_settings(username, "reload", before, {key: after[key] for key in changed if key in after})
+    return {
+        "file": manager.file_status(),
+        "changedKeys": changed,
+        # 顶层键不会热生效，单独报出来提醒管理员需要重启。
+        "restartRequiredChangedKeys": top_changed,
+        "applied": applied,
+    }
 
 
 @router.get("/config/export")
@@ -1539,6 +1722,51 @@ def _import_fallback_policy(entry: dict, mode: str) -> str:
     return "created"
 
 
+def _import_settings(payload: dict, mode: str, username: str) -> dict:
+    """导入 payload 里的 settings 段（config.json defaults 的显式写入项）。
+
+    逐键走与 PUT /admin/settings 完全相同的校验，非法键记入错误而不中断整份导入；
+    写入同样只动指定键（patch），写后推送运行时对象。mode=skip 时整段保留现状。
+    """
+    raw = payload.get("settings")
+    if raw is None:
+        return {"applied": 0, "skipped": 0, "errors": []}
+    if not isinstance(raw, dict):
+        return {"applied": 0, "skipped": 0, "errors": ["settings 必须是 JSON 对象"]}
+    if not raw:
+        return {"applied": 0, "skipped": 0, "errors": []}
+    if mode == "skip":
+        return {"applied": 0, "skipped": len(raw), "errors": []}
+
+    normalized: dict = {}
+    errors: list[str] = []
+    # 风险值在导入路径同样需要显式确认：否则一份导出文件就能静默禁用请求体上限、
+    # 关掉 payload 脱敏或放宽 SSRF 边界，界面那条确认线就成了可绕过的摆设。
+    confirmed = payload.get("confirmDanger") is True
+    for key, value in raw.items():
+        try:
+            checked = settings_schema.validate_values({str(key): value})
+        except settings_schema.SettingsValidationError as exc:
+            errors.append(str(exc))
+            continue
+        danger = settings_schema.danger_for(str(key), value)
+        if danger and not confirmed:
+            errors.append(f"{key}: 该取值会放宽限制或关闭保护，导入已拒绕（需 confirmDanger）")
+            continue
+        normalized.update(checked)
+    if normalized:
+        cfg = get_config()
+        before = dict(cfg.config.get("defaults") or {})
+        try:
+            cfg.patch("defaults", normalized)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            errors.append(f"settings 写入失败: {exc}")
+        else:
+            apply_runtime_config()
+            _audit_settings(username, "import", before, normalized)
+    return {"applied": len(normalized), "skipped": len(errors), "errors": errors}
+
+
 @router.post("/config/import")
 async def import_config_endpoint(payload: dict, authorization: Optional[str] = Header(None)):
     username = await require_admin_session(authorization)
@@ -1549,7 +1777,6 @@ async def import_config_endpoint(payload: dict, authorization: Optional[str] = H
 
     summary = {"providers": {}, "preprocessors": {}, "image_generators": {}, "routing_rules": {}, "fallback_policies": {}}
     errors: list[str] = []
-
     def _run(section: str, label: str, fn) -> None:
         # 单条导入失败不再让整个请求 500：记入 errors 后继续，
         # 避免损坏的导入文件把数据库留在半导入状态且无任何反馈。
@@ -1573,6 +1800,10 @@ async def import_config_endpoint(payload: dict, authorization: Optional[str] = H
         _run("routing_rules", f"routing_rules[{index}]", lambda entry=entry: _import_routing_rule(entry, mode))
     for index, entry in enumerate(fallbacks):
         _run("fallback_policies", f"fallback_policies[{index}]", lambda entry=entry: _import_fallback_policy(entry, mode))
+
+    settings_result = _import_settings(payload, mode, username)
+    summary["settings"] = settings_result["applied"]
+    errors.extend(settings_result["errors"])
 
     _app_log.info("Config imported by '%s' mode=%s summary=%s errors=%d", username, mode, summary, len(errors))
     return {"status": "ok" if not errors else "partial", "mode": mode, "summary": summary, "errors": errors}

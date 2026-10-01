@@ -13,6 +13,9 @@ from typing import Any
 
 import re
 
+from app.database import get_model_stored_capabilities, parse_model_id
+from app.services.model_registry import registry_lookup
+
 # 能力字段白名单：context_window/max_output_tokens 为正整数，
 # supports_vision/supports_tools 为布尔，input_modalities 为字符串列表，
 # pricing 为 {prompt|completion|image: 字符串数字}（OpenRouter 口径，$/M tokens）。
@@ -244,3 +247,21 @@ def capabilities_for_client_entry(caps: dict) -> dict:
     if caps.get("pricing"):
         entry["pricing"] = dict(caps["pricing"])
     return entry
+
+
+def resolve_request_capabilities(model: str, provider_id: str = "") -> dict:
+    """按请求路径解析 provider/model 的合并能力（与 /v1/models 同一来源顺序）。
+
+    来源：内置家族表 < 在线注册表 < 已存储（上游透传 + 管理员覆盖）。
+    provider_models 行不存在时仍会回退到家族表与在线注册表，因此调用方的行为
+    不依赖数据库里是否有该模型行。请求路径需要能力数据时使用本函数，
+    不要在端点/适配器里重复拼解析链。
+    """
+    ref = parse_model_id(model)
+    name = ref.model_name
+    resolved_provider = provider_id or ref.provider_id
+    stored = get_model_stored_capabilities(resolved_provider, name) if resolved_provider else {}
+    remote = registry_lookup(name, name)
+    return resolve_model_capabilities(
+        {"id": name, "name": name, "capabilities": stored}, remote=remote
+    )

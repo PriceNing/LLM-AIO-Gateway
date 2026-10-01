@@ -4,6 +4,7 @@ import threading
 import time
 
 from app.config import get_default
+from app.core.runtime_config import register_runtime_hook
 from app.core.text import message_text
 from app.core.types import InternalMessage
 
@@ -93,12 +94,35 @@ class TTLDict:
             self._evict_expired()
             return list(self._data.keys())
 
+    def configure(self, ttl_seconds: int, max_size: int) -> bool:
+        """按新上限重配自ttl/容量；容量调小时立即淘汰到新的上限。
+
+        返回是否发生变化。该属性本来就是普通字段，提供显式入口是为了让“配置写入
+        后推送新值”有一个确定的地方，而不是在热路径上每次现读。
+        """
+        with self._lock:
+            changed = self.ttl != ttl_seconds or self.max_size != max_size
+            self.ttl = ttl_seconds
+            self.max_size = max_size
+            if len(self._data) > max_size:
+                self._evict_expired()
+                while len(self._data) > max_size and self._timestamps:
+                    oldest = min(self._timestamps, key=lambda k: self._timestamps[k])
+                    self._drop_locked(oldest)
+            return changed
+
     def __len__(self) -> int:
         with self._lock:
             return len(self._data)
 
 
-TOOL_ONLY_LIMIT = get_default("tool_only_limit", 20)
+def tool_only_limit() -> int:
+    """工具调用循环断路器阈值（每次现读，设置页改完立即生效）。"""
+    try:
+        return max(0, int(get_default("tool_only_limit", 20)))
+    except (TypeError, ValueError):
+        return 20
+
 
 tool_only_turns = TTLDict(
     ttl_seconds=get_default("tool_only_turns_ttl", 600),
@@ -124,6 +148,53 @@ image_generation_budget = TTLDict(
     ttl_seconds=get_default("image_generation_budget_ttl", 3600),
     max_size=get_default("image_generation_budget_max_size", 1000),
 )
+
+
+# 各 TTL 缓存与其配置键的对应关系：(缓存, ttl 键, max_size 键, 默认 ttl, 默认容量)。
+# 新增带 TTL/容量配置的缓存时在这里登记，不要另写一份推送逻辑。
+_CACHE_LIMITS: tuple[tuple["TTLDict", str, str, int, int], ...] = (
+    (tool_only_turns, "tool_only_turns_ttl", "tool_only_turns_max_size", 600, 2000),
+    (reasoning_cache, "reasoning_cache_ttl", "reasoning_cache_max_size", 1800, 1000),
+    (reasoning_tool_cache, "reasoning_cache_ttl", "reasoning_cache_max_size", 1800, 1000),
+    (reasoning_tool_global_cache, "reasoning_cache_ttl", "reasoning_cache_max_size", 1800, 1000),
+    (response_chain_cache, "reasoning_cache_ttl", "reasoning_cache_max_size", 1800, 1000),
+    (image_generation_budget, "image_generation_budget_ttl", "image_generation_budget_max_size", 3600, 1000),
+)
+
+
+def _limit_value(defaults: dict, key: str, fallback: int) -> int:
+    raw = defaults.get(key, fallback)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return fallback
+    return value if value > 0 else fallback
+
+
+def configure_caches(defaults: dict | None = None) -> list[str]:
+    """把配置里的 ttl/max_size 推送到各 TTL 缓存，返回实际发生变化的缓存键。
+
+    ttl 与容量在构造时定死，所以“改配置就生效”依赖调用方（启动时的
+    core.runtime_config.apply_runtime_config、以及管理页写入后的同一次推送）。
+    """
+    defaults = defaults if isinstance(defaults, dict) else {}
+    changed: list[str] = []
+    for cache, ttl_key, size_key, ttl_fallback, size_fallback in _CACHE_LIMITS:
+        if cache.configure(
+            _limit_value(defaults, ttl_key, ttl_fallback),
+            _limit_value(defaults, size_key, size_fallback),
+        ):
+            changed.append(f"{ttl_key}/{size_key}")
+    return changed
+
+
+def _reconfigure_caches_from_config(config: dict) -> None:
+    """runtime hook：把整份配置的 defaults 段推送到各 TTL 缓存。"""
+    defaults = config.get("defaults") if isinstance(config, dict) else None
+    configure_caches(defaults if isinstance(defaults, dict) else {})
+
+
+register_runtime_hook("state_caches", _reconfigure_caches_from_config)
 
 
 def charge_image_generation_budget(conv_key: str, count: int) -> int:

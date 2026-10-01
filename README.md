@@ -21,7 +21,7 @@ LLM AIO Gateway 是一个基于 FastAPI 的统一 LLM API 网关，用一个服�
 | 图像生成网关 | 支持 `/images/generations`、Codex `/responses` 生图工具桥接、原图短期存储、压缩缩略图、批量生成和生图统计。 |
 | 工具调用可靠性 | 保留工具调用 ID，修复 malformed JSON 工具参数，并提供工具调用循环断路器。 |
 | Reasoning 连续性 | 对 DeepSeek 等 thinking 模型自动缓存和回传 `reasoning_content`，保证多轮工具调用不中断。 |
-| Web 管理面板 | 管理提供商、用户、API Key、路由规则、模型预处理器和调用统计；响应式设计，适配桌面/平板/手机。 |
+| Web 管理面板 | 管理提供商、用户、API Key、路由规则、模型预处理器、运行参数（设置页）和调用统计；响应式设计，适配桌面/平板/手机。 |
 | 模型能力元数据 | `/v1/models` 附带上下文窗口、视觉/工具支持等能力信息（内置家族表 < 在线注册表 < 上游透传 < 管理员覆盖），在线注册表默认从 OpenRouter 定期拉取并持久化缓存，供下游 harness 自动识别模型能力。能力字段只做正向声明，缺失 = 未知/不支持；管理员选"不支持"即不向客户端声明该能力。 |
 | SQLite 存储 | 提供商、用户、密钥、路由规则、统计和请求记录保存在 `data.db`。 |
 
@@ -198,15 +198,18 @@ curl http://localhost:8000/v1/responses \
 
 ## 配置
 
-`config.json` 保存服务级配置，修改后需要重启服务。完整可选项见 `config.example.json` 中的 `defaults` 块。
+`config.json` 保存服务级配置，它是服务级设置的唯一真源（没有第二份数据库副本）。`defaults` 段可在管理面板的“设置 / 运行参数”页直接修改，**写完立即生效，不需要重启**；在服务器上手改文件后点“从磁盘重新加载”也能立即生效。只有顶层配置项（`host`、`port`、`database`、`image_result_dir`、`cors_allow_origins`、`logging`）仍必须重启服务，因为启动流程只跑一次 `init_db` / `init_logging`。完整可选项见 `config.example.json` 中的 `defaults` 块。
+
+设置页只写“管理员真正改过”的键：未改动的键不会写进文件，因此网关升级后新版本默认值会自动接管；“重置为默认”也是从文件删除该键而不是把当前默认值写回去。每次写入都记入 `settings` 日志通道（谁、旧值、新值、来源），因为 `config.json` 不入库且生产上住在 volume 里没有版本历史。
 
 重要默认项：
 
 | 键 | 默认值 | 说明 |
 |---|---:|---|
 | `max_tokens` | 16384 | 客户端未传 `max_tokens` 和 `max_completion_tokens` 时使用。 |
+| `reasoning_max_tokens` | 32768 | 客户端未传输出上限、且路由到的模型声明 `supports_reasoning` 时改用该值（思考内容与答案共用同一个 completion 预算）。只抬高未指定的默认值，不压低客户端显式传入的上限。 |
 | `temperature` | 0.7 | 默认温度。 |
-| `max_request_body_bytes` | 33554432 | 入站请求体大小上限（32 MiB）；超出返回 413。 |
+| `max_request_body_bytes` | 134217728 | 入站请求体大小上限（128 MiB）；超出返回 413。多轮带图对话会重发历史 base64 图片，默认值据此上调。 |
 | `litellm_request_timeout` | 120 | liteLLM 上游调用超时。 |
 | `same_target_retry_limit` | 1 | 同一目标首字节瞬态失败时的原地重试次数（0–3）。 |
 | `tool_only_limit` | 20 | 工具调用循环断路器阈值。 |
@@ -307,7 +310,9 @@ OpenAI 兼容提供商默认走 Chat Completions；仅在原生 Responses 能力
 | `app/core/policy.py` | 路由决策、消息规范化、预处理挂钩、reasoning 注入、工具参数修复、tool-only 限制。 |
 | `app/core/state.py` | TTL cache、reasoning cache、tool-only counter、response chain cache。 |
 | `app/core/streaming.py` | 流式事件计量、reasoning 存储、tool-only 计数、流式错误渲染和统计回调。 |
-| `app/core/body_limit.py` | `RequestBodyLimitMiddleware`，限制入站请求体大小（默认 32 MiB）。 |
+| `app/core/body_limit.py` | `RequestBodyLimitMiddleware`，限制入站请求体大小（默认 128 MiB）。 |
+| `app/core/settings_schema.py` | 运行参数 schema（由 `default_config()` 生成）：类型/范围/单位/分组/风险条件，服务端校验的唯一入参。 |
+| `app/core/runtime_config.py` | reconfigure 钩子注册表：把配置推送进“构造时定死”的对象（TTL 缓存上限、内存请求日志 maxlen、liteLLM 全局超时）。 |
 | `app/core/images.py` | data URI 图片提取、图片内容检测和 OpenAI 图像内容归一化。 |
 | `app/core/image_intent.py` | 生图意图判断（`is_image_generation_intent`、`latest_user_text`）。 |
 | `app/core/image_bridge.py` | Codex `/responses` 生图工具发现、调用解析与素材交接。 |
@@ -335,7 +340,7 @@ OpenAI 兼容提供商默认走 Chat Completions；仅在原生 Responses 能力
 pytest tests/ -q
 ```
 
-当前预期结果：`1038 passed`。
+当前预期结果：`1123 passed`。
 
 客户端错误映射收口基线（差分语料一致性 / 关键路径断言 / 写死状态码白名单 / 文档计数一致）已固化为：
 

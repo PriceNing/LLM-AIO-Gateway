@@ -65,6 +65,10 @@ HARDCODED_WHITELIST: Counter = Counter({
     ("app/router/admin.py",
      'raise HTTPException(status_code=502, detail="Failed to fetch models from server")'): 1,
     ("app/router/admin.py", "raise HTTPException(status_code=502, detail=detail)"): 1,
+    # 运行参数写盘失败（只读挂载/磁盘满/磁盘上 JSON 已损坏）：没有上游参与，也不是
+    # 客户端请求错误，500 = 网关自身基础设施问题。
+    ("app/router/admin.py",
+     """raise HTTPException(status_code=500, detail=f"配置文件写入失败（{cfg.file_status()['path']}）：{exc}") from exc"""): 1,
 })
 
 # 关键路径的测试断言必须存在：文件 → 必须同时出现的子串（用例名 + 断言文本）。

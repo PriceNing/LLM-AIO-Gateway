@@ -13,7 +13,7 @@ from app.services.lite_llm import (
     get_litellm_model_name,
     model_temperature_locks,
 )
-from app.core.model_capabilities import builtin_capabilities
+from app.core.model_capabilities import builtin_capabilities, resolve_request_capabilities
 
 # -- Model name routing --
 
@@ -179,10 +179,10 @@ def test_other_model_families_are_left_alone():
 def test_stored_override_wins_over_builtin_family(monkeypatch):
     """管理员/上游覆盖能改变锁，不需要改代码。"""
     monkeypatch.setattr(
-        "app.services.lite_llm.get_model_stored_capabilities",
+        "app.core.model_capabilities.get_model_stored_capabilities",
         lambda provider_id, model: {"fixed_temperature": 0.7},
     )
-    monkeypatch.setattr("app.services.lite_llm.registry_lookup", lambda *args: {})
+    monkeypatch.setattr("app.core.model_capabilities.registry_lookup", lambda *args: {})
 
     caps = model_temperature_locks("openai/gpt-5.6-terra", "PixelAPI")
     assert caps["fixed_temperature"] == 0.7
@@ -194,10 +194,10 @@ def test_stored_override_wins_over_builtin_family(monkeypatch):
 def test_lock_still_applies_when_no_provider_model_row(monkeypatch):
     """未同步的模型不得因查不到 DB 行而丢失锁（回退到内置家族表）。"""
     monkeypatch.setattr(
-        "app.services.lite_llm.get_model_stored_capabilities",
+        "app.core.model_capabilities.get_model_stored_capabilities",
         lambda provider_id, model: {},
     )
-    monkeypatch.setattr("app.services.lite_llm.registry_lookup", lambda *args: {})
+    monkeypatch.setattr("app.core.model_capabilities.registry_lookup", lambda *args: {})
 
     caps = model_temperature_locks("gpt-5.6-terra", "PixelAPI")
     assert caps.get("fixed_temperature") == 1

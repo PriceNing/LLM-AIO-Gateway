@@ -10,7 +10,6 @@ from app.config import get_default
 
 _sessions: dict[str, dict] = {}
 _sessions_lock = threading.Lock()
-SESSION_TTL_HOURS = get_default("session_ttl_hours", 12)
 _login_attempts: dict[str, list[float]] = {}
 _login_blocked_until: dict[str, float] = {}
 _login_attempts_lock = threading.Lock()
@@ -92,12 +91,25 @@ def new_api_key(prefix: str = "sk-aio") -> str:
     return f"{prefix}-{secrets.token_urlsafe(32)}"
 
 
+def session_ttl_hours() -> int:
+    """管理员会话有效期（每次签发时现读）。
+
+    只影响新签发的会话：已存在的会话仍按自己创建时的过期时间失效，改配置不会
+    把已登录的会话拉长或缩短——设置页需要把这行语义写给管理员看。
+    """
+    try:
+        hours = int(get_default("session_ttl_hours", 12))
+    except (TypeError, ValueError):
+        return 12
+    return hours if hours > 0 else 12
+
+
 def create_session(username: str) -> str:
     token = secrets.token_urlsafe(32)
     with _sessions_lock:
         _sessions[token] = {
             "username": username,
-            "expires_at": datetime.now(UTC) + timedelta(hours=SESSION_TTL_HOURS),
+            "expires_at": datetime.now(UTC) + timedelta(hours=session_ttl_hours()),
         }
     return token
 

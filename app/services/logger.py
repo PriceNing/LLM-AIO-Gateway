@@ -118,6 +118,9 @@ class LogManager:
         "app": "app.log",
         "tool_calls": "tool_calls.log",
         "request": "request.log",
+        # 运行参数变更审计：config.json 不入库（gitignore）且生产在 volume 里，
+        # 没有 VCS 历史可查，「谁在什么时候把哪个键改成了什么」只能靠这份日志。
+        "settings": "settings.log",
     }
 
     @classmethod

@@ -5,11 +5,12 @@ from litellm import completion
 from typing import Optional, Any
 from pydantic import Field
 from litellm.types.utils import ModelResponse, Message, Delta
-from app.database import get_providers, get_provider, find_provider_by_model, get_model_stored_capabilities, parse_model_id
+from app.database import get_providers, get_provider, find_provider_by_model
 from app.services.logger import get_logger
 from app.config import get_default
 from app.core.images import has_image_content, normalize_image_content
-from app.core.model_capabilities import resolve_model_capabilities
+from app.core.model_capabilities import resolve_model_capabilities, resolve_request_capabilities
+from app.core.runtime_config import register_runtime_hook
 from app.services.model_registry import registry_lookup
 
 # -- liteLLM compatibility: expose reasoning_content on response models --
@@ -109,9 +110,32 @@ litellm.request_timeout = get_default("litellm_request_timeout", 120)
 
 OPENAI_HOSTS = ("api.openai.com", "azure.com")
 
-# Minimum max_tokens for requests containing images, to accommodate thinking/reasoning
-# tokens that consume the budget before visible content is generated.
-MIN_IMAGE_MAX_TOKENS = get_default("min_image_max_tokens", 2000)
+
+def min_image_max_tokens() -> int:
+    """含图片请求的输出下限（每次现读）。
+
+    思考/推理内容会在可见正文之前消耗同一个 completion 预算，含图请求需要一个
+    高于“只描述图片”的下限，否则正文可能为空。
+    """
+    try:
+        value = int(get_default("min_image_max_tokens", 2000))
+    except (TypeError, ValueError):
+        return 2000
+    return value if value > 0 else 0
+
+
+def _reconfigure_litellm_timeout(config: dict) -> None:
+    """runtime hook：litellm.request_timeout 是全局模块属性，写入配置后要推一送。"""
+    defaults = config.get("defaults") if isinstance(config, dict) else None
+    raw = defaults.get("litellm_request_timeout", 120) if isinstance(defaults, dict) else 120
+    try:
+        seconds = int(raw)
+    except (TypeError, ValueError):
+        seconds = 120
+    litellm.request_timeout = seconds if seconds > 0 else 120
+
+
+register_runtime_hook("litellm_timeout", _reconfigure_litellm_timeout)
 
 
 def get_litellm_model_name(model: str, provider: dict) -> str:
@@ -191,17 +215,11 @@ def clean_params(params: dict[str, Any]) -> dict[str, Any]:
 def model_temperature_locks(model: str, provider_id: Optional[str] = None) -> dict[str, Any]:
     """解析该模型的 temperature 锁能力。
 
-    来源顺序与 /v1/models 一致：内置家族表 < 在线注册表 < 已存储（上游透传 + 管理员覆盖）。
-    provider_models 行不存在时仍会回退到家族表，因此行为不依赖数据库里是否有该模型行。
+    能力来源顺序与 /v1/models 一致（内置家族表 < 在线注册表 < 已存储），解析链
+    统一在 core.model_capabilities.resolve_request_capabilities，provider_models
+    行不存在时仍会回退到家族表，因此行为不依赖数据库里是否有该模型行。
     """
-    mid = parse_model_id(model)
-    name = mid.model_name
-    resolved_provider = provider_id or mid.provider_id
-    stored = get_model_stored_capabilities(resolved_provider, name) if resolved_provider else {}
-    remote = registry_lookup(name, name)
-    return resolve_model_capabilities(
-        {"id": name, "name": name, "capabilities": stored}, remote=remote
-    )
+    return resolve_request_capabilities(model, provider_id or "")
 
 
 def apply_temperature_lock(caps: dict[str, Any], kwargs: dict[str, Any]) -> None:
@@ -308,7 +326,7 @@ def create_chat_completion(
     messages = _system_messages_first(messages)
     normalize_image_content(messages)
     if has_image_content(messages):
-        kwargs["max_tokens"] = max(kwargs.get("max_tokens", 0), MIN_IMAGE_MAX_TOKENS)
+        kwargs["max_tokens"] = max(kwargs.get("max_tokens", 0), min_image_max_tokens())
     response = completion(model=litellm_model, messages=messages, **clean_params(kwargs))
     return response
 
@@ -330,7 +348,7 @@ def create_chat_completion_stream(
     messages = _system_messages_first(messages)
     normalize_image_content(messages)
     if has_image_content(messages):
-        kwargs["max_tokens"] = max(kwargs.get("max_tokens", 0), MIN_IMAGE_MAX_TOKENS)
+        kwargs["max_tokens"] = max(kwargs.get("max_tokens", 0), min_image_max_tokens())
     return completion(model=litellm_model, messages=messages, **clean_params(kwargs))
 
 

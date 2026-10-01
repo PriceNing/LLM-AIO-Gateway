@@ -178,4 +178,8 @@ def routing_details_from_policy(policy) -> dict[str, Any]:
         "routed_model": target_model if matched else "",
         "routed_provider": target_provider if matched else "",
     }
+    budget = str(getattr(policy, "output_budget", "") or "")
+    if budget:
+        # 网关在客户端未指定上限时注入了默认预算（见 core.policy.apply_output_budget_policy）。
+        details["output_budget"] = budget
     return details

@@ -214,10 +214,13 @@ def test_export_config_redacts_secrets(temp_db):
     r = client.get("/admin/config/export", headers=temp_db["headers"])
     assert r.status_code == 200
     body = r.json()
-    assert body["version"] == 1
+    assert body["version"] == 2
     assert body["include_secrets"] is False
     assert body["providers"][0]["api_key"] == ""
     assert body["providers"][0].get("upstream_headers") in (None, {})
+    # v2：运行参数属于设置的一部分，随配置导出；只带磁盘上显式写了的键，
+    # 不把内置默认固化到目标机器（否则升级后的新默认值对该键永久失效）。
+    assert isinstance(body["settings"], dict)
 
 
 def test_export_config_includes_secrets(temp_db):

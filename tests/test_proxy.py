@@ -404,3 +404,76 @@ async def test_policy_preprocess_model_not_in_db(preprocess_db):
 async def test_policy_preprocess_respects_requested_model(preprocess_db):
     """Test behavior."""
     """Test behavior."""
+
+
+# -- 客户端未指定输出上限时，网关按模型能力注入 completion 预算 --
+
+class _StubUsage:
+    prompt_tokens = 1
+    completion_tokens = 1
+    total_tokens = 2
+
+
+class _StubMessage:
+    content = "ok"
+    tool_calls = None
+    reasoning_content = None
+
+
+class _StubChoice:
+    message = _StubMessage()
+    finish_reason = "stop"
+
+
+class _StubResponse:
+    choices = [_StubChoice()]
+    usage = _StubUsage()
+
+
+def _capture_upstream_kwargs(monkeypatch, capabilities):
+    """拦截 liteLLM 调用，返回捕获到的上游 kwargs（含最终生效的 max_tokens）。"""
+    from app.router import proxy
+
+    captured: dict = {}
+
+    def fake_completion(**kwargs):
+        captured.update(kwargs)
+        return _StubResponse()
+
+    monkeypatch.setattr(proxy, "create_chat_completion", fake_completion)
+    monkeypatch.setattr(proxy, "resolve_request_capabilities", lambda model, provider_id="": dict(capabilities))
+    return captured
+
+
+def test_chat_without_max_tokens_gets_reasoning_budget(monkeypatch):
+    captured = _capture_upstream_kwargs(monkeypatch, {"supports_reasoning": True})
+    response = client.post("/v1/chat/completions", headers=headers, json={
+        "model": "allowed-model",
+        "messages": [{"role": "user", "content": "写一段 600 字的中文回答"}],
+        "stream": False,
+    })
+    assert response.status_code == 200
+    assert captured["max_tokens"] == 32768
+
+
+def test_chat_without_max_tokens_keeps_base_budget_for_plain_models(monkeypatch):
+    captured = _capture_upstream_kwargs(monkeypatch, {})
+    response = client.post("/v1/chat/completions", headers=headers, json={
+        "model": "allowed-model",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": False,
+    })
+    assert response.status_code == 200
+    assert captured["max_tokens"] == 16384
+
+
+def test_chat_client_max_tokens_wins_over_reasoning_budget(monkeypatch):
+    captured = _capture_upstream_kwargs(monkeypatch, {"supports_reasoning": True})
+    response = client.post("/v1/chat/completions", headers=headers, json={
+        "model": "allowed-model",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 512,
+        "stream": False,
+    })
+    assert response.status_code == 200
+    assert captured["max_tokens"] == 512

@@ -54,7 +54,11 @@ from app.core.image_orchestration import (
     image_generator_identity as _image_generator_identity,
     image_prompt_key as _image_prompt_key,
 )
-from app.core.model_capabilities import capabilities_for_client_entry, resolve_model_capabilities
+from app.core.model_capabilities import (
+    capabilities_for_client_entry,
+    resolve_model_capabilities,
+    resolve_request_capabilities,
+)
 from app.services.model_registry import registry_lookup
 from app.core.tool_leak import repair_output as _repair_output_tool_leaks
 from app.core.outcome import (
@@ -70,9 +74,10 @@ from app.core.output import (
     aclose_async_iterator,
 )
 from app.core.types import InternalMessage, append_system_text, prepend_system_text, text_part, tool_call_part, tool_result_part
+from app.core.runtime_config import register_runtime_hook
 
 from app.core.state import (
-    TOOL_ONLY_LIMIT,
+    tool_only_limit as _tool_only_limit,
     conversation_cache_key as _conversation_cache_key,
     ir_reasoning_message_count as _ir_reasoning_message_count,
     ir_tool_message_count as _ir_tool_message_count,
@@ -147,6 +152,39 @@ router = APIRouter()
 # Rolling log of recent requests for the admin stats dashboard
 _request_log = deque(maxlen=get_default("request_log_max", 200))
 _request_log_lock = threading.Lock()
+
+
+def set_request_log_max(value) -> bool:
+    """按新上限重建内存请求日志。
+
+    `deque.maxlen` 在 CPython 里是只读的，只能重建对象后重新赋值模块全局；变量在
+    各函数里都是按名字读取模块属性，因此重建对现有代码透明。
+    与重启路径保持同一语义：<=0 就是 maxlen=0（内存滚动日志关闭，仪表盘为空），
+    设置页不允许输入 0。
+    """
+    global _request_log
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        limit = 200
+    with _request_log_lock:
+        if _request_log.maxlen == limit:
+            return False
+        # 写入用 appendleft，最新条目在左端。deque(iterable, maxlen=n) 保留的是右端
+        # n 个，直接重建会把“最近的请求日志”截成“最旧的几条”，仪表盘反而看不到
+        # 刚刚发生的请求。必须显式取左端 limit 个。
+        kept = list(_request_log)[:limit] if limit > 0 else []
+        _request_log = deque(kept, maxlen=limit)
+        return True
+
+
+def _reconfigure_request_log(config: dict) -> None:
+    defaults = config.get("defaults") if isinstance(config, dict) else None
+    if isinstance(defaults, dict):
+        set_request_log_max(defaults.get("request_log_max", 200))
+
+
+register_runtime_hook("request_log", _reconfigure_request_log)
 
 
 def _chat_latest_user_text(internal) -> str:
@@ -2251,6 +2289,11 @@ def _log_request_body(username: str, model: str, endpoint: str, body: dict) -> N
     )
 
 
+def _request_capabilities(model: str, provider_id: str) -> dict:
+    """策略层按已路由的 provider/model 取合并能力（四层来源顺序见 core.model_capabilities）。"""
+    return resolve_request_capabilities(model, provider_id or "")
+
+
 async def _policy_preprocess_request(internal, model: str, provider_id: str, requested_model: str):
     check_model = requested_model or model
     has_img = has_image_content(internal.messages)
@@ -2686,11 +2729,13 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
         conversation_cache_key=_conversation_cache_key,
         reasoning_context=_reasoning_context,
         tool_only_turns=_tool_only_turns,
-        tool_only_limit=TOOL_ONLY_LIMIT,
+        tool_only_limit=_tool_only_limit(),
         log_label="chat",
+        capabilities_lookup=_request_capabilities,
     )
     model = internal.target_model
     provider_id = internal.provider_id
+    max_tokens = internal.max_tokens
     ensure_routed_model_allowed(
         user, api_key, requested_model, model, provider_id, endpoint="chat_completions"
     )
@@ -3138,9 +3183,11 @@ async def completions(request: Request, authorization: Optional[str] = Header(No
         reasoning_context=None,
         normalize=True,
         log_label="completions",
+        capabilities_lookup=_request_capabilities,
     )
     model = internal.target_model
     provider_id = internal.provider_id
+    max_tokens = internal.max_tokens
     ensure_routed_model_allowed(
         user, api_key, requested_model, model, provider_id, endpoint="completions"
     )
@@ -3267,6 +3314,7 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
         reasoning_context=_reasoning_context,
         normalize=False,
         log_label="messages",
+        capabilities_lookup=_request_capabilities,
     )
     model = internal.target_model
     provider_id = internal.provider_id
@@ -3461,9 +3509,11 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
         preprocess=False,
         apply_ir_transforms=False,
         log_label="responses",
+        capabilities_lookup=_request_capabilities,
     )
     model = internal.target_model
     provider_id = internal.provider_id
+    max_tokens = internal.max_tokens
     ensure_routed_model_allowed(
         user, api_key, requested_model, model, provider_id, endpoint="responses"
     )
@@ -3619,10 +3669,12 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                 conversation_cache_key=_conversation_cache_key,
                 reasoning_context=_reasoning_context if isinstance(input_data, list) else None,
                 tool_only_turns=_tool_only_turns,
-                tool_only_limit=TOOL_ONLY_LIMIT,
+                tool_only_limit=_tool_only_limit(),
                 log_label="responses.image_bridge",
                 conv_key_override=conv_key,
+                capabilities_lookup=_request_capabilities,
             )
+            max_tokens = internal.max_tokens
             configure_internal_image_bridge(internal, body)
             output, provider_info, adapter_provider_id = await _call_nonstream_with_fallbacks(
                 policy, internal, temperature=temperature, max_tokens=max_tokens,
@@ -3905,12 +3957,14 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
             preprocess_request=_policy_preprocess_request, conversation_cache_key=_conversation_cache_key,
             reasoning_context=_reasoning_context if isinstance(input_data, list) else None,
             tool_only_turns=_tool_only_turns,
-            tool_only_limit=TOOL_ONLY_LIMIT,
+            tool_only_limit=_tool_only_limit(),
             log_label="responses",
             conv_key_override=conv_key,
+            capabilities_lookup=_request_capabilities,
         )
         model = internal.target_model
         provider_id = internal.provider_id
+        max_tokens = internal.max_tokens
         provider_info = resolve_provider(model, provider_id)
         adapter_provider_id = provider_for_log(provider_info, provider_id)
         if stream:

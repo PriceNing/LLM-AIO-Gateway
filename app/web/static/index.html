@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>LLM AIO Gateway</title>
-    <link rel="stylesheet" href="styles.css?v=20260909-history-sort">
+    <link rel="stylesheet" href="styles.css?v=20260930-settings">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 </head>
 <body>
@@ -89,8 +89,8 @@
                 <button class="nav-btn" onclick="showSection('system-logs', event)" data-section="system-logs">
                     <span class="nav-icon">&#128220;</span><span data-i18n="nav.systemLogs">系统日志</span>
                 </button>
-                <button class="nav-btn" onclick="showSection('config', event)" data-section="config">
-                    <span class="nav-icon">&#128190;</span><span data-i18n="nav.config">配置导入/导出</span>
+                <button class="nav-btn" onclick="showSection('settings', event)" data-section="settings">
+                    <span class="nav-icon">&#128295;</span><span data-i18n="nav.settings">设置</span>
                 </button>
             </aside>
 
@@ -220,11 +220,24 @@
                     <div id="systemLogsContent"></div>
                 </div>
 
-                <!-- Config import/export -->
-                <div id="config-section" class="section" style="display:none;">
+                <!-- Settings：运行参数 / 备份与迁移 / 诊断 -->
+                <div id="settings-section" class="section" style="display:none;">
                     <div class="section-header">
-                        <h2 data-i18n="config.title">配置导入/导出</h2>
+                        <h2 data-i18n="settings.title">设置</h2>
+                        <div class="section-actions">
+                            <button class="btn btn-secondary" onclick="reloadConfigFile()" data-i18n="settings.reloadFile" data-i18n-title="settings.reloadFileHint">从磁盘重新加载</button>
+                        </div>
                     </div>
+                    <div class="tab-bar">
+                        <button class="tab-btn active" data-settings-tab="runtime" onclick="showSettingsTab('runtime')" data-i18n="settings.tab.runtime">运行参数</button>
+                        <button class="tab-btn" data-settings-tab="backup" onclick="showSettingsTab('backup')" data-i18n="settings.tab.backup">备份与迁移</button>
+                        <button class="tab-btn" data-settings-tab="diagnostics" onclick="showSettingsTab('diagnostics')" data-i18n="settings.tab.diagnostics">诊断</button>
+                    </div>
+                    <div id="settings-runtime" class="settings-tab">
+                        <div id="settingsStatusLine" class="settings-status"></div>
+                        <div id="settingsRuntimeContent"></div>
+                    </div>
+                    <div id="settings-backup" class="settings-tab" style="display:none;">
                     <div class="config-grid">
                         <div class="config-card glass">
                             <h3 data-i18n="config.exportTitle">导出配置</h3>
@@ -284,6 +297,10 @@
                             <div id="usersImportResult" class="config-result"></div>
                         </div>
                     </div>
+                    </div>
+                    <div id="settings-diagnostics" class="settings-tab" style="display:none;">
+                        <div id="settingsDiagnosticsContent"></div>
+                    </div>
                 </div>
             </main>
         </div>
@@ -297,7 +314,8 @@
         </div>
     </div>
 
-    <script src="app.js?v=20260909-history-sort"></script>
+    <script src="app.js?v=20260930-settings"></script>
+    <script src="js/settings.js?v=20260930-settings"></script>
     <script src="js/routing-tools.js"></script>
 </body>
 </html>
