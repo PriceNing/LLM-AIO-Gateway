@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 from app.core.output import InternalOutputEvent
 from app.core.streaming import record_streaming_events, stream_internal_output
 from app.adapters.streaming import iter_stream_async
+from app.core.streaming import iter_output_idle_timeout
 from app.services.logger import get_request_id, set_request_id
 
 
@@ -790,3 +791,285 @@ async def test_concurrent_streams_do_not_leak_worker_threads():
     assert threading.active_count() <= baseline, (
         f"流工作线程未回收：baseline={baseline}, now={threading.active_count()}"
     )
+
+
+# -- 上游 HTTP 传输层必须随流一起释放（2026-10-03 单槽上游楔死事故）--
+#
+# 事故根因：网关只关掉 Python 生成器层，而 litellm 1.83 的流式包装器
+# （CustomStreamWrapper）没有同步 close()，上游 httpx 响应挂在它的
+# completion_stream 上，只能等引用计数回收；异常 traceback 在请求存活期间
+# 一直拽着它，被放弃的上游连接因此继续占着单槽推理引擎的执行槽。
+# 下面几条断言的都是"显式关闭"，不得依赖 gc.collect()。
+
+
+class _TransportStream:
+    """litellm CustomStreamWrapper 的形状：可迭代、只有异步 aclose、内层流挂 completion_stream。"""
+
+    def __init__(self, events: list, *, fail_at: int | None = None, tick: float = 0.005):
+        import time as _time
+
+        self.events = events
+        self.completion_stream = _InnerSyncStream(events)
+        self._fail_at = fail_at
+        self._tick = tick
+        self._time = _time
+
+    def __iter__(self):
+        for index in range(100):
+            if self._fail_at is not None and index == self._fail_at:
+                raise RuntimeError("upstream stream broke mid-flight")
+            self._time.sleep(self._tick)  # 让生产者停在流中间，而不是抢在消费者之前跑完
+            yield index
+
+    async def aclose(self):
+        # 工作线程不得调用异步 aclose：消费者此刻可能仍卡在 socket 读上，
+        # 跨线程关闭 httpx 同步响应不安全。
+        self.events.append("aclose")
+
+
+class _InnerSyncStream:
+    """openai.Stream / httpx.Response 的形状：同步 close()，幂等。"""
+
+    def __init__(self, events: list):
+        self.events = events
+
+    def close(self) -> None:
+        self.events.append("close")
+
+
+async def _wait_until(predicate, *, attempts: int = 400, delay: float = 0.005) -> bool:
+    for _ in range(attempts):
+        if predicate():
+            return True
+        await _asyncio.sleep(delay)
+    return predicate()
+
+
+@pytest.mark.asyncio
+async def test_iter_stream_async_closes_upstream_transport_on_early_consumer_exit():
+    """客户端提前断开（消费者 break）必须在工作线程内关掉上游 HTTP 响应。"""
+    events: list = []
+
+    agen = iter_stream_async(lambda: _TransportStream(events), maxsize=1, poll_interval=0.005)
+    got = []
+    async for chunk in agen:
+        got.append(chunk)
+        if len(got) == 2:
+            break
+    # 网关的真实收尾：渲染链提前丢弃后由 finally 里的 aclose_async_iterator 关闭。
+    await agen.aclose()
+
+    assert await _wait_until(lambda: "close" in events), f"上游传输未被关闭: events={events}"
+    assert got == [0, 1]
+    assert "aclose" not in events
+
+
+@pytest.mark.asyncio
+async def test_iter_stream_async_closes_upstream_transport_on_midstream_error():
+    """中途超时/异常放弃上游（事故路径）同样必须关闭上游 HTTP 响应。"""
+    events: list = []
+
+    agen = iter_stream_async(
+        lambda: _TransportStream(events, fail_at=40), maxsize=1, poll_interval=0.005
+    )
+    got = []
+    error = None
+    try:
+        async for chunk in agen:
+            got.append(chunk)
+    except RuntimeError as exc:
+        error = str(exc)
+
+    assert error == "upstream stream broke mid-flight"
+    assert await _wait_until(lambda: "close" in events), f"上游传输未被关闭: events={events}"
+    assert len(got) == 40
+    assert "aclose" not in events
+
+
+@pytest.mark.asyncio
+async def test_iter_stream_async_closes_upstream_transport_on_normal_completion():
+    """正常读完也关闭一次（openai.Stream.close 幂等），不得重复或遗漏。"""
+    events: list = []
+
+    received = [chunk async for chunk in iter_stream_async(lambda: _TransportStream(events, tick=0.0), poll_interval=0.005)]
+
+    assert received == list(range(100))
+    assert events == ["close"]
+
+
+@pytest.mark.asyncio
+async def test_iter_stream_async_reports_transport_close_failure_without_breaking_stream():
+    """关闭失败不能把正常流变成错误，但必须留下可取证的 WARNING。"""
+    import app.adapters.streaming as streaming_adapter
+
+    warnings: list = []
+
+    class BrokenClose:
+        def close(self):
+            raise OSError("transport already gone")
+
+    class Wrapper:
+        def __init__(self):
+            self.completion_stream = BrokenClose()
+
+        def __iter__(self):
+            yield from range(3)
+
+    original = streaming_adapter._app_log.warning
+    streaming_adapter._app_log.warning = lambda *args: warnings.append(args)
+    try:
+        received = [chunk async for chunk in iter_stream_async(Wrapper, poll_interval=0.005)]
+    finally:
+        streaming_adapter._app_log.warning = original
+
+    assert received == [0, 1, 2]
+    assert any("upstream transport" in str(arg) for args in warnings for arg in args), warnings
+
+
+@pytest.mark.asyncio
+async def test_iter_stream_async_tolerates_wrapper_without_transport_attribute():
+    """既有契约：包装器既没有 close() 也没有 completion_stream 时不得产生告警。"""
+    import app.adapters.streaming as streaming_adapter
+
+    warnings: list = []
+    original = streaming_adapter._app_log.warning
+    streaming_adapter._app_log.warning = lambda *args: warnings.append(args)
+    try:
+        received = []
+        async for chunk in iter_stream_async(lambda: _WrapperNoCloseNoTransport(), poll_interval=0.005):
+            received.append(chunk)
+    finally:
+        streaming_adapter._app_log.warning = original
+
+    assert received == ["one", "two"]
+    assert warnings == []
+
+
+class _WrapperNoCloseNoTransport:
+    def __iter__(self):
+        return iter(["one", "two"])
+
+
+@pytest.mark.asyncio
+async def test_iter_stream_async_skips_async_only_inner_stream_without_warning():
+    """内层流只有 async def close()（openai.AsyncStream 形状）时必须跳过。
+
+    在工作线程里调协程函数只会拿到一个未被 await 的协程：既没关掉连接，
+    又留下 RuntimeWarning，看起来像修好了其实没修。
+    """
+    import app.adapters.streaming as streaming_adapter
+
+    calls: list = []
+    warnings: list = []
+    original = streaming_adapter._app_log.warning
+    streaming_adapter._app_log.warning = lambda *args: warnings.append(args)
+
+    class AsyncOnlyInner:
+        async def close(self):
+            calls.append("close")
+
+    class Wrapper:
+        def __init__(self):
+            self.completion_stream = AsyncOnlyInner()
+
+        def __iter__(self):
+            yield from range(2)
+
+    try:
+        received = [chunk async for chunk in iter_stream_async(Wrapper, poll_interval=0.005)]
+    finally:
+        streaming_adapter._app_log.warning = original
+
+    assert received == [0, 1]
+    assert calls == []
+    assert warnings == []
+    assert received == [0, 1]
+    assert calls == []
+    assert warnings == []
+
+
+# -- 流式块间空闲超时（stream_idle_timeout_seconds）--
+#
+# 语义：只在已向客户端产出首个可见输出之后计时。provider.request_timeout 透传给
+# httpx 后是分段读超时，对"冷 prefill 静默"和"解码间隙"是同一个旋钮；本层负责
+# 后者，因此可以用远小于前者的值快速发现死流，而不会砍掉长 prefill。
+
+
+def _idle_factory(seconds: float) -> TimeoutError:
+    exc = TimeoutError(f"upstream stream idle for {int(seconds)}s after output started")
+    return exc
+
+
+def _is_output(item) -> bool:
+    return isinstance(item, str) and item.startswith("out:")
+
+
+async def _collect_idle(events, *, idle_seconds):
+    return [
+        item
+        async for item in iter_output_idle_timeout(
+            events, idle_seconds=idle_seconds, is_output=_is_output, error_factory=_idle_factory
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_output_idle_timeout_disabled_passes_everything_through():
+    async def source():
+        yield "out:a"
+        await _asyncio.sleep(0.05)
+        yield "out:b"
+
+    for idle in (0, None):
+        assert await _collect_idle(source(), idle_seconds=idle) == ["out:a", "out:b"]
+
+
+@pytest.mark.asyncio
+async def test_output_idle_timeout_fires_after_first_visible_output():
+    closed = []
+
+    async def source():
+        try:
+            yield "out:a"
+            await _asyncio.sleep(3600)  # 产出开始后上游再也不出声
+        finally:
+            closed.append(True)
+
+    with pytest.raises(TimeoutError):
+        await _collect_idle(source(), idle_seconds=0.05)
+    assert closed == [True]  # 被砍也必须级联关闭上游流
+
+
+@pytest.mark.asyncio
+async def test_output_idle_timeout_never_cuts_silence_before_first_output():
+    """prefill 静默归 provider.request_timeout 管，本层不得插手。"""
+
+    async def source():
+        await _asyncio.sleep(0.2)
+        yield "out:a"
+
+    assert await _collect_idle(source(), idle_seconds=0.05) == ["out:a"]
+
+
+@pytest.mark.asyncio
+async def test_output_idle_timeout_resets_on_invisible_upstream_items():
+    """不可见的 usage/metadata 同样证明连接活着：必须重新计时。"""
+
+    async def source():
+        yield "out:a"
+        for _ in range(20):
+            await _asyncio.sleep(0.02)  # 总时长远超 idle 上限
+            yield "meta:usage"
+        yield "out:b"
+
+    assert await _collect_idle(source(), idle_seconds=0.1) == ["out:a"] + ["meta:usage"] * 20 + ["out:b"]
+
+
+@pytest.mark.asyncio
+async def test_output_idle_timeout_passes_upstream_errors_through():
+    async def source():
+        yield "out:a"
+        raise RuntimeError("upstream broke")
+
+    with pytest.raises(RuntimeError, match="upstream broke"):
+        await _collect_idle(source(), idle_seconds=0.05)

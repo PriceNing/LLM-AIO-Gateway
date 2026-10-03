@@ -212,6 +212,7 @@ curl http://localhost:8000/v1/responses \
 | `max_request_body_bytes` | 134217728 | 入站请求体大小上限（128 MiB）；超出返回 413。多轮带图对话会重发历史 base64 图片，默认值据此上调。 |
 | `litellm_request_timeout` | 120 | liteLLM 上游调用超时。 |
 | `same_target_retry_limit` | 1 | 同一目标首字节瞬态失败时的原地重试次数（0–3）。 |
+| `stream_idle_timeout_seconds` | 0 | 流式块间空闲超时：只在已向客户端产出首个可见输出之后计时，上游连续静默超过该值即判定连接已死并按上游超时报错（504）。与 provider 的请求超时分工——后者管首字之前（冷 prefill 静默，需要调高），本项管产出开始之后的死连接，因此可设得远小于它。0 = 关闭。 |
 | `tool_only_limit` | 20 | 工具调用循环断路器阈值。 |
 | `min_image_max_tokens` | 2000 | 含图片请求的最小 max tokens。 |
 | `session_ttl_hours` | 12 | 管理员会话有效期。 |
@@ -340,7 +341,7 @@ OpenAI 兼容提供商默认走 Chat Completions；仅在原生 Responses 能力
 pytest tests/ -q
 ```
 
-当前预期结果：`1137 passed`。
+当前预期结果：`1152 passed`。
 
 客户端错误映射收口基线（差分语料一致性 / 关键路径断言 / 写死状态码白名单 / 文档计数一致）已固化为：
 

@@ -75,6 +75,10 @@ _META: dict[str, dict] = {
     # -- 上游调用 --
     "litellm_request_timeout": {"group": "upstream", "unit": "seconds", "min": 5, "max": 3600},
     "same_target_retry_limit": {"group": "upstream", "unit": "count", "min": 0, "max": 3},
+    "stream_idle_timeout_seconds": {
+        "group": "upstream", "unit": "seconds", "min": 0, "max": 3600,
+        "hint": "settings.hint.streamIdleTimeout",
+    },
     "anthropic_thinking_budget_tokens": {
         "group": "upstream", "unit": "tokens", "min": 1024, "max": 128_000,
         "hint": "settings.hint.thinkingBudget",

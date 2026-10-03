@@ -1,6 +1,7 @@
 import asyncio
 import queue
 import threading
+from inspect import iscoroutinefunction as _iscoroutinefunction
 
 from app.core.text import error_detail_for_log
 from app.services.logger import get_logger, get_request_id, set_request_id
@@ -16,6 +17,40 @@ _STREAM_QUEUE_MAXSIZE = 256
 _STREAM_POLL_INTERVAL = 0.02
 # 单次唤醒之间最多搬运的 chunk 数，避免长时间占住事件循环。
 _STREAM_DRAIN_BATCH = 64
+
+
+def _close_upstream_transport(stream_gen: object) -> None:
+    """在工作线程内释放被包装的上游 HTTP 传输（S5 不变量在同步流上的落点）。
+
+    “上游流必须被关闭”这条不变量以前只做到 Python 生成器层：
+    ``stream_gen.close()`` 对 litellm 1.83 的 ``CustomStreamWrapper`` 是空操作（它只有
+    异步 ``aclose()``，没有同步 ``close()``），而上游 HTTP 响应就挂在它的
+    ``completion_stream`` 上。结果是：被放弃的上游连接只能等 CPython 引用计数回收，
+    而引用又被异常 ``__traceback__`` 拽着（traceback → 上游迭代器帧 → httpx 响应 →
+    连接），只要请求本身还活着就不释放——同一请求内的多次尝试会把这段时间叠加成
+    分钟级（2026-10-03 事故：三次 120s 尝试共 ~4 分钟，单槽上游被同一次超时楔死）。
+
+    在此期间上游仍在往一个我们不再读取、也没发 FIN 的 socket 里写；对单槽推理引擎，
+    一次中途超时足以把整台服务楔死。
+
+    只在工作线程自己的栈里关闭：消费者（事件循环侧）此刻可能仍卡在 ``__next__`` 的
+    socket 读上，跨线程关闭 httpx 同步响应不安全。``openai.Stream.close()`` /
+    ``httpx.Response.close()`` 都是幂等的同步关闭，正常读完的流重复关闭无副作用。
+    """
+    inner = getattr(stream_gen, "completion_stream", None)
+    if inner is None or inner is stream_gen:
+        return
+    close = getattr(inner, "close", None)
+    if not callable(close) or _iscoroutinefunction(close):
+        # 只有 aclose()/async def close() 的内层流属于异步适配层（openai.AsyncStream 的
+        # close 是协程函数，在这里调只会得一个未被 await 的协程），由上层 aclose 链负责。
+        return
+    try:
+        close()
+    except Exception as close_err:
+        _app_log.warning("[iter_stream_async] error closing upstream transport: %s", close_err)
+    else:
+        _app_log.debug("[iter_stream_async] upstream transport closed (%s)", type(inner).__name__)
 
 
 async def iter_stream_async(
@@ -36,6 +71,9 @@ async def iter_stream_async(
       线程内** ``close()`` 上游生成器。不再向工作线程注入异步异常
       （``PyThreadState_SetAsyncExc`` 在 C 扩展执行期间不生效且可能损坏解释器
       状态，见「当前问题.md」S3）。
+    * 同一线程内还会显式释放被包装的上游 HTTP 传输层（见
+      ``_close_upstream_transport``）：只关生成器不够，litellm 的流式包装器根本没有
+      同步 ``close()``。
     * 生产者退出时**无条件**置位 ``producer_done``；消费者在哨兵丢失时靠它收尾，
       不会永久等待。
     * 上游卡死时本函数无法提前收回控制权，由 ``litellm.request_timeout`` 兜底；
@@ -100,6 +138,9 @@ async def iter_stream_async(
                         close()
                     except Exception as close_err:
                         _app_log.warning("[iter_stream_async] error closing generator: %s", close_err)
+                # 生成器层关闭不等于连接释放：litellm 包装器没有同步 close()，
+                # 必须再显式关掉它包装的上游 HTTP 响应（见 _close_upstream_transport）。
+                _close_upstream_transport(stream_gen)
             if not cancel.is_set():
                 _offer(_STREAM_SENTINEL)
                 _notify()

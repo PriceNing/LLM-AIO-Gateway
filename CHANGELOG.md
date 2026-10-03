@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.3] - 2026-10-03
+
+### Added
+- **流式新增块间空闲超时 `stream_idle_timeout_seconds`（默认 0 = 关闭，设置页“上游”可改，写入即生效）。** 背景：`provider.request_timeout` 透传给 httpx 后是**分段读超时**，不是总时长上限（实测：每秒一个 chunk 的 25s 流在 `timeout=5` 下完整跑完；发三块后静默则在 5s 报错）。因此它对“冷 prefill 静默”和“解码期间的块间静默”是同一个旋钮：本地长上下文引擎需要 300 秒容忍 prefill，同一个值用在解码阶段就意味着真死流也要 5 分钟才发现（2026-10-03 事故里上游被楔死后，网关每条请求都要静默 120s 才换目标）。新旋钮只在**已向客户端产出首个可见输出之后**计时，任何上游产出（包括不可见的 usage/metadata 帧）都重新计时，因此不会砍 prefill、也不与首字超时争权；超时后按上游超时处理（504），且因为已经产出，**绝不重试也不换目标**（否则客户端会看到重复内容）。
+  实现位置 `core.streaming.iter_output_idle_timeout`，同时接入两条流式入口：`_stream_events_with_fallbacks`（IR 事件流，覆盖 chat/completions/messages/responses 兼容路径）与 `_native_responses_stream_with_accounting`（native Responses 原始 SSE 直通）。报错时输出可 grep 的 `[stream.idle_timeout]` 日志（model / provider / idle_s），补上“网关何时放弃这条流”的取证缺口。
+
+### Fixed
+- **中途放弃上游流时必须释放上游 HTTP 连接（单槽推理引擎被一次超时楔死的根因）。** 2026-10-03 生产事故：上游为 `total_slots: 1` 的本地推理引擎，一次会话压缩请求在流式中途被 `provider.request_timeout=120` 砍掉（litellm `MidStreamFallbackError`）后，上游侧那条连接长期停在 `ESTAB` 且 `Send-Q=95568` 不清零，同时另有 3 条 `CLOSE-WAIT`（说明别的适配层会正常发 FIN）。引擎已生成完毕，但 server 握着全局执行锁卡在 `send()` 上永不返回，后续请求全部堵在锁上，只能人工重启。
+  根因不在“超时设多少”，而在关闭只做到了 Python 生成器层：`adapters/streaming.py` 退出时调 `getattr(stream_gen, "close", None)`，而 litellm 1.83 的流式包装器 `CustomStreamWrapper` **只有异步 `aclose()`、没有同步 `close()`**（实测 `has close: False`），于是上游 httpx 响应的释放完全依赖 CPython 引用计数；而引用又被异常 `__traceback__` 拽着（traceback → 上游迭代器帧 → httpx 响应 → 连接），只要本请求还活着就不释放——同一请求内三次 120s 尝试把这段时间叠加成 ~4 分钟，足够把单槽上游楔死。现于**工作线程自己的栈里**（此刻它确定不在 socket 读上，跨线程关 httpx 同步响应不安全）额外关闭包装器内层的 `completion_stream`（`openai.Stream.close()` / `httpx.Response.close()` 均为幂等同步关闭），任何提前 return / 异常 / 客户端断开路径都不再留下“半开且不再读”的上游流。
+  缺陷范围仅限 `provider_type == "openai"` 的 liteLLM 同步流路径：Anthropic / native Responses 适配层本来就在 `async with client.stream(...)` 里，已被现有 `aclose_async_iterator` 链正确关闭。
+
+### Tests
+- 新增 6 个不依赖 GC 的关闭闸门（`tests/test_streaming.py`）：按 litellm 包装器形状（可迭代、只有 `aclose`、内层流挂 `completion_stream`）分别断言客户端提前断开、中途异常放弃、正常跑完、关闭失败只留 WARNING 不阻断流、以及“既无 `close` 也无 `completion_stream` 时不得产生告警”（保留既有契约）；并断言工作线程不会误用异步 `aclose`。已验证前 4 条在修复前全红、修复后全绿。
+- 新增 9 个块间空闲超时用例：`core.streaming.iter_output_idle_timeout` 的 5 条语义闸门（关闭时零开销透传、首个可见输出之后才计时、**首字之前的静默绝不砍**、不可见的 usage/metadata 帧同样重新计时、被砍时级联关闭上游流），以及端到端 4 条（IR 流被砍后**只有一次尝试**且已输出内容不重复、默认 0 时 1 秒静默不受影响、新键已进设置页 schema 且范围受限、native Responses 原始 SSE 直通路径同样被砍）。全量 **1152 passed**。
+
 ## [0.14.2] - 2026-10-01
 
 ### Fixed
@@ -16,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Tests
 - 新增启动路径回归闸门 `tests/test_database_migration.py` + `tests/fixtures/schema_v0.14.0.sql`（发布版本 schema 快照）：用旧库跑真实 `init_db()`，断言不报错、表齐全、哨兵旧行保留、重复重启幂等、升级后无需人工迁移即可写入并按 `request_id` 检索。已验证这些用例在 0.14.1 代码下全部失败、修复后全部通过（参数化自 schema 快照，以后任何列/索引顺序错误都会在这里先炸，而不是在生产第一次启动时炸）。
   另附 `test_schema_snapshots_exist` 自检：快照缺失 / 为空 / 已含新列时**直接红**。否则 `parametrize` 会生成 0 个用例，套件静默全绿而闸门已经消失——`release.yml` 的 `test → build → release → container` 全靠 `pytest tests/ -q` 卡住，这条闸门是全世界拉 GHCR 镜像的用户唯一的保护点，它失效必须响。全量 **1137 passed**。
+
 
 ### Docs
 - `AGENTS.md` / `CLAUDE.md` 新增 Schema 顺序铁律：`_SCHEMA` 不得引用仅由 `migrate()` 新增的列；新增列的索引只在 `migrate()` 里建；schema 变更由 `tests/test_database_migration.py` 用发布版本 schema 快照兜住，新增列/索引后要把当时 `_SCHEMA` 另存为新的 `tests/fixtures/schema_v<版本>.sql`。

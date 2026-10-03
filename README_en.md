@@ -210,6 +210,7 @@ Important defaults:
 | `max_request_body_bytes` | 134217728 | Inbound request body limit (128 MiB); larger bodies return 413. Raised from 32 MiB because multi-turn image chats resend historical base64 images. |
 | `litellm_request_timeout` | 120 | liteLLM upstream call timeout. |
 | `same_target_retry_limit` | 1 | In-place retries for a transient first-byte failure on the same target (0–3). |
+| `stream_idle_timeout_seconds` | 0 | Streaming inter-chunk idle timeout, measured only after the first client-visible output: that much consecutive upstream silence fails the stream as an upstream timeout (504). It splits duties with the provider request timeout, which covers the pre-first-token phase (cold prefill silence) and must stay high; this one covers dead connections after output started and can be far smaller. 0 = disabled. |
 | `tool_only_limit` | 20 | Tool-only loop circuit breaker threshold. |
 | `min_image_max_tokens` | 2000 | Minimum max tokens for requests containing images. |
 | `session_ttl_hours` | 12 | Admin session lifetime. |
@@ -338,7 +339,7 @@ Main code boundaries:
 pytest tests/ -q
 ```
 
-Expected current result: `1137 passed`.
+Expected current result: `1152 passed`.
 
 The client-error-mapping baseline (diff-corpus coherence / required path assertions / hardcoded-status whitelist / doc count consistency) is enforced by:
 

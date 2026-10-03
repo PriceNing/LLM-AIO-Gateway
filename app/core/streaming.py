@@ -37,6 +37,56 @@ RememberResponseChainKey = Callable[[str, str], None]
 RememberReasoningContent = Callable[[str, str, Any], None]
 
 
+async def iter_output_idle_timeout(
+    events,
+    *,
+    idle_seconds: float | None,
+    is_output: Callable[[Any], bool],
+    error_factory: Callable[[float], BaseException],
+):
+    """已向客户端产出首个可见输出后，限制两次上游产出之间的空闲时长。
+
+    为何要单独有这一层：``provider.request_timeout`` 透传给 httpx 后是**分段读超时**
+    （不是总时长上限），它对“冷 prefill 静默”和“解码期间的块间静默”是同一个旋钮。
+    本地长上下文引擎需要 300 秒容忍 prefill，同一个数值用在解码阶段就意味着真死
+    也要 5 分钟才发现。本包装器只在**首个可见输出之后**计时，因此不会砍 prefill，
+    也不与首字超时争权；两者天然对齐（首字前由 provider.request_timeout / fallback
+    attempt_timeout 负责）。
+
+    语义边界：本函数不判断“上游是否真的死了”，只给出一个与上游无关的静默上限；
+    条件里不出现 provider/model 名称。任何上游产出（包括不可见的 usage/metadata 帧）
+    都重新计时，因为它已经证明连接还活着。``idle_seconds`` 为 0/None 时零开销透传。
+
+    注意：超时只能在事件循环层“停止等待”，不能把卡在同步 socket 读上的工作线程拉
+    回来（liteLLM 同步流）；那条路径的收尾见 ``adapters.streaming.iter_stream_async``。
+    """
+    if not idle_seconds or idle_seconds <= 0:
+        async for item in events:
+            yield item
+        return
+
+    agen = events if hasattr(events, "__anext__") else events.__aiter__()
+    started = False
+    try:
+        while True:
+            try:
+                if started:
+                    with anyio.fail_after(float(idle_seconds)):
+                        item = await agen.__anext__()
+                else:
+                    item = await agen.__anext__()
+            except StopAsyncIteration:
+                return
+            except TimeoutError as exc:
+                raise error_factory(float(idle_seconds)) from exc
+            if not started and is_output(item):
+                started = True
+            yield item
+    finally:
+        # 被砍、报错、上层提前丢弃都要级联关闭内层上游流（S5 不变量）。
+        await aclose_async_iterator(agen)
+
+
 async def record_streaming_events(
     events,
     *,

@@ -31,6 +31,12 @@ def default_config() -> dict:
             "min_image_max_tokens": 2000,
             "litellm_request_timeout": 120,
             "same_target_retry_limit": 1,
+            # 流式块间空闲超时：只在**已向客户端产出首个可见输出之后**计时，0 = 关闭。
+            # 为什么需要单独一个键：socket 层的读超时（provider.request_timeout 透传给
+            # httpx）对“冷 prefill 静默”与“解码期间块间静默”是同一个旋钮，本地长上下文
+            # 引擎需要 300 秒容忍 prefill，同一个值用于解码阶段意味着真死流也要 5 分钟
+            # 才发现（2026-10-03 单槽上游楔死事故的误杀侧）。0 为默认：不改变现有部署行为。
+            "stream_idle_timeout_seconds": 0,
             "session_ttl_hours": 12,
             "login_attempt_limit": 10,
             "login_attempt_window_seconds": 300,

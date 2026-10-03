@@ -86,7 +86,11 @@ from app.core.state import (
     remember_response_chain_key as _remember_response_chain_key,
     tool_only_turns as _tool_only_turns,
 )
-from app.core.streaming import stream_internal_output as _stream_internal_output, _attach_stream_performance
+from app.core.streaming import (
+    iter_output_idle_timeout,
+    stream_internal_output as _stream_internal_output,
+    _attach_stream_performance,
+)
 from app.protocols.ingress import (
     anthropic_messages_to_internal,
     chat_completions_to_internal,
@@ -679,7 +683,12 @@ async def _native_responses_stream_with_accounting(events, *, username, api_key_
     first_output_at = None
     client_disconnected = False
     try:
-        async for frame in iter_sse_frames(events):
+        async for frame in iter_output_idle_timeout(
+            iter_sse_frames(events),
+            idle_seconds=_stream_idle_timeout_seconds(),
+            is_output=lambda frame: native_sse_payload_has_output(sse_payload(frame)),
+            error_factory=lambda idle: _stream_idle_timeout_error(idle, model=model, provider_id=provider_id),
+        ):
             payload = sse_payload(frame)
             has_output = native_sse_payload_has_output(payload)
             if has_output and first_output_at is None:
@@ -1435,6 +1444,32 @@ def _attempt_timeout_error(seconds: int, target: RouteTarget, provider_id: str) 
     return exc
 
 
+def _stream_idle_timeout_seconds() -> float:
+    """每次请求现读：设置页改完即生效（0 = 关闭块间空闲超时）。"""
+    try:
+        return max(0.0, float(get_default("stream_idle_timeout_seconds", 0) or 0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _stream_idle_timeout_error(seconds: float, *, model: str, provider_id: str) -> TimeoutError:
+    """块间静默超限：是超时不是客户端错误（classify_upstream_error → timeout → 504）。
+
+    独立可 grep 的日志是取证点：这类问题只在上游摊后才被发现，必须能从
+    request_id 直接看到“网关在哪条流上、静默多久后放弃”。
+    """
+    exc = TimeoutError(f"upstream stream idle for {int(seconds)}s after output started")
+    exc.attempted_model = model
+    exc.attempted_provider = provider_id or ""
+    _app_log.warning(
+        "[stream.idle_timeout] model=%s provider=%s idle_s=%d（首个可见输出之后的静默）",
+        model,
+        provider_id or "-",
+        int(seconds),
+    )
+    return exc
+
+
 async def _await_with_attempt_timeout(awaitable, *, timeout_s: int | None, target: RouteTarget, provider_id: str):
     if not timeout_s or timeout_s <= 0:
         return await awaitable
@@ -1833,6 +1868,9 @@ async def _stream_events_with_fallbacks(internal, *, temperature, max_tokens, lo
             primary.model,
             primary.provider_id or "-",
         )
+    # 块间空闲超时与 fallback 策略无关：没匹配到 policy 时 attempt_timeout 为 None，
+    # 但已开始产出的死流仍必须能被及时发现。
+    idle_seconds = _stream_idle_timeout_seconds()
 
     while index < len(targets):
         target = targets[index]
@@ -1871,11 +1909,20 @@ async def _stream_events_with_fallbacks(internal, *, temperature, max_tokens, lo
                 )],
                 "upstream_endpoint": _upstream_endpoint_for_provider(provider_info),
             })
-            timed_events = _iter_events_with_first_output_timeout(
-                events,
-                timeout_s=attempt_timeout,
-                target=target,
-                provider_id=adapter_provider_id or fallback_provider_id or "",
+            timed_events = iter_output_idle_timeout(
+                _iter_events_with_first_output_timeout(
+                    events,
+                    timeout_s=attempt_timeout,
+                    target=target,
+                    provider_id=adapter_provider_id or fallback_provider_id or "",
+                ),
+                idle_seconds=idle_seconds,
+                is_output=_is_client_visible_stream_event,
+                error_factory=lambda idle: _stream_idle_timeout_error(
+                    idle,
+                    model=target.model,
+                    provider_id=adapter_provider_id or fallback_provider_id or "",
+                ),
             )
             async for event in timed_events:
                 if event.kind == "message_done":
