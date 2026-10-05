@@ -526,7 +526,11 @@ async function resetSetting(key) {
             body: JSON.stringify({ keys: [key] })
         });
         settingsApplyItems(data);
-        toast(t('settings.resetDone'), 'success');
+        var resetFailedNames = Object.keys(data.failedHooks || {});
+        toast(t('settings.resetDone'), resetFailedNames.length ? 'warning' : 'success');
+        if (resetFailedNames.length) {
+            toast(t('settings.hookFailed') + ': ' + resetFailedNames.join(', '), 'warning');
+        }
     } catch (e) {
         toast(t('settings.resetFail') + ': ' + e.message, 'error');
     }
@@ -542,6 +546,10 @@ async function reloadConfigFile() {
         var restart = data.restartRequiredChangedKeys || [];
         if (restart.length) {
             toast(t('settings.restartNeeded') + ': ' + restart.join(', '), 'warning');
+        }
+        var reloadFailedNames = Object.keys(data.failedHooks || {});
+        if (reloadFailedNames.length) {
+            toast(t('settings.hookFailed') + ': ' + reloadFailedNames.join(', '), 'warning');
         }
     } catch (e) {
         toast(t('settings.reloadFail') + ': ' + e.message, 'error');

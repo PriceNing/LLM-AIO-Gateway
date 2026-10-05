@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.4] - 2026-10-04
+
+### Fixed
+- **`<think>` 标签被拆到多个 chunk 时不再漏入正文。** 逐 token 流式的上游第一帧几乎必然是 `<` 或 `<t`，原缓冲逻辑要求缓冲区完整包含 `<think>` 才开始剥离，导致开标签之前的内容泄漏进正文。现在缓冲区能判断「当前内容是否仍可能是开标签前缀」，并在确认开标签后正确剥离；缓冲区上限 64 KiB，超限时按 reasoning 发出而非无界增长。
+- **Anthropic `tool_use.input` 必须是对象。** OpenAI 工具调用参数顶层为 array/string/number 时（合法 JSON），直接赋给 `input` 会被 Anthropic 上游拒绝。现在将非对象参数包成 `{"value": args}`，保留语义不丢弃。
+- **legacy `/completions` 流式不再静默丢弃工具调用。** 该端点响应格式无 tool-call 字段，原代码直接丢弃且不记录。现在丢弃时记 WARNING 日志（含丢弃数量），`finish_reason` 改为 `tool_calls`（有工具调用被丢弃时），便于排查客户端为何收不到工具调用。
+- **`/completions` 流式工具调用帧格式修正。** 原代码每个 `arguments_delta` chunk 都发出完整的 `tool_calls` delta（含 `id`/`name`），不符合流式协议（header 帧只在第一个 chunk 发 `id`/`name`，后续 chunk 只发 `arguments`）。现在用 `tool_headers` 集合跟踪已发过 header 的 index，后续 chunk 只发 `arguments`。
+- **`reasoning_part` 不再对非字符串内容调 `str()`。** 改用 `_reasoning_text()` 处理，避免 dict/list 等非字符串 reasoning 内容被序列化成 Python repr 字符串发给上游。
+
+### Added
+- **`max_output_tokens` 作为 `max_tokens` 的别名**（Responses API 用这个名字）；`stop_sequences`、`top_p`、`top_k` 从请求体透传到 extra 参数。
+- **设置页 reset/reload 失败时显示警告 toast。** 后端 `PUT /admin/settings` 响应新增 `failedHooks` 字段（记录哪些运行时推送钩子执行失败），前端在 `failedHooks` 非空时改为 warning toast 并列出失败的钩子名。
+
+### Tests
+- 新增 `tests/test_confirmed_bug_fixes.py`、`tests/test_egress_tool_call_frames.py`、`tests/test_updated_gateway_findings.py`；全量 **1166 passed**（较 0.14.3 +14）。
+
 ## [0.14.3] - 2026-10-03
 
 ### Added

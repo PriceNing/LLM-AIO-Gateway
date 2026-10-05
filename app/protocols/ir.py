@@ -278,7 +278,9 @@ def openai_messages_to_ir(messages: list[dict[str, Any]]) -> list[InternalMessag
 
         reasoning = msg.get("reasoning_content")
         if reasoning:
-            parts.insert(0, reasoning_part(reasoning, raw=reasoning))
+            reasoning_text = _reasoning_text(reasoning)
+            if reasoning_text:
+                parts.insert(0, reasoning_part(reasoning_text, raw=reasoning))
 
         for tc in msg.get("tool_calls") or []:
             if not isinstance(tc, dict):
@@ -722,7 +724,13 @@ def _parts_to_anthropic_content(parts: list[InternalPart]) -> list[dict[str, Any
             _append_anthropic_image_content(content, part)
         elif part.kind == "tool_call":
             args = part.arguments if part.arguments is not None else _parse_arguments(part.raw_arguments)
-            content.append({"type": "tool_use", "id": part.tool_call_id, "name": part.name, "input": args or {}})
+            if isinstance(args, str):
+                args = _parse_arguments(args)
+            if not isinstance(args, dict):
+                # Anthropic 要求 tool_use.input 必须是对象；合法但顶层为
+                # array/string/number 的 OpenAI 参数需要保留语义并包成对象。
+                args = {"value": args} if args is not None else {}
+            content.append({"type": "tool_use", "id": part.tool_call_id, "name": part.name, "input": args})
         elif part.kind == "tool_result":
             block = {"type": "tool_result", "tool_use_id": part.tool_call_id, "content": _anthropic_tool_result_content(part.parts)}
             if _tool_result_is_error(part):

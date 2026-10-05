@@ -53,6 +53,8 @@ def _max_tokens_from_body(body: dict[str, Any]) -> int:
     if max_tokens is None:
         max_tokens = body.get("max_completion_tokens")
     if max_tokens is None:
+        max_tokens = body.get("max_output_tokens")
+    if max_tokens is None:
         max_tokens = get_default("max_tokens", 16384)
     return max_tokens
 
@@ -62,7 +64,7 @@ def _max_tokens_specified(body: dict[str, Any]) -> bool:
 
     只有未指定时策略层才允许注入/上调默认预算；显式传值（含 0）一律尊重原意。
     """
-    return body.get("max_tokens") is not None or body.get("max_completion_tokens") is not None
+    return any(body.get(key) is not None for key in ("max_tokens", "max_completion_tokens", "max_output_tokens"))
 
 
 def _temperature_from_body(body: dict[str, Any]):
@@ -487,6 +489,9 @@ def anthropic_messages_to_internal(body: dict[str, Any]) -> InternalRequest:
     # OpenAI-compatible upstream. Responses-style reasoning.effort is mapped
     # onto reasoning_effort by thinking_fields_from_body().
     extra = thinking_fields_from_body(body)
+    for key in ("stop_sequences", "top_p", "top_k"):
+        if key in body:
+            extra[key] = body[key]
 
     return InternalRequest(
         endpoint="messages",

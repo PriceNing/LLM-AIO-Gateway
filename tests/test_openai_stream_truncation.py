@@ -49,10 +49,11 @@ def _patch(monkeypatch, factory):
     monkeypatch.setattr("app.adapters.openai_streaming.create_chat_completion_stream", factory)
 
 
-def _assert_silent_truncation(exc):
+def _assert_silent_truncation(exc, *, empty_stream=True, reasoning_only=False):
     assert "without a finish reason" in str(exc)
     assert getattr(exc, "confirmed_upstream", False) is True
-    assert getattr(exc, "empty_stream_response", False) is True
+    assert getattr(exc, "empty_stream_response", False) is empty_stream
+    assert getattr(exc, "reasoning_only_stream", False) is reasoning_only
     assert client_status_for_upstream_error(exc) == 502
     assert "LEAK" not in friendly_error_msg(exc)
     assert "without a finish reason" not in friendly_error_msg(exc)
@@ -68,7 +69,7 @@ async def test_reasoning_only_without_finish_raises(monkeypatch):
         await _collect(iter_openai_chat_output_events(
             model="m", messages=[], provider_id="p", temperature=0.7, max_tokens=64,
         ))
-    _assert_silent_truncation(excinfo.value)
+    _assert_silent_truncation(excinfo.value, empty_stream=False, reasoning_only=True)
 
 
 @pytest.mark.asyncio
@@ -78,7 +79,7 @@ async def test_empty_stream_without_finish_raises(monkeypatch):
         await _collect(iter_openai_chat_output_events(
             model="m", messages=[], provider_id="p", temperature=0.7, max_tokens=64,
         ))
-    _assert_silent_truncation(excinfo.value)
+    _assert_silent_truncation(excinfo.value, empty_stream=True)
 
 
 @pytest.mark.asyncio
@@ -92,7 +93,7 @@ async def test_usage_only_without_finish_raises(monkeypatch):
         await _collect(iter_openai_chat_output_events(
             model="m", messages=[], provider_id="p", temperature=0.7, max_tokens=64,
         ))
-    _assert_silent_truncation(excinfo.value)
+    _assert_silent_truncation(excinfo.value, empty_stream=True)
 
 
 @pytest.mark.asyncio
@@ -105,7 +106,7 @@ async def test_reasoning_only_tail_error_still_raises_truncation(monkeypatch):
         await _collect(iter_openai_chat_output_events(
             model="m", messages=[], provider_id="p", temperature=0.7, max_tokens=64,
         ))
-    _assert_silent_truncation(excinfo.value)
+    _assert_silent_truncation(excinfo.value, empty_stream=False, reasoning_only=True)
 
 
 @pytest.mark.asyncio

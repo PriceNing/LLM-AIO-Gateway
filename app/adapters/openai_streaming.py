@@ -11,6 +11,29 @@ from app.services.logger import get_logger
 _app_log = get_logger("app")
 _tool_log = get_logger("tool_calls")
 
+_THINK_BUFFER_LIMIT = 64 * 1024
+_THINK_OPEN = "<think>"
+_THINK_CLOSE = "</think>"
+
+
+def _looks_like_think_prefix(value: str) -> bool:
+    """Whether the buffered text can still be the opening ``<think>`` tag."""
+    stripped = value.lstrip()
+    return _THINK_OPEN.startswith(stripped) or stripped.startswith(_THINK_OPEN)
+
+
+def _has_complete_think_open(value: str) -> bool:
+    return value.lstrip().startswith(_THINK_OPEN)
+
+
+def _strip_think_prefix(value: str) -> str:
+    stripped = value.lstrip()
+    if stripped.startswith(_THINK_OPEN):
+        return stripped[len(_THINK_OPEN):]
+    if stripped.startswith("<think"):
+        return stripped[len("<think"):]
+    return stripped
+
 
 def _tool_call_to_dict(tool_call) -> dict:
     if hasattr(tool_call, "model_dump"):
@@ -92,12 +115,17 @@ async def iter_openai_chat_output_events(
 
     yield InternalOutputEvent(kind="message_start", role="assistant")
 
-    think_state = {"stripped": not strip_thinking, "buf": ""}
+    think_state = {
+        "stripped": not strip_thinking,
+        "buf": "",
+        "overflowed": False,
+    }
     tool_states: dict[int, dict] = {}
     finish_reason = None
     saw_output = False
     saw_finish = False
     saw_answer_output = False
+    saw_reasoning_output = False
     tolerated_tail_error = False
 
     try:
@@ -110,6 +138,8 @@ async def iter_openai_chat_output_events(
             ):
                 if event.kind in ("text_delta", "reasoning_delta", "tool_call_start", "tool_call_arguments_delta", "usage"):
                     saw_output = True
+                if event.kind == "reasoning_delta":
+                    saw_reasoning_output = True
                 if event.kind in ("text_delta", "tool_call_start", "tool_call_arguments_delta"):
                     saw_answer_output = True
                 if event.kind == "message_delta" and event.finish_reason:
@@ -134,8 +164,16 @@ async def iter_openai_chat_output_events(
             raise
 
     if think_state["buf"]:
-        yield InternalOutputEvent(kind="text_delta", text=think_state["buf"])
-        saw_answer_output = True
+        # 未闭合的、但已明确以 <think> 开始的块仍属于 reasoning，不能泄漏到
+        # 客户端正文。其余缓冲内容才按普通正文处理。
+        buffered = think_state["buf"]
+        if think_state.get("overflowed") or _has_complete_think_open(buffered):
+            reasoning = _strip_think_prefix(buffered) if not think_state.get("overflowed") else buffered
+            if reasoning:
+                yield InternalOutputEvent(kind="reasoning_delta", reasoning=reasoning)
+        else:
+            yield InternalOutputEvent(kind="text_delta", text=buffered)
+            saw_answer_output = True
 
     for idx, state in sorted(tool_states.items()):
         _tool_log.debug(
@@ -180,10 +218,9 @@ async def iter_openai_chat_output_events(
         raise _silent_truncation_error(
             model=model,
             provider_id=provider_id or "",
-            # 走到这里已经没有回答；打上 empty_stream_response 让 fallback 层
-            # 在尚未向客户端可见输出时保留同目标退化重试。reasoning-only
-            # 已 emitted，不会换模型，此标记无效。
-            empty_stream=True,
+            # 走到这里已经没有回答；仅完全空流允许 fallback 层做同目标退化重试。
+            empty_stream=not saw_answer_output and not saw_reasoning_output,
+            reasoning_only=bool(saw_reasoning_output and not saw_answer_output),
         )
 
     _app_log.debug(
@@ -213,7 +250,26 @@ async def _events_from_openai_chunk(chunk, *, model, tool_states: dict[int, dict
                 _app_log.debug("[openai_stream_adapter] text_chunk chars=%d", len(content))
                 if not think_state["stripped"]:
                     think_state["buf"] += content
-                    if "</think>" in think_state["buf"]:
+                    if think_state.get("overflowed"):
+                        candidate = think_state["buf"]
+                        close = candidate.find(_THINK_CLOSE)
+                        if close >= 0:
+                            if candidate[:close]:
+                                yield InternalOutputEvent(kind="reasoning_delta", reasoning=candidate[:close], raw=chunk)
+                            visible = candidate[close + len(_THINK_CLOSE):]
+                            think_state["buf"] = ""
+                            think_state["overflowed"] = False
+                            think_state["stripped"] = True
+                            if visible:
+                                yield InternalOutputEvent(kind="text_delta", text=visible, raw=chunk)
+                        else:
+                            # 保留闭合标签可能跨 chunk 的尾部，其余已确认是
+                            # reasoning，可以及时发出，避免无界缓冲。
+                            keep = len(_THINK_CLOSE) - 1
+                            if len(candidate) > keep:
+                                yield InternalOutputEvent(kind="reasoning_delta", reasoning=candidate[:-keep], raw=chunk)
+                                think_state["buf"] = candidate[-keep:]
+                    elif _THINK_CLOSE in think_state["buf"]:
                         visible, thinking = extract_and_strip_think(think_state["buf"])
                         if thinking:
                             _app_log.debug("[openai_stream_adapter] think_extracted chars=%d", len(thinking))
@@ -222,13 +278,16 @@ async def _events_from_openai_chunk(chunk, *, model, tool_states: dict[int, dict
                         think_state["buf"] = ""
                         if visible:
                             yield InternalOutputEvent(kind="text_delta", text=visible, raw=chunk)
-                    elif "<think>" in think_state["buf"] or think_state["buf"].lstrip().startswith("<think"):
-                        if len(think_state["buf"]) >= 200:
-                            visible = think_state["buf"].replace("<think>", "", 1)
-                            think_state["stripped"] = True
-                            think_state["buf"] = ""
-                            if visible:
-                                yield InternalOutputEvent(kind="text_delta", text=visible, raw=chunk)
+                    elif _looks_like_think_prefix(think_state["buf"]):
+                        if len(think_state["buf"]) >= _THINK_BUFFER_LIMIT:
+                            candidate = think_state["buf"]
+                            keep = len(_THINK_CLOSE) - 1
+                            if len(candidate) > keep:
+                                reasoning = _strip_think_prefix(candidate[:-keep])
+                                if reasoning:
+                                    yield InternalOutputEvent(kind="reasoning_delta", reasoning=reasoning, raw=chunk)
+                                think_state["buf"] = candidate[-keep:]
+                            think_state["overflowed"] = True
                     else:
                         think_state["stripped"] = True
                         visible = think_state["buf"]
@@ -338,7 +397,7 @@ def _is_litellm_tail_chunk_builder_error(exc: Exception) -> bool:
     return "Error building chunks for logging/streaming usage calculation" in msg
 
 
-def _silent_truncation_error(*, model: str, provider_id: str, empty_stream: bool) -> RuntimeError:
+def _silent_truncation_error(*, model: str, provider_id: str, empty_stream: bool, reasoning_only: bool = False) -> RuntimeError:
     """Confirmed upstream failure: stream closed with no finish and no answer."""
     exc = RuntimeError("upstream stream ended without a finish reason before sending any answer output")
     exc.confirmed_upstream = True
@@ -346,4 +405,5 @@ def _silent_truncation_error(*, model: str, provider_id: str, empty_stream: bool
     exc.attempted_provider = provider_id or ""
     # 空流才允许 fallback 层做同目标退化重试；reasoning-only 不算 empty。
     exc.empty_stream_response = bool(empty_stream)
+    exc.reasoning_only_stream = bool(reasoning_only)
     return exc

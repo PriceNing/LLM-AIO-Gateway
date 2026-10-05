@@ -121,6 +121,7 @@ async def render_chat_completions_sse(events, *, model: str, include_usage: bool
     accumulated_reasoning = ""
     text_chars = 0
     tool_calls = set()
+    tool_headers = set()
     usage_payload: dict | None = None
 
     _app_log.debug("[egress_chat_stream] START model=%s chat_id=%s", model, chat_id)
@@ -137,6 +138,7 @@ async def render_chat_completions_sse(events, *, model: str, include_usage: bool
             delta = {"role": event.role}
         elif event.kind == "tool_call_start":
             tool_calls.add(event.tool_index)
+            tool_headers.add(event.tool_index)
             _tool_log.debug("[egress_chat_stream] tool_start index=%d id=%s name=%s", event.tool_index, event.tool_call_id, event.name)
             delta = {
                 "tool_calls": [{
@@ -147,14 +149,20 @@ async def render_chat_completions_sse(events, *, model: str, include_usage: bool
                 }]
             }
         elif event.kind == "tool_call_arguments_delta":
-            delta = {
-                "tool_calls": [{
-                    "index": event.tool_index,
+            header = event.tool_index not in tool_headers
+            tool_calls.add(event.tool_index)
+            tool_headers.add(event.tool_index)
+            call = {
+                "index": event.tool_index,
+                "function": {"arguments": event.arguments_delta},
+            }
+            if header:
+                call.update({
                     "id": event.tool_call_id,
                     "type": "function",
                     "function": {"name": event.name, "arguments": event.arguments_delta},
-                }]
-            }
+                })
+            delta = {"tool_calls": [call]}
         elif event.kind == "usage":
             if event.usage:
                 usage_payload = _openai_usage_payload(event.usage)
@@ -193,6 +201,7 @@ async def render_completions_sse(events, *, model: str):
     _app_log.debug("[egress_completions_stream] START model=%s completion_id=%s", model, cmpl_id)
     text_chars = 0
     reasoning_chars = 0
+    dropped_tool_indices = set()
 
     async for event in events:
         if event.kind == "text_delta" and event.text:
@@ -200,7 +209,14 @@ async def render_completions_sse(events, *, model: str):
             yield _completion_chunk(cmpl_id, model, event.text, None)
         elif event.kind == "reasoning_delta" and event.reasoning:
             reasoning_chars += len(event.reasoning)
+        elif event.kind in ("tool_call_start", "tool_call_arguments_delta", "tool_call_done"):
+            dropped_tool_indices.add(event.tool_index)
         elif event.kind == "message_done":
+            if dropped_tool_indices:
+                _tool_log.warning(
+                    "[egress_completions_stream] dropped_tool_calls=%d: legacy completions has no tool-call field",
+                    len(dropped_tool_indices),
+                )
             _app_log.debug(
                 "[egress_completions_stream] DONE model=%s finish_reason=%s text_chars=%d reasoning_chars=%d",
                 model,
@@ -208,7 +224,7 @@ async def render_completions_sse(events, *, model: str):
                 text_chars,
                 reasoning_chars,
             )
-            yield _completion_chunk(cmpl_id, model, "", event.finish_reason or "stop")
+            yield _completion_chunk(cmpl_id, model, "", event.finish_reason or ("tool_calls" if dropped_tool_indices else "stop"))
             yield "data: [DONE]\n\n"
             return
 
@@ -329,8 +345,12 @@ async def render_responses_sse(events, *, model: str, previous_response_id: str 
     accumulated_reasoning = ""
     usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
     tool_states: dict[int, dict] = {}
-    completion_output = []
+    completion_entries: list[tuple[int, dict]] = []
     saw_message_done = False
+    finish_reason = "stop"
+    reasoning_item: dict | None = None
+    reasoning_output_index: int | None = None
+    completed_items: list[tuple[int, dict]] = []
 
     _app_log.debug("[egress_responses_stream] START model=%s response_id=%s previous_response_id=%s", model, resp_id, previous_response_id or "")
 
@@ -348,6 +368,14 @@ async def render_responses_sse(events, *, model: str, previous_response_id: str 
             yield f"data: {json.dumps({'type': 'response.output_text.delta', 'output_index': text_output_index, 'content_index': 0, 'delta': event.text})}\n\n"
         elif event.kind == "reasoning_delta":
             accumulated_reasoning += event.reasoning
+            if reasoning_item is None:
+                reasoning_output_index = output_index_counter
+                output_index_counter += 1
+                reasoning_item = {
+                    "type": "reasoning", "id": f"rs_{uuid.uuid4().hex}",
+                    "status": "in_progress", "summary": [],
+                }
+                yield f"data: {json.dumps({'type': 'response.output_item.added', 'output_index': reasoning_output_index, 'item': reasoning_item}, ensure_ascii=False)}\n\n"
         elif event.kind == "tool_call_start":
             tool_id, call_id = _responses_tool_ids(event)
             state = tool_states.setdefault(event.tool_index, {
@@ -387,22 +415,29 @@ async def render_responses_sse(events, *, model: str, previous_response_id: str 
         elif event.kind == "usage":
             usage.update({k: v for k, v in event.usage.items() if k in usage})
         elif event.kind == "message_done":
-            _app_log.debug("[egress_responses_stream] message_done finish_reason=%s", event.finish_reason or "")
+            finish_reason = event.finish_reason or finish_reason
+            _app_log.debug("[egress_responses_stream] message_done finish_reason=%s", finish_reason)
             saw_message_done = True
             break
 
     if not saw_message_done and not accumulated_text and not accumulated_reasoning and not tool_states:
         raise RuntimeError("upstream closed before sending response output")
 
+    if reasoning_item is not None and reasoning_output_index is not None:
+        reasoning_item = {
+            **reasoning_item, "status": "completed",
+            "summary": [{"type": "summary_text", "text": accumulated_reasoning}],
+        }
+        completed_items.append((reasoning_output_index, reasoning_item))
+        completion_entries.append((reasoning_output_index, reasoning_item))
+
     if text_item_added:
         if text_content_added:
             yield f"data: {json.dumps({'type': 'response.output_text.done', 'output_index': text_output_index, 'content_index': 0, 'text': accumulated_text})}\n\n"
             yield f"data: {json.dumps({'type': 'response.content_part.done', 'output_index': text_output_index, 'content_index': 0, 'part': {'type': 'output_text', 'text': accumulated_text, 'annotations': []}})}\n\n"
         msg_out = {"type": "message", "id": msg_id, "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": accumulated_text, "annotations": []}]}
-        if accumulated_reasoning:
-            msg_out["reasoning_content"] = accumulated_reasoning
-        yield f"data: {json.dumps({'type': 'response.output_item.done', 'output_index': text_output_index, 'item': msg_out})}\n\n"
-        completion_output.append(msg_out)
+        completed_items.append((text_output_index, msg_out))
+        completion_entries.append((text_output_index, msg_out))
 
     for idx in sorted(tool_states):
         state = tool_states[idx]
@@ -416,8 +451,11 @@ async def render_responses_sse(events, *, model: str, previous_response_id: str 
         else:
             yield f"data: {json.dumps({'type': 'response.function_call_arguments.done', 'output_index': state['output_index'], 'call_id': state['call_id'], 'arguments': state['arguments']})}\n\n"
         item = _responses_tool_item_from_state(state, status="completed", extra=extra)
-        yield f"data: {json.dumps({'type': 'response.output_item.done', 'output_index': state['output_index'], 'item': item})}\n\n"
-        completion_output.append(item)
+        completed_items.append((state['output_index'], item))
+        completion_entries.append((state['output_index'], item))
+
+    for output_index, item in sorted(completed_items, key=lambda entry: entry[0]):
+        yield f"data: {json.dumps({'type': 'response.output_item.done', 'output_index': output_index, 'item': item}, ensure_ascii=False)}\n\n"
 
     completed = {
         "type": "response.completed",
@@ -425,11 +463,12 @@ async def render_responses_sse(events, *, model: str, previous_response_id: str 
             "id": resp_id,
             "object": "response",
             "created_at": created_at,
-            "status": "completed",
+            "status": "incomplete" if finish_reason == "length" else "completed",
             "model": model,
-            "output": completion_output,
+            "output": [item for _, item in sorted(completion_entries, key=lambda entry: entry[0])],
             "previous_response_id": previous_response_id or None,
             "metadata": {},
+            "incomplete_details": {"reason": "max_output_tokens"} if finish_reason == "length" else None,
             "usage": usage,
         },
     }
@@ -682,6 +721,13 @@ def render_response(output: InternalOutputMessage, *, model: str, previous_respo
         len(output.tool_calls),
         output.usage.get("total_tokens", 0),
     )
+    if output.reasoning:
+        rendered_output.append({
+            "type": "reasoning",
+            "id": f"rs_{uuid.uuid4().hex}",
+            "status": "completed",
+            "summary": [{"type": "summary_text", "text": output.reasoning}],
+        })
     if output.text:
         msg_out = {
             "type": "message",
@@ -690,8 +736,6 @@ def render_response(output: InternalOutputMessage, *, model: str, previous_respo
             "role": output.role or "assistant",
             "content": [{"type": "output_text", "text": output.text, "annotations": []}],
         }
-        if output.reasoning:
-            msg_out["reasoning_content"] = output.reasoning
         rendered_output.append(msg_out)
     for tool in output.tool_calls:
         rendered_output.append(_responses_tool_item_from_state({
@@ -704,10 +748,11 @@ def render_response(output: InternalOutputMessage, *, model: str, previous_respo
         "id": resp_id,
         "object": "response",
         "created_at": int(time.time()),
-        "status": "completed",
+        "status": "incomplete" if output.finish_reason == "length" else "completed",
         "model": model,
         "previous_response_id": previous_response_id or None,
         "output": rendered_output,
+        "incomplete_details": {"reason": "max_output_tokens"} if output.finish_reason == "length" else None,
         "usage": {
             "input_tokens": output.usage.get("prompt_tokens", output.usage.get("input_tokens", 0)),
             "output_tokens": output.usage.get("completion_tokens", output.usage.get("output_tokens", 0)),

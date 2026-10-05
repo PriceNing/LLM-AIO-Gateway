@@ -1520,6 +1520,7 @@ async def reset_settings(payload: dict, authorization: Optional[str] = Header(No
     return {
         "items": _settings_items(),
         "applied": applied,
+        "failedHooks": {name: result for name, result in applied.items() if result != "applied"},
         "file": cfg.file_status(),
     }
 

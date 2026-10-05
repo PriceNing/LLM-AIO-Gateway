@@ -69,6 +69,10 @@ def _build_anthropic_request_body(
                 if isinstance(tool, dict) and tool.get("name")
             ]
 
+    for key in ("stop_sequences", "top_p", "top_k"):
+        if key in body and body[key] is not None:
+            req_body[key] = body[key]
+
     tool_choice = body.get("tool_choice")
     if isinstance(tool_choice, dict):
         choice_type = tool_choice.get("type")
@@ -241,6 +245,9 @@ def anthropic_body_from_internal(internal: InternalRequest) -> tuple[list, dict]
         body["tools"] = tools
     if internal.tool_choice is not None:
         body["tool_choice"] = internal.tool_choice
+    for key in ("stop_sequences", "top_p", "top_k"):
+        if key in internal.extra:
+            body[key] = internal.extra[key]
     return anthropic_messages, body
 
 
