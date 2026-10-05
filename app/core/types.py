@@ -209,9 +209,57 @@ def _tool_parameters(tool: dict[str, Any]) -> dict[str, Any]:
     return params if isinstance(params, dict) else {"type": "object", "properties": {}}
 
 
+# tool_choice 的合法形状（协议事实，不含任何厂商/模型身份）：
+# * None
+# * "auto" / "none" / "required"
+# * 带合法 type 的 dict；function/tool 还必须能解析出工具名
+TOOL_CHOICE_STRINGS = frozenset({"auto", "none", "required"})
+TOOL_CHOICE_DICT_TYPES = frozenset({"auto", "none", "required", "any", "function", "tool"})
+
+
+def is_valid_tool_choice(tool_choice: Any, *, strict_dict_types: bool = True) -> bool:
+    """Whether a client ``tool_choice`` value has a projectable shape.
+
+    非法值以前被原样透传给下游客户端库，库侧校验异常被归类为 upstream
+    failure（500「请联系管理员」），但请求根本没有发出去。入口据此判定 400，
+    适配器据此拒绝投影，两处必须用同一条规则。
+
+    ``strict_dict_types=False`` 给 Responses 入口用：它的 tool_choice 值空间比
+    Chat 大得多（file_search / web_search / mcp / image_generation 等），且原生
+    路径会把整个 body 回放给上游、由上游校验。那里只拦“不可能是任何协议的
+    合法形状”的值（非 None/str/dict，以及不在白名单里的字符串）。
+    """
+    if tool_choice is None:
+        return True
+    if isinstance(tool_choice, str):
+        return tool_choice in TOOL_CHOICE_STRINGS
+    if not isinstance(tool_choice, dict):
+        return False
+    if not strict_dict_types:
+        return True
+    choice_type = tool_choice.get("type")
+    if choice_type is None:
+        # 容忍旧形 {"function": {"name": ...}}（无 type 字段）：以前是透传且
+        # 上游可用，改成 400 属于无谓收紧。仍能解析出工具名就放行。
+        function = tool_choice.get("function")
+        return isinstance(function, dict) and bool(function.get("name"))
+    if choice_type not in TOOL_CHOICE_DICT_TYPES:
+        return False
+    if choice_type in ("function", "tool"):
+        function = tool_choice.get("function")
+        if isinstance(function, dict) and function.get("name"):
+            return True
+        return bool(tool_choice.get("name"))
+    return True
+
+
 def tools_from_chat(tools: list[Any] | None) -> list[InternalTool]:
     normalized = []
-    for tool in tools or []:
+    if not isinstance(tools, list):
+        # 入口已对非 list 的 tools 返回 400；这里只做防御，保证诊断/归一化
+        # 路径不会因为一个标量而抛 TypeError（`tools or []` 对 123 不生效）。
+        return normalized
+    for tool in tools:
         if not isinstance(tool, dict):
             continue
         name = _tool_name(tool)

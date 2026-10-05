@@ -264,7 +264,11 @@ def _reasoning_text(value: Any) -> str:
 
 def openai_messages_to_ir(messages: list[dict[str, Any]]) -> list[InternalMessage]:
     result = []
-    for msg in messages or []:
+    if not isinstance(messages, list):
+        # 入口已对非 list 的 messages 返回 400；这里只做防御，避免
+        # `for msg in messages or []` 对 123 这类真值标量抛 TypeError。
+        return result
+    for msg in messages:
         if not isinstance(msg, dict):
             result.append(InternalMessage(role="user", parts=[unknown_part(msg)], raw={}))
             continue
@@ -382,7 +386,9 @@ def anthropic_messages_to_ir(messages: list[dict[str, Any]], system: Any = "") -
             result.append(InternalMessage(role="system", parts=_anthropic_content_to_parts(system), raw={"system": system}))
         else:
             result.append(InternalMessage(role="system", parts=[text_part(system)], raw={"system": system}))
-    for msg in messages or []:
+    # 入口已对非 list 的 messages 返回 400；这里只做防御，避免
+    # `for msg in messages or []` 对 123 这类真值标量抛 TypeError。
+    for msg in messages if isinstance(messages, list) else []:
         if not isinstance(msg, dict):
             result.append(InternalMessage(role="user", parts=[unknown_part(msg)], raw={}))
             continue

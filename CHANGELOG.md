@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **畸形 `tools` 不再把请求打成裸 500（F1）。** 客户端传 `tools: 123 / 1.5 / true / null / "notalist" / {"a":1}` 时，网关返回 HTTP 500 且 body 是纯文本 `Internal Server Error`（不是网关标准 JSON 错误形状），而同样的输入直连上游是 400。崩点有 4 处，其中 **3 处在日志/诊断表达式里**：`body.get("tools", [])` 的默认值只在**键缺失**时生效，客户端显式传 `null` 时拿到的是 `None`，于是 `len(None)`、`None[:10]`、`123[:10]` 直接抛异常——一行 debug 日志就有能力让整个请求失败。现在两层都收口：入口（`protocols.ingress._validate_client_tool_fields`，四个 `*_to_internal()` 共用）对非 list 的 `tools` 直接 400 `invalid_request_error`，文案对齐上游；日志侧新增 `_tools_count()` / `_tools_preview()` 助手（`isinstance` 判定后才取 `len`/切片），`core.types.tools_from_chat()` 也改为非 list 直接返回空表（`for tool in tools or []` 对 `123` 不生效）。`tools: [1, 2]`（list 内含非 dict 项）保持既有的逐项跳过宽容行为，未收紧。
+- **畸形 `tool_choice` 不再被误报成「上游故障」（F2）。** `tool_choice: 123 / [] / 0` 曾被 `adapters/openai._chat_tool_choice()` 原样透传给下游客户端库，库侧校验异常被归类为 upstream failure → 500「Upstream request failed. Please retry later or contact the administrator.」，但**请求根本没有发出去**（同样的值直连上游是 200）。把客户端输入错误报成上游故障会误导排查方向（去查上游而不是查请求体），并可能让 fallback 层做无意义的同目标重试。现在入口按白名单校验（`None` / `"auto"|"none"|"required"` / 带合法 `type` 的 dict，`function`/`tool` 还需能解析出工具名）→ 400，判定规则收敛在 `core.types.is_valid_tool_choice()` 供入口与适配器同源使用；适配器对「不可能是任何协议合法形状」的值（非 None/str/dict）抛 `ValueError` 作为最后一道防线。
+  Responses 入口用 `strict_dict_types=False`：它的 `tool_choice` 值空间比 Chat 大得多（`file_search` / `web_search` / `mcp` / `image_generation` 等），且原生路径会把整个 body 回放给上游、由上游校验，网关不在这里猜；dict 仍透传，交给上游用正确的 4xx 拒绝。
+- **同一 bug 类的遗漏：`messages` / `instructions` 显式 null 也会裸 500。** F1 只 fuzz 了 `tools`，但「`body.get(key, default)` 的默认值只在键缺失时生效」这个陷阱对其它字段同样成立。实测：`messages: null` / `messages: 123` 在 `protocols.ingress` 的 debug 日志行（`len(body.get("messages", []))`）与 `ir.openai_messages_to_ir` / `anthropic_messages_to_ir` 的 `for msg in messages or []`（`123 or []` 为真值，迭代抛 TypeError）两处都会炸；`instructions: null` 在 `router/proxy.py` 的 `len(body.get("instructions", ""))` 炸。现按同一原则收口：两个真正消费 `messages` 的入口（chat_completions / messages）对非 list 返回 400（`/completions` 用 `prompt`、`/responses` 用 `input`，不因无关的同名残留字段拒请求），IR 层两个解析器改为非 list 直接返回空表，日志侧新增 `_count_if_list()` 并把 `instructions_len` 改成 `isinstance` 判定后取长度。
+
+### Docs
+- 四个文档（`README.md` / `README_en.md` / `AGENTS.md` / `CLAUDE.md`）的全量测试计数从 `1152 passed` 同步到 `1216 passed`。0.14.4 发版时漏改，导致 `tools/scripts/check_error_mapping.py` 的检查 4（文档计数 vs 实际收集数）持续 FAIL——该检查是发布流水线的一部分，计数不同步会卡住发版。
+
+### Tests
+- 新增 `tests/test_malformed_tools_and_choice.py`（50 例）：畸形 `tools` / `messages` 在各入口都返回 400 且是网关标准 JSON 错误形状（不含堆栈、不含「Upstream request failed」）、`_tools_count`/`_tools_preview` 与 IR 解析器对同一组畸形值不抛异常、畸形 `tool_choice` 返回 400、合法 `tool_choice` 形状（含 `{"type":"function","function":{"name":...}}`、`{"type":"any"}` → `required` 投影）不被新校验误伤、`tools: [1,2]` 宽容行为保留、`instructions: null` 与合法请求同形（差分断言；已用临时回退验证修复前为纯文本 500、修复后绿）。全量 **1216 passed**，`check_error_mapping.py` 四项全 PASS。
+
 ## [0.14.4] - 2026-10-04
 
 ### Fixed

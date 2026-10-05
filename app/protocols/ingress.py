@@ -2,11 +2,13 @@ import copy
 import json
 from typing import Any
 
+from fastapi import HTTPException
+
 from app.config import get_default
 from app.services.logger import get_logger
 
 _app_log = get_logger("app")
-from app.core.types import InternalRequest, tools_from_chat
+from app.core.types import InternalRequest, is_valid_tool_choice, tools_from_chat
 from app.protocols.ir import (
     anthropic_messages_to_ir,
     openai_messages_to_ir,
@@ -17,6 +19,64 @@ from app.protocols.responses_features import request_flags as responses_request_
 
 
 _INCOMPLETE_JSON_PREFIXES = ("{", "[", '"')
+
+_TOOLS_ERROR_DETAIL = 'tools must be a list of tool objects, each {"type": "function", ...}'
+_TOOL_CHOICE_ERROR_DETAIL = (
+    'tool_choice must be null, one of "auto"/"none"/"required", '
+    'or an object with a valid "type"'
+)
+
+
+def _validate_client_tool_fields(body: dict[str, Any], *, strict_tool_choice: bool = True) -> None:
+    """入口单点校验 tools / tool_choice 形状，非法一律 400。
+
+    两类客户端输入错误曾被报成网关故障：
+
+    * ``body.get("tools", [])`` 的默认值只在**键缺失**时生效。客户端显式传
+      ``null`` 或标量时，``len()``、切片与 ``tools_from_chat()`` 的迭代会抛
+      TypeError，把请求打成裸 500——其中三处崩点还位于日志表达式里。
+      诊断代码不应该有能力让请求失败，因此入口先拦，日志侧另有
+      ``_tools_count`` / ``_tools_preview`` 兜底。
+    * 非法 ``tool_choice`` 被原样透传给下游客户端库，库侧校验异常被归类为
+      upstream failure（500「请联系管理员」），但请求根本没有发出去，
+      会把排查引向上游，并可能触发 fallback 层无意义的同目标重试。
+
+    判定规则与 ``core.types.is_valid_tool_choice`` 共用，适配器侧同源。
+    """
+    if "tools" in body and not isinstance(body.get("tools"), list):
+        raise HTTPException(status_code=400, detail=_TOOLS_ERROR_DETAIL)
+    if "tool_choice" in body and not is_valid_tool_choice(
+        body.get("tool_choice"), strict_dict_types=strict_tool_choice,
+    ):
+        _app_log.warning(
+            "[ingress] rejected malformed tool_choice type=%s value=%r",
+            type(body.get("tool_choice")).__name__, body.get("tool_choice"),
+        )
+        raise HTTPException(status_code=400, detail=_TOOL_CHOICE_ERROR_DETAIL)
+
+
+def _count_if_list(value: Any) -> int:
+    """日志用的安全计数。
+
+    ``body.get("messages", [])`` 的默认值只在键缺失时生效，客户端显式传
+    ``null`` 或标量时 ``len()`` 会抛 TypeError——与 F1 同一 bug 类，只是字段
+    不同。诊断代码不应该具备让请求失败的能力。
+    """
+    return len(value) if isinstance(value, list) else 0
+
+
+def _validate_messages_field(body: dict[str, Any]) -> None:
+    """messages 必须缺席或为 list；显式 null/标量一律 400。
+
+    只给真正消费 ``messages`` 字段的两个入口用（chat_completions / messages）；
+    ``/completions`` 用 ``prompt``、``/responses`` 用 ``input``，不得因为一个
+    无关的同名残留字段而拒请求。
+    """
+    if "messages" in body and not isinstance(body.get("messages"), list):
+        raise HTTPException(
+            status_code=400,
+            detail='messages must be a list of message objects, each {"role": ..., "content": ...}',
+        )
 
 
 def thinking_fields_from_body(body: dict[str, Any] | None) -> dict[str, Any]:
@@ -404,8 +464,10 @@ def _responses_additional_tools_from_input(input_data: Any) -> list[dict[str, An
 
 def chat_completions_to_internal(body: dict[str, Any]) -> InternalRequest:
     model = body.get("model")
+    _validate_client_tool_fields(body)
+    _validate_messages_field(body)
     _app_log.debug("[ingress] chat_completions model=%s stream=%s msgs=%d tools=%s",
-                   model, body.get("stream"), len(body.get("messages", [])), bool(body.get("tools")))
+                   model, body.get("stream"), _count_if_list(body.get("messages")), bool(body.get("tools")))
     extra_keys = {
         "top_p",
         "presence_penalty",
@@ -440,6 +502,7 @@ def chat_completions_to_internal(body: dict[str, Any]) -> InternalRequest:
 
 def completions_to_internal(body: dict[str, Any]) -> InternalRequest:
     model = body.get("model")
+    _validate_client_tool_fields(body)
     prompt = _completion_prompt_to_text(body.get("prompt", ""))
     _app_log.debug("[ingress] completions model=%s stream=%s prompt_len=%d",
                    model, body.get("stream"), len(prompt))
@@ -473,8 +536,10 @@ def completions_to_internal(body: dict[str, Any]) -> InternalRequest:
 
 def anthropic_messages_to_internal(body: dict[str, Any]) -> InternalRequest:
     model = body.get("model")
+    _validate_client_tool_fields(body)
+    _validate_messages_field(body)
     _app_log.debug("[ingress] messages model=%s stream=%s msgs=%d tools=%s",
-                   model, body.get("stream"), len(body.get("messages", [])), bool(body.get("tools")))
+                   model, body.get("stream"), _count_if_list(body.get("messages")), bool(body.get("tools")))
     system_prompt = strip_billing_header(body.get("system", ""))
     anthropic_messages = body.get("messages", [])
     messages = anthropic_messages_to_ir(anthropic_messages, system_prompt)
@@ -514,6 +579,9 @@ def anthropic_messages_to_internal(body: dict[str, Any]) -> InternalRequest:
 
 def responses_to_internal(body: dict[str, Any]) -> InternalRequest:
     model = body.get("model")
+    # Responses 的 tool_choice 值空间更大且原生路径会回放整个 body，
+    # 只拦不可能是任何协议合法形状的值（见 is_valid_tool_choice 注释）。
+    _validate_client_tool_fields(body, strict_tool_choice=False)
     input_data = body.get("input", "")
     instructions = body.get("instructions", "")
     input_count = len(input_data) if isinstance(input_data, list) else 0

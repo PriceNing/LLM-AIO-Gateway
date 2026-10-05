@@ -2324,14 +2324,34 @@ def _log_request(username: str, api_key: str, model: str, provider_id: str,
         _app_log.warning("Failed to log request: %s", e)
 
 
+def _tools_count(body: dict) -> int:
+    """日志/指标用的 tools 计数，绝不抛异常。
+
+    ``body.get("tools", [])`` 的默认值只在**键缺失**时生效：客户端显式传
+    ``null`` 时拿到的是 ``None``，``len(None)`` 直接 TypeError，一行 debug
+    日志就能把整个请求打成裸 500。入口已对非 list 的 tools 返回 400，
+    但诊断代码本身也不应该具备让请求失败的能力。
+    """
+    tools = body.get("tools") if isinstance(body, dict) else None
+    return len(tools) if isinstance(tools, list) else 0
+
+
+def _tools_preview(body: dict) -> str:
+    """日志用的 tools 摘要；非 list 一律当“无工具”，不做切片。"""
+    tools = body.get("tools") if isinstance(body, dict) else None
+    if not isinstance(tools, list) or not tools:
+        return "none"
+    return str(tools[:10])
+
+
 def _log_request_body(username: str, model: str, endpoint: str, body: dict) -> None:
     """Log request metadata for debugging (truncated body, DEBUG level by default)."""
     _req_log.debug(
         "[%s] user=%s model=%s stream=%s tools=%d msgs=%d body_len=%d",
         endpoint, username, model,
         body.get("stream", False),
-        len(body.get("tools", [])),
-        len(body.get("messages", [])),
+        _tools_count(body),
+        len(body.get("messages", [])) if isinstance(body.get("messages"), list) else 0,
         len(json.dumps(body, ensure_ascii=False, default=str)),
     )
 
@@ -3377,7 +3397,7 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
     _app_log.debug(
         "[messages] NORMALIZED anthropic(%d msgs) -> internal(%d msgs) system_prompt_len=%d tools=%s stream=%s max_tokens=%s model=%s provider_type=%s",
         len(anthropic_msgs), len(internal.messages), len(system_prompt) if system_prompt else 0,
-        str(body.get("tools", [])[:10]) if body.get("tools") else "none",
+        _tools_preview(body),
         str(body.get("stream")), str(max_tokens), model,
         provider_info.get("provider_type") if provider_info else "unknown",
     )
@@ -3514,9 +3534,9 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
         raise HTTPException(status_code=400, detail="input is required")
 
     # Log Codex request details for debugging
-    tools_count = len(body.get("tools", []))
+    tools_count = _tools_count(body)
     input_len = len(json.dumps(body.get("input", ""), ensure_ascii=False))
-    instructions_len = len(body.get("instructions", ""))
+    instructions_len = len(body.get("instructions")) if isinstance(body.get("instructions"), str) else 0
     # Log input item types for debugging tool loop
     if isinstance(body.get("input"), list):
         item_types = {}

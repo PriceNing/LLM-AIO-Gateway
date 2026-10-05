@@ -21,7 +21,13 @@ def _chat_tool_choice(tool_choice: Any) -> Any:
     if isinstance(tool_choice, str):
         return tool_choice
     if not isinstance(tool_choice, dict):
-        return tool_choice
+        # 标量/列表不可能是任何协议的合法 tool_choice。以前原样透传给下游
+        # 客户端库，库侧校验异常被归类为 upstream failure（500「请联系管理员」），
+        # 但请求根本没有发出去，会把排查引向上游并可能触发 fallback 无意义重试。
+        # 入口（protocols.ingress）已拦成 400，这里只是最后一道防线。
+        # dict 仍然透传：Responses 的 tool_choice 值空间更大（file_search /
+        # web_search / mcp 等），交给上游用正确的 4xx 拒绝，不在这里猜。
+        raise ValueError(f"unsupported tool_choice shape: {type(tool_choice).__name__}")
 
     choice_type = tool_choice.get("type")
     if choice_type in ("auto", "none", "required"):
