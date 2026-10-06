@@ -32,6 +32,29 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Guard tag matches source version
+        shell: bash
+        env:
+          EXPECTED_TAG: ${{ github.event.inputs.tag_name || github.ref_name }}
+        run: |
+          set -euo pipefail
+          TAG="${EXPECTED_TAG}"
+          case "$TAG" in
+            v*) TAG_V="${TAG#v}" ;;
+            *) echo "SKIP: not a tag ref ($TAG)"; exit 0 ;;
+          esac
+          VER="$(python - <<'PY'
+          import re
+          src = open("app/__init__.py", encoding="utf-8").read()
+          print(re.search(r"__version__\s*=\s*[\"']([^\"']+)", src).group(1))
+          PY
+          )"
+          echo "tag version: $TAG_V / source version: $VER"
+          if [ "$TAG_V" != "$VER" ]; then
+            echo "::error::tag $TAG does not match app/__init__.py ($VER). Run tools/scripts/bump_version.py $TAG_V and commit it BEFORE tagging; the release workflow names assets and tags the image from the source version, so a tag cut without bumping silently publishes the previous version number."
+            exit 1
+          fi
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
