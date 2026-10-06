@@ -35,7 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **tool-only 断路器：部分路径只检查不计数；`limit=0` 语义反转（M-18）。** responses 非流式补 increment/reset；limit>0 守卫。
 - **`message_to_events` 缺 `tool_call_done` → 流式记账丢多工具场景（M-19）。** 逐工具发 tool_call_done。
 - **错误分类文本启发式误判（M-20）。** 429 用非数字边界正则；内部 bug 异常类型归 unknown，RuntimeError 保持 connection_error 可用性语义。
-- **Responses 专有 tool_choice 投影到 Chat 时本地 SDK 拒绝 → 误报 500（M-21/F3）。** `_chat_tool_choice` 不可投影 dict 丢弃+WARNING。
+- **Responses 专有 tool_choice 投影到 Chat 时本地 SDK 拒绝 → 误报 500（M-21）。** `_chat_tool_choice` 不可投影 dict 丢弃+WARNING。
 - **`_is_grok_image_backend` 违反兼容补丁边界规则（M-22）。** `image_param_profile` 配置字段+内置规则表替代 grok if 分支。
 - **会话指纹过弱，推理缓存跨会话串流（M-23）。** 指纹改为前 3 条用户消息全文 sha256 摘要（不再 200/2000 截断）；response_chain 命中增加 principal 段校验，跨调用方不再直接返回存储键。
 - **`ImageInvocationCache` 孤儿条目永不逐出（M-24）。** claim 带 in-flight 时效，僵尸条目 set_exception。
