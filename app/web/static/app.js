@@ -354,6 +354,11 @@ zh: {
     'imageGeneration.externalModel': '外部模型',
     'imageGeneration.comfyui': 'ComfyUI',
     'imageGeneration.providerModel': '提供商模型',
+    'imageGeneration.paramProfile': '参数档位',
+    'imageGeneration.paramProfileAuto': '自动（按后端识别）',
+    'imageGeneration.paramProfileOpenai': 'OpenAI Images 标准',
+    'imageGeneration.paramProfileAspect': 'aspect_ratio 档（拒绝 quality 等）',
+    'imageGeneration.paramProfileHint': '后端拒绝 OpenAI 专有生图参数（quality/background/output_format）时选 aspect_ratio 档；xAI Imagine 类端点属此档。',
     'imageGeneration.selectModel': '请选择提供商模型',
     'imageGeneration.apiBase': 'API Base URL',
     'imageGeneration.apiKey': '密钥',
@@ -739,6 +744,11 @@ en: {
     'imageGeneration.externalModel': 'External Model',
     'imageGeneration.comfyui': 'ComfyUI',
     'imageGeneration.providerModel': 'Provider Model',
+    'imageGeneration.paramProfile': 'Parameter Profile',
+    'imageGeneration.paramProfileAuto': 'Auto (detect by backend)',
+    'imageGeneration.paramProfileOpenai': 'OpenAI Images standard',
+    'imageGeneration.paramProfileAspect': 'aspect_ratio (rejects quality etc.)',
+    'imageGeneration.paramProfileHint': 'Pick aspect_ratio when the backend rejects OpenAI-only image params (quality/background/output_format); xAI Imagine endpoints are this profile.',
     'imageGeneration.selectModel': 'Select a provider model',
     'imageGeneration.apiBase': 'API Base URL',
     'imageGeneration.apiKey': 'API Key',
@@ -2289,6 +2299,7 @@ function renderImageGeneration() {
         '<div id="imageComfyMappings"></div>' +
         '<div class="form-group"><label>' + t('imageGeneration.pollInterval') + '</label><input type="number" id="imageComfyPollInterval" value="1" min="0.2" max="10" step="0.1"></div></div>' +
         '<div class="form-group"><label>' + t('imageGeneration.timeout') + '</label><input type="number" id="imageTimeout" value="' + (active.timeout || 180) + '" min="1" max="3600"></div>' +
+        '<div class="form-group"><label>' + t('imageGeneration.paramProfile') + '</label><select id="imageParamProfile"><option value="">' + t('imageGeneration.paramProfileAuto') + '</option><option value="openai">' + t('imageGeneration.paramProfileOpenai') + '</option><option value="aspect_ratio">' + t('imageGeneration.paramProfileAspect') + '</option></select><div class="form-hint">' + t('imageGeneration.paramProfileHint') + '</div></div>' +
         '<div class="form-group"><label><input type="checkbox" id="imageEnabled"' + (active.enabled === false ? '' : ' checked') + '> ' + t('imageGeneration.enabled') + '</label></div>' +
         '<div class="form-actions"><button class="btn btn-secondary" id="imageGenerationTestBtn" onclick="testImageGeneration(this)">' + t('imageGeneration.test') + '</button><button class="btn btn-primary" onclick="saveImageGeneration()">' + t('imageGeneration.save') + '</button></div>' +
         '</div></div></div>';
@@ -2339,6 +2350,7 @@ function renderImageGeneration() {
     document.getElementById('imageApiKey').value = '';
     document.getElementById('imageApiKey').placeholder = active.has_api_key ? '********' : '';
     document.getElementById('imageModel').value = active.model || '';
+    if (document.getElementById('imageParamProfile')) document.getElementById('imageParamProfile').value = active.image_param_profile || '';
     document.getElementById('imageComfyBase').value = active.backend_type === 'comfyui' ? (active.api_base || '') : '';
     document.getElementById('imageComfyApiKey').value = '';
     document.getElementById('imageComfyApiKey').placeholder = active.backend_type === 'comfyui' && active.has_api_key ? '********' : '';
@@ -2467,6 +2479,8 @@ async function saveImageGeneration() {
     try {
         var type = document.getElementById('imageBackendType').value;
         var config = { backend_type: type, provider_model: type === 'existing_model' ? document.getElementById('imageProviderModel').value : '', api_base: type === 'external_model' ? document.getElementById('imageApiBase').value.trim() : (type === 'comfyui' ? document.getElementById('imageComfyBase').value.trim() : ''), api_key: type === 'external_model' ? document.getElementById('imageApiKey').value.trim() : (type === 'comfyui' ? document.getElementById('imageComfyApiKey').value.trim() : ''), model: type === 'external_model' ? document.getElementById('imageModel').value.trim() : '', timeout: parseInt(document.getElementById('imageTimeout').value) || 180, enabled: document.getElementById('imageEnabled').checked };
+        var profileSelect = document.getElementById('imageParamProfile');
+        if (profileSelect && profileSelect.value) config.image_param_profile = profileSelect.value;
         if (type === 'comfyui') {
             config.workflow = JSON.parse(document.getElementById('imageComfyWorkflow').value || '{}');
             config.workflow_mapping = collectComfyMapping();

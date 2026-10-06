@@ -108,7 +108,9 @@ litellm.add_function_to_prompt = False
 # cause multi-minute hangs when an upstream is unreachable.
 litellm.request_timeout = get_default("litellm_request_timeout", 120)
 
-OPENAI_HOSTS = ("api.openai.com", "azure.com")
+# 官方系主机后缀（精确 hostname 匹配，见 _is_official_host）：命中时把裸模型名
+# 交给 litellm 自动路由，否则强制 openai/ 前缀走自定义兼容端点。
+OPENAI_HOST_SUFFIXES = ("api.openai.com", "azure.com")
 
 
 def min_image_max_tokens() -> int:
@@ -138,6 +140,28 @@ def _reconfigure_litellm_timeout(config: dict) -> None:
 register_runtime_hook("litellm_timeout", _reconfigure_litellm_timeout)
 
 
+def _is_official_host(api_base: str) -> bool:
+    """api_base 是否指向 OpenAI/Azure 官方主机。
+
+    旧实现用子串匹配，`https://evil.example/?ref=azure.com` 这类 URL 会被误判
+    为官方系（bug-2026-10-05 L-11）。改为解析出 hostname 后做精确/后缀匹配。
+    """
+    from urllib.parse import urlparse
+
+    url = api_base if "//" in api_base else f"//{api_base}"
+    try:
+        hostname = urlparse(url).hostname
+    except ValueError:
+        return False
+    if not hostname:
+        return False
+    hostname = hostname.lower().rstrip(".")
+    for suffix in OPENAI_HOST_SUFFIXES:
+        if hostname == suffix or hostname.endswith("." + suffix):
+            return True
+    return False
+
+
 def get_litellm_model_name(model: str, provider: dict) -> str:
     """Build the liteLLM model name for OpenAI-compatible providers."""
     provider_type = provider.get("provider_type", "openai")
@@ -149,7 +173,7 @@ def get_litellm_model_name(model: str, provider: dict) -> str:
     from app.database import parse_model_id
     model = parse_model_id(model).model_name
 
-    if api_base and not any(host in api_base for host in OPENAI_HOSTS):
+    if api_base and not _is_official_host(api_base):
         return f"openai/{model}"
     return model
 

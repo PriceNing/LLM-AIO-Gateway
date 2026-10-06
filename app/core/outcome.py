@@ -115,6 +115,20 @@ def stats_counters_for_status(status: str) -> OutcomeCounters:
     return OutcomeCounters(False, False, False, False)
 
 
+# 优雅停机标志：uvicorn 关闭时会给在途请求任务发 CancelledError，这不是客户端
+# 主动断开。lifespan shutdown 里置位，供归因区分（bug-2026-10-05 L-18）。
+_SHUTTING_DOWN = False
+
+
+def set_shutting_down(value: bool = True) -> None:
+    global _SHUTTING_DOWN
+    _SHUTTING_DOWN = bool(value)
+
+
+def is_shutting_down() -> bool:
+    return _SHUTTING_DOWN
+
+
 def is_client_disconnect_error(exc: BaseException) -> bool:
     """Detect client-gone errors from Starlette/anyio/asyncio transport layers.
 
@@ -129,7 +143,9 @@ def is_client_disconnect_error(exc: BaseException) -> bool:
         import asyncio
 
         if isinstance(exc, asyncio.CancelledError):
-            return True
+            # 停机期间的取消来自服务器自身（uvicorn graceful shutdown），不得
+            # 记成客户端断开，否则失败/取消统计在每次重启时出现假阳性（L-18）。
+            return not _SHUTTING_DOWN
     except Exception:
         pass
 

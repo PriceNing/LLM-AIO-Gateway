@@ -3,6 +3,7 @@ import threading
 from fastapi import APIRouter, Header, HTTPException, Request
 from typing import Optional
 from app import __version__
+from app.config import get_default
 from app.database import get_admins, get_admin, add_admin, update_admin_password
 from app.security import (
     clear_login_failures,
@@ -12,7 +13,9 @@ from app.security import (
     hash_password,
     login_retry_after,
     record_login_failure,
+    revoke_sessions_for_username,
     verify_password,
+    password_needs_rehash,
 )
 
 router = APIRouter()
@@ -70,6 +73,30 @@ async def setup_admin(payload: dict):
     return {"token": token, "username": username, "display_name": display_name}
 
 
+def _throttle_client_ip(request: Request) -> str:
+    """登录限速用的客户端 IP。
+
+    直接读 request.client.host 时，反代后部署所有请求共享代理 IP：
+    攻击者用乱用户名连续失败就能把真实管理员锁在门外（共享锁定 key，
+    bug-2026-10-05 M-6）。配置 login_throttle_trusted_hops>0 表示前置有 N
+    层自控反代，此时从 X-Forwarded-For 右侧第 N 个跳点取 IP；
+    默认 0 不信任任何转发头（攻击者不能伪造 XFF 绕过限速）。
+    """
+    direct = request.client.host if request.client else "unknown"
+    try:
+        hops = int(get_default("login_throttle_trusted_hops", 0) or 0)
+    except (TypeError, ValueError):
+        hops = 0
+    if hops <= 0:
+        return direct
+    forwarded = request.headers.get("x-forwarded-for", "")
+    parts = [item.strip() for item in forwarded.split(",") if item.strip()]
+    if not parts:
+        return direct
+    index = len(parts) - hops
+    return parts[index - 1] if index - 1 >= 0 else parts[0]
+
+
 @router.post("/login")
 async def login(payload: dict, request: Request):
     username = payload.get("username")
@@ -77,8 +104,7 @@ async def login(payload: dict, request: Request):
     if not isinstance(username, str) or not isinstance(password, str):
         raise HTTPException(status_code=400, detail="username and password must be strings")
     username = username.strip()
-    client_host = request.client.host if request.client else "unknown"
-    identity = f"{client_host}\0{username.casefold()}"
+    identity = f"{_throttle_client_ip(request)}\0{username.casefold()}"
     retry_after = login_retry_after(identity)
     if retry_after:
         raise HTTPException(
@@ -95,6 +121,14 @@ async def login(payload: dict, request: Request):
         record_login_failure(identity)
         raise HTTPException(status_code=401, detail="Invalid username or password")
     clear_login_failures(identity)
+    # 旧轮数哈希在成功登录时透明升级到当前参数（L-10）；升级失败不影响本次登录。
+    stored_hash = admin.get("password_hash", "")
+    if password_needs_rehash(stored_hash):
+        try:
+            new_hash = await asyncio.to_thread(hash_password, password)
+            await asyncio.to_thread(update_admin_password, username, new_hash)
+        except Exception:  # noqa: BLE001 - 升级失败不阻断登录
+            pass
     token = create_session(username)
     return {"token": token, "username": username, "display_name": admin.get("display_name", username)}
 
@@ -130,4 +164,7 @@ async def change_password(payload: dict, authorization: Optional[str] = Header(N
         raise HTTPException(status_code=401, detail="Current password is incorrect")
     password_hash = await asyncio.to_thread(hash_password, new_password)
     update_admin_password(username, password_hash)
+    # 改密后吊销其他设备会话：旧 token 可能已泄露，提示改密本身就
+    # 是发生在可疑场景下；当前会话保留，不把操作者自己踢出去（M-7）。
+    revoke_sessions_for_username(username, keep_token=get_bearer_token(authorization))
     return {"status": "ok"}

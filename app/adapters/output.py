@@ -39,7 +39,12 @@ def response_to_internal_output(response) -> InternalOutputMessage:
     tool_outputs = []
     for tc in attr(message, "tool_calls", None) or []:
         tc_dict = _tool_call_to_dict(tc)
-        if int(tc_dict.get("index", 0)) < 0:
+        try:
+            tc_index = int(tc_dict.get("index", 0))
+        except (TypeError, ValueError):
+            # 非数字 index 只说明上游脏，不是伪造负数过滤的理由（L-8）。
+            tc_index = 0
+        if tc_index < 0:
             _tool_log.debug("[output_adapter] FILTERED spurious tool_call id=%s idx=%s", tc_dict.get("id"), tc_dict.get("index", 0))
             continue
         fix_tool_args(tc_dict)

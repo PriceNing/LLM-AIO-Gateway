@@ -1,9 +1,9 @@
-import time
+import uuid
 
 from app.adapters.streaming import iter_stream_async
 from app.core.output import InternalOutputEvent
 from app.core.think import extract_and_strip_think
-from app.core.tool_args import fix_tool_args, sanitize_args
+from app.core.tool_args import sanitize_args, StreamingArgsSanitizer
 from app.services.lite_llm import create_chat_completion_stream
 from app.services.logger import get_logger
 
@@ -176,6 +176,20 @@ async def iter_openai_chat_output_events(
             saw_answer_output = True
 
     for idx, state in sorted(tool_states.items()):
+        sanitizer = state.get("sanitizer")
+        if sanitizer is not None:
+            tail = sanitizer.flush()
+            if tail:
+                state["arguments"] += tail
+                yield InternalOutputEvent(
+                    kind="tool_call_arguments_delta",
+                    tool_index=idx,
+                    tool_call_id=state["id"],
+                    call_id=state["call_id"],
+                    name=state["name"],
+                    arguments_delta=tail,
+                    arguments=state["arguments"],
+                )
         _tool_log.debug(
             "[openai_stream_adapter] tool_done index=%d id=%s name=%s args_chars=%d",
             idx,
@@ -306,22 +320,32 @@ async def _events_from_openai_chunk(chunk, *, model, tool_states: dict[int, dict
                 _tool_log.debug("[openai_stream_adapter] raw tool_calls count=%d model=%s", len(tool_calls), model)
                 for tc in tool_calls:
                     tc_dict = _tool_call_to_dict(tc)
-                    idx = int(tc_dict.get("index", 0)) if "index" in tc_dict else _infer_tool_index(tc_dict, tool_states)
+                    raw_index = tc_dict.get("index")
+                    try:
+                        idx = int(raw_index)
+                    except (TypeError, ValueError):
+                        # 上游把 index 发成 "abc"/None/dict 时不得让整流 ValueError
+                        # （bug-2026-10-05 L-8）；按"缺 index"路径推断。
+                        idx = _infer_tool_index(tc_dict, tool_states)
                     if idx < 0:
                         _tool_log.debug("[openai_stream_adapter] FILTERED spurious: id=%s idx=%s", tc_dict.get("id"), idx)
                         continue
-                    fix_tool_args(tc_dict)
                     fn = tc_dict.get("function") or {}
                     tc_id = tc_dict.get("id") or ""
                     name = fn.get("name") or ""
                     args_delta = fn.get("arguments") or ""
                     if idx not in tool_states:
-                        call_id = tc_id if str(tc_id).startswith("call_") else (f"call_{tc_id}" if tc_id else f"call_{int(time.time())}_{idx}")
+                        # 合成 id 必须全局唯一：旧实现用秒级时间戳+下标，两个并发用户
+                        # 同一秒可碰撞，叠加 reasoning_tool_global_cache 的裸 id 索引会
+                        # 造成跨用户推理内容注入（bug-2026-10-05 H-1）。
+                        synth = uuid.uuid4().hex[:20]
+                        call_id = tc_id if str(tc_id).startswith("call_") else (f"call_{tc_id}" if tc_id else f"call_{synth}")
                         tool_states[idx] = {
-                            "id": tc_id or f"fc_{int(time.time())}_{idx}",
+                            "id": tc_id or f"fc_{synth}",
                             "call_id": call_id,
                             "name": name,
                             "arguments": "",
+                            "sanitizer": StreamingArgsSanitizer(),
                         }
                         _tool_log.debug(
                             "[openai_stream_adapter] tool_start index=%d id=%s name=%s",
@@ -343,11 +367,16 @@ async def _events_from_openai_chunk(chunk, *, model, tool_states: dict[int, dict
                     if name:
                         state["name"] = name
                     if args_delta:
-                        if "undefined" in args_delta:
+                        # 流式路径按分片增量修复（跨分片保持字符串状态），不再对
+                        # 单个分片跑无状态扫描，也不再对累积串二次扫描：旧做法会
+                        # 误改字符串值内的合法内容，且 delta 流与最终参数不一致
+                        # （bug-2026-10-05 M-1）。
+                        sanitizer = state.get("sanitizer")
+                        if sanitizer is not None:
+                            args_delta = sanitizer.feed(args_delta)
+                        else:
                             args_delta = sanitize_args(args_delta)
                         state["arguments"] += args_delta
-                        if "undefined" in state["arguments"]:
-                            state["arguments"] = sanitize_args(state["arguments"])
                         _tool_log.debug(
                             "[openai_stream_adapter] tool_args_delta index=%d id=%s chars=%d total_chars=%d",
                             idx,

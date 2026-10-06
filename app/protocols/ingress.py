@@ -79,6 +79,18 @@ def _validate_messages_field(body: dict[str, Any]) -> None:
         )
 
 
+def _validate_instructions_field(body: dict[str, Any]) -> None:
+    """instructions 缺席/null/字符串之外一律 400（bug-2026-10-05 M-13）。
+
+    旧实现把任意真值直传给 text_part/日志表达式，int 在 len() 处 TypeError → 裸
+    500，dict 则把非字符串正文带进 IR 在更深处崩——都是“客户端输入被报成
+    服务器故障”同一故障类，在入口单点拦成 400。
+    """
+    instructions = body.get("instructions")
+    if instructions is not None and not isinstance(instructions, str):
+        raise HTTPException(status_code=400, detail="instructions must be a string")
+
+
 def thinking_fields_from_body(body: dict[str, Any] | None) -> dict[str, Any]:
     """Whitelist thinking controls from Chat, Completions, Messages, or Responses.
 
@@ -108,7 +120,23 @@ def thinking_fields_from_body(body: dict[str, Any] | None) -> dict[str, Any]:
     return fields
 
 
+def _validate_numeric_field(body: dict[str, Any], key: str, *, allow_negative: bool = False) -> None:
+    """数值字段只接受 JSON 数字（bool 不是数字）。
+
+    旧实现把 "100"/true/dict 原样透传，到 lite_llm 的 max()/litellm 参数层
+    才 TypeError → 裸 500（bug-2026-10-05 L-2）。入口单点拦成 400；范围
+    （0/负数）维持既有语义不变，仍由下游/上游处理。
+    """
+    value = body.get(key)
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise HTTPException(status_code=400, detail=f"{key} must be a number")
+
+
 def _max_tokens_from_body(body: dict[str, Any]) -> int:
+    for key in ("max_tokens", "max_completion_tokens", "max_output_tokens"):
+        _validate_numeric_field(body, key)
     max_tokens = body.get("max_tokens")
     if max_tokens is None:
         max_tokens = body.get("max_completion_tokens")
@@ -128,6 +156,7 @@ def _max_tokens_specified(body: dict[str, Any]) -> bool:
 
 
 def _temperature_from_body(body: dict[str, Any]):
+    _validate_numeric_field(body, "temperature")
     if "temperature" in body:
         return body.get("temperature")
     return get_default("temperature", 0.7)
@@ -582,11 +611,12 @@ def responses_to_internal(body: dict[str, Any]) -> InternalRequest:
     # Responses 的 tool_choice 值空间更大且原生路径会回放整个 body，
     # 只拦不可能是任何协议合法形状的值（见 is_valid_tool_choice 注释）。
     _validate_client_tool_fields(body, strict_tool_choice=False)
+    _validate_instructions_field(body)
     input_data = body.get("input", "")
-    instructions = body.get("instructions", "")
-    input_count = len(input_data) if isinstance(input_data, list) else 0
+    instructions = body.get("instructions") or ""
+    input_count = _count_if_list(input_data)
     _app_log.debug("[ingress] responses model=%s stream=%s input_items=%d instructions_len=%d",
-                   model, body.get("stream"), input_count, len(instructions) if instructions else 0)
+                   model, body.get("stream"), input_count, len(instructions))
     request_tools = _responses_request_tools(body)
     namespace_tools, custom_tools = responses_tool_maps(request_tools)
     messages = responses_input_to_ir(input_data, instructions, custom_tools=custom_tools)

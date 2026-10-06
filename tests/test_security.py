@@ -3,21 +3,30 @@ Unit tests for app.security - password hashing, session management, API key gene
 """
 import time
 import pytest
-from app.security import (
-    hash_password, verify_password, new_api_key,
-    create_session, get_session_username, delete_session,
-    clear_login_failures, login_retry_after, record_login_failure,
-)
+from app.security import (hash_password, verify_password, new_api_key, create_session, get_session_username, delete_session, clear_login_failures, login_retry_after, record_login_failure, PBKDF2_ITERATIONS, LEGACY_PBKDF2_ITERATIONS, password_needs_rehash)
 
 # -- Password hashing --
 
 def test_hash_password_produces_expected_format():
     result = hash_password("mypassword")
     assert result.startswith("pbkdf2_sha256$")
-    parts = result.split("$", 2)
-    assert len(parts) == 3
-    assert len(parts[1]) == 32  # salt is 16 bytes hex = 32 chars
-    assert len(parts[2]) == 64  # sha256 hex = 64 chars
+    # 自描述格式：scheme$iterations$salt$digest（bug-2026-10-05 L-10）
+    parts = result.split("$")
+    assert len(parts) == 4
+    assert int(parts[1]) == PBKDF2_ITERATIONS
+    assert len(parts[2]) == 32  # salt is 16 bytes hex = 32 chars
+    assert len(parts[3]) == 64  # sha256 hex = 64 chars
+
+
+def test_legacy_hash_still_verifies_and_needs_rehash():
+    import hashlib
+    salt = "b" * 32
+    digest = hashlib.pbkdf2_hmac("sha256", b"oldpass", salt.encode(), LEGACY_PBKDF2_ITERATIONS).hex()
+    legacy = f"pbkdf2_sha256${salt}${digest}"
+    assert verify_password("oldpass", legacy) is True
+    assert verify_password("wrongpass", legacy) is False
+    assert password_needs_rehash(legacy) is True
+    assert password_needs_rehash(hash_password("oldpass")) is False
 
 
 def test_hash_password_deterministic_with_same_salt():

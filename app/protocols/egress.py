@@ -236,7 +236,8 @@ def _completion_chunk(cmpl_id: str, model: str, text: str, finish_reason):
 
 
 def _responses_tool_ids(event: InternalOutputEvent) -> tuple[str, str]:
-    tool_id = event.tool_call_id or f"fc_{int(time.time())}_{event.tool_index}"
+    # 合成 id 用 uuid：秒级时间戳形态会跨用户碰撞（bug-2026-10-05 H-1）。
+    tool_id = event.tool_call_id or f"fc_{uuid.uuid4().hex[:20]}"
     call_id = event.call_id or (tool_id if str(tool_id).startswith("call_") else f"call_{tool_id}")
     return tool_id, call_id
 
@@ -278,8 +279,8 @@ def _responses_tool_item_from_state(state: dict, *, status: str, extra: dict | N
     name = state.get("name") or ""
     custom_tools = _responses_custom_tools(extra)
     custom_tool = custom_tools.get(name)
-    item_id = state.get("item_id") or state.get("id") or f"fc_{int(time.time())}"
-    call_id = state.get("call_id") or state.get("id") or f"call_{int(time.time())}"
+    item_id = state.get("item_id") or state.get("id") or f"fc_{uuid.uuid4().hex[:20]}"
+    call_id = state.get("call_id") or state.get("id") or f"call_{uuid.uuid4().hex[:20]}"
     if custom_tool:
         argument_field = custom_tool.get("argument_field") or ("patch" if name == "apply_patch" else "input")
         input_text = custom_tool_input_from_arguments(state.get("arguments") or "", argument_field)
@@ -368,7 +369,10 @@ async def render_responses_sse(events, *, model: str, previous_response_id: str 
             yield f"data: {json.dumps({'type': 'response.output_text.delta', 'output_index': text_output_index, 'content_index': 0, 'delta': event.text})}\n\n"
         elif event.kind == "reasoning_delta":
             accumulated_reasoning += event.reasoning
-            if reasoning_item is None:
+            # 仅带 signature 的 reasoning 事件（Anthropic 加密思考签名透传）没有
+            # 可见文本，旧实现仍会创建空 reasoning output item 发给客户端
+            # （bug-2026-10-05 L-6）。只有确实有文本时才建 item。
+            if reasoning_item is None and event.reasoning:
                 reasoning_output_index = output_index_counter
                 output_index_counter += 1
                 reasoning_item = {
@@ -523,6 +527,12 @@ async def render_anthropic_messages_sse(events, *, model: str):
                 thinking_signature = signature
             if event.reasoning:
                 if not thinking_started:
+                    if text_started:
+                        # Anthropic content block 生命周期不得交叠：text 块还开着时
+                        # 起新 thinking 块会违反 SSE 语义，严格 SDK 报错或丢内容
+                        # （reasoning 出现在 text 之后的退化/多段流，bug-2026-10-05 M-3）。
+                        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': text_index})}\n\n"
+                        text_started = False
                     thinking_started = True
                     thinking_index = next_block_index
                     next_block_index += 1
@@ -546,8 +556,14 @@ async def render_anthropic_messages_sse(events, *, model: str):
             })
             state["arguments"] = event.arguments or (state["arguments"] + event.arguments_delta)
         elif event.kind == "usage":
-            input_tokens = event.usage.get("input_tokens", input_tokens) or input_tokens
-            output_tokens = event.usage.get("output_tokens", output_tokens) or output_tokens
+            # 显式报 0 也是权威值：`or` 合并会把"上游把计数重置为 0"的帧当成
+            # 缺省而保留旧值，累计口径下统计偏高（bug-2026-10-05 L-5）。
+            incoming_input = event.usage.get("input_tokens")
+            incoming_output = event.usage.get("output_tokens")
+            if incoming_input is not None:
+                input_tokens = int(incoming_input)
+            if incoming_output is not None:
+                output_tokens = int(incoming_output)
         elif event.kind == "message_done":
             finish_reason = event.finish_reason or finish_reason
             _app_log.debug("[egress_messages_stream] message_done finish_reason=%s", finish_reason)
@@ -739,8 +755,8 @@ def render_response(output: InternalOutputMessage, *, model: str, previous_respo
         rendered_output.append(msg_out)
     for tool in output.tool_calls:
         rendered_output.append(_responses_tool_item_from_state({
-            "id": tool.id or f"fc_{int(time.time())}",
-            "call_id": tool.call_id or tool.id or f"call_{int(time.time())}",
+            "id": tool.id or f"fc_{uuid.uuid4().hex[:20]}",
+            "call_id": tool.call_id or tool.id or f"call_{uuid.uuid4().hex[:20]}",
             "name": tool.name,
             "arguments": tool.arguments,
         }, status="completed", extra=extra))

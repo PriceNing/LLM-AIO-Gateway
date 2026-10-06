@@ -713,7 +713,9 @@ async def prepare_request_policy(
         fix_tool_args(request)
 
     limited = False
-    if apply_ir_transforms and tool_only_turns is not None and tool_only_limit is not None:
+    if apply_ir_transforms and tool_only_turns is not None and tool_only_limit is not None and tool_only_limit > 0:
+        # tool_only_limit<=0 是管理员关闭断路器的意图；旧判定 `>= 0` 恒真，
+        # 会把所有带 tools 的请求强制剥工具（bug-2026-10-05 M-18②）。
         if request_has_tools(request) and tool_only_turns.get(conv_key, 0) >= tool_only_limit:
             strip_tools(request)
             limited = True

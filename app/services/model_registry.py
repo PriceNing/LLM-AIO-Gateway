@@ -131,19 +131,31 @@ async def _get_with_guard(client: httpx.AsyncClient, url: str) -> bytes:
     """带 SSRF 校验、受控重定向与体积上限的 GET。"""
     from urllib.parse import urljoin
 
-    from app.services.url_guard import validate_upstream_url_async
+    from app.services.url_guard import pinned_request
 
-    current = url
+    logical = url
     for redirect in range(_MAX_REDIRECTS + 1):
         # 与项目安全惯例一致：每一跳都过 url_guard（含 DNS 解析，拦元数据
-        # 地址/非法 scheme/解析到被禁 IP 的主机名），并采用其归一化返回值。
-        current = await validate_upstream_url_async(current, field="model_registry_url")
-        async with client.stream("GET", current, follow_redirects=False) as resp:
+        # 地址/非法 scheme/解析到被禁 IP 的主机名），并把解析结果钉进连接：
+        # 校验过的地址与实际连接地址同一个（bug-2026-10-05 R-1）。
+        target = await pinned_request(logical, field="model_registry_url")
+        headers = dict(target.headers)
+        if target.rewritten:
+            # 重定向在同一 client 上跨主机名：钉 IP 后连接池按 IP origin
+            # 分组，Connection: close 防止后一主机复用前一主机的 TLS 会话
+            # （与 imagegen 下载同口径）。
+            headers["Connection"] = "close"
+        stream_kwargs: dict = {"follow_redirects": False}
+        if headers:
+            stream_kwargs["headers"] = headers
+        if target.extensions:
+            stream_kwargs["extensions"] = target.extensions
+        async with client.stream("GET", target.url, **stream_kwargs) as resp:
             if 300 <= resp.status_code < 400:
                 location = resp.headers.get("location")
                 if not location or redirect == _MAX_REDIRECTS:
                     raise ValueError(f"registry URL returned an unresolvable redirect (HTTP {resp.status_code})")
-                current = urljoin(current, location)
+                logical = urljoin(logical, location)
                 continue
             resp.raise_for_status()
             chunks = bytearray()

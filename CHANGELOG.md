@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-10-05
+
+深度架构审查修复批次（H-1~6 / M-1~24 / L-1~24 / R-1~7），覆盖缓存隔离、SSRF 防护、并发安全、流式协议正确性、事件循环阻塞边界、安全加固。
+
+### Fixed
+- **全局 reasoning 缓存跨用户泄漏 + 合成 tool_call_id 可碰撞（H-1）。** 缓存键加 api_key 哈希前缀；合成 tool_call id 改 uuid4。
+- **Responses 内部映射表泄漏进 litellm kwargs → Chat 降级路径必然 500（H-2）。** `chat_kwargs_from_internal` 剔除 `responses_` 前缀内部键。
+- **Anthropic 上游 → Chat 流式输出 tool_calls index 空洞（H-3）。** block 全局序号→紧凑 tool index 映射。
+- **native Responses 流式路径上游连接释放完全依赖 GC（H-4）。** accounting→idle_timeout→iter_sse_frames→prefixed 全链 try/finally aclose 级联。
+- **图像幂等等待者以 ~2460s 超时阻塞 anyio 线程池（H-5）。** 等待者改 `asyncio.wrap_future`，退出线程池。
+- **非法/非对象 JSON 请求体 → 四个代理端点全部返回裸 500（H-6）。** 端点入口统一 JSON 解析校验 → 400 + request_id。
+- **流式分片上运行 `sanitize_args` 损坏合法内容（M-1/M-2）。** 分片原样透传，仅 tool_call_done 做一次修复；sanitize 改连续反斜杠奇偶判定。
+- **Anthropic SSE 出口 content block 交叠/乱序关闭（M-3）。** thinking 开始前先关闭 text 块。
+- **SSRF 防护：DNS rebinding TOCTOU + 元数据域名后缀绕过（M-4）。** IPv4-mapped 解包/IPv6 ULA 拦截/主机名后缀匹配/imagegen 下载 IP 钉住（Host/SNI/Connection:close）/导入路径异步 DNS 校验；NXDOMAIN 拒绝做成 `url_guard_require_resolvable` 开关（默认关，兼容离线/分裂 DNS）。
+- **完整 API Key 明文泄漏进日志（M-5）。** conv_key 用 sha256(api_key) 派生；日志侧统一掩码。
+- **登录限流身份基于裸客户端 IP：反代后全局共享（M-6）。** `login_throttle_trusted_hops` + XFF 可信跳数解析。
+- **改密/禁用管理员后旧会话不失效（M-7）。** 改密/禁用时 `revoke_sessions_for_username`。
+- **fallback 候选去重失效：同一物理目标被重复尝试（M-8）。** `target_identity` 归一化去重（provider 解析+复合名拆解）。
+- **chat 流式图像桥接：拦截 message_done 后上游流未显式关闭（M-9）。** `_live_bridge_events` return 前显式 aclose source_events。
+- **事件循环上的同步阻塞不一致（M-10）。** 非流式终态记账、统计写库、失败日志全数挪线程；预处理两段查库挪线程。
+- **`ConfigManager.patch` 无锁读改写 + 固定临时文件名（M-11）。** 加 `threading.RLock` + `tempfile.mkstemp`。
+- **设置校验对 `"nan"` / `"inf"` 失守（M-12）。** int/OverflowError 也捕获。
+- **生图预算：TOCTOU 双花 + 失败不退还（M-15）。** `TTLDict.reserve` 原子检查+扣减；失败批次退还预算。
+- **placeholder 冲刷按单事件判定 → 客户端文本丢字符（M-16）。** 冲刷判定用累积文本，不再逐事件。
+- **first-output 超时被"尚未发给客户端"的事件提前解除（M-17）。** 占位符事件不再解除 attempt_timeout。
+- **tool-only 断路器：部分路径只检查不计数；`limit=0` 语义反转（M-18）。** responses 非流式补 increment/reset；limit>0 守卫。
+- **`message_to_events` 缺 `tool_call_done` → 流式记账丢多工具场景（M-19）。** 逐工具发 tool_call_done。
+- **错误分类文本启发式误判（M-20）。** 429 用非数字边界正则；内部 bug 异常类型归 unknown，RuntimeError 保持 connection_error 可用性语义。
+- **Responses 专有 tool_choice 投影到 Chat 时本地 SDK 拒绝 → 误报 500（M-21/F3）。** `_chat_tool_choice` 不可投影 dict 丢弃+WARNING。
+- **`_is_grok_image_backend` 违反兼容补丁边界规则（M-22）。** `image_param_profile` 配置字段+内置规则表替代 grok if 分支。
+- **会话指纹过弱，推理缓存跨会话串流（M-23）。** 指纹改为前 3 条用户消息全文 sha256 摘要（不再 200/2000 截断）；response_chain 命中增加 principal 段校验，跨调用方不再直接返回存储键。
+- **`ImageInvocationCache` 孤儿条目永不逐出（M-24）。** claim 带 in-flight 时效，僵尸条目 set_exception。
+- **DNS 钉 IP 机制接入所有网关自有 HTTP 上游路径（R-1）。** Anthropic、Responses、imagegen、ComfyUI、discovery、model registry、preprocessing 和管理端探测等路径；保留 `Host`/SNI 语义。
+- **imagegen 的 `allow_private_hosts=True` 绕过绝对禁止地址检查（R-2）。** metadata、link-local、multicast、reserved、未指定及 IPv4-mapped 地址仍恒封，并继续钉 IP。
+- **生图预算 continuation 按张扣预算 + 退款只退本轮扣减量 + 过期窗口退款丢弃（R-3）。**
+- **health check 加 `Semaphore(8)` 上限（R-4）。**
+- **discovery 改流式读取，逐 chunk 累计超上限即中断（R-5）。**
+- **lifespan 启动段 `set_shutting_down(False)`（R-6）。**
+- **PBKDF2 升 600k 轮并改自描述格式 `scheme$iterations$salt$digest`（L-10）。** 旧哈希可校验、登录成功时透明升级。
+
+### Added
+- `url_guard_require_resolvable` 设置项（NXDOMAIN 拒绝开关，默认关，兼容离线/分裂 DNS）。
+- `login_throttle_trusted_hops` 设置项（XFF 可信跳数，默认 0）。
+- `image_param_profile` 配置字段（替代 grok if 分支）。
+
+### Tests
+- 新增 `tests/conftest.py`、`tests/test_anthropic_sse_parser.py`、`tests/test_log_reader_pagination.py`、`tests/test_r_series_fixes.py`；全量 **1258 passed**（较 0.14.5 +42）。
+
 ### Fixed
 - **畸形 `tools` 不再把请求打成裸 500（F1）。** 客户端传 `tools: 123 / 1.5 / true / null / "notalist" / {"a":1}` 时，网关返回 HTTP 500 且 body 是纯文本 `Internal Server Error`（不是网关标准 JSON 错误形状），而同样的输入直连上游是 400。崩点有 4 处，其中 **3 处在日志/诊断表达式里**：`body.get("tools", [])` 的默认值只在**键缺失**时生效，客户端显式传 `null` 时拿到的是 `None`，于是 `len(None)`、`None[:10]`、`123[:10]` 直接抛异常——一行 debug 日志就有能力让整个请求失败。现在两层都收口：入口（`protocols.ingress._validate_client_tool_fields`，四个 `*_to_internal()` 共用）对非 list 的 `tools` 直接 400 `invalid_request_error`，文案对齐上游；日志侧新增 `_tools_count()` / `_tools_preview()` 助手（`isinstance` 判定后才取 `len`/切片），`core.types.tools_from_chat()` 也改为非 list 直接返回空表（`for tool in tools or []` 对 `123` 不生效）。`tools: [1, 2]`（list 内含非 dict 项）保持既有的逐项跳过宽容行为，未收紧。
 - **畸形 `tool_choice` 不再被误报成「上游故障」（F2）。** `tool_choice: 123 / [] / 0` 曾被 `adapters/openai._chat_tool_choice()` 原样透传给下游客户端库，库侧校验异常被归类为 upstream failure → 500「Upstream request failed. Please retry later or contact the administrator.」，但**请求根本没有发出去**（同样的值直连上游是 200）。把客户端输入错误报成上游故障会误导排查方向（去查上游而不是查请求体），并可能让 fallback 层做无意义的同目标重试。现在入口按白名单校验（`None` / `"auto"|"none"|"required"` / 带合法 `type` 的 dict，`function`/`tool` 还需能解析出工具名）→ 400，判定规则收敛在 `core.types.is_valid_tool_choice()` 供入口与适配器同源使用；适配器对「不可能是任何协议合法形状」的值（非 None/str/dict）抛 `ValueError` 作为最后一道防线。

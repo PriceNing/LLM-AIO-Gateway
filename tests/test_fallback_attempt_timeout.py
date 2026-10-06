@@ -333,5 +333,8 @@ async def test_native_responses_stream_idle_timeout_cuts_dead_stream(temp_db, mo
         ):
             collected.append(frame)
 
-    assert collected == frames  # 已转发的帧不会被撤回
+    # 已转发的帧不会被撤回；L-17 起中途失败会追加 response.failed 终帧
+    assert collected[:len(frames)] == frames
+    assert b'"response.failed"' in collected[-1]
+    assert collected[-1] != frames[-1]
     assert any("[stream.idle_timeout]" in line for line in idle_logs), idle_logs

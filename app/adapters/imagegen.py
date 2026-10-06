@@ -115,14 +115,40 @@ def _mime_from_bytes(data: bytes, fallback: str = "image/png") -> str:
     return fallback if fallback.startswith("image/") else "image/png"
 
 
-def _is_grok_image_backend(config: dict) -> bool:
+# 生图后端参数档位：profile 决定 size 如何发送、以及是否携带 OpenAI 专有参数。
+# - "openai"：标准 OpenAI Images 形状（size/quality/background/output_format 全发）。
+# - "aspect_ratio"：接受 aspect_ratio+resolution、拒绝 OpenAI 专有参数
+#   （xAI Imagine 的 OpenAI 兼容端点即属此档）。
+_IMAGE_PARAM_PROFILES = {"openai", "aspect_ratio"}
+
+# 内置启发式表：仅当生成器未显式配置 image_param_profile 时用于推断默认档位，
+# 与 model_capabilities 的内置家族表同构——身份判断集中在数据表 + 可被配置覆盖，
+# 不散落 if 分支（AGENTS.md 兼容补丁边界规则第 2/3 条，bug-2026-10-05 M-22）。
+_BUILTIN_IMAGE_PARAM_PROFILE_RULES = (
+    ("aspect_ratio", {"grok", "supergrok", "xai"}, ("grok-imagine",)),
+)
+
+
+def _resolve_image_param_profile(config: dict) -> str:
+    """解析生图后端的参数档位（配置优先，内置表兑底，默认 openai）。"""
+    explicit = str(config.get("image_param_profile") or "").strip().lower()
+    if explicit in _IMAGE_PARAM_PROFILES:
+        return explicit
     provider = str(config.get("provider_id") or "").lower()
     model = str(config.get("model") or config.get("provider_model") or "").lower()
-    return provider in {"grok", "supergrok", "xai"} or "grok-imagine" in model
+    for profile, providers, model_tokens in _BUILTIN_IMAGE_PARAM_PROFILE_RULES:
+        if provider in providers or any(token in model for token in model_tokens):
+            return profile
+    return "openai"
 
 
-def _grok_image_options(size: str | None) -> dict[str, str]:
-    """Translate OpenAI size values to xAI Imagine controls."""
+def _is_grok_image_backend(config: dict) -> bool:
+    """@deprecated 兼容旧调用：等价于档位为 aspect_ratio。新代码用 _resolve_image_param_profile。"""
+    return _resolve_image_param_profile(config) == "aspect_ratio"
+
+
+def _aspect_ratio_options(size: str | None) -> dict[str, str]:
+    """Translate OpenAI size values to aspect_ratio+resolution (aspect_ratio profile)."""
     value = str(size or "").strip().lower()
     # Codex's built-in image_gen extension always sends size="auto".  Grok
     # Imagine does not accept that OpenAI sentinel, so let the backend choose
@@ -156,9 +182,36 @@ def _is_public_address(value: str) -> bool:
     )
 
 
-async def _validate_download_host(hostname: str, *, allow_private_hosts: bool) -> None:
-    if allow_private_hosts:
-        return
+async def _validate_download_host(hostname: str, *, allow_private_hosts: bool) -> str | None:
+    """校验下载主机；返回需要钉进连接的已验证 IP 字面量（None = 无需改写）。
+
+    只校验不复用结果等于没校验：getaddrinfo 与 httpx 各自解析一次，两次之间
+    DNS 答案可变（rebinding TOCTOU，bug-2026-10-05 M-4②）。这里把校验过的
+    那一个地址返回给调用方，由它改写请求 URL，httpx 不再自行解析。
+
+    ``allow_private_hosts`` 只放宽普通私网/回环一档；元数据主机名与恒封
+    地址（链路本地/组播/保留/未指定/169.254.169.254）无论配置如何都检查，
+    域名也不因该开关跳过解析（bug-2026-10-05 R-2，对齐 url_guard 的
+    “元数据地址始终禁止”契约：开启私网下载后 rebinding 到元数据地址
+    仍是真实可达的提权路径）。
+    """
+    from app.services.url_guard import is_blocked_hostname, is_blocked_ip_address
+
+    if not hostname:
+        return None
+    if is_blocked_hostname(hostname):
+        raise ValueError("image result URL points at a blocked metadata endpoint")
+    try:
+        literal = ipaddress.ip_address(hostname)
+    except ValueError:
+        literal = None
+    if literal is not None:
+        # URL 本身就是 IP 字面量，httpx 不会再解析，无 TOCTOU 窗口。
+        if is_blocked_ip_address(literal):
+            raise ValueError("image result URL resolves to a private or unsafe network address")
+        if not allow_private_hosts and not _is_public_address(str(literal)):
+            raise ValueError("image result URL resolves to a private or unsafe network address")
+        return None
     try:
         addresses = await asyncio.to_thread(
             socket.getaddrinfo,
@@ -169,8 +222,17 @@ async def _validate_download_host(hostname: str, *, allow_private_hosts: bool) -
     except socket.gaierror as exc:
         raise ValueError(f"image result host could not be resolved: {hostname}") from exc
     resolved = {str(item[4][0]).split("%", 1)[0] for item in addresses if item[4]}
-    if not resolved or any(not _is_public_address(address) for address in resolved):
+    if not resolved:
+        raise ValueError(f"image result host could not be resolved: {hostname}")
+    # 恒封地址检查与 allow_private 开关无关（R-2）。
+    if any(is_blocked_ip_address(address) for address in resolved):
         raise ValueError("image result URL resolves to a private or unsafe network address")
+    if not allow_private_hosts and any(not _is_public_address(address) for address in resolved):
+        raise ValueError("image result URL resolves to a private or unsafe network address")
+    # 双栈优先 IPv4：v6 路由缺失的部署更常见。两种模式下都钉 IP：
+    # 私网主机同样存在 rebinding 窗口，只是对地址范围的容忍不同。
+    v4 = sorted(item for item in resolved if ":" not in item)
+    return (v4 or sorted(resolved))[0]
 
 
 async def _download_image(
@@ -188,9 +250,27 @@ async def _download_image(
             raise ValueError("image result URL must use http or https")
         if parsed.username or parsed.password:
             raise ValueError("image result URL must not contain credentials")
-        await _validate_download_host(parsed.hostname or "", allow_private_hosts=allow_private_hosts)
+        pinned_ip = await _validate_download_host(parsed.hostname or "", allow_private_hosts=allow_private_hosts)
+        request_url = current_url
+        headers: dict[str, str] = {}
+        extensions: dict[str, Any] = {}
+        if pinned_ip:
+            port = f":{parsed.port}" if parsed.port else ""
+            literal = f"[{pinned_ip}]" if ":" in pinned_ip else pinned_ip
+            request_url = parsed._replace(netloc=f"{literal}{port}").geturl()
+            # Host/SNI 保留原主机名：虚拟主机路由与证书校验语义不变；
+            # Connection: close 防止同 IP 不同主机的请求复用上一条 TLS 会话
+            # （连接池按 origin 分组，改写后的 origin 已不含主机名）。
+            headers["Host"] = parsed.netloc
+            headers["Connection"] = "close"
+            if parsed.scheme == "https":
+                extensions["sni_hostname"] = parsed.hostname or ""
         chunks = bytearray()
-        async with client.stream("GET", current_url, follow_redirects=False) as response:
+        async with client.stream(
+            "GET", request_url,
+            headers=headers or None, extensions=extensions or None,
+            follow_redirects=False,
+        ) as response:
             if 300 <= response.status_code < 400:
                 # raise_for_status() 对 3xx 不报错；不处理重定向会读到空 body
                 # 产出空 data URI。手动跟随并逐跳重新校验主机（SSRF 防护）。
@@ -248,18 +328,16 @@ async def generate_images(config: dict, *, prompt: str, model: str | None = None
     if not request_model:
         raise ValueError("image generation model is not configured")
     payload: dict[str, Any] = {"model": request_model, "prompt": prompt, "n": max(1, min(int(n or 1), 10)), "response_format": "b64_json"}
-    is_grok = _is_grok_image_backend(config)
-    if is_grok and size:
-        payload.update(_grok_image_options(size))
-    for key, value in (("size", size), ("quality", quality), ("background", background), ("output_format", output_format)):
-        # xAI Imagine's OpenAI-compatible endpoint accepts aspect_ratio and
-        # resolution, but rejects OpenAI image controls such as quality,
-        # background and output_format. The response MIME type is detected
-        # from the returned bytes, so dropping them is lossless.
-        if is_grok:
-            continue
-        if value not in (None, ""):
-            payload[key] = value
+    param_profile = _resolve_image_param_profile(config)
+    if param_profile == "aspect_ratio":
+        # 该档位的后端用 aspect_ratio+resolution 表达尺寸，且拒绝 OpenAI 专有
+        # 参数（quality/background/output_format）。响应 MIME 由字节嗅探，丢弃无损。
+        if size:
+            payload.update(_aspect_ratio_options(size))
+    else:
+        for key, value in (("size", size), ("quality", quality), ("background", background), ("output_format", output_format)):
+            if value not in (None, ""):
+                payload[key] = value
     if isinstance(extra, dict):
         payload.update({k: v for k, v in extra.items() if k not in {"model", "prompt", "n", "response_format"} and v is not None})
     timeout = max(1, int(config.get("timeout") or 180))
@@ -273,13 +351,20 @@ async def generate_images(config: dict, *, prompt: str, model: str | None = None
     async with httpx.AsyncClient(timeout=timeout) as client:
         response = None
         attempts = 0
+        # 请求时钉 IP：生图后端同样是管理员配置的上游（bug-2026-10-05 R-1）。
+        from app.services.url_guard import pinned_request
+
+        target = await pinned_request(images_url(config.get("api_base") or ""), field="image_backend_api_base")
+        request_kwargs = {"extensions": target.extensions} if target.extensions else {}
+        backend_headers = {**_headers(config), **target.headers}
         while True:
             attempts += 1
             try:
                 response = await client.post(
-                    images_url(config.get("api_base") or ""),
-                    headers=_headers(config),
+                    target.url,
+                    headers=backend_headers,
                     json=payload,
+                    **request_kwargs,
                 )
                 status_code = int(getattr(response, "status_code", 200))
                 if status_code >= 400:

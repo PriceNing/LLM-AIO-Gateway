@@ -1112,9 +1112,18 @@ def test_conversation_cache_key_prefers_response_chain_id():
     key_b = _conversation_cache_key("api", messages_b)
     assert key_a == key_b
 
-    _remember_response_chain_key("resp_chain_1", "stable-conv-key")
+    # 链式命中只在存储键的 principal 段与调用方一致时生效（M-23 附带项）。
+    import hashlib
+    principal = hashlib.sha256(b"api").hexdigest()[:16]
+    chained_key = f"{principal}:stable-conv-key"
+    _remember_response_chain_key("resp_chain_1", chained_key)
     key_c = _conversation_cache_key("api", [{"role": "user", "content": "Different"}], "resp_chain_1")
-    assert key_c == "stable-conv-key"
+    assert key_c == chained_key
+
+    # 别的调用方即使拿到同一 response id 也不得命中（防跨 principal 劫持）。
+    key_d = _conversation_cache_key("other-api", [{"role": "user", "content": "Different"}], "resp_chain_1")
+    assert key_d != chained_key
+    assert key_d == _conversation_cache_key("other-api", [{"role": "user", "content": "Different"}])
 
 
 def test_conversation_cache_key_uses_followup_user_messages():

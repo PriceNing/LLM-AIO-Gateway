@@ -1,3 +1,4 @@
+import asyncio
 import json
 import copy
 import hashlib
@@ -132,7 +133,7 @@ from app.protocols.egress import (
 )
 from app.services.lite_llm import create_chat_completion
 from app.services.preprocessing import has_image_content, preprocess_messages
-from app.services.routing_targets import candidate_targets, classify_upstream_error, is_same_target_retryable, provider_for_log, resolve_provider, upstream_status_code
+from app.services.routing_targets import candidate_targets, classify_upstream_error, is_same_target_retryable, provider_for_log, resolve_provider, target_identity, upstream_status_code
 from app.services.responses_capability import (
     RESPONSES_CAPABILITY_PROBE_MARKER,
     mark_model_responses_unknown,
@@ -376,7 +377,13 @@ async def _generate_and_store_cached(
 ) -> tuple[list, _CachedImageInvocation, bool]:
     ttl = get_default("image_generation_idempotency_ttl_seconds", 300)
     max_entries = get_default("image_generation_idempotency_max_entries", 64)
-    claim = image_invocation_cache.claim(cache_key, ttl_seconds=ttl, max_entries=max_entries)
+    # owner 的合法寿命上限：批生成超时再给 120s 收尾余量；超过即视为遗弃，
+    # 新 claim 会回收条目并让旧等待者立即拿到错误（M-24）。
+    inflight_max_age = float(get_default("image_generation_batch_timeout_seconds", 2400)) + 120
+    claim = image_invocation_cache.claim(
+        cache_key, ttl_seconds=ttl, max_entries=max_entries,
+        inflight_max_age_seconds=inflight_max_age,
+    )
     if claim.owner:
         try:
             generated, resolved_generator = await _generate_with_configured_backend(
@@ -399,8 +406,12 @@ async def _generate_and_store_cached(
     # 客户端重试可重新发起。
     wait_timeout = float(get_default("image_generation_batch_timeout_seconds", 2400)) + 60
     try:
-        cached = await anyio.to_thread.run_sync(partial(claim.future.result, timeout=wait_timeout))
-    except TimeoutError:
+        # 不再用 to_thread 阻塞等待：anyio 默认线程池（40 线程）同时承载认证、
+        # 非流式调用、store_image_results 等所有阻塞操作——少量长等待者即可
+        # 饥死整个池，甚至抢夺同批次 owner 自己需要的线程（bug-2026-10-05 H-5）。
+        # concurrent.futures.Future 可由 asyncio 直接挂载等待，零线程占用。
+        cached = await asyncio.wait_for(asyncio.wrap_future(claim.future), timeout=wait_timeout)
+    except (TimeoutError, asyncio.TimeoutError):
         image_invocation_cache.invalidate(cache_key)
         raise RuntimeError(f"image generation wait timed out after {int(wait_timeout)}s")
     if not all(item.path.is_file() for item in cached.stored):
@@ -682,13 +693,14 @@ async def _native_responses_stream_with_accounting(events, *, username, api_key_
     stream_started_at = time.monotonic()
     first_output_at = None
     client_disconnected = False
+    stream_iter = iter_output_idle_timeout(
+        iter_sse_frames(events),
+        idle_seconds=_stream_idle_timeout_seconds(),
+        is_output=lambda frame: native_sse_payload_has_output(sse_payload(frame)),
+        error_factory=lambda idle: _stream_idle_timeout_error(idle, model=model, provider_id=provider_id),
+    )
     try:
-        async for frame in iter_output_idle_timeout(
-            iter_sse_frames(events),
-            idle_seconds=_stream_idle_timeout_seconds(),
-            is_output=lambda frame: native_sse_payload_has_output(sse_payload(frame)),
-            error_factory=lambda idle: _stream_idle_timeout_error(idle, model=model, provider_id=provider_id),
-        ):
+        async for frame in stream_iter:
             payload = sse_payload(frame)
             has_output = native_sse_payload_has_output(payload)
             if has_output and first_output_at is None:
@@ -728,8 +740,33 @@ async def _native_responses_stream_with_accounting(events, *, username, api_key_
     except BaseException as exc:
         failed = True
         client_disconnected = is_client_disconnect_error(exc)
+        # 中途失败旧实现只 raise：连接被掐断，客户端无法区分"网络断"与
+        # "上游错误"；兼容路径有 error 帧，native 路径补齐同型语义
+        # （bug-2026-10-05 L-17）。客户端已走/生成器被关闭时写帧必然失败或
+        # 非法（GeneratorExit 中 yield），静默跳过。
+        if not client_disconnected and not isinstance(exc, GeneratorExit):
+            error_payload = {
+                "type": "response.failed",
+                "response": {
+                    "id": (response_body or {}).get("id") or f"resp_{uuid.uuid4().hex[:24]}",
+                    "object": "response",
+                    "status": "failed",
+                    "error": {
+                        "code": "server_error",
+                        # 客户端只拿安全文案，上游原文仅进日志（错误映射契约）。
+                        "message": friendly_error_msg(exc),
+                    },
+                },
+            }
+            try:
+                yield f"data: {json.dumps(error_payload, ensure_ascii=False)}\n\n".encode("utf-8")
+            except Exception:
+                pass
         raise
     finally:
+        # 本生成器被客户端断开提前关闭时，正在迭代的 stream_iter 不会自动关闭；
+        # 显式关闭以级联释放内层上游连接（S5，bug-2026-10-05 H-4）。
+        await aclose_async_iterator(stream_iter)
         usage = (response_body or {}).get("usage") or {}
         tokens = usage.get("total_tokens") or 0
         # Codex closes the SSE after a completed tool/message item and then
@@ -839,7 +876,19 @@ async def _wait_for_native_response_output(events) -> bytes:
     buffered = b""
     saw_output = False
     while True:
-        chunk = await events.__anext__()
+        try:
+            chunk = await events.__anext__()
+        except StopAsyncIteration:
+            if saw_output:
+                return buffered
+            # 首输出前上游正常关流：旧实现让裸 StopAsyncIteration 冒到回退层，
+            # 被兜底归为 connection_error，"空响应"在日志里记成"连接故障"，
+            # 误导排查（bug-2026-10-05 L-19）。给退化完成一个专属错误与成因，
+            # trigger 仍走 connection_error 保持可用性回退语义。
+            error = _native_empty_output_error(None)
+            error.empty_stream_response = True
+            _attach_request_details(error, native_failure_reason="stream_closed_before_output")
+            raise error from None
         buffered += chunk
         while (split := split_sse_frame(buffered)) is not None:
             frame, rest = split
@@ -927,9 +976,15 @@ async def _native_response_with_fallbacks(internal, *, stream: bool, required_to
                     await aclose_async_iterator(events)
                     raise
                 async def prefixed():
-                    yield first
-                    async for chunk in events:
-                        yield chunk
+                    try:
+                        yield first
+                        async for chunk in events:
+                            yield chunk
+                    finally:
+                        # 本生成器被提前丢弃时级联关闭 stream_native_response：
+                        # 它内部的 async with 持有上游连接，等 GC 不是释放保证
+                        # （S5，bug-2026-10-05 H-4）。
+                        await aclose_async_iterator(events)
                 attempts.append({"index": index, "stage": "primary" if index == 0 else "fallback", "target": target.model, "provider_id": provider_id, "status": "success"})
                 return prefixed(), target, provider_id, attempts
             response = await post_native_response(provider, attempt)
@@ -1219,6 +1274,16 @@ def _finalize_success_details(output=None, *, policy=None, extra: dict | None = 
     return apply_outcome_to_details(details, success=True, partial_output=False)
 
 
+async def _log_request_async(*args, **kwargs):
+    """`_log_request`（request_records/实时 deque 的同步写）的事件循环安全壳（M-10）。"""
+    return await anyio.to_thread.run_sync(partial(_log_request, *args, **kwargs))
+
+
+async def _record_success_metrics_async(*args, **kwargs):
+    """global_stats/user_usage UPDATE 挪线程（M-10）。"""
+    return await anyio.to_thread.run_sync(partial(_record_success_metrics, *args, **kwargs))
+
+
 def _record_success_metrics(username: str, api_key_value: str, tokens: int, status: str) -> None:
     counters = stats_counters_for_status(status)
     increment_global_stats(
@@ -1288,6 +1353,42 @@ def _log_rejected_request(
             increment_user_usage(username, api_key_value, False, 0)
     except Exception as exc:
         _app_log.warning("Failed to record rejected request: %s", exc)
+
+
+async def _read_json_object(request: Request, *, endpoint: str = "", api_key_value: str = "") -> dict:
+    """读取并解析客户端 JSON 对象体（bug-2026-10-05 H-6）。
+
+    非法 JSON、非对象顶层值、空体统一在入口拦成 400：旧实现直接
+    ``await request.json()``，JSONDecodeError/AttributeError 无任何接管 →
+    裸 500 且无 request_id，违反“500 保留给网关内部 bug”的契约。
+    RequestBodyTooLarge 必须原样上抛，由 body-limit 中间件翻译成 413。
+    """
+    from app.core.body_limit import RequestBodyTooLarge
+
+    try:
+        raw = await request.body()
+    except RequestBodyTooLarge:
+        raise
+    except Exception as exc:
+        detail = "Failed to read request body"
+        await anyio.to_thread.run_sync(partial(_log_rejected_request, status_code=400, detail=detail, endpoint=endpoint, api_key_value=api_key_value))
+        raise HTTPException(status_code=400, detail=detail) from exc
+    detail = ""
+    body: Any = None
+    if not raw.strip():
+        detail = "Request body is required"
+    else:
+        try:
+            body = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            detail = "Request body must be valid JSON"
+        else:
+            if not isinstance(body, dict):
+                detail = "Request body must be a JSON object"
+    if detail:
+        await anyio.to_thread.run_sync(partial(_log_rejected_request, status_code=400, detail=detail, endpoint=endpoint, api_key_value=api_key_value))
+        raise HTTPException(status_code=400, detail=detail)
+    return body
 
 
 def _target_model_for_log(target: RouteTarget, provider_id: str = "") -> str:
@@ -1521,7 +1622,11 @@ async def _iter_events_with_first_output_timeout(events, *, timeout_s: int | Non
                 if isinstance(exc, TimeoutError) and "fallback attempt timeout" in str(exc):
                     raise
                 raise _attempt_timeout_error(timeout_s, target, provider_id) from exc
-            if _is_client_visible_stream_event(event):
+            if not emitted and _stream_output_starts_client_clock(event):
+                # 只有外层确定会转发给客户端的事件才能解除首字超时：占位符
+                # 文本（"." 等）会被外层扣留，若在此处就解除武装，上游先吐
+                # 几个标点再死掉时 attempt_timeout 永不触发，主动超时→fallback
+                # 的设计目标在退化流上失效（bug-2026-10-05 M-17）。
                 emitted = True
             yield event
     finally:
@@ -1617,7 +1722,7 @@ async def _call_nonstream_with_fallbacks(policy, internal, *, temperature, max_t
                 trigger,
                 error_detail_for_log(exc),
             )
-            retry_key = (target.provider_id or "", target.model)
+            retry_key = target_identity(target)
             retry_limit = _same_target_retry_limit()
             if is_same_target_retryable(exc, trigger) and same_target_retries.get(retry_key, 0) < retry_limit:
                 same_target_retries[retry_key] = same_target_retries.get(retry_key, 0) + 1
@@ -1816,6 +1921,19 @@ def _stream_event_has_payload(event: InternalOutputEvent) -> bool:
     )
 
 
+def _stream_output_starts_client_clock(event: InternalOutputEvent) -> bool:
+    """事件是否算"客户端已见到首个输出"（首字超时的解除条件）。
+
+    与 _is_client_visible_stream_event 的差别：纯占位符 text_delta 虽然对外
+    可见，但会被外层缓冲扣留，不能提前解除 attempt_timeout（M-17）。
+    """
+    if not _is_client_visible_stream_event(event):
+        return False
+    if event.kind == "text_delta" and _placeholder_only_stream_text(event.text or ""):
+        return False
+    return True
+
+
 def _placeholder_only_stream_text(text: str) -> bool:
     """Return whether text is only an upstream placeholder, not useful output."""
     compact = "".join(str(text or "").split())
@@ -1950,12 +2068,16 @@ async def _stream_events_with_fallbacks(internal, *, temperature, max_tokens, lo
                     pending_events.append(event)
                 elif _is_client_visible_stream_event(event):
                     if not emitted:
+                        # 冲刷判定必须与扣留判定同口径（扣留看的是 pending+当前的累积
+                        # 文本）：若当前事件是文本，说明累积前缀+本事件已构成可用输出，
+                        # 逐事件丢弃会把被拆分的 "." 等合法前缀抹掉（bug-2026-10-05 M-16）。
+                        # 只有非文本事件（如 tool_start）触发冲刷时，才按旧口径丢弃
+                        # 纯占位符前缀，避免退化 "..." 抢在工具回合前落屏。
+                        flush_text = event.kind == "text_delta"
                         for pending in pending_events:
-                            if not (
-                                pending.kind == "text_delta"
-                                and _placeholder_only_stream_text(pending.text or "")
-                            ):
-                                yield pending
+                            if not flush_text and pending.kind == "text_delta" and _placeholder_only_stream_text(pending.text or ""):
+                                continue
+                            yield pending
                         pending_events = []
                     emitted = True
                     yield event
@@ -2044,7 +2166,7 @@ async def _stream_events_with_fallbacks(internal, *, temperature, max_tokens, lo
                     trigger,
                 )
                 raise
-            retry_key = (target.provider_id or "", target.model)
+            retry_key = target_identity(target)
             empty_or_placeholder = (
                 getattr(exc, "placeholder_only_response", False)
                 or getattr(exc, "empty_stream_response", False)
@@ -2373,27 +2495,36 @@ async def _policy_preprocess_request(internal, model: str, provider_id: str, req
         len(internal.messages),
     )
 
-    mid = parse_model_id(check_model)
-    with get_db() as db:
-        if mid.provider_id:
-            row = db.execute(
-                "SELECT preprocessor FROM provider_models WHERE provider_id = ? AND model_id = ? AND enabled = 1 LIMIT 1",
-                (mid.provider_id, mid.model_name)
-            ).fetchone()
-        else:
-            row = db.execute(
-                "SELECT preprocessor FROM provider_models WHERE model_id = ? AND enabled = 1 ORDER BY provider_id LIMIT 1",
-                (mid.model_name,)
-            ).fetchone()
-    _app_log.debug("[preprocess.lookup] requested=%s row=%s", check_model, dict(row) if row else None)
-    if not row or not row["preprocessor"]:
+    # 两段 SQLite 读（provider_models.preprocessor、启用的 preprocessor 配置）
+    # 挪线程执行：本函数在每条请求的策略路径上，留在循环上违反自身 P1 口径
+    # （bug-2026-10-05 M-10）。
+    def _lookup_preprocessor() -> tuple[str, dict | None]:
+        mid = parse_model_id(check_model)
+        with get_db() as db:
+            if mid.provider_id:
+                row = db.execute(
+                    "SELECT preprocessor FROM provider_models WHERE provider_id = ? AND model_id = ? AND enabled = 1 LIMIT 1",
+                    (mid.provider_id, mid.model_name)
+                ).fetchone()
+            else:
+                row = db.execute(
+                    "SELECT preprocessor FROM provider_models WHERE model_id = ? AND enabled = 1 ORDER BY provider_id LIMIT 1",
+                    (mid.model_name,)
+                ).fetchone()
+        _app_log.debug("[preprocess.lookup] requested=%s row=%s", check_model, dict(row) if row else None)
+        preprocessor = str(row["preprocessor"] or "") if row else ""
+        if not preprocessor:
+            return "", None
+        config = get_enabled_preprocessor()
+        return preprocessor, config
+
+    preprocessor_id, preprocessor_config = await anyio.to_thread.run_sync(_lookup_preprocessor)
+    if not preprocessor_id:
         if has_img:
             _app_log.warning("[preprocess.decision] enabled=False requested=%s reason=model_preprocessor_disabled", check_model)
         else:
             _app_log.info("[preprocess.decision] enabled=False requested=%s reason=no_images", check_model)
         return False
-
-    preprocessor_config = get_enabled_preprocessor()
     if not preprocessor_config:
         _app_log.warning("[preprocess.decision] enabled=False requested=%s reason=no_enabled_preprocessor_config", check_model)
         return False
@@ -2770,7 +2901,7 @@ def _model_should_advertise_vision(provider: dict, model: dict) -> bool:
 async def chat_completions(request: Request, authorization: Optional[str] = Header(None)):
     user, api_key = await verify_api_key_async(authorization, endpoint="chat_completions")
 
-    body = await request.json()
+    body = await _read_json_object(request, endpoint="chat_completions", api_key_value=api_key.get("key", ""))
     internal = chat_completions_to_internal(body)
     model = internal.target_model
     temperature = internal.temperature
@@ -2953,27 +3084,33 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
                         yield ev
 
                 async def _live_bridge_events():
-                    async for ev in source_events:
-                        if (
-                            ev.kind in ("tool_call_start", "tool_call_arguments_delta", "tool_call_done")
-                            and ev.name == IMAGE_BRIDGE_TOOL_NAME
-                        ):
-                            bridge_call_events.append(ev)
-                            continue
-                        if ev.kind == "tool_call_start":
-                            forwarded_tool_indexes.add(ev.tool_index)
-                        if ev.kind == "message_done" and bridge_call_events:
-                            # renderer 在 message_done 处终止迭代（源流不会被耗尽），
-                            # 所以 bridge 必须在转发 message_done 之前执行；续接事件
-                            # 自带最终 message_done。
+                    try:
+                        async for ev in source_events:
+                            if (
+                                ev.kind in ("tool_call_start", "tool_call_arguments_delta", "tool_call_done")
+                                and ev.name == IMAGE_BRIDGE_TOOL_NAME
+                            ):
+                                bridge_call_events.append(ev)
+                                continue
+                            if ev.kind == "tool_call_start":
+                                forwarded_tool_indexes.add(ev.tool_index)
+                            if ev.kind == "message_done" and bridge_call_events:
+                                # renderer 在 message_done 处终止迭代（源流不会被耗尽），
+                                # 所以 bridge 必须在转发 message_done 之前执行；续接事件
+                                # 自带最终 message_done。
+                                async for cont in _run_bridge_continuation():
+                                    yield cont
+                                return
+                            yield ev
+                        if bridge_call_events:
+                            # 上游流在 message_done 前就结束（异常截断等）：兑底续接。
                             async for cont in _run_bridge_continuation():
                                 yield cont
-                            return
-                        yield ev
-                    if bridge_call_events:
-                        # 上游流在 message_done 前就结束（异常截断等）：兜底续接。
-                        async for cont in _run_bridge_continuation():
-                            yield cont
+                    finally:
+                        # 本生成器在 message_done 处 return / 被客户端断开时，
+                        # source_events 仍悬挂在 yield，其 finally（关闭上游连接）
+                        # 不会自动执行；显式级联关闭（S5，bug-2026-10-05 M-9）。
+                        await aclose_async_iterator(source_events)
 
                 events = _live_bridge_events()
                 # 生图 bridge 会先记一行 "running" 日志；流编排器的最终日志复用
@@ -3120,15 +3257,15 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
                 image_request_log_id = _image_log_id_box[0]
                 rendered = render_chat_completion(image_output, model=model)
                 details = apply_outcome_to_details(details, success=True)
-                _log_request(username, api_key_value, bridge_final_model, bridge_final_provider, "chat_completions", True, tokens, requested_model, details=details)
-                _record_request_log(
+                await _log_request_async(username, api_key_value, bridge_final_model, bridge_final_provider, "chat_completions", True, tokens, requested_model, details=details)
+                await _record_request_log_async(
                     endpoint="chat_completions", username=username, api_key_value=api_key_value,
                     requested_model=requested_model, final_model=bridge_final_model,
                     final_provider=bridge_final_provider, request_body=body,
                     response_body=rendered, success=True, status=request_status, tokens=tokens,
                     usage=outcome.usage, details=details, log_id=image_request_log_id,
                 )
-                _record_success_metrics(username, api_key_value, tokens, request_status)
+                await _record_success_metrics_async(username, api_key_value, tokens, request_status)
                 return rendered
 
             # The model chose not to generate an image. Never expose the
@@ -3139,15 +3276,15 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
             tokens = output.usage.get("total_tokens", 0)
             details = {**routing_details_from_policy(policy), **_output_request_details(output), "chat_mode": "image_bridge_model_passthrough"}
             details = apply_outcome_to_details(details, success=True)
-            _log_request(username, api_key_value, logged_model, adapter_provider_id or "", "chat_completions", True, tokens, requested_model, details=details)
-            _record_request_log(
+            await _log_request_async(username, api_key_value, logged_model, adapter_provider_id or "", "chat_completions", True, tokens, requested_model, details=details)
+            await _record_request_log_async(
                 endpoint="chat_completions", username=username, api_key_value=api_key_value,
                 requested_model=requested_model, final_model=logged_model,
                 final_provider=adapter_provider_id or "", request_body=body,
                 response_body=rendered, success=True, status=details.get("status", "ok"), tokens=tokens,
                 usage=output.usage, details=details,
             )
-            _record_success_metrics(username, api_key_value, tokens, details.get("status", "ok"))
+            await _record_success_metrics_async(username, api_key_value, tokens, details.get("status", "ok"))
             return rendered
 
         output, provider_info, adapter_provider_id = await _call_nonstream_with_fallbacks(
@@ -3176,7 +3313,7 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
         success_details = _finalize_success_details(output, policy=policy, extra=_thinking_fields_from_payload(body))
         status = success_details.get("status", "ok")
         tokens = output.usage.get("total_tokens", 0)
-        _record_request_log(
+        await _record_request_log_async(
             endpoint="chat_completions",
             username=username, api_key_value=api_key_value, requested_model=requested_model,
             final_model=logged_model, final_provider=adapter_provider_id or "",
@@ -3184,17 +3321,18 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
             success=True, status=status, tokens=tokens,
             usage=output.usage, details=success_details,
         )
-        _log_request(username, api_key_value, logged_model, adapter_provider_id or "", "chat_completions", True, tokens, requested_model, details=success_details)
-        _record_success_metrics(username, api_key_value, tokens, status)
+        await _log_request_async(username, api_key_value, logged_model, adapter_provider_id or "", "chat_completions", True, tokens, requested_model, details=success_details)
+        await _record_success_metrics_async(username, api_key_value, tokens, status)
         return rendered
     except HTTPException as http_exc:
         # image bridge correction 失败（502）等透传路径也要留下失败日志/统计，
         # 与 completions/messages/responses 端点对齐，避免可观测性盲区。
-        _log_upstream_http_exception_failure(
+        await anyio.to_thread.run_sync(partial(
+            _log_upstream_http_exception_failure,
             "chat_completions", http_exc,
             username=username, api_key_value=api_key_value, requested_model=requested_model,
             model=model, provider_id=adapter_provider_id or provider_id or "", body=body,
-        )
+        ))
         raise
     except Exception as e:
         _error_log.error("[chat] %s", error_detail_for_log(e))
@@ -3204,8 +3342,8 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
             attempted_model=getattr(e, "attempted_model", None) or model or requested_model,
             attempted_provider=getattr(e, "attempted_provider", None) or provider_id or "",
         )
-        _log_request(username, api_key_value, details.get("attempted_model") or requested_model, details.get("attempted_provider") or provider_id or "", "chat_completions", False, 0, requested_model, details=details)
-        _record_request_log(
+        await _log_request_async(username, api_key_value, details.get("attempted_model") or requested_model, details.get("attempted_provider") or provider_id or "", "chat_completions", False, 0, requested_model, details=details)
+        await _record_request_log_async(
             endpoint="chat_completions",
             username=username, api_key_value=api_key_value, requested_model=requested_model,
             final_model=details.get("attempted_model") or requested_model,
@@ -3225,7 +3363,7 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
 async def completions(request: Request, authorization: Optional[str] = Header(None)):
     user, api_key = await verify_api_key_async(authorization, endpoint="completions")
 
-    body = await request.json()
+    body = await _read_json_object(request, endpoint="completions", api_key_value=api_key.get("key", ""))
     internal = completions_to_internal(body)
     model = internal.target_model
     provider_id = internal.provider_id
@@ -3303,8 +3441,8 @@ async def completions(request: Request, authorization: Optional[str] = Header(No
         success_details = _finalize_success_details(output, policy=policy, extra=_thinking_fields_from_payload(body))
         status = success_details.get("status", "ok")
         tokens = output.usage.get("total_tokens", 0)
-        _log_request(username, api_key_value, logged_model, adapter_provider_id or "", "completions", True, tokens, requested_model, details=success_details)
-        _record_request_log(
+        await _log_request_async(username, api_key_value, logged_model, adapter_provider_id or "", "completions", True, tokens, requested_model, details=success_details)
+        await _record_request_log_async(
             endpoint="completions",
             username=username, api_key_value=api_key_value, requested_model=requested_model,
             final_model=logged_model, final_provider=adapter_provider_id or "",
@@ -3312,17 +3450,18 @@ async def completions(request: Request, authorization: Optional[str] = Header(No
             success=True, status=status, tokens=tokens,
             usage=output.usage, details=success_details,
         )
-        _record_success_metrics(username, api_key_value, tokens, status)
+        await _record_success_metrics_async(username, api_key_value, tokens, status)
         return rendered
     except HTTPException as http_exc:
         # 适配器把上游状态映射为 HTTPException（429/502 等），必须保留状态码
         # 语义透传，不能压成 500，否则客户端无法正确退避；同时补记失败
         # 日志/统计，避免透传造成可观测性回归。
-        _log_upstream_http_exception_failure(
+        await anyio.to_thread.run_sync(partial(
+            _log_upstream_http_exception_failure,
             "completions", http_exc,
             username=username, api_key_value=api_key_value, requested_model=requested_model,
             model=model, provider_id=provider_id or "", body=body,
-        )
+        ))
         raise
     except Exception as e:
         details = _request_details_from_exception(
@@ -3331,8 +3470,8 @@ async def completions(request: Request, authorization: Optional[str] = Header(No
             attempted_model=getattr(e, "attempted_model", None) or model or requested_model,
             attempted_provider=getattr(e, "attempted_provider", None) or provider_id or "",
         )
-        _log_request(username, api_key_value, details.get("attempted_model") or model or requested_model, details.get("attempted_provider") or provider_id or "", "completions", False, 0, requested_model, details=details)
-        _record_request_log(
+        await _log_request_async(username, api_key_value, details.get("attempted_model") or model or requested_model, details.get("attempted_provider") or provider_id or "", "completions", False, 0, requested_model, details=details)
+        await _record_request_log_async(
             endpoint="completions",
             username=username, api_key_value=api_key_value, requested_model=requested_model,
             final_model=details.get("attempted_model") or model or requested_model,
@@ -3351,7 +3490,7 @@ async def completions(request: Request, authorization: Optional[str] = Header(No
 async def anthropic_messages(request: Request, authorization: Optional[str] = Header(None)):
     user, api_key = await verify_api_key_async(authorization, endpoint="messages")
 
-    body = await request.json()
+    body = await _read_json_object(request, endpoint="messages", api_key_value=api_key.get("key", ""))
     model = body.get("model")
     anthropic_msgs = body.get("messages", [])
     provider_id = body.get("provider_id")
@@ -3452,8 +3591,8 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
         success_details = _finalize_success_details(output, policy=policy, extra=_thinking_fields_from_payload(body))
         status = success_details.get("status", "ok")
         tokens = output.usage.get("total_tokens", 0)
-        _log_request(username, api_key_value, logged_model, adapter_provider_id, "messages", True, tokens, requested_model, details=success_details)
-        _record_request_log(
+        await _log_request_async(username, api_key_value, logged_model, adapter_provider_id, "messages", True, tokens, requested_model, details=success_details)
+        await _record_request_log_async(
             endpoint="messages",
             username=username, api_key_value=api_key_value, requested_model=requested_model,
             final_model=logged_model, final_provider=adapter_provider_id,
@@ -3461,15 +3600,16 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
             success=True, status=status, tokens=tokens,
             usage=output.usage, details=success_details,
         )
-        _record_success_metrics(username, api_key_value, tokens, status)
+        await _record_success_metrics_async(username, api_key_value, tokens, status)
         return rendered
     except HTTPException as http_exc:
         # 保留 anthropic 适配器映射的上游状态码（429/502 等），同时补记失败日志。
-        _log_upstream_http_exception_failure(
+        await anyio.to_thread.run_sync(partial(
+            _log_upstream_http_exception_failure,
             "messages", http_exc,
             username=username, api_key_value=api_key_value, requested_model=requested_model,
             model=model, provider_id=adapter_provider_id or provider_id or "", body=body,
-        )
+        ))
         raise
     except Exception as e:
         details = _request_details_from_exception(
@@ -3478,8 +3618,8 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
             attempted_model=getattr(e, "attempted_model", None) or model or requested_model,
             attempted_provider=getattr(e, "attempted_provider", None) or adapter_provider_id or provider_id or "",
         )
-        _log_request(username, api_key_value, details.get("attempted_model") or model or requested_model, details.get("attempted_provider") or adapter_provider_id or "", "messages", False, 0, requested_model, details=details)
-        _record_request_log(
+        await _log_request_async(username, api_key_value, details.get("attempted_model") or model or requested_model, details.get("attempted_provider") or adapter_provider_id or "", "messages", False, 0, requested_model, details=details)
+        await _record_request_log_async(
             endpoint="messages",
             username=username, api_key_value=api_key_value, requested_model=requested_model,
             final_model=details.get("attempted_model") or model or requested_model,
@@ -3499,7 +3639,7 @@ async def anthropic_messages(request: Request, authorization: Optional[str] = He
 async def responses_endpoint(request: Request, authorization: Optional[str] = Header(None)):
     user, api_key = await verify_api_key_async(authorization, endpoint="responses")
 
-    body = await request.json()
+    body = await _read_json_object(request, endpoint="responses", api_key_value=api_key.get("key", ""))
     # Read the hidden manifest before display follow-up sanitization replaces
     # the large generatedImage script with its compact placeholder.
     image_asset_context = gateway_generated_image_asset_context(body.get("input"))
@@ -3632,8 +3772,8 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                 "responses_mode": "image_generation",
                 "upstream_endpoint": "images/generations",
             }
-            _log_request(username, api_key_value, model, adapter_provider_id or "", "responses", False, 0, requested_model, details=fail_details)
-            _record_request_log(
+            await _log_request_async(username, api_key_value, model, adapter_provider_id or "", "responses", False, 0, requested_model, details=fail_details)
+            await _record_request_log_async(
                 endpoint="responses", username=username, api_key_value=api_key_value,
                 requested_model=requested_model, final_model=model,
                 final_provider=adapter_provider_id or "", request_body=body,
@@ -3656,9 +3796,9 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
             # Streaming requests return before the body iterator runs. Record
             # the completed backend operation here so the admin statistics do
             # not lose successful image requests.
-            _log_request(username, api_key_value, image_model, image_provider, "responses", True, 0, requested_model, details=details)
-            _record_request_log(endpoint="responses", username=username, api_key_value=api_key_value, requested_model=requested_model, final_model=image_model, final_provider=image_provider, request_body=body, response_body={"status": "completed", "output_count": len(image_results)}, success=True, status="ok", tokens=0, usage={}, details={**details, "stream": True}, stream=True)
-            _record_success_metrics(username, api_key_value, 0, "ok")
+            await _log_request_async(username, api_key_value, image_model, image_provider, "responses", True, 0, requested_model, details=details)
+            await _record_request_log_async(endpoint="responses", username=username, api_key_value=api_key_value, requested_model=requested_model, final_model=image_model, final_provider=image_provider, request_body=body, response_body={"status": "completed", "output_count": len(image_results)}, success=True, status="ok", tokens=0, usage={}, details={**details, "stream": True}, stream=True)
+            await _record_success_metrics_async(username, api_key_value, 0, "ok")
             _app_log.info(
                 "[responses image_generation.bridge_wire] stream=true output_items=%d image_bytes=%d "
                 "partial=false done=true completed_output=true",
@@ -3672,15 +3812,15 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
             )
         rendered = render_responses_image_generation(image_results, model=model, previous_response_id=previous_response_id,
                                                      tool={"type": "image_generation", "output_format": "png"})
-        _log_request(username, api_key_value, image_model, image_provider, "responses", True, 0, requested_model, details=details)
-        _record_request_log(
+        await _log_request_async(username, api_key_value, image_model, image_provider, "responses", True, 0, requested_model, details=details)
+        await _record_request_log_async(
             endpoint="responses", username=username, api_key_value=api_key_value,
             requested_model=requested_model, final_model=image_model,
             final_provider=image_provider, request_body=body,
             response_body={"status": "completed", "output_count": len(image_results)},
             success=True, status="ok", tokens=0, usage={}, details=details,
         )
-        _record_success_metrics(username, api_key_value, 0, "ok")
+        await _record_success_metrics_async(username, api_key_value, 0, "ok")
         return rendered
 
     # 现代 harness 约定：桥接工具可用性只由模型能力 + 后端配置决定
@@ -3851,10 +3991,16 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                 bridge_final_model = outcome.bridge_final_model
                 bridge_final_provider = outcome.bridge_final_provider
                 image_request_log_id = _image_log_id_box[0]
+                # 记录已落盘工件，供后续 continuation/correction 失败时的
+                # _rollback_image_bridge_artifacts 使用；此前从不写入，回滚恒为空操作
+                # （bug-2026-10-05 L-16）。
+                bridge_stored_images = list(outcome.stored_images)
+                bridge_image_results = list(image_results)
+                bridge_image_model = bridge_final_model or model
                 if stream:
                     details = apply_outcome_to_details(details, success=True)
-                    _log_request(username, api_key_value, bridge_final_model, bridge_final_provider, "responses", True, tokens, requested_model, details=details)
-                    _record_request_log(
+                    await _log_request_async(username, api_key_value, bridge_final_model, bridge_final_provider, "responses", True, tokens, requested_model, details=details)
+                    await _record_request_log_async(
                         endpoint="responses", username=username, api_key_value=api_key_value,
                         requested_model=requested_model, final_model=bridge_final_model,
                         final_provider=bridge_final_provider, request_body=body,
@@ -3862,7 +4008,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                         success=True, status=request_status, tokens=tokens, usage=image_output.usage,
                         details=details, stream=True, log_id=image_request_log_id,
                     )
-                    _record_success_metrics(username, api_key_value, tokens, request_status)
+                    await _record_success_metrics_async(username, api_key_value, tokens, request_status)
                     return StreamingResponse(
                         render_responses_sse(
                             _nonstream_output_events(image_output), model=model,
@@ -3877,15 +4023,15 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                     extra=internal.extra,
                 )
                 details = apply_outcome_to_details(details, success=True)
-                _log_request(username, api_key_value, bridge_final_model, bridge_final_provider, "responses", True, tokens, requested_model, details=details)
-                _record_request_log(
+                await _log_request_async(username, api_key_value, bridge_final_model, bridge_final_provider, "responses", True, tokens, requested_model, details=details)
+                await _record_request_log_async(
                     endpoint="responses", username=username, api_key_value=api_key_value,
                         requested_model=requested_model, final_model=bridge_final_model,
                         final_provider=bridge_final_provider, request_body=body,
                         response_body=rendered, success=True, status=request_status, tokens=tokens,
                         usage=image_output.usage, details=details, log_id=image_request_log_id,
                 )
-                _record_success_metrics(username, api_key_value, tokens, request_status)
+                await _record_success_metrics_async(username, api_key_value, tokens, request_status)
                 return rendered
 
 
@@ -3916,15 +4062,15 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
             details = {**routing_details_from_policy(policy), **_output_request_details(output), "responses_mode": "image_bridge_model_passthrough", "response_id": resp_id}
             final_model = _target_model_for_log(RouteTarget(model=internal.target_model, provider_id=adapter_provider_id), adapter_provider_id)
             details = apply_outcome_to_details(details, success=True)
-            _log_request(username, api_key_value, final_model, adapter_provider_id, "responses", True, tokens, requested_model, details=details)
-            _record_request_log(
+            await _log_request_async(username, api_key_value, final_model, adapter_provider_id, "responses", True, tokens, requested_model, details=details)
+            await _record_request_log_async(
                 endpoint="responses", username=username, api_key_value=api_key_value,
                 requested_model=requested_model, final_model=final_model,
                 final_provider=adapter_provider_id, request_body=body,
                 response_body=rendered, success=True, status=details.get("status", "ok"), tokens=tokens,
                 usage=output.usage, details=details,
             )
-            _record_success_metrics(username, api_key_value, tokens, details.get("status", "ok"))
+            await _record_success_metrics_async(username, api_key_value, tokens, details.get("status", "ok"))
             return rendered
 
         native_required = list(meta.get("requires_native_responses") or [])
@@ -3978,9 +4124,9 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                     update_model_responses_tool_types(adapter_provider_id, model, list(set(capability.get("responses_tool_types") or []) | observed))
                 native_details = apply_outcome_to_details({**routing_details_from_policy(policy), **_thinking_fields_from_payload(body), "responses_mode": "native", "upstream_endpoint": "responses", "fallback_attempts": native_attempts}, success=True)
                 status = native_details.get("status", "ok")
-                _log_request(username, api_key_value, model, adapter_provider_id, "responses", True, tokens, requested_model, details=native_details)
-                _record_request_log(endpoint="responses", username=username, api_key_value=api_key_value, requested_model=requested_model, final_model=model, final_provider=adapter_provider_id, request_body=body, response_body=rendered, success=True, status=status, tokens=tokens, usage=usage, details=native_details)
-                _record_success_metrics(username, api_key_value, tokens, status)
+                await _log_request_async(username, api_key_value, model, adapter_provider_id, "responses", True, tokens, requested_model, details=native_details)
+                await _record_request_log_async(endpoint="responses", username=username, api_key_value=api_key_value, requested_model=requested_model, final_model=model, final_provider=adapter_provider_id, request_body=body, response_body=rendered, success=True, status=status, tokens=tokens, usage=usage, details=native_details)
+                await _record_success_metrics_async(username, api_key_value, tokens, status)
                 return rendered
             except Exception as native_error:
                 native_attempts = list(getattr(native_error, "request_details", {}).get("fallback_attempts", []) or [])
@@ -4081,6 +4227,14 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
                           conv_key, len(output.reasoning),
                           output.usage.get("prompt_cache_hit_tokens", 0), output.usage.get("prompt_cache_miss_tokens", 0))
 
+        # tool-only 断路器必须在这里计数：本路径应用了断路器（prepare_request_policy）
+        # 却从不 increment/reset，纯工具回合永远不推进，断路器在本端点上永不触发
+        # （bug-2026-10-05 M-18①，对齐 chat 非流式路径）。
+        if output.tool_calls and not output.text:
+            _tool_only_turns.increment(conv_key)
+        else:
+            _tool_only_turns.reset(conv_key)
+
         resp_id = f"resp_{uuid.uuid4().hex}"
         _remember_response_chain_key(resp_id, conv_key)
         rendered = render_response(output, model=model, previous_response_id=previous_response_id, response_id=resp_id, extra=internal.extra)
@@ -4090,8 +4244,8 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
         )
         status = success_details.get("status", "ok")
         tokens = output.usage.get("total_tokens", 0)
-        _log_request(username, api_key_value, logged_model, adapter_provider_id, "responses", True, tokens, requested_model, details=success_details)
-        _record_request_log(
+        await _log_request_async(username, api_key_value, logged_model, adapter_provider_id, "responses", True, tokens, requested_model, details=success_details)
+        await _record_request_log_async(
             endpoint="responses",
             username=username, api_key_value=api_key_value, requested_model=requested_model,
             final_model=logged_model, final_provider=adapter_provider_id,
@@ -4099,7 +4253,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
             success=True, status=status, tokens=tokens,
             usage=output.usage, details=success_details,
         )
-        _record_success_metrics(username, api_key_value, tokens, status)
+        await _record_success_metrics_async(username, api_key_value, tokens, status)
         return rendered
     except HTTPException as e:
         _rollback_image_bridge_artifacts(
@@ -4108,14 +4262,25 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
             image_results=bridge_image_results,
             image_model=bridge_image_model,
         )
+        # responses 端点此前只在 image_generation 分支记账，普通上游 HTTPException
+        # 透传时不留失败日志，管理端失败率在该端点存在盲区（bug-2026-10-05 L-15）。
+        if _request_details_from_exception(e).get("request_kind") != "image_generation":
+            await anyio.to_thread.run_sync(partial(
+                _log_upstream_http_exception_failure,
+                "responses", e,
+                username=username, api_key_value=api_key_value, requested_model=requested_model,
+                model=model, provider_id=provider_for_log(provider_info, provider_id) or provider_id or "",
+                body=body,
+            ))
         if _request_details_from_exception(e).get("request_kind") == "image_generation":
-            _record_image_generation_failure(
+            await anyio.to_thread.run_sync(partial(
+                _record_image_generation_failure,
                 username=username, api_key_value=api_key_value,
                 requested_model=requested_model, model=model,
                 provider_id=adapter_provider_id, endpoint="responses",
                 request_body=body, exc=e,
                 request_log_id=image_request_log_id or None,
-            )
+            ))
         raise
     except Exception as e:
         _rollback_image_bridge_artifacts(
@@ -4130,8 +4295,8 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
             attempted_model=getattr(e, "attempted_model", None) or model or requested_model,
             attempted_provider=getattr(e, "attempted_provider", None) or provider_for_log(provider_info, provider_id),
         )
-        _log_request(username, api_key_value, details.get("attempted_model") or model or requested_model, details.get("attempted_provider") or provider_for_log(provider_info, provider_id), "responses", False, 0, requested_model, details=details)
-        _record_request_log(
+        await _log_request_async(username, api_key_value, details.get("attempted_model") or model or requested_model, details.get("attempted_provider") or provider_for_log(provider_info, provider_id), "responses", False, 0, requested_model, details=details)
+        await _record_request_log_async(
             endpoint="responses",
             username=username, api_key_value=api_key_value, requested_model=requested_model,
             final_model=details.get("attempted_model") or model or requested_model,
@@ -4150,7 +4315,7 @@ async def responses_endpoint(request: Request, authorization: Optional[str] = He
 
 async def _images_generation_request(request: Request, authorization: Optional[str]):
     user, api_key = await verify_api_key_async(authorization, endpoint="images_generations")
-    body = await request.json()
+    body = await _read_json_object(request, endpoint="images_generations", api_key_value=api_key.get("key", ""))
     requested_model = str(body.get("model") or "")
     prompt = str(body.get("prompt") or "").strip()
     if not requested_model or not prompt:
@@ -4196,29 +4361,29 @@ async def _images_generation_request(request: Request, authorization: Optional[s
             "image_backend_type": str(generator.get("backend_type") or ""), "image_fallback_status": "unused",
             "image_count": 0, "image_bytes": 0, "error_message": error_detail_for_log(exc),
         }
-        _log_request(username, api_key_value, image_model, image_provider_id, "images_generations", False, 0, requested_model, details=details)
-        _record_request_log(
+        await _log_request_async(username, api_key_value, image_model, image_provider_id, "images_generations", False, 0, requested_model, details=details)
+        await _record_request_log_async(
             endpoint="images_generations", username=username, api_key_value=api_key_value,
             requested_model=requested_model, final_model=image_model,
             final_provider=image_provider_id, request_body=body, success=False,
             status="fail", tokens=0, details=details, error_message=error_detail_for_log(exc),
         )
-        _record_success_metrics(username, api_key_value, 0, "fail")
+        await _record_success_metrics_async(username, api_key_value, 0, "fail")
         _error_log.error("[images_generations] FAILED: %s", error_detail_for_log(exc))
         raise HTTPException(status_code=client_status_for_upstream_error(exc), detail=friendly_error_msg(exc)) from exc
     data = [{"b64_json": item.data_uri.split(",", 1)[1], "mime_type": item.mime_type} for item in results]
     details = {"request_kind": "image_generation", "responses_mode": "image_generation", "upstream_endpoint": "images/generations", "image_model": image_model, "image_backend_provider": image_provider_id, "image_backend_model": image_model, "image_backend_type": str(generator.get("backend_type") or ""), "image_fallback_status": "unused", "image_count": len(results), "image_bytes": image_results_bytes(results)}
     username = user.get("username", "legacy")
     api_key_value = api_key.get("key", "")
-    _log_request(username, api_key_value, image_model, image_provider_id, "images_generations", True, 0, requested_model, details=details)
-    _record_request_log(
+    await _log_request_async(username, api_key_value, image_model, image_provider_id, "images_generations", True, 0, requested_model, details=details)
+    await _record_request_log_async(
         endpoint="images_generations", username=username, api_key_value=api_key_value,
         requested_model=requested_model, final_model=image_model,
         final_provider=image_provider_id, request_body=body,
         response_body={"created": True, "image_count": len(results)},
         success=True, status="ok", tokens=0, details=details,
     )
-    _record_success_metrics(username, api_key_value, 0, "ok")
+    await _record_success_metrics_async(username, api_key_value, 0, "ok")
     return {"created": int(time.time()), "data": data}
 
 
@@ -4319,6 +4484,17 @@ def _request_log_response_body(
             'model': final_model or '',
         }
     return None
+
+
+async def _record_request_log_async(**kwargs):
+    """`_record_request_log` 的事件循环安全壳。
+
+    终态日志是全请求最重的同步写（完整 payload 的 json.dumps + 截断 +
+    SQLite），非流式端点旧实现直接在事件循环里调用它，高并发下拖慢所有
+    在途请求（bug-2026-10-05 M-10，与 streaming._invoke_record_request_log
+    同口径）。
+    """
+    return await anyio.to_thread.run_sync(partial(_record_request_log, **kwargs))
 
 
 def _record_request_log(

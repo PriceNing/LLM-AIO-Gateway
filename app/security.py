@@ -65,26 +65,62 @@ def _prune_login_throttle_locked(now: float, window: int, max_identities: int) -
         _login_seq.pop(identity, None)
 
 
-def hash_password(password: str, salt: Optional[str] = None) -> str:
+# OWASP 现行 PBKDF2-SHA256 建议为 600k 轮；120k 是历史值（bug-2026-10-05 L-10）。
+# 迭代次数写进哈希格式（自描述），旧哈希仍可校验，登录成功时透明升级。
+PBKDF2_ITERATIONS = 600_000
+LEGACY_PBKDF2_ITERATIONS = 120_000
+
+
+def hash_password(password: str, salt: Optional[str] = None, iterations: int = PBKDF2_ITERATIONS) -> str:
     salt = salt or secrets.token_hex(16)
     digest = hashlib.pbkdf2_hmac(
         "sha256",
         password.encode("utf-8"),
         salt.encode("utf-8"),
-        120_000,
+        iterations,
     ).hex()
-    return f"pbkdf2_sha256${salt}${digest}"
+    return f"pbkdf2_sha256${iterations}${salt}${digest}"
+
+
+def _parse_password_hash(password_hash: str) -> tuple[str, int, str, str] | None:
+    """(scheme, iterations, salt, digest)；兼容不带迭代次数的旧三段格式。"""
+    parts = password_hash.split("$")
+    if len(parts) == 4:
+        scheme, iterations, salt, digest = parts
+        try:
+            rounds = int(iterations)
+        except ValueError:
+            return None
+    elif len(parts) == 3:
+        scheme, salt, digest = parts
+        rounds = LEGACY_PBKDF2_ITERATIONS
+    else:
+        return None
+    if scheme != "pbkdf2_sha256":
+        return None
+    return scheme, rounds, salt, digest
 
 
 def verify_password(password: str, password_hash: str) -> bool:
-    try:
-        scheme, salt, expected = password_hash.split("$", 2)
-    except ValueError:
+    parsed = _parse_password_hash(password_hash)
+    if parsed is None:
         return False
-    if scheme != "pbkdf2_sha256":
-        return False
-    actual = hash_password(password, salt).split("$", 2)[2]
+    _, rounds, salt, expected = parsed
+    actual = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt.encode("utf-8"),
+        rounds,
+    ).hex()
     return hmac.compare_digest(actual, expected)
+
+
+def password_needs_rehash(password_hash: str) -> bool:
+    """旧格式（无迭代次数段）或轮数低于当前值时需要重哈希升级。"""
+    parsed = _parse_password_hash(password_hash)
+    if parsed is None:
+        return False
+    return parsed[1] < PBKDF2_ITERATIONS
 
 
 def new_api_key(prefix: str = "sk-aio") -> str:
@@ -128,6 +164,23 @@ def get_session_username(token: str) -> Optional[str]:
 def delete_session(token: str) -> None:
     with _sessions_lock:
         _sessions.pop(token, None)
+
+
+def revoke_sessions_for_username(username: str, keep_token: str = "") -> int:
+    """吊销某用户的全部会话（改密后旧 token 不得继续有效，M-7）。
+
+    keep_token 保留发起本次改密的当前会话；其余设备一律重新登录。
+    返回被吊销的会话数。
+    """
+    revoked = 0
+    with _sessions_lock:
+        for token in list(_sessions):
+            if token == keep_token:
+                continue
+            if _sessions[token].get("username") == username:
+                _sessions.pop(token, None)
+                revoked += 1
+    return revoked
 
 
 def login_retry_after(identity: str) -> int:

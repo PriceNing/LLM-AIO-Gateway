@@ -14,6 +14,7 @@ venv/
 data.db
 data.db-shm
 data.db-wal
+data.db.bak-*
 config.json
 tools/live-eval.config.json
 tools/live-eval.config.local.json

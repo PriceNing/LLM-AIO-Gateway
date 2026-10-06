@@ -219,3 +219,54 @@ def test_list_of_non_dict_tools_still_tolerated(temp_db, monkeypatch):
     response = _post_chat(temp_db["headers"], tools=[1, 2])
     assert response.status_code != 400, response.text[:200]
     assert reached.get("yes") is True
+
+# ---------------------------------------------------------------------------
+# F3（GATEWAY-F3-FINDING.md）：Responses 专有 tool_choice 投影到 Chat 时必须
+# 丢弃并记 WARNING，不得透传给 openai SDK（建连前本地校验失败 → 误报 500）。
+# ---------------------------------------------------------------------------
+
+RESPONSES_ONLY_TOOL_CHOICE = [
+    {"type": "file_search"},
+    {"type": "web_search"},
+    {"type": "allowed_tools"},
+    {"type": "mcp", "server_label": "x"},
+    {"type": "image_generation"},
+    {"type": "bash"},
+]
+
+
+@pytest.mark.parametrize("tool_choice", RESPONSES_ONLY_TOOL_CHOICE)
+def test_responses_only_tool_choice_dropped_in_chat_projection(tool_choice, monkeypatch):
+    from app.adapters import openai as openai_adapter
+
+    warnings: list[str] = []
+    monkeypatch.setattr(openai_adapter._app_log, "warning", lambda msg, *a, **k: warnings.append(msg % a if a else msg))
+    assert openai_adapter._chat_tool_choice(tool_choice) is None
+    assert any("cannot be projected" in message for message in warnings)
+
+
+def test_chat_kwargs_omit_dropped_tool_choice():
+    """投影丢弃后 kwargs 里不得残留 tool_choice（否则等于没修）。"""
+    from app.adapters.openai import chat_kwargs_from_internal
+    from app.core.types import InternalMessage, InternalRequest, InternalTool, text_part
+
+    internal = InternalRequest(
+        endpoint="chat_completions",
+        requested_model="m",
+        target_model="m",
+        messages=[InternalMessage(role="user", parts=[text_part("hi")])],
+        tools=[InternalTool(name="get_weather", raw={"type": "function", "function": {"name": "get_weather"}})],
+        tool_choice={"type": "file_search"},
+    )
+    kwargs = chat_kwargs_from_internal(internal)
+    assert "tool_choice" not in kwargs
+    assert "tools" in kwargs
+
+
+def test_responses_tool_choice_still_flows_to_native_upstream():
+    """原生 Responses 回放不受影响：入口放行，未知类型交上游 4xx 判定。"""
+    from app.protocols.ingress import responses_to_internal  # noqa: F401  (确保可导入)
+    from app.core.types import is_valid_tool_choice
+
+    for tool_choice in RESPONSES_ONLY_TOOL_CHOICE:
+        assert is_valid_tool_choice(tool_choice, strict_dict_types=False) is True

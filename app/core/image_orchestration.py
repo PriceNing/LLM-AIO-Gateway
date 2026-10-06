@@ -46,7 +46,7 @@ from app.core.image_bridge import (
 from app.core.image_results import StoredImageResult, generation_results_from_stored
 from app.adapters.imagegen import image_results_bytes
 from app.core.outcome import apply_outcome_to_details
-from app.core.state import charge_image_generation_budget
+from app.core.state import charge_image_generation_budget, refund_image_generation_budget
 from app.core.text import friendly_error_msg
 
 _log = logging.getLogger("llmgw.app")
@@ -291,6 +291,15 @@ def message_to_events(message: InternalOutputMessage) -> list:
                 tool_call_id=call.id, call_id=call.call_id, name=call.name,
                 arguments_delta=call.arguments,
             ))
+        # 必须补 tool_call_done：下游记账（stream_internal_output 的
+        # streamed_tool_calls 聚合）靠 done 把 current_tool 落盘；缺了它，
+        # 多工具续接下每次 start 直接覆盖上一个，只记到最后一个工具
+        # （bug-2026-10-05 M-19；对齐 proxy._nonstream_output_events 的写法）。
+        events.append(InternalOutputEvent(
+            kind="tool_call_done", tool_index=index,
+            tool_call_id=call.id, call_id=call.call_id, name=call.name,
+            arguments=call.arguments,
+        ))
     if message.usage:
         events.append(InternalOutputEvent(kind="usage", usage=dict(message.usage)))
     events.append(InternalOutputEvent(kind="message_done", finish_reason=message.finish_reason or "stop"))
@@ -464,6 +473,12 @@ async def run_image_bridge(
         image_artifacts.extend(invocation_artifacts)
         completed_invocations.append((call, args, invocation_artifacts))
         unresolved_failed_keys.discard(image_prompt_key(args))
+    if failed_invocations:
+        # 失败的张数退回预算（预留按整批扣，M-15）。整批失败时这里已覆盖
+        # 全部 initial_outcomes，下方早退路径不得重复退。
+        refund_image_generation_budget(
+            getattr(policy, "conv_key", "") or "", len(failed_invocations)
+        )
     if not completed_invocations:
         first_error = next((item.error for item in initial_outcomes if item.error), None)
         if first_error is None:
@@ -541,6 +556,19 @@ async def run_image_bridge(
                 force_without_image_tool = len(pending_images) == len(continuation.tool_calls)
             else:
                 fresh_images = fresh_images[:remaining_image_budget]
+            # continuation 轮同样要过会话预算：旧实现只在初始批扣一次，
+            # continuation 生图既不受预算限制、失败时又按“未扣减的额度”退款，
+            # 会系统性抬高剩余预算（bug-2026-10-05 R-3）。
+            budget_allowed_round = charge_image_generation_budget(
+                getattr(policy, "conv_key", "") or "", len(fresh_images)
+            )
+            if budget_allowed_round < len(fresh_images):
+                _log.warning(
+                    "[image_generation.budget_limited] round=%d requested=%d allowed=%d conv_key=%s",
+                    continuation_round, len(fresh_images), budget_allowed_round,
+                    getattr(policy, "conv_key", "") or "-",
+                )
+                fresh_images = fresh_images[:budget_allowed_round]
             _log.info(
                 "[image_generation.continuation_images] round=%d requested=%d fresh=%d",
                 continuation_round, len(pending_images), len(fresh_images),
@@ -617,6 +645,13 @@ async def run_image_bridge(
                 round_completed.append((call, args, invocation_artifacts))
                 generated_prompt_keys.add(image_prompt_key(args))
                 unresolved_failed_keys.discard(image_prompt_key(args))
+            if round_failed:
+                # 本轮已在上方按张扣过预算，这里只退本轮失败的张数；
+                # 初始轮失败的 prompt 在 continuation 重试时会被重新扣减，
+                # 不存在无扣减对应的退款（R-3）。
+                refund_image_generation_budget(
+                    getattr(policy, "conv_key", "") or "", len(round_failed)
+                )
             image_results.extend(round_results)
             completed_invocations.extend(round_completed)
             image_model = image_generator_identity(generator)[1]

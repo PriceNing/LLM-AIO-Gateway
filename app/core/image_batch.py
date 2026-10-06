@@ -31,7 +31,7 @@ class ImageInvocationCache:
         self._entries: dict[str, _Entry] = {}
         self._lock = threading.Lock()
 
-    def claim(self, key: str, *, ttl_seconds: int, max_entries: int) -> ImageInvocationClaim:
+    def claim(self, key: str, *, ttl_seconds: int, max_entries: int, inflight_max_age_seconds: float = 0) -> ImageInvocationClaim:
         now = time.monotonic()
         ttl = max(1, int(ttl_seconds))
         limit = max(1, int(max_entries))
@@ -40,6 +40,23 @@ class ImageInvocationCache:
                 entry_key for entry_key, entry in self._entries.items()
                 if entry.completed_at is not None and now - entry.completed_at > ttl
             ]
+            # in-flight 条目同样要有寿命上限：owner 在 claim 后、resolve/reject 前
+            # 因未预期路径退出时，旧实现里该条目永不超时（过期清理只认
+            # completed_at，容量逐出也只弹已完成条目），等待者只能靠自身超时
+            # 脱身（bug-2026-10-05 M-24）。超过 owner 合法寿命上限即视为遗弃。
+            if inflight_max_age_seconds > 0:
+                abandoned = [
+                    entry_key for entry_key, entry in self._entries.items()
+                    if entry.completed_at is None and now - entry.created_at > inflight_max_age_seconds
+                ]
+            else:
+                abandoned = []
+            for entry_key in abandoned:
+                dropped = self._entries.pop(entry_key, None)
+                if dropped is not None and not dropped.future.done():
+                    dropped.future.set_exception(
+                        RuntimeError("image generation owner was abandoned; retry the request")
+                    )
             for entry_key in expired:
                 self._entries.pop(entry_key, None)
 

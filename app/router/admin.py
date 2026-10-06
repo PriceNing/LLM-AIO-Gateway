@@ -363,7 +363,10 @@ async def _run_preprocessor_test(preprocessor_id: str) -> dict:
         "temperature": 0,
     }
     async with httpx.AsyncClient(timeout=timeout) as client:
-        resp = await client.post(_preprocessor_test_url(api_base), headers=headers, json=payload)
+        # 管理员连通性测试同样走请求时钉 IP（bug-2026-10-05 R-1）。
+        from app.services.url_guard import pinned_request
+        target = await pinned_request(_preprocessor_test_url(api_base), field="preprocessor_api_base")
+        resp = await client.post(target.url, headers={**headers, **target.headers}, json=payload, **({"extensions": target.extensions} if target.extensions else {}))
     if resp.status_code != 200:
         raise RuntimeError((resp.text or f"HTTP {resp.status_code}")[:500])
     data = resp.json()
@@ -821,10 +824,16 @@ async def fetch_preprocessor_models(body: dict,
     headers_list = auth_headers(api_key, "openai")
     last_error = ""
     async with httpx.AsyncClient(timeout=10) as client:
+        from app.services.url_guard import pinned_request
         for url in urls:
             for h in headers_list:
                 try:
-                    resp = await client.get(url, headers=h)
+                    # 请求时钉 IP：校验地址与连接地址一致（bug-2026-10-05 R-1）。
+                    target = await pinned_request(url, field="api_base")
+                    request_kwargs = {"headers": {**h, **target.headers}}
+                    if target.extensions:
+                        request_kwargs["extensions"] = target.extensions
+                    resp = await client.get(target.url, **request_kwargs)
                     resp.raise_for_status()
                     data = resp.json()
                     models = data.get("data") or data.get("models") or []
@@ -1063,6 +1072,10 @@ async def update_image_generation(generator_id: str, config: dict, authorization
             raise HTTPException(status_code=400, detail=str(exc)) from exc
     if backend_type not in {"existing_model", "external_model", "comfyui"}:
         raise HTTPException(status_code=400, detail="unsupported image-generation backend type")
+    # 参数档位只接受已知值（M-22）：脏值会静默退回内置启发式，管理员应得到 400
+    # 而不是“保存成功但行为不符”。
+    if str(config.get("image_param_profile") or "").strip().lower() not in ("", "openai", "aspect_ratio"):
+        raise HTTPException(status_code=400, detail="image_param_profile must be openai or aspect_ratio")
     try:
         current = upsert_image_generator(generator_id, config)
     except ValueError as exc:
@@ -1574,7 +1587,6 @@ def _validate_config_payload(payload) -> tuple[list, dict, dict, list, list]:
         raise HTTPException(status_code=400, detail="preprocessors must be an object")
     if not isinstance(image_generators, dict):
         raise HTTPException(status_code=400, detail="image_generators must be an object")
-    _validate_imported_upstream_urls(providers, preprocessors, image_generators)
     if not isinstance(routing, list):
         raise HTTPException(status_code=400, detail="routing_rules must be a list")
     if not isinstance(fallbacks, list):
@@ -1597,32 +1609,36 @@ def _validate_config_payload(payload) -> tuple[list, dict, dict, list, list]:
     return providers, preprocessors, image_generators, routing, fallbacks
 
 
-def _validate_imported_upstream_urls(providers, preprocessors, image_generators) -> None:
+async def _validate_imported_upstream_urls(providers, preprocessors, image_generators) -> None:
     """导入路径不得绕过保存时的上游地址校验（S6）。
 
     否则一份恶意导出文件可以把 file:// 或云元数据地址写进 providers，
     之后由健康检查、模型发现或代理请求直接发起。
-    """
-    from app.services.url_guard import UnsafeUpstreamURL, validate_upstream_url
 
-    def check(value, field: str) -> None:
+    必须走 async DNS 校验（validate_upstream_url_async）：旧实现只做同步字面
+    校验，连保存路径都有的“解析后命中元数据 IP”检查都缺失，一个解析到
+    169.254.169.254 的域名可直接导入（bug-2026-10-05 M-4③）。
+    """
+    from app.services.url_guard import UnsafeUpstreamURL, validate_upstream_url_async
+
+    async def check(value, field: str) -> None:
         base = str(value or "")
         if not base.strip():
             return
         try:
-            validate_upstream_url(base, field=field)
+            await validate_upstream_url_async(base, field=field)
         except UnsafeUpstreamURL as exc:
             raise HTTPException(status_code=400, detail=f"{field}: {exc}") from exc
 
     for index, entry in enumerate(providers or []):
         if isinstance(entry, dict):
-            check(entry.get("api_base"), f"providers[{index}].api_base")
+            await check(entry.get("api_base"), f"providers[{index}].api_base")
     for pid, config in (preprocessors or {}).items():
         if isinstance(config, dict):
-            check(config.get("api_base"), f"preprocessors[{pid}].api_base")
+            await check(config.get("api_base"), f"preprocessors[{pid}].api_base")
     for gid, config in (image_generators or {}).items():
         if isinstance(config, dict):
-            check(config.get("api_base"), f"image_generators[{gid}].api_base")
+            await check(config.get("api_base"), f"image_generators[{gid}].api_base")
 
 
 def _import_provider(entry: dict, mode: str) -> str:
@@ -1780,6 +1796,7 @@ async def import_config_endpoint(payload: dict, authorization: Optional[str] = H
     if mode not in _IMPORT_MODES:
         raise HTTPException(status_code=400, detail=f"mode must be one of {sorted(_IMPORT_MODES)}")
     providers, preprocessors, image_generators, routing, fallbacks = _validate_config_payload(payload)
+    await _validate_imported_upstream_urls(providers, preprocessors, image_generators)
 
     summary = {"providers": {}, "preprocessors": {}, "image_generators": {}, "routing_rules": {}, "fallback_policies": {}}
     errors: list[str] = []

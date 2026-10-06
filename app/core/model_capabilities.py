@@ -27,7 +27,14 @@ _BOOL_KEYS = ("supports_vision", "supports_tools", "supports_reasoning")
 # 两者供网关在发出请求前归一参数，避免 liteLLM/上游本地拒绝；不对外广告
 # （capabilities_for_client_entry 不投影它们），也不包含任何模型/厂商名称。
 _FLOAT_KEYS = ("fixed_temperature", "fixed_temperature_with_reasoning")
-_CAPABILITY_KEYS = _INT_KEYS + _BOOL_KEYS + _FLOAT_KEYS + ("input_modalities", "pricing")
+# accepts_reasoning_content：描述"该上游接受消息对象携带 reasoning_content 扩展字段"
+# 这一参数约束事实。缺省（未知）= 接受，保持 DeepSeek 系回放的既有行为；False =
+# Chat 投影时剥离该字段。严格 OpenAI 官方系对消息对象的非标准字段回 400，多轮
+# reasoning 历史重放会被 400（bug-2026-10-05 L-1）。不对外广告。
+_INTERNAL_BOOL_KEYS = ("accepts_reasoning_content",)
+_CAPABILITY_KEYS = (
+    _INT_KEYS + _BOOL_KEYS + _FLOAT_KEYS + _INTERNAL_BOOL_KEYS + ("input_modalities", "pricing")
+)
 
 # 异常/被篡改的上游数据不得直出客户端：超出合理上限的值丢弃（保持"未知"）。
 _INT_LIMITS = {"context_window": 100_000_000, "max_output_tokens": 10_000_000}
@@ -77,6 +84,11 @@ def normalize_capabilities(raw: Any) -> dict:
             continue
         out[key] = parsed
     for key in _BOOL_KEYS:
+        if key in raw and raw[key] is not None:
+            parsed = _parse_bool(raw[key])
+            if parsed is not None:
+                out[key] = parsed
+    for key in _INTERNAL_BOOL_KEYS:
         if key in raw and raw[key] is not None:
             parsed = _parse_bool(raw[key])
             if parsed is not None:
@@ -132,18 +144,21 @@ _BUILTIN_FAMILIES: list[tuple[tuple[str, ...], dict]] = [
     (("claude-4", "claude-sonnet-4", "claude-opus-4", "claude-haiku-4"), {"context_window": 200000, "max_output_tokens": 8192, "supports_vision": True, "supports_tools": True, "supports_reasoning": True}),
     (("claude-3", "claude-4", "claude-sonnet", "claude-opus", "claude-haiku"), {"context_window": 200000, "max_output_tokens": 4096, "supports_vision": True, "supports_tools": True}),
     (("claude-2",), {"context_window": 100000, "supports_vision": False, "supports_tools": False}),
-    # OpenAI
-    (("gpt-4o",), {"context_window": 128000, "max_output_tokens": 16384, "supports_vision": True, "supports_tools": True}),
-    (("gpt-4.1",), {"context_window": 1047552, "max_output_tokens": 32768, "supports_vision": True, "supports_tools": True}),
-    (("gpt-4-turbo", "gpt-4-turbo-preview"), {"context_window": 128000, "max_output_tokens": 4096, "supports_vision": True, "supports_tools": True}),
-    (("gpt-6",), {"context_window": 1050000, "max_output_tokens": 128000, "supports_vision": True, "supports_tools": True, "supports_reasoning": True}),
+    # OpenAI 官方 API 对消息对象的非标准字段回 400：显式声明不接受
+    # reasoning_content 扩展，Chat 投影时剥离（L-1）。
+    (("gpt-4o",), {"context_window": 128000, "max_output_tokens": 16384, "supports_vision": True, "supports_tools": True, "accepts_reasoning_content": False}),
+    (("gpt-4.1",), {"context_window": 1047552, "max_output_tokens": 32768, "supports_vision": True, "supports_tools": True, "accepts_reasoning_content": False}),
+    (("gpt-4-turbo", "gpt-4-turbo-preview"), {"context_window": 128000, "max_output_tokens": 4096, "supports_vision": True, "supports_tools": True, "accepts_reasoning_content": False}),
+    (("gpt-6",), {"context_window": 1050000, "max_output_tokens": 128000, "supports_vision": True, "supports_tools": True, "supports_reasoning": True, "accepts_reasoning_content": False}),
     # gpt-5.1 必须排在 gpt-5 之前：marker 是子串命中（"gpt-5.1" 包含 "gpt-5"）且首个命中即生效。
     (("gpt-5.1",), {"max_output_tokens": 128000, "supports_vision": True, "supports_tools": True,
-                    "supports_reasoning": True, "fixed_temperature_with_reasoning": 1}),
+                    "supports_reasoning": True, "fixed_temperature_with_reasoning": 1,
+                    "accepts_reasoning_content": False}),
     (("gpt-5",), {"max_output_tokens": 128000, "supports_vision": True, "supports_tools": True,
-                  "supports_reasoning": True, "fixed_temperature": 1}),
-    (("o1", "o3", "o4-mini"), {"context_window": 200000, "max_output_tokens": 100000, "supports_vision": True, "supports_tools": True, "supports_reasoning": True}),
-    (("gpt-3.5",), {"context_window": 16383, "max_output_tokens": 4096, "supports_vision": False, "supports_tools": True}),
+                  "supports_reasoning": True, "fixed_temperature": 1,
+                  "accepts_reasoning_content": False}),
+    (("o1", "o3", "o4-mini"), {"context_window": 200000, "max_output_tokens": 100000, "supports_vision": True, "supports_tools": True, "supports_reasoning": True, "accepts_reasoning_content": False}),
+    (("gpt-3.5",), {"context_window": 16383, "max_output_tokens": 4096, "supports_vision": False, "supports_tools": True, "accepts_reasoning_content": False}),
     # Google
     (("gemini-1.5-pro", "gemini-1.5-ultra"), {"context_window": 2000000, "max_output_tokens": 8192, "supports_vision": True, "supports_tools": True}),
     (("gemini-1.5-flash",), {"context_window": 1000000, "max_output_tokens": 8192, "supports_vision": True, "supports_tools": True}),

@@ -392,12 +392,41 @@ def read_log_entries(
     if not path.exists():
         return {"items": [], "total": 0, "limit": limit, "offset": offset, "path": str(path)}
 
-    items = []
+    # 两遍扫描（bug-2026-10-05 L-22）：第一遍只做匹配判定、记录命中行号，
+    # 第二遍只解析当前页需要的行。旧实现把全文件所有匹配行都解析成 dict 并
+    # 保留 raw 文本再切片，大日志文件下内存/延迟随文件线性放大。
+    def _matches(raw: str) -> bool:
+        if q and q not in raw.lower():
+            return False
+        if level:
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                parsed = None
+            entry_level = str(parsed.get("level") or "").upper() if isinstance(parsed, dict) else ""
+            if entry_level != level:
+                return False
+        return True
+
+    matched_lines: list[int] = []
     with path.open("r", encoding="utf-8", errors="replace") as fh:
         for line_no, line in enumerate(fh, start=1):
             raw = line.rstrip("\r\n")
             if not raw:
                 continue
+            if _matches(raw):
+                matched_lines.append(line_no)
+
+    total = len(matched_lines)
+    # 新→旧排序后取分页窗口；page_by_no 供第二遍按行号回读。
+    newest_first = sorted(matched_lines, reverse=True)
+    page_nos = set(newest_first[offset:offset + limit])
+    items = []
+    with path.open("r", encoding="utf-8", errors="replace") as fh:
+        for line_no, line in enumerate(fh, start=1):
+            if line_no not in page_nos:
+                continue
+            raw = line.rstrip("\r\n")
             try:
                 entry = json.loads(raw)
                 if not isinstance(entry, dict):
@@ -411,16 +440,11 @@ def read_log_entries(
             entry.setdefault("msg", raw)
             entry["line"] = line_no
             entry["raw"] = raw
-            if level and str(entry.get("level") or "").upper() != level:
-                continue
-            if q and q not in raw.lower():
-                continue
             items.append(entry)
+    items.sort(key=lambda entry: entry["line"], reverse=True)
 
-    items.reverse()
-    total = len(items)
     return {
-        "items": items[offset:offset + limit],
+        "items": items,
         "total": total,
         "limit": limit,
         "offset": offset,

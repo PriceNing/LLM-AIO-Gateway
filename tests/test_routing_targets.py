@@ -173,12 +173,30 @@ def test_classify_text_pure_503():
     assert classify_upstream_error(RuntimeError("upstream returned 503")) == "http_5xx"
 
 
-def test_classify_unknown_string_falls_back_to_connection_error():
+def test_classify_internal_bug_types_do_not_masquerade_as_connection_error():
+    # bug-2026-10-05 M-20②：网关自身缺陷（Python 内置错误类型且无任何可分类
+    # 信号）不得归 connection_error，否则启用该触发器的策略会让内部 bug 跑完
+    # 整条 fallback 链。
+    assert classify_upstream_error(ValueError("something weird")) == "unknown"
+    assert classify_upstream_error(KeyError("boom")) == "unknown"
+    assert classify_upstream_error(TypeError("bad operand")) == "unknown"
+
+
+def test_classify_generic_runtime_error_keeps_availability_semantics():
+    # 上游失败常以 RuntimeError 包装（litellm/自有适配器惯例），无连接字样时
+    # 仍归 connection_error，可用性回退语义不得收窄。
     assert classify_upstream_error(RuntimeError("something weird")) == "connection_error"
 
 
 def test_classify_empty_message():
     assert classify_upstream_error(RuntimeError("")) == "connection_error"
+
+
+def test_classify_429_substring_does_not_trigger_rate_limit():
+    # M-20①：429 必须是独立状态码，token 数/端口/模型名里的子串不算。
+    assert classify_upstream_error(RuntimeError("used 14293 tokens")) != "http_429"
+    assert classify_upstream_error(RuntimeError("port 8429 busy")) != "http_429"
+    assert classify_upstream_error(RuntimeError("model gpt-429 not found")) != "http_429"
 
 
 def test_classify_wrapped_httpx_timeout_as_timeout():

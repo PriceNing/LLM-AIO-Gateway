@@ -8,6 +8,7 @@ from typing import Any
 
 from app.database import parse_model_id
 from app.services.http_pool import shared_client
+from app.services.url_guard import pinned_request
 
 
 def split_sse_frame(buffer: bytes) -> tuple[bytes, bytes] | None:
@@ -33,13 +34,23 @@ def iter_sse_frames(chunks):
     """Yield complete SSE frames from an async byte iterator without rewriting bytes."""
     async def _iter():
         buffer = b""
-        async for chunk in chunks:
-            buffer += chunk
-            while (split := split_sse_frame(buffer)) is not None:
-                frame, buffer = split
-                yield frame
-        if buffer:
-            yield buffer
+        try:
+            async for chunk in chunks:
+                buffer += chunk
+                while (split := split_sse_frame(buffer)) is not None:
+                    frame, buffer = split
+                    yield frame
+            if buffer:
+                # 上游在帧中间关流：旧实现把未闭合尾帧当完整帧 yield，下游按字节
+                # 原样转发后与后续 [DONE] 帧粘连成破帧（bug-2026-10-05 L-4）。
+                # SSE 语义下连接关闭也应派发已缓冲的事件，补一个终止空行使其自洽。
+                yield buffer if buffer.endswith((b"\n\n", b"\r\n\r\n")) else buffer + b"\n\n"
+        finally:
+            # 本生成器被提前关闭（客户端断开/超时）时级联关闭内层字节流：
+            # 内层持有上游 HTTP 连接，等 GC 不是释放保证（S5，bug-2026-10-05 H-4）。
+            from app.core.output import aclose_async_iterator
+
+            await aclose_async_iterator(chunks)
     return _iter()
 
 
@@ -100,8 +111,11 @@ def _request_timeout(provider: dict) -> int:
 
 async def post_native_response(provider: dict, internal) -> dict[str, Any]:
     timeout = _request_timeout(provider)
+    # 请求时钉 IP：校验地址与连接地址一致（bug-2026-10-05 R-1）。
+    target = await pinned_request(responses_url(provider.get("api_base", "")))
+    request_kwargs = {"extensions": target.extensions} if target.extensions else {}
     async with shared_client(provider.get("api_base", ""), timeout) as client:
-        response = await client.post(responses_url(provider.get("api_base", "")), headers=responses_headers(provider), json=native_responses_body(internal, stream=False))
+        response = await client.post(target.url, headers={**responses_headers(provider), **target.headers}, json=native_responses_body(internal, stream=False), **request_kwargs)
         await _raise_for_status_with_body(response)
         payload = response.json()
     if not isinstance(payload, dict) or payload.get("object") != "response":
@@ -111,8 +125,10 @@ async def post_native_response(provider: dict, internal) -> dict[str, Any]:
 
 async def stream_native_response(provider: dict, internal):
     timeout = _request_timeout(provider)
+    target = await pinned_request(responses_url(provider.get("api_base", "")))
+    request_kwargs = {"extensions": target.extensions} if target.extensions else {}
     async with shared_client(provider.get("api_base", ""), timeout) as client:
-        async with client.stream("POST", responses_url(provider.get("api_base", "")), headers=responses_headers(provider), json=native_responses_body(internal, stream=True)) as response:
+        async with client.stream("POST", target.url, headers={**responses_headers(provider), **target.headers}, json=native_responses_body(internal, stream=True), **request_kwargs) as response:
             await _raise_for_status_with_body(response)
             async for chunk in response.aiter_raw():
                 # Preserve the upstream event framing byte-for-byte.

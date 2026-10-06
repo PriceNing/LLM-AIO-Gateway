@@ -1,4 +1,11 @@
 def extract_and_strip_think(text: str) -> tuple[str, str]:
+    """抽取并剥离 <think>...</think> 块，返回 (正文, reasoning)。
+
+    边界口径（bug-2026-10-05 L-24，与流式路径 iter_openai_chat_output_events
+    收尾处理一致）：只有开标签、到文本结束仍未闭合的 <think> 块按 reasoning
+    处理（开标签本身一并剥离），不再原样留在正文——正文泄漏未闭合思考过程
+    比截断更糟，且两条路径口径必须一致。嵌套 <think> 需配对闭合。
+    """
     if not text:
         return text, ""
     think_parts = []
@@ -27,7 +34,8 @@ def extract_and_strip_think(text: str) -> tuple[str, str]:
                     think_parts.append(text[start + 7:next_close])
                 pos = next_close + 8
         if pos == -1:
-            result.append(text[start:])
+            # 未闭合：标签后的全部内容归 reasoning（对齐流式收尾口径）。
+            think_parts.append(text[start + 7:])
             break
         while pos < len(text) and text[pos] in " \t\n\r\f":
             pos += 1

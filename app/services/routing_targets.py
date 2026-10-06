@@ -1,3 +1,5 @@
+import re
+
 from fastapi import HTTPException
 import httpx
 
@@ -26,12 +28,31 @@ def candidate_targets(primary: RouteTarget, fallback_chain: list[RouteTarget] | 
     targets = []
     for target in [primary, *(fallback_chain or [])]:
         _app_log.debug("[candidate_targets] model=%s provider=%s", target.model, target.provider_id)
-        key = (target.model, target.provider_id)
-        if not target.model or key in seen:
+        if not target.model:
+            continue
+        # 去重键必须按“解析后的物理目标”归一（bug-2026-10-05 M-8）：
+        # primary 入链前已被解析成具体 provider_id，而 chain 条目常保留管理员
+        # 配置的空 provider 或复合 "provider/model" 写法；旧键
+        # (model, provider_id) 把同一上游当成两个目标重试两次，放大故障时
+        # 的上游压力并浪费 attempt_timeout 预算。
+        key = target_identity(target)
+        if key in seen:
             continue
         seen.add(key)
         targets.append(target)
     return targets
+
+
+def target_identity(target: RouteTarget) -> tuple[str, str]:
+    """(裸模型名, 解析后 provider_id)：同一物理上游的多种写法归一到同一键。"""
+    from app.database import parse_model_id
+
+    ref = parse_model_id(target.model)
+    provider_id = target.provider_id or ref.provider_id
+    if not provider_id:
+        resolved = resolve_provider(ref.model_name, "")
+        provider_id = (resolved or {}).get("id") or ""
+    return (ref.model_name, provider_id)
 
 
 def _exception_chain(exc: BaseException):
@@ -122,12 +143,25 @@ def classify_upstream_error(exc: Exception) -> str:
                 return "http_4xx"
 
     text = str(exc).lower()
-    if "429" in text or "rate limit" in text:
+    # 429 必须作为独立状态码出现（非数字边界），否则 "14293 tokens"、端口
+    # 8429、模型名 gpt-429 等子串都会误归限流并错触发回退（bug-2026-10-05 M-20①）。
+    if re.search(r"(?<![\w.\-])429(?!\d)", text) or "rate limit" in text or "too many requests" in text:
         _app_log.debug("[classify_upstream_error] category=http_429 text_match exc_type=%s", type(exc).__name__)
         return "http_429"
     if any(code in text for code in (" 500", " 502", " 503", " 504", "http 500", "http 502", "http 503", "http 504")):
         _app_log.debug("[classify_upstream_error] category=http_5xx text_match exc_type=%s", type(exc).__name__)
         return "http_5xx"
+    # 兜底分类（bug-2026-10-05 M-20②）：旧实现把一切未识别异常都归
+    # connection_error，于是网关自身 bug（TypeError/KeyError/…）也会消耗整条
+    # fallback 链。现在只有两类能拿到 connection_error：
+    #   - 文本/类型带真实连接语义；
+    #   - 其余非内部 bug 类型的异常（RuntimeError 等包装上游失败的惯例形状），
+    #     保持可用性回退语义不变。
+    # Python 内置错误类型在没有任何可分类信号时视为网关自身缺陷 → unknown，
+    # 不命中任何触发器，不消耗回退预算。
+    if isinstance(exc, (TypeError, ValueError, KeyError, IndexError, AttributeError, NameError, AssertionError, ZeroDivisionError, ImportError, UnboundLocalError)):
+        _app_log.debug("[classify_upstream_error] category=unknown internal_bug_type exc_type=%s", type(exc).__name__)
+        return "unknown"
     _app_log.debug("[classify_upstream_error] category=connection_error fallback exc_type=%s", type(exc).__name__)
     return "connection_error"
 

@@ -599,7 +599,11 @@ def _merge_openai_system_contents(contents: list[Any]) -> Any:
     return merged or ""
 
 
-def ir_to_openai_messages(messages: list[InternalMessage]) -> list[dict[str, Any]]:
+def ir_to_openai_messages(
+    messages: list[InternalMessage],
+    *,
+    include_reasoning_content: bool = True,
+) -> list[dict[str, Any]]:
     result = []
     # llama.cpp/Qwen templates reject both late system turns and more than one
     # system turn. Collapse every system message into a single leading prompt.
@@ -674,9 +678,12 @@ def ir_to_openai_messages(messages: list[InternalMessage]) -> list[dict[str, Any
             if msg.role == "assistant" and not out.get("content"):
                 out["content"] = None
 
-        reasoning = "\n".join(part.text for part in msg.parts if part.kind == "reasoning" and part.text)
-        if reasoning:
-            out["reasoning_content"] = reasoning
+        # include_reasoning_content=False：上游声明不接受消息级 reasoning_content
+        # 扩展（严格 OpenAI 官方会 400），投影时剥离（bug-2026-10-05 L-1）。
+        if include_reasoning_content:
+            reasoning = "\n".join(part.text for part in msg.parts if part.kind == "reasoning" and part.text)
+            if reasoning:
+                out["reasoning_content"] = reasoning
         result.append(out)
         index += 1
     return result

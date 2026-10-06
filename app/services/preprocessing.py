@@ -6,12 +6,11 @@ for description, then replaces the image with text so non-multimodal models can
 Configuration is stored in SQLite preprocessors and model switches are stored on
 provider_models rows.
 """
+import asyncio
 import hashlib
 import logging
 import threading
 from typing import Optional
-
-import httpx
 
 from app.config import get_default
 from app.core.text import error_detail_for_log
@@ -107,11 +106,19 @@ async def describe_image(
     }
 
     try:
-        async with httpx.AsyncClient(timeout=preprocessor_config.get("timeout", 120)) as client:
+        # 复用共享 HTTP 连接池：旧实现每张图新建一个 AsyncClient，max_images=10 时
+        # 首字节延迟随图片数线性放大且丢弃了 keep-alive（bug-2026-10-05 L-21）。
+        from app.services.http_pool import shared_client
+        # 请求时钉 IP：预处理器地址同样是管理员配置的上游（bug-2026-10-05 R-1）。
+        from app.services.url_guard import pinned_request
+        target = await pinned_request(f"{api_base}/chat/completions", field="preprocessor_api_base")
+        request_kwargs = {"extensions": target.extensions} if target.extensions else {}
+        async with shared_client(api_base, preprocessor_config.get("timeout", 120)) as client:
             resp = await client.post(
-                f"{api_base}/chat/completions",
-                headers=headers,
+                target.url,
+                headers={**headers, **target.headers},
                 json=body,
+                **request_kwargs,
             )
             if resp.status_code == 200:
                 data = resp.json()
@@ -185,13 +192,24 @@ async def preprocess_messages(
               len(unique_images), preprocessor_id, new_turn_start)
 
     max_images = preprocessor_config.get("max_images", 10)
-    for img in unique_images[:max_images]:
-        desc = await describe_image(
-            image_url=img.get("url", ""),
-            image_data=img.get("data", ""),
-            preprocessor_config=preprocessor_config,
-        )
-        image_descriptions[_cache_key(img.get("url", ""), img.get("data", ""))] = desc or "[image: could not be described]"
+    targets = unique_images[:max_images]
+    # 并发描述当前轮图片（旧实现串行，首字节延迟线性放大，L-21）。信号量限幅
+    # 避免一批大量图片瞬间压垮视觉预处理模型；描述按 cache key 写独立键，并发安全。
+    concurrency = max(1, min(len(targets), 4))
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def _describe_one(img: dict) -> tuple[str, str]:
+        async with semaphore:
+            desc = await describe_image(
+                image_url=img.get("url", ""),
+                image_data=img.get("data", ""),
+                preprocessor_config=preprocessor_config,
+            )
+        return _cache_key(img.get("url", ""), img.get("data", "")), desc or "[image: could not be described]"
+
+    if targets:
+        for key, desc in await asyncio.gather(*(_describe_one(img) for img in targets)):
+            image_descriptions[key] = desc
 
     _strip_images_with_descriptions(messages, image_descriptions, new_turn_start, max_images)
     return messages

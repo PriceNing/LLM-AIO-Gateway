@@ -36,7 +36,8 @@ def init_db(path: Optional[str] = None) -> None:
     if str(db_file) != ":memory:" and db_file.parent != Path("."):
         db_file.parent.mkdir(parents=True, exist_ok=True)
     with _lock:
-        with sqlite3.connect(_db_path()) as conn:
+        conn = sqlite3.connect(_db_path())
+        try:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA foreign_keys=ON")
             conn.executescript(_SCHEMA)
@@ -56,6 +57,14 @@ def init_db(path: Optional[str] = None) -> None:
             routing_db.migrate(conn)
             fallback_db.migrate(conn)
             request_logs_db.migrate(conn)
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            # `with sqlite3.connect()` 只提交不关闭（sqlite3 上下文管理器语义），
+            # 测试反复 init_db 会泄漏连接/WAL 句柄（bug-2026-10-05 L-9）。
+            conn.close()
         _initialized = True
 
 
@@ -146,7 +155,14 @@ def _remove_legacy_provider_responses_capability(conn: sqlite3.Connection) -> No
     existing = {row[1] for row in conn.execute("PRAGMA table_info(providers)").fetchall()}
     for column in legacy_columns:
         if column in existing:
-            conn.execute(f"ALTER TABLE providers DROP COLUMN {column}")
+            # DROP COLUMN 在 SQLite < 3.35 不支持，或列被索引/视图/生成列引用时会抛
+            # OperationalError。其它迁移的 ALTER 都包了 try/except，唯独这里没包：
+            # 旧库升级时 init_db 会在 lifespan 里直接崩（bug-2026-10-05 M-14）。
+            # 删不掉只是留下无害的废弃列，绝不能因此阻断启动。
+            try:
+                conn.execute(f"ALTER TABLE providers DROP COLUMN {column}")
+            except sqlite3.OperationalError:
+                pass
 
 
 def _migrate_model_responses_capability(conn: sqlite3.Connection) -> None:
@@ -271,42 +287,53 @@ def _migrate_image_generation_stats(conn: sqlite3.Connection) -> None:
             "SELECT key FROM global_stats WHERE key IN (?, ?, ?, ?)", tuple(sorted(keys))
         ).fetchall()
     }
-    if not keys.issubset(existing):
-        calls = failures = images = image_bytes = 0
-        for row in conn.execute("SELECT status, details FROM request_logs").fetchall():
-            try:
-                details = json.loads(row[1] or "{}")
-            except (TypeError, json.JSONDecodeError):
-                details = {}
-            mode = str(details.get("responses_mode") or "")
-            is_image = (
-                details.get("request_kind") == "image_generation"
-                or details.get("upstream_endpoint") == "images/generations"
-                or "image_generation" in mode
-            )
-            if not is_image:
-                continue
-            calls += 1
-            failures += 0 if row[0] in {"ok", "degraded"} else 1
-            try:
-                images += max(0, int(details.get("image_count") or 0))
-                image_bytes += max(0, int(details.get("image_bytes") or 0))
-            except (TypeError, ValueError):
-                pass
-        initial = {
-            "image_generation_calls": calls,
-            "image_generation_failed_calls": failures,
-            "image_generation_images": images,
-            "image_generation_bytes": image_bytes,
-        }
-    else:
-        initial = {}
-    for key in sorted(keys):
-        if key in initial:
+    missing = keys - existing
+    if not missing:
+        return
+    if existing:
+        # 部分键已存在（异常/半程升级）：缺失键补 0 而不是从 request_logs 重算。
+        # 旧实现对缺失键用"留存日志重算值"、对已存在键保留"增量累计值"，两套口径
+        # 混进同一张统计表，计数从此不可解释（bug-2026-10-05 L-13）。
+        for key in sorted(missing):
             conn.execute(
                 "INSERT OR IGNORE INTO global_stats (key, value) VALUES (?, ?)",
-                (key, str(initial[key])),
+                (key, "0"),
             )
+        return
+    # 四个键全部缺失（首次升级到带生图统计的版本）：从留存日志一次性重算播种，
+    # 四个计数共享同一口径。
+    calls = failures = images = image_bytes = 0
+    for row in conn.execute("SELECT status, details FROM request_logs").fetchall():
+        try:
+            details = json.loads(row[1] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            details = {}
+        mode = str(details.get("responses_mode") or "")
+        is_image = (
+            details.get("request_kind") == "image_generation"
+            or details.get("upstream_endpoint") == "images/generations"
+            or "image_generation" in mode
+        )
+        if not is_image:
+            continue
+        calls += 1
+        failures += 0 if row[0] in {"ok", "degraded"} else 1
+        try:
+            images += max(0, int(details.get("image_count") or 0))
+            image_bytes += max(0, int(details.get("image_bytes") or 0))
+        except (TypeError, ValueError):
+            pass
+    initial = {
+        "image_generation_calls": calls,
+        "image_generation_failed_calls": failures,
+        "image_generation_images": images,
+        "image_generation_bytes": image_bytes,
+    }
+    for key in sorted(keys):
+        conn.execute(
+            "INSERT OR IGNORE INTO global_stats (key, value) VALUES (?, ?)",
+            (key, str(initial[key])),
+        )
 
 
 def _ensure_init() -> None:
@@ -391,8 +418,12 @@ def get_db():
     以前每个数据库操作都新建连接并重设 PRAGMA；复用连接可去掉这部分固定开销（P1）。
 
     注意：复用后“同一线程内不得在 ``with get_db()`` 块里 await”成为硬约束：
-    一旦 await，同线程的另一个任务会拿到同一个未提交的事务。重入检测按任务
-    隔离，违反时直接报错而不是静默串事务。
+    一旦 await，同线程的另一个任务会拿到同一个未提交的事务。重入检测只在
+    **有运行事件循环**的任务之间生效（owner/current 都取到任务 id 时
+    才比较）：无循环的同步上下文 token 为 None，不互相检测，也不与任务态检测
+    （bug-2026-10-05 L-12：旧注释宣称“任务隔离”过强）。当前调用模式是安全的：
+    同步块内不存在 await 让渡点，to_thread 路径用的是各线程自己的连接。
+    新增“持连接跨 await”的用法时必须显式传连接或先扩展本守卫。
     """
     _ensure_init()
     if getattr(_thread_local, "depth", 0):

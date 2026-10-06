@@ -129,8 +129,82 @@ async def test_anthropic_sse_block_indices_monotonic_when_text_follows_tool_star
     assert types == ["text", "tool_use"]
 
 
+
+# ---------------------------------------------------------------------------
+# H-3 Anthropic block 全局序号 -> Chat tool_calls 紧凑 index
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_anthropic_adapter_compacts_tool_index_after_text_block(monkeypatch):
+    """text(0) 之后 tool(1)：适配器不得把 block 全局序号当 tool index 外发，
+    否则 Chat 出口出现 0 空洞，严格 SDK 合并错位（bug-2026-10-05 H-3）。"""
+
+    class FakeStream:
+        status_code = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def aiter_lines(self):
+            yield "event: message_start"
+            yield 'data: {"type":"message_start","message":{"usage":{"input_tokens":1}}}'
+            yield "event: content_block_start"
+            yield 'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}'
+            yield "event: content_block_delta"
+            yield 'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"thinking out loud"}}'
+            yield "event: content_block_stop"
+            yield 'data: {"type":"content_block_stop","index":0}'
+            yield "event: content_block_start"
+            yield 'data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_9","name":"run"}}'
+            yield "event: content_block_delta"
+            yield 'data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\\"x\\":1}"}}'
+            yield "event: content_block_stop"
+            yield 'data: {"type":"content_block_stop","index":1}'
+            yield "event: message_delta"
+            yield 'data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":2}}'
+            yield "event: message_stop"
+            yield 'data: {"type":"message_stop"}'
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def stream(self, *args, **kwargs):
+            return FakeClient._stream_instance
+
+    FakeClient._stream_instance = FakeStream()
+    monkeypatch.setattr(anthropic_streaming, "shared_client", lambda *args, **kwargs: FakeClient())
+
+    tool_events = []
+    async for event in iter_anthropic_output_events(
+        provider_info={"id": "anth", "api_base": "https://a.example", "api_key": "k"},
+        messages=[{"role": "user", "content": "hi"}],
+        body={},
+        max_tokens=16,
+        temperature=0.7,
+        model="claude-test",
+    ):
+        if event.kind in {"tool_call_start", "tool_call_arguments_delta", "tool_call_done"}:
+            tool_events.append((event.kind, event.tool_index))
+
+    assert [kind for kind, _ in tool_events] == [
+        "tool_call_start", "tool_call_arguments_delta", "tool_call_done",
+    ]
+    assert [idx for _, idx in tool_events] == [0, 0, 0], tool_events
+
+
 # ---------------------------------------------------------------------------
 # #6 无签名 thinking 块不发给 Anthropic 上游
+
 # ---------------------------------------------------------------------------
 
 def test_unsigned_thinking_dropped_for_anthropic_upstream():

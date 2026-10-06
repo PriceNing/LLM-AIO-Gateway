@@ -27,6 +27,9 @@ def strip_billing_header(text):
         for block in text:
             if isinstance(block, dict) and block.get("type") == "text":
                 t = block.get("text", "")
+                if not isinstance(t, str):
+                    cleaned.append(block)
+                    continue
                 stripped = _BILLING_HEADER_RE.sub('', t).strip()
                 if stripped:
                     cleaned_block = dict(block)
@@ -35,6 +38,11 @@ def strip_billing_header(text):
             else:
                 cleaned.append(block)
         return cleaned
+    if not isinstance(text, str):
+        # 客户端可把 system 传成 dict/数字等任意 JSON 值；正则对非字符串
+        # 直接 TypeError → 裸 500（bug-2026-10-05 L-7）。非文本值没有计费头
+        # 可剥，原样返回交给下游既有形状处理。
+        return text
     return _BILLING_HEADER_RE.sub('', text).strip()
 
 

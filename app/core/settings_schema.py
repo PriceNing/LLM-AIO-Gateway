@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+import math
+
 from typing import Any
 
 from app.config import default_config
@@ -145,6 +147,7 @@ _META: dict[str, dict] = {
     "login_attempt_window_seconds": {"group": "security", "unit": "seconds", "min": 10, "max": 86_400},
     "login_lockout_seconds": {"group": "security", "unit": "seconds", "min": 10, "max": 86_400},
     "login_attempt_max_identities": {"group": "security", "unit": "count", "min": 100, "max": 1_000_000},
+    "login_throttle_trusted_hops": {"group": "security", "unit": "count", "min": 0, "max": 10},
 }
 
 _DEFAULT_GROUP = "maintenance"
@@ -285,6 +288,11 @@ def validate(key: str, value: Any) -> Any:
             number = float(value)
         except (TypeError, ValueError):
             raise SettingsValidationError(f"{key}: 需要数字") from None
+        # nan/inf 能过 float()，但：int 键上 int(nan) 抛 ValueError、int(inf) 抛
+        # OverflowError（裸 500）；float 键上 NaN 与 min/max 比较恒 False 直接
+        # 写盘，json.dump 又产出非法 NaN 字面量（bug-2026-10-05 M-12）。
+        if not math.isfinite(number):
+            raise SettingsValidationError(f"{key}: 需要有限数字")
         if kind == "int":
             if number != int(number):
                 raise SettingsValidationError(f"{key}: 需要整数")

@@ -210,7 +210,7 @@ async def test_imagegen_retry_after_capped(monkeypatch):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_download_image_follows_redirect():
+async def test_download_image_follows_redirect(monkeypatch):
     from app.adapters.imagegen import _download_image
 
     class Resp:
@@ -248,10 +248,18 @@ async def test_download_image_follows_redirect():
         Resp(302, {"location": "http://cdn.test/img.png"}),
         Resp(200, {"content-type": "image/png"}, fake_png),
     ])
+    # R-2 后 allow_private=True 也逐跳解析+钉 IP：不再因开关跳过检查，
+    # 因此测试需要确定性 DNS。
+    dns = {"image.test": "10.0.0.5", "cdn.test": "10.0.0.6"}
+    monkeypatch.setattr(
+        "app.adapters.imagegen.socket.getaddrinfo",
+        lambda host, *args, **kwargs: [(2, 1, 6, "", (dns[host], 0))],
+    )
     data_uri, mime = await _download_image(fake_client, "http://image.test/result", allow_private_hosts=True)
     assert mime == "image/png"
     assert data_uri == f"data:image/png;base64,{base64.b64encode(fake_png).decode('ascii')}"
-    assert fake_client.urls == ["http://image.test/result", "http://cdn.test/img.png"]
+    # 连接地址是钉住的 IP（校验地址=连接地址），原主机名由 Host 头保留。
+    assert [url.split("/")[2] for url in fake_client.urls] == ["10.0.0.5", "10.0.0.6"]
 
 
 # ---------------------------------------------------------------------------

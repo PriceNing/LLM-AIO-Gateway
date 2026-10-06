@@ -2205,6 +2205,6 @@ def test_codex_images_generation_accepts_fixed_image_model(image_app_db, monkeyp
 
 
 def test_grok_image_options_ignore_codex_auto_size():
-    from app.adapters.imagegen import _grok_image_options
+    from app.adapters.imagegen import _aspect_ratio_options as _grok_image_options
 
     assert _grok_image_options("auto") == {}

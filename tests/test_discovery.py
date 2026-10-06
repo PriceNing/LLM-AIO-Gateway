@@ -128,12 +128,23 @@ async def test_check_provider_health_ok(monkeypatch):
 
     class Response:
         status_code = 200
+        headers = {"content-length": "20"}
 
         def raise_for_status(self):
             return None
 
-        def json(self):
-            return {"data": [{"id": "m1"}]}
+        async def aiter_bytes(self):
+            yield b'{"data": [{"id": "m1"}]}'
+
+    class Ctx:
+        def __init__(self, resp):
+            self._resp = resp
+
+        async def __aenter__(self):
+            return self._resp
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
 
     class Client:
         def __init__(self, *args, **kwargs):
@@ -145,8 +156,8 @@ async def test_check_provider_health_ok(monkeypatch):
         async def __aexit__(self, exc_type, exc, tb):
             return False
 
-        async def get(self, url, headers=None):
-            return Response()
+        def stream(self, method, url, **kwargs):
+            return Ctx(Response())
 
     monkeypatch.setattr("app.services.discovery.httpx.AsyncClient", Client)
 
@@ -180,7 +191,7 @@ async def test_check_provider_health_error(monkeypatch):
         async def __aexit__(self, exc_type, exc, tb):
             return False
 
-        async def get(self, url, headers=None):
+        def stream(self, method, url, **kwargs):
             raise RuntimeError("boom")
 
     monkeypatch.setattr("app.services.discovery.httpx.AsyncClient", Client)
@@ -246,6 +257,7 @@ async def test_discover_models_follows_anthropic_pagination(monkeypatch):
 
     class Response:
         status_code = 200
+        headers = {"content-length": "20"}
 
         def __init__(self, payload):
             self.payload = payload
@@ -253,8 +265,19 @@ async def test_discover_models_follows_anthropic_pagination(monkeypatch):
         def raise_for_status(self):
             return None
 
-        def json(self):
-            return self.payload
+        async def aiter_bytes(self):
+            import json as _json
+            yield _json.dumps(self.payload).encode()
+
+    class Ctx:
+        def __init__(self, resp):
+            self._resp = resp
+
+        async def __aenter__(self):
+            return self._resp
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
 
     class Client:
         def __init__(self, *args, **kwargs):
@@ -266,11 +289,11 @@ async def test_discover_models_follows_anthropic_pagination(monkeypatch):
         async def __aexit__(self, exc_type, exc, tb):
             return False
 
-        async def get(self, url, **kwargs):
+        def stream(self, method, url, **kwargs):
             calls.append(kwargs.get("params"))
             if kwargs.get("params"):
-                return Response({"data": [{"id": "model-2"}], "has_more": False})
-            return Response({"data": [{"id": "model-1"}], "has_more": True, "last_id": "model-1"})
+                return Ctx(Response({"data": [{"id": "model-2"}], "has_more": False}))
+            return Ctx(Response({"data": [{"id": "model-1"}], "has_more": True, "last_id": "model-1"}))
 
     monkeypatch.setattr("app.services.discovery.httpx.AsyncClient", Client)
 

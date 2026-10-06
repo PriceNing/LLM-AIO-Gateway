@@ -5,6 +5,7 @@ import time
 import httpx
 from app.database import get_provider, update_provider, get_providers, get_db, merge_upstream_model_capabilities
 from app.adapters.responses import iter_sse_frames, responses_headers, responses_url, sse_payload
+from app.services.url_guard import pinned_request
 
 
 def model_list_urls(api_base: str, provider_type: str) -> list[str]:
@@ -147,6 +148,35 @@ def parse_models(data: dict) -> list[dict]:
     return models
 
 
+# 上游 /models 响应体积上限，与 model_registry 的抓取同口径（bug-2026-10-05 L-23）：
+# 无上限时异常/恶意上游可用超大 JSON 在 resp.json() 处打爆网关内存。
+_MAX_DISCOVERY_BYTES = 10 * 1024 * 1024
+
+
+async def _get_capped(client, url, **kwargs) -> tuple[int, bytes]:
+    """流式读取、带字节上限的 GET，返回 (status_code, body)。
+
+    httpx 非流式 get() 返回时整个 body 已进内存，事后检查 Content-Length
+    只能阻止超大 JSON 被解析、不能阻止它被持有（bug-2026-10-05 R-5）。
+    流式累计超上限立即中断；header 声明检查保留作快速失败路径。
+    不抛状态异常：由调用方按 status 决定（健康检查需要记录状态码）。
+    """
+    async with client.stream("GET", url, **kwargs) as resp:
+        headers = getattr(resp, "headers", None) or {}
+        try:
+            declared = str(headers.get("content-length") or "")
+        except Exception:  # noqa: BLE001 - 假响应对象缺 headers 时不做判定
+            declared = ""
+        if declared.isdigit() and int(declared) > _MAX_DISCOVERY_BYTES:
+            raise RuntimeError(f"upstream models response exceeds {_MAX_DISCOVERY_BYTES} bytes")
+        chunks = bytearray()
+        async for chunk in resp.aiter_bytes():
+            chunks.extend(chunk)
+            if len(chunks) > _MAX_DISCOVERY_BYTES:
+                raise RuntimeError(f"upstream models response exceeds {_MAX_DISCOVERY_BYTES} bytes")
+        return resp.status_code, bytes(chunks)
+
+
 async def discover_models(provider_id: str) -> list[dict]:
     provider = get_provider(provider_id)
     if not provider:
@@ -173,9 +203,15 @@ async def discover_models(provider_id: str) -> list[dict]:
                         request_kwargs = {"headers": headers, "timeout": 10.0}
                         if params:
                             request_kwargs["params"] = params
-                        resp = await client.get(url, **request_kwargs)
-                        resp.raise_for_status()
-                        payload = resp.json()
+                        # 请求时钉 IP：校验过的地址与实际连接地址一致（R-1）。
+                        target = await pinned_request(url)
+                        request_kwargs["headers"] = {**headers, **target.headers}
+                        if target.extensions:
+                            request_kwargs["extensions"] = target.extensions
+                        status, body = await _get_capped(client, target.url, **request_kwargs)
+                        if status >= 400:
+                            raise RuntimeError(f"upstream models endpoint returned HTTP {status}")
+                        payload = json.loads(body)
                         page_models = parse_models(payload)
                         for model in page_models:
                             models_by_id[str(model["id"])] = model
@@ -300,10 +336,15 @@ async def check_provider_health(provider_id: str, timeout: float = 10.0) -> dict
             for headers in auth_headers(provider.get("api_key", ""), provider.get("provider_type", "openai")):
                 attempt = {"url": url, "ok": False, "status_code": None, "model_count": 0, "error": ""}
                 try:
-                    resp = await client.get(url, headers=headers)
-                    attempt["status_code"] = resp.status_code
-                    resp.raise_for_status()
-                    models = parse_models(resp.json())
+                    target = await pinned_request(url)
+                    request_kwargs = {"headers": {**headers, **target.headers}}
+                    if target.extensions:
+                        request_kwargs["extensions"] = target.extensions
+                    status, body = await _get_capped(client, target.url, **request_kwargs)
+                    attempt["status_code"] = status
+                    if status >= 400:
+                        raise RuntimeError(f"health endpoint returned HTTP {status}")
+                    models = parse_models(json.loads(body))
                     attempt["ok"] = True
                     attempt["model_count"] = len(models)
                     attempts.append(attempt)
@@ -313,7 +354,7 @@ async def check_provider_health(provider_id: str, timeout: float = 10.0) -> dict
                         "status": "ok",
                         "latency_ms": int((time.perf_counter() - started) * 1000),
                         "checked_url": url,
-                        "status_code": resp.status_code,
+                        "status_code": status,
                         "model_count": len(models),
                         "attempts": attempts,
                     }
@@ -332,8 +373,20 @@ async def check_provider_health(provider_id: str, timeout: float = 10.0) -> dict
     }
 
 
+# 健康检查并发上限：无上限时 N 个 provider 同时创建 client、DNS 查询与
+# 超时任务，规模化部署下管理端会瞬现连接/任务尖峰（bug-2026-10-05 R-4）。
+_HEALTH_CHECK_CONCURRENCY = 8
+
+
 async def check_all_provider_health(timeout: float = 10.0) -> list[dict]:
-    results = []
-    for provider in get_providers():
-        results.append(await check_provider_health(provider["id"], timeout=timeout))
-    return results
+    # 并发检查：串行时 N 个 provider 的总耗时是 N 个 10s 超时之和，一个挂死的
+    # 上游就能把管理端健康检查拖满整分钟（L-23）。每个 provider 独立 client，
+    # 并发无共享状态；semaphore 只限瞬时并发，不改结果集合（R-4）。
+    providers = get_providers()
+    limiter = asyncio.Semaphore(_HEALTH_CHECK_CONCURRENCY)
+
+    async def guarded(provider_id: str) -> dict:
+        async with limiter:
+            return await check_provider_health(provider_id, timeout=timeout)
+
+    return list(await asyncio.gather(*(guarded(provider["id"]) for provider in providers)))

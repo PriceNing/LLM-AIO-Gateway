@@ -10,6 +10,7 @@ from app.database import parse_model_id
 from app.protocols.ir import ir_to_anthropic_messages
 from app.core.text import strip_billing_header
 from app.services.http_pool import shared_client
+from app.services.url_guard import pinned_request
 from app.config import get_default
 from app.services.logger import get_logger
 
@@ -284,13 +285,19 @@ async def anthropic_messages_completion(
     retries = provider_retry_count(provider_info)
     backoff = provider_retry_backoff(provider_info)
     last_exc = None
+    # 请求时钉 IP：保存时校验过一次不等于连接时不重新解析，校验过的地址
+    # 与实际连接地址必须同一个（bug-2026-10-05 R-1）。
+    # extensions 仅在发生改写时传递，降级/原样路径的请求参数与旧行为一致。
+    target = await pinned_request(_anthropic_message_url(provider_info.get("api_base") or ""))
+    stream_kwargs = {"extensions": target.extensions} if target.extensions else {}
     async with shared_client(provider_info.get("api_base") or "", timeout) as client:
         for attempt in range(retries + 1):
             try:
                 resp = await client.post(
-                    _anthropic_message_url(provider_info.get("api_base") or ""),
-                    headers=_anthropic_headers(provider_info),
+                    target.url,
+                    headers={**_anthropic_headers(provider_info), **target.headers},
                     json=req_body,
+                    **stream_kwargs,
                 )
                 if resp.status_code == 200:
                     return _anthropic_response_to_internal(resp.json())

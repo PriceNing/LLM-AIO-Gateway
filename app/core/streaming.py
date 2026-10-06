@@ -332,7 +332,8 @@ async def stream_internal_output(
         )
         _attach_stream_performance(success_details, streamed_usage, first_output_at, stream_started_at)
         counters = stats_counters_for_status(success_details.get("status", "ok"))
-        log_request(
+        await _invoke_log_request(
+            log_request,
             username,
             api_key_value,
             final_model,
@@ -400,7 +401,8 @@ async def stream_internal_output(
                 )
                 _attach_stream_performance(success_details, streamed_usage, first_output_at, stream_started_at)
                 counters = stats_counters_for_status(success_details.get("status", "ok"))
-                log_request(
+                await _invoke_log_request(
+                    log_request,
                     username,
                     api_key_value,
                     logged_model,
@@ -457,7 +459,8 @@ async def stream_internal_output(
                     visible_output_started,
                     total_tokens,
                 )
-                log_request(
+                await _invoke_log_request(
+                    log_request,
                     username,
                     api_key_value,
                     logged_model,
@@ -529,7 +532,8 @@ async def stream_internal_output(
             or ""
         )
         _error_log.error("[%s_stream] %s", endpoint, error_detail_for_log(exc))
-        log_request(
+        await _invoke_log_request(
+            log_request,
             username,
             api_key_value,
             logged_model,
@@ -581,6 +585,20 @@ async def stream_internal_output(
         # 避免上游 HTTP 连接只能等 GC 才释放（S5）。
         await aclose_async_iterator(upstream_events)
         await aclose_async_iterator(events)
+
+
+async def _invoke_log_request(log_request, *args, **kwargs) -> None:
+    """`_log_request`（request_records/global_stats 的 SQLite 写）离开事件循环执行。
+
+    流收尾与 `_invoke_record_request_log` 同口径：终态记账每请求必发生，留在
+    循环上会拖慢所有在途流（bug-2026-10-05 M-10）。
+    """
+    if log_request is None:
+        return
+    try:
+        await anyio.to_thread.run_sync(partial(log_request, *args, **kwargs))
+    except Exception as exc:  # noqa: BLE001 - 记账失败不得改变流终态
+        _app_log.warning("[stream_log] log_request failed: %s", exc)
 
 
 async def _invoke_record_request_log(

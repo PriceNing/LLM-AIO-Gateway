@@ -1,5 +1,7 @@
 import os
 import json
+import tempfile
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -40,6 +42,7 @@ def default_config() -> dict:
             "session_ttl_hours": 12,
             "login_attempt_limit": 10,
             "login_attempt_window_seconds": 300,
+            "login_throttle_trusted_hops": 0,
             "login_lockout_seconds": 900,
             "login_attempt_max_identities": 10000,
             "request_log_max": 200,
@@ -75,6 +78,7 @@ def default_config() -> dict:
             "image_download_allow_private_hosts": False,
             # 局域网自建推理服务是正常用法，默认放行私网上游；元数据地址始终禁止。
             "allow_private_upstream_hosts": True,
+            "url_guard_require_resolvable": False,
             "image_generation_idempotency_ttl_seconds": 300,
             "image_generation_idempotency_max_entries": 64,
             "responses_capability_supported_ttl": 604800,
@@ -98,6 +102,10 @@ class ConfigManager:
         self.path = Path(path or os.environ.get("LLM_GATEWAY_CONFIG", "config.json"))
         self.config: dict = {}
         self._loaded = False
+        # 同步端点在线程池并发执行；旧实现无锁且临时文件名固定，
+        # 两个并发写者会交错写同一 .tmp 再二次 replace（污损/丢更新，
+        # bug-2026-10-05 M-11）。锁覆盖“读磁盘→改键→原子写”全程。
+        self._write_lock = threading.RLock()
 
     def load(self) -> None:
         if self.path.exists():
@@ -121,12 +129,26 @@ class ConfigManager:
             for key in base[section]:
                 self.config[section].setdefault(key, base[section][key])
 
-    def save(self) -> None:
+    def _atomic_dump(self, payload: dict) -> None:
+        """唯一临时文件 + os.replace；失败时清理自己的临时文件。"""
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = self.path.with_suffix(".tmp")
-        with tmp_path.open("w", encoding="utf-8") as f:
-            json.dump(self.config, f, indent=2, ensure_ascii=False)
-        tmp_path.replace(self.path)
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(self.path.parent), prefix=self.path.name + ".", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False)
+            os.replace(tmp_name, self.path)
+        except BaseException:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
+
+    def save(self) -> None:
+        with self._write_lock:
+            self._atomic_dump(self.config)
 
     def patch(self, section: str, values: dict | None = None, remove: tuple[str, ...] = ()) -> dict:
         """只改指定键并落盘；返回磁盘上该 section 的最新内容。
@@ -143,6 +165,10 @@ class ConfigManager:
         if not values and not remove:
             return dict(self._section_on_disk(section, filled=False))
 
+        with self._write_lock:
+            return self._patch_locked(section, values, tuple(remove))
+
+    def _patch_locked(self, section: str, values: dict, remove: tuple[str, ...]) -> dict:
         on_disk: dict = {}
         if self.path.exists():
             with self.path.open("r", encoding="utf-8") as f:
@@ -164,11 +190,7 @@ class ConfigManager:
                 on_disk.pop(key, None)
             on_disk.update(values)
 
-        tmp_path = self.path.with_suffix(".tmp")
-        tmp_path.parent.mkdir(parents=True, exist_ok=True)
-        with tmp_path.open("w", encoding="utf-8") as f:
-            json.dump(on_disk, f, indent=2, ensure_ascii=False)
-        tmp_path.replace(self.path)
+        self._atomic_dump(on_disk)
 
         # 内存同步：单进程部署，写盘成功后立即让 get_default 读到新值。
         if section:

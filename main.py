@@ -2,6 +2,7 @@ import sys
 import io
 import asyncio
 import contextlib
+import re
 import time
 # Windows cmd.exe uses GBK by default, which can't encode emoji (e.g. OK).
 # Reconfigure stdout/stderr to UTF-8 so diagnostic prints don't crash.
@@ -28,10 +29,22 @@ BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "app" / "web" / "static"
 
 
+# 客户端可自带的 request id 白名单：可见 ASCII、无空格/控制字符，长度受限，
+# 避免污染日志行与前缀查询。
+_CLIENT_REQUEST_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
+
+
 class RequestIdMiddleware(BaseHTTPMiddleware):
     """Assign a unique request_id to every HTTP request for log tracing."""
     async def dispatch(self, request: Request, call_next):
-        rid = request.headers.get("X-Request-ID") or generate_request_id()
+        # 客户端 id 只在通过白名单校验时采用：旧实现原样信任任意头值，
+        # 伪造/超长/控制字符会污染日志关联与 request_id 前缀查询
+        # （bug-2026-10-05 L-20）。不合格一律换成服务端 uuid。
+        client_rid = request.headers.get("X-Request-ID") or ""
+        if _CLIENT_REQUEST_ID_RE.fullmatch(client_rid):
+            rid = client_rid
+        else:
+            rid = generate_request_id()
         set_request_id(rid)
         start = time.perf_counter()
         access_log = get_logger("access")
@@ -75,6 +88,11 @@ def _maintenance_interval() -> int:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from app.core.outcome import set_shutting_down
+    # 停机标志必须在启动段重置：同进程重复 lifespan（TestClient、嵌入式、
+    # 未来可能的多轮启停）若沿用上一轮的 True，后续请求的 CancelledError
+    # 会被永久归因为"服务端停机取消"（bug-2026-10-05 R-6）。
+    set_shutting_down(False)
     from app.database import init_db, run_storage_maintenance, close_thread_connection
     cfg = load_config()
     db_path = cfg.config.get("database", "data.db")
@@ -123,6 +141,8 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        from app.core.outcome import set_shutting_down
+        set_shutting_down(True)
         stop_maintenance.set()
         maintenance_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):

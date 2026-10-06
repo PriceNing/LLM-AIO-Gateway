@@ -35,10 +35,14 @@ def workflow_userdata_url(api_base: str, workflow_name: str) -> str:
 
 async def list_saved_workflows(api_base: str, *, api_key: str = "", timeout: int = 30) -> list[str]:
     """List saved ComfyUI workflow paths from its userdata API."""
+    from app.services.url_guard import pinned_request
+
     base = _base_url(api_base)
     headers = _headers({"api_key": api_key})
-    async with httpx.AsyncClient(timeout=max(1, min(60, int(timeout))), headers=headers) as client:
-        response = await client.get(f"{base}/api/userdata", params={"dir": "workflows", "recurse": "true"})
+    target = await pinned_request(f"{base}/api/userdata", field="comfyui_api_base")
+    request_kwargs = {"extensions": target.extensions} if target.extensions else {}
+    async with httpx.AsyncClient(timeout=max(1, min(60, int(timeout))), headers={**headers, **target.headers}) as client:
+        response = await client.get(target.url, params={"dir": "workflows", "recurse": "true"}, **request_kwargs)
         response.raise_for_status()
         body = response.json()
     if not isinstance(body, list):
@@ -48,9 +52,13 @@ async def list_saved_workflows(api_base: str, *, api_key: str = "", timeout: int
 
 async def load_saved_workflow(api_base: str, workflow_name: str, *, api_key: str = "", timeout: int = 30) -> dict[str, Any]:
     """Load a saved ComfyUI workflow JSON from userdata."""
+    from app.services.url_guard import pinned_request
+
     headers = _headers({"api_key": api_key})
-    async with httpx.AsyncClient(timeout=max(1, min(60, int(timeout))), headers=headers) as client:
-        response = await client.get(workflow_userdata_url(api_base, workflow_name))
+    target = await pinned_request(workflow_userdata_url(api_base, workflow_name), field="comfyui_api_base")
+    request_kwargs = {"extensions": target.extensions} if target.extensions else {}
+    async with httpx.AsyncClient(timeout=max(1, min(60, int(timeout))), headers={**headers, **target.headers}) as client:
+        response = await client.get(target.url, **request_kwargs)
         response.raise_for_status()
         body = response.json()
     if not isinstance(body, dict):
@@ -343,8 +351,15 @@ async def generate_comfyui_images(
     max_bytes = max(64 * 1024, min(100 * 1024 * 1024, int(config.get("result_max_bytes") or 25 * 1024 * 1024)))
     client_id = uuid.uuid4().hex
     started = time.monotonic()
-    async with httpx.AsyncClient(timeout=httpx.Timeout(min(timeout, 60), connect=min(timeout, 15)), headers=_headers(config)) as client:
-        response = await client.post(f"{base}/prompt", json={"prompt": workflow, "client_id": client_id})
+    # 请求时钉 IP：ComfyUI 基址同样是管理员配置的上游（bug-2026-10-05 R-1）。
+    # 单一 client 上多个端点共用同一 origin，解析一次后把同主机 URL 统一改写。
+    from app.services.url_guard import pinned_request
+
+    target = await pinned_request(f"{base}/prompt", field="comfyui_api_base")
+    request_kwargs = {"extensions": target.extensions} if target.extensions else {}
+    client_headers = {**_headers(config), **target.headers}
+    async with httpx.AsyncClient(timeout=httpx.Timeout(min(timeout, 60), connect=min(timeout, 15)), headers=client_headers) as client:
+        response = await client.post(target.rewrite_url(f"{base}/prompt"), json={"prompt": workflow, "client_id": client_id}, **request_kwargs)
         if response.status_code >= 400:
             raise ImageBackendHTTPError(response.status_code, response.text[:1000].strip())
         try:
@@ -359,7 +374,7 @@ async def generate_comfyui_images(
 
         history_item: dict[str, Any] | None = None
         while time.monotonic() - started < timeout:
-            history_response = await client.get(f"{base}/history/{prompt_id}")
+            history_response = await client.get(target.rewrite_url(f"{base}/history/{prompt_id}"), **request_kwargs)
             if history_response.status_code >= 400:
                 raise ImageBackendHTTPError(history_response.status_code, history_response.text[:1000].strip())
             body = history_response.json()
@@ -393,11 +408,11 @@ async def generate_comfyui_images(
             filename = str(descriptor.get("filename") or "")
             if not filename:
                 continue
-            image_response = await client.get(f"{base}/view", params={
+            image_response = await client.get(target.rewrite_url(f"{base}/view"), params={
                 "filename": filename,
                 "subfolder": str(descriptor.get("subfolder") or ""),
                 "type": str(descriptor.get("type") or "output"),
-            })
+            }, **request_kwargs)
             if image_response.status_code >= 400:
                 raise ImageBackendHTTPError(image_response.status_code, image_response.text[:1000].strip())
             raw = image_response.content
